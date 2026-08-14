@@ -146,4 +146,76 @@ describe('run comparison projection', () => {
       'Immutable work items differ.',
     ]);
   });
+
+  test('projects the latest deterministic and human evaluation evidence', () => {
+    const run = comparisonRun();
+    const evaluated: RunDetails = {
+      ...run,
+      evaluations: [
+        {
+          binding: {
+            reportId: 'report-a',
+            experimentId: 'experiment-a',
+            runId: run.id,
+            repositoryId: run.repositoryId,
+            startingCommit: run.startingCommit,
+            workflowChecksum: run.workflowChecksum,
+            configurationChecksum: 'sha256:configuration',
+            datasetId: 'feature-regression',
+            datasetVersion: '1.0.0',
+            datasetChecksum: 'sha256:dataset',
+            caseId: 'comparison',
+            evaluatorVersion: '1',
+            createdBy: 'operator',
+            createdAt: '2026-08-14T12:00:00.000Z',
+          },
+          report: {
+            datasetId: 'feature-regression',
+            datasetVersion: '1.0.0',
+            datasetChecksum: 'sha256:dataset',
+            caseId: 'comparison',
+            status: 'failed',
+            checks: [
+              {
+                expectation: { type: 'run_status', value: 'succeeded' },
+                status: 'passed',
+                message: 'passed',
+              },
+              {
+                expectation: { type: 'max_invocations', value: 1 },
+                status: 'failed',
+                message: 'failed',
+              },
+            ],
+          },
+          annotations: [
+            {
+              id: 'annotation-a',
+              reportId: 'report-a',
+              actor: 'reviewer',
+              verdict: 'unsure',
+              note: 'Needs inspection',
+              createdAt: '2026-08-14T12:01:00.000Z',
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(runComparisonColumn(evaluated).evaluation).toEqual({
+      reportId: 'report-a',
+      experimentId: 'experiment-a',
+      datasetId: 'feature-regression',
+      datasetVersion: '1.0.0',
+      datasetChecksum: 'sha256:dataset',
+      caseId: 'comparison',
+      status: 'failed',
+      passedChecks: 1,
+      totalChecks: 2,
+      humanVerdicts: ['unsure'],
+    });
+    expect(runComparisonWarnings([evaluated, comparisonRun('run-b')])).toContain(
+      'Only some runs have evaluation evidence.',
+    );
+  });
 });

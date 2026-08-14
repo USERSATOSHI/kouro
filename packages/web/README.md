@@ -3,7 +3,7 @@
 Kouro's local ticket and execution dashboard, built with **React 19**, **Vite**,
 and **React Flow** (`@xyflow/react`). It displays a unified planning/execution
 Kanban, ticket histories and redacted provider configuration alongside runs,
-workflow graphs, durable events, artifacts, diffs, and artifact-bound approval
+workflow flowcharts and timelines, durable events, artifacts, diffs, and artifact-bound approval
 controls. Active agent attempts expose a best-effort coding-agent session where
 provider streams are presented as user, agent, reasoning, and call-ID-correlated
 tool exchanges above in-context steering and stop controls.
@@ -11,7 +11,7 @@ tool exchanges above in-context steering and stop controls.
 ## Design Constraints
 
 - **Durable operator controls** — Pause, resume, cancel, steer, interrupt, retry, and policy-authorized skip call application endpoints with idempotency keys; the browser never mutates run state locally
-- **Read-only workflow graph** — Operator actions do not edit graph structure (`nodesConnectable={false}`, `nodesDraggable={false}`)
+- **Read-only workflow flowchart** — Operator actions do not edit workflow structure (`nodesConnectable={false}`, `nodesDraggable={false}`)
 - **Repository-scoped runs** — The serving application enforces the repository boundary before data reaches React
 - **Explicit terminal deletion** — A confirmed delete removes only terminal runs and Kouro-owned local data
 - **The browser cannot supply an approval binding** — Approvals are submitted by a human operator ("web-user") but cryptographic/state bindings happen server-side
@@ -23,15 +23,15 @@ tool exchanges above in-context steering and stop controls.
 - **Resizable inspector** — The execution inspector is a persistent bottom drawer that supports pointer dragging and keyboard resizing
 - **Markdown tool activity** — Structured tool arguments and results become readable Markdown fields, while shell commands and fenced code retain syntax highlighting
 - **Prompt deduplication** — The invocation prompt is added only when the provider transcript did not already emit the same user message
-- **Switchable workflow layout** — Operators can use a layered top-to-bottom or left-to-right flowchart, or a compact network graph
+- **Useful workflow views** — Operators can switch between a layered top-to-bottom or left-to-right flowchart and the durable invocation timeline
 - **Derived ticket columns** — The API supplies planning and runtime-owned execution projections; React never persists board state
 - **Markdown ticket details** — Ticket descriptions and comments render headings, lists, links, quotes, inline code, and fenced code without accepting raw HTML
 - **Ticket-scoped workflow launch** — Ticket details launch a workflow against a selected repository with immutable ticket input, optional base-branch and harness routing, and direct navigation to the created run
 - **Portable reasoning effort** — Ticket launch can snapshot a provider-default, low, medium, or high fallback while compiled agent and subagent settings take precedence
 - **Nested subagent sessions** — Active and completed Kouro subagents render as separate live sessions with delegated task, harness/model/effort metadata, reasoning, tool activity, and structured output instead of embedded JSONL
-- **Delegation-aware diagrams** — Flow and graph views show declared child roles with dashed parent edges; timeline lanes show each recorded child call at its parent activation tick
+- **Delegation-aware diagrams** — Flow shows declared child roles with dashed parent edges; timeline lanes show each recorded child call at its parent activation tick
 - **Visible usage attribution** — Workflow and subagent blocks display token usage and derived cost directly, while unpriced models fail closed to an `unpriced` label
-- **Read-only run comparison** — Operators can select two to four durable runs and compare status, inputs, duration, invocations, attempts, subagent calls, tokens, estimated cost, and per-role attribution without creating evaluation state or inferring a winner
+- **Evaluation-aware run comparison** — Operators can select two to four durable runs and compare status, inputs, duration, invocations, attempts, subagent calls, tokens, estimated cost, per-role attribution, deterministic checks, dataset bindings, and human evidence without mutating evaluation state
 - **Approval proposal context** — Generic approvals include the exact source invocation output, so a plan can be reviewed without leaving the approval workspace
 - **Server-resolved provider secrets** — Provider configuration responses contain status and non-secret scope only
 
@@ -58,8 +58,9 @@ App (root component)
     ├── Error banner (conditional)
     ├── Run Header
     │   └── Workflow ID, run ID, pause/resume/cancel, status, event count
-    ├── Graph (React Flow)
-    │   └── Top-to-bottom flowchart with topology layers, typed shapes, outcomes, and selected-path emphasis
+    ├── Workflow view
+    │   ├── Flowchart with topology layers, typed shapes, outcomes, and selected-path emphasis
+    │   └── Timeline with durable invocation and subagent lanes
     └── Inspector (tabbed panel)
         ├── "control" tab → OperatorConsole
         │   └── Exact invocation selection, agent-session launcher, interrupt, retry, and declared skip
@@ -185,8 +186,9 @@ artifact inspectors.
 
 Node positions derive from graph reachability rather than declaration index, so
 branches share a layer and bounded loop edges route back to earlier layers.
-The diagram toolbar stores its flowchart/graph and direction choices as
-device-local preferences. Parallel outgoing transition labels receive separate
+The diagram toolbar stores its flowchart/timeline and direction choices as
+device-local preferences. A removed graph preference migrates to flowchart.
+Parallel outgoing transition labels receive separate
 offsets so their outcome titles remain readable.
 
 ## Vite Dev Proxy

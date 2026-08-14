@@ -28,7 +28,6 @@ import {
   type Edge,
   EdgeLabelRenderer,
   type EdgeProps,
-  getBezierPath,
   getSmoothStepPath,
   Handle,
   MarkerType,
@@ -99,13 +98,16 @@ import {
   structuredValueMarkdown,
 } from './code-viewer.tsx';
 import {
+  diagramModeForStoredValue,
+  type DiagramMode,
+} from './diagram-preferences.ts';
+import {
   groupTranscript,
   parseTranscript,
   type TranscriptEntry,
 } from './transcript.ts';
 
 type Tab = 'control' | 'details' | 'events' | 'artifacts' | 'approval';
-type DiagramMode = 'flowchart' | 'graph' | 'timeline';
 type DiagramDirection = 'TB' | 'LR';
 
 interface WorkspaceStyle extends CSSProperties {
@@ -188,7 +190,6 @@ interface WorkflowNodeData extends Record<string, unknown> {
   readonly nodeType: WorkflowNodeView['type'] | 'subagent';
   readonly state: string;
   readonly direction: DiagramDirection;
-  readonly mode: DiagramMode;
   readonly usageLabel?: string;
   readonly parentNodeId?: string;
 }
@@ -196,9 +197,9 @@ interface WorkflowNodeData extends Record<string, unknown> {
 type WorkflowFlowNode = Node<WorkflowNodeData, 'workflow'>;
 
 function WorkflowGraphNode({ data }: NodeProps<WorkflowFlowNode>) {
-  const horizontal = data.direction === 'LR' && data.mode === 'flowchart';
+  const horizontal = data.direction === 'LR';
   return (
-    <div className={`flow-node flow-node-${data.nodeType} flow-node-${data.mode}`}>
+    <div className={`flow-node flow-node-${data.nodeType}`}>
       <Handle position={horizontal ? Position.Left : Position.Top} type="target" />
       <small>{data.nodeType}</small>
       <strong>{data.title}</strong>
@@ -215,7 +216,6 @@ interface WorkflowEdgeData extends Record<string, unknown> {
   readonly direction: DiagramDirection;
   readonly label: string;
   readonly labelOffset: number;
-  readonly mode: DiagramMode;
   readonly selected: boolean;
 }
 
@@ -233,25 +233,15 @@ function WorkflowGraphEdge({
   targetY,
 }: EdgeProps<WorkflowFlowEdge>) {
   if (!data) return null;
-  const [path, labelX, labelY] =
-    data.mode === 'graph'
-      ? getBezierPath({
-          sourceX,
-          sourceY,
-          sourcePosition,
-          targetX,
-          targetY,
-          targetPosition,
-        })
-      : getSmoothStepPath({
-          sourceX,
-          sourceY,
-          sourcePosition,
-          targetX,
-          targetY,
-          targetPosition,
-          borderRadius: 8,
-        });
+  const [path, labelX, labelY] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition,
+    borderRadius: 8,
+  });
   const xOffset = data.direction === 'TB' ? data.labelOffset : 0;
   const yOffset = data.direction === 'LR' ? data.labelOffset : 0;
   return (
@@ -382,7 +372,6 @@ function flowchartNodes(
         state: nodeState(run, node),
         usageLabel: workflowNodeUsageLabel(run, node.id),
         direction,
-        mode: 'flowchart' as const,
       },
     }));
   });
@@ -414,64 +403,12 @@ function flowchartNodes(
         nodeType: 'subagent' as const,
         state: subagentState(run, child),
         direction,
-        mode: 'flowchart' as const,
         usageLabel: executionUsageLabel(executions),
         parentNodeId: child.parentNodeId,
       },
     }];
   });
   return [...workflowNodes, ...subagentNodes];
-}
-
-function networkGraphNodes(run: RunDetails): WorkflowFlowNode[] {
-  const subagents = diagramSubagents(run);
-  const count = Math.max(1, run.nodes.length + subagents.length);
-  const radius = Math.max(220, count * 42);
-  const nodes: WorkflowFlowNode[] = run.nodes
-    .toSorted((left, right) => left.ordinal - right.ordinal)
-    .map((node, index) => {
-      const angle = (index / count) * Math.PI * 2 - Math.PI / 2;
-      return {
-        id: node.id,
-        type: 'workflow' as const,
-        position: {
-          x: Math.cos(angle) * radius,
-          y: Math.sin(angle) * radius,
-        },
-        data: {
-          title: node.title,
-          nodeType: node.type,
-          state: nodeState(run, node),
-          usageLabel: workflowNodeUsageLabel(run, node.id),
-          direction: 'TB' as const,
-          mode: 'graph' as const,
-        },
-      };
-    });
-  const subagentNodes = subagents.map((child, childIndex) => {
-    const index = run.nodes.length + childIndex;
-    const angle = (index / count) * Math.PI * 2 - Math.PI / 2;
-    const executions = subagentExecutions(run, child);
-    return {
-      id: child.id,
-      type: 'workflow' as const,
-      position: {
-        x: Math.cos(angle) * radius,
-        y: Math.sin(angle) * radius,
-      },
-      selectable: false,
-      data: {
-        title: child.definition.role,
-        nodeType: 'subagent' as const,
-        state: subagentState(run, child),
-        direction: 'TB' as const,
-        mode: 'graph' as const,
-        usageLabel: executionUsageLabel(executions),
-        parentNodeId: child.parentNodeId,
-      },
-    };
-  });
-  return [...nodes, ...subagentNodes];
 }
 
 function nodeState(run: RunDetails, node: WorkflowNodeView): string {
@@ -491,12 +428,7 @@ function displayedInvocationState(
   return invocationDisplayState(invocation);
 }
 
-function graphEdges(
-  run: RunDetails,
-  mode: DiagramMode,
-  direction: DiagramDirection,
-): WorkflowFlowEdge[] {
-  const edgeDirection = mode === 'graph' ? 'TB' : direction;
+function flowEdges(run: RunDetails, direction: DiagramDirection): WorkflowFlowEdge[] {
   const selectedTransitions = new Set(
     run.state.invocations.flatMap(({ selectedTransitionId }) =>
       selectedTransitionId ? [selectedTransitionId] : [],
@@ -525,10 +457,9 @@ function graphEdges(
       type: 'workflow' as const,
       animated: activeNodes.has(edge.source),
       data: {
-        direction: edgeDirection,
+        direction,
         label: edge.outcome,
         labelOffset,
-        mode,
         selected,
       },
       markerEnd: {
@@ -548,10 +479,9 @@ function graphEdges(
     type: 'workflow',
     animated: activeNodes.has(child.parentNodeId),
     data: {
-      direction: edgeDirection,
+      direction,
       label: 'delegates',
       labelOffset: 0,
-      mode,
       selected: false,
     },
     markerEnd: { type: MarkerType.ArrowClosed, color: '#8957e5' },
@@ -820,6 +750,21 @@ function comparisonUsage(column: RunComparisonColumn): string {
     : '—';
 }
 
+function comparisonEvaluation(column: RunComparisonColumn): ReactNode {
+  const evaluation = column.evaluation;
+  if (!evaluation) return '—';
+  return (
+    <span className={stateClass(evaluation.status)}>
+      {evaluation.status} · {evaluation.passedChecks}/{evaluation.totalChecks} checks
+    </span>
+  );
+}
+
+function comparisonHumanEvidence(column: RunComparisonColumn): string {
+  const verdicts = column.evaluation?.humanVerdicts ?? [];
+  return verdicts.length === 0 ? '—' : verdicts.join(', ');
+}
+
 function ComparisonOverview({ columns }: { readonly columns: readonly RunComparisonColumn[] }) {
   return (
     <div className="comparison-table-scroll">
@@ -841,6 +786,10 @@ function ComparisonOverview({ columns }: { readonly columns: readonly RunCompari
           {comparisonMetric(columns, 'Subagent calls', (column) => column.subagentCallCount)}
           {comparisonMetric(columns, 'Reported usage', comparisonUsage)}
           {comparisonMetric(columns, 'Estimated cost', (column) => column.usage ? column.costUsd === undefined ? 'unpriced' : formatUsd(column.costUsd) : '—')}
+          {comparisonMetric(columns, 'Evaluation', comparisonEvaluation)}
+          {comparisonMetric(columns, 'Dataset case', (column) => column.evaluation ? `${column.evaluation.datasetId}@${column.evaluation.datasetVersion} · ${column.evaluation.caseId}` : '—')}
+          {comparisonMetric(columns, 'Experiment', (column) => column.evaluation?.experimentId ?? '—')}
+          {comparisonMetric(columns, 'Human evidence', comparisonHumanEvidence)}
         </tbody>
       </table>
     </div>
@@ -909,7 +858,7 @@ function RunComparisonModal({ runs, onClose }: { readonly runs: readonly RunDeta
       )}
       <ComparisonOverview columns={columns} />
       <ComparisonBreakdown columns={columns} />
-      <p className="comparison-footnote">Kouro does not infer a winner. Cost is shown only when every reported source in that total has known pricing.</p>
+      <p className="comparison-footnote">Deterministic checks and human evidence remain separate. Cost is shown only when every reported source in that total has known pricing.</p>
     </InspectorModal>
   );
 }
@@ -1961,7 +1910,7 @@ const autoRefreshEvents = new Set([
 function storedDiagramMode(): DiagramMode {
   try {
     const stored = localStorage.getItem('kouro:diagram-mode');
-    return stored === 'graph' || stored === 'timeline' ? stored : 'flowchart';
+    return diagramModeForStoredValue(stored);
   } catch {
     return 'flowchart';
   }
@@ -2128,16 +2077,11 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
   }, [run]);
 
   const nodes = useMemo(
-    () =>
-      run && diagramMode !== 'timeline'
-        ? diagramMode === 'graph'
-          ? networkGraphNodes(run)
-          : flowchartNodes(run, diagramDirection)
-        : [],
+    () => (run && diagramMode !== 'timeline' ? flowchartNodes(run, diagramDirection) : []),
     [diagramDirection, diagramMode, run],
   );
   const edges = useMemo(
-    () => (run && diagramMode !== 'timeline' ? graphEdges(run, diagramMode, diagramDirection) : []),
+    () => (run && diagramMode !== 'timeline' ? flowEdges(run, diagramDirection) : []),
     [diagramDirection, diagramMode, run],
   );
   const node = run?.nodes.find(({ id }) => id === selectedNode) ?? null;
@@ -2475,7 +2419,7 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
             <section className="graph">
               <div className="graph-toolbar">
                 <div aria-label="Diagram style" className="segmented-control" role="group">
-                  {(['flowchart', 'graph', 'timeline'] as const).map((mode) => (
+                  {(['flowchart', 'timeline'] as const).map((mode) => (
                     <button
                       aria-pressed={diagramMode === mode}
                       className={diagramMode === mode ? 'active' : ''}

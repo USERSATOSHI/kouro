@@ -1,4 +1,4 @@
-import type { RunDetails } from '@kouro/api-contracts';
+import type { EvaluationRecordView, RunDetails } from '@kouro/api-contracts';
 import { estimateCostUsd, sumUsage, type JsonValue, type TokenUsage } from '@kouro/domain';
 
 import { runCostUsd, runUsage } from './execution-presentation.ts';
@@ -30,6 +30,18 @@ export interface RunComparisonColumn {
   readonly subagentCallCount: number;
   readonly usage?: TokenUsage;
   readonly costUsd?: number;
+  readonly evaluation?: {
+    readonly reportId: string;
+    readonly experimentId: string;
+    readonly datasetId: string;
+    readonly datasetVersion: string;
+    readonly datasetChecksum: string;
+    readonly caseId: string;
+    readonly status: 'passed' | 'failed' | 'incomplete';
+    readonly passedChecks: number;
+    readonly totalChecks: number;
+    readonly humanVerdicts: readonly ('pass' | 'fail' | 'unsure')[];
+  };
   readonly executions: readonly RunComparisonExecution[];
 }
 
@@ -55,6 +67,16 @@ function runDurationMs(run: RunDetails): number | undefined {
   const observedAt = Date.parse(run.state.observedAt);
   const duration = observedAt - startedAt;
   return Number.isFinite(duration) && duration >= 0 ? duration : undefined;
+}
+
+function latestEvaluation(run: RunDetails): EvaluationRecordView | undefined {
+  return (run.evaluations ?? []).toSorted((left, right) =>
+    right.binding.createdAt < left.binding.createdAt
+      ? -1
+      : right.binding.createdAt > left.binding.createdAt
+        ? 1
+        : 0,
+  )[0];
 }
 
 function agentExecutions(run: RunDetails): readonly RunComparisonExecution[] {
@@ -112,6 +134,7 @@ export function runComparisonColumn(run: RunDetails): RunComparisonColumn {
   const durationMs = runDurationMs(run);
   const usage = runUsage(run);
   const costUsd = runCostUsd(run);
+  const evaluation = latestEvaluation(run);
   return {
     runId: run.id,
     status: run.status,
@@ -127,6 +150,23 @@ export function runComparisonColumn(run: RunDetails): RunComparisonColumn {
     ...(durationMs === undefined ? {} : { durationMs }),
     ...(usage ? { usage } : {}),
     ...(costUsd === undefined ? {} : { costUsd }),
+    ...(evaluation
+      ? {
+          evaluation: {
+            reportId: evaluation.binding.reportId,
+            experimentId: evaluation.binding.experimentId,
+            datasetId: evaluation.binding.datasetId,
+            datasetVersion: evaluation.binding.datasetVersion,
+            datasetChecksum: evaluation.binding.datasetChecksum,
+            caseId: evaluation.binding.caseId,
+            status: evaluation.report.status,
+            passedChecks: evaluation.report.checks.filter(({ status }) => status === 'passed')
+              .length,
+            totalChecks: evaluation.report.checks.length,
+            humanVerdicts: evaluation.annotations.map(({ verdict }) => verdict),
+          },
+        }
+      : {}),
     executions: [...agentExecutions(run), ...subagentExecutions(run)],
   };
 }
@@ -155,6 +195,22 @@ export function runComparisonWarnings(runs: readonly RunDetails[]): readonly str
   }
   if (new Set(runs.map(({ state }) => canonicalJson(state.configuration.workItem))).size > 1) {
     warnings.push('Immutable work items differ.');
+  }
+  const evaluations = runs.flatMap((run) => {
+    const evaluation = latestEvaluation(run);
+    return evaluation ? [evaluation] : [];
+  });
+  if (evaluations.length > 0 && evaluations.length !== runs.length) {
+    warnings.push('Only some runs have evaluation evidence.');
+  }
+  if (new Set(evaluations.map(({ binding }) => binding.experimentId)).size > 1) {
+    warnings.push('Evaluation experiment IDs differ.');
+  }
+  if (
+    new Set(evaluations.map(({ binding }) => `${binding.datasetChecksum}:${binding.caseId}`)).size >
+    1
+  ) {
+    warnings.push('Evaluation dataset cases differ.');
   }
   return warnings;
 }

@@ -636,17 +636,6 @@ pre,
   text-align: left;
 }
 
-.flow-node-graph {
-  min-height: 82px;
-  border-radius: 999px;
-  padding-inline: 22px;
-  text-align: center;
-}
-
-.flow-node-graph .state {
-  justify-self: center;
-}
-
 .flow-node-agent {
   border-left: 3px solid var(--purple);
 }

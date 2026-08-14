@@ -7,6 +7,7 @@ import type {
   CreateRunRequest,
   CreateRunResponse,
   DeleteRunResponse,
+  EvaluationRecordView,
   InvocationActivityView,
   LifecycleRequest,
   LifecycleResponse,
@@ -50,12 +51,30 @@ function isRunSummary(value: unknown): value is RunSummary {
   );
 }
 
+function isEvaluationRecordView(value: unknown): value is EvaluationRecordView {
+  return (
+    isRecord(value) &&
+    isRecord(value.binding) &&
+    typeof value.binding.reportId === 'string' &&
+    typeof value.binding.experimentId === 'string' &&
+    typeof value.binding.datasetId === 'string' &&
+    typeof value.binding.caseId === 'string' &&
+    typeof value.binding.createdAt === 'string' &&
+    isRecord(value.report) &&
+    typeof value.report.status === 'string' &&
+    Array.isArray(value.report.checks) &&
+    Array.isArray(value.annotations)
+  );
+}
+
 function isRunDetails(value: unknown): value is RunDetails {
   return (
     isRecord(value) &&
     isRecord(value.state) &&
     Array.isArray(value.nodes) &&
     Array.isArray(value.edges) &&
+    (value.evaluations === undefined ||
+      (Array.isArray(value.evaluations) && value.evaluations.every(isEvaluationRecordView))) &&
     isRunSummary(value)
   );
 }
