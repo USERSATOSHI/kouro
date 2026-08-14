@@ -91,7 +91,11 @@ import {
   runComparisonWarnings,
   type RunComparisonColumn,
 } from './run-comparison.ts';
-import { timelineModel, type TimelineSubagentObservation } from './timeline.ts';
+import {
+  isTimelineBlockSelected,
+  timelineModel,
+  type TimelineSubagentObservation,
+} from './timeline.ts';
 import {
   CodeViewer,
   MarkdownContent,
@@ -538,8 +542,25 @@ function RunTimeline({
   readonly selectedNodeId: string | null;
   readonly onSelectNode: (nodeId: string) => void;
 }) {
+  const [selectedTimelineBlockId, setSelectedTimelineBlockId] = useState<string | null>(null);
+  const [observedAt, setObservedAt] = useState(() => new Date().toISOString());
   const observations = useMemo(() => timelineSubagentObservations(activities), [activities]);
-  const model = useMemo(() => timelineModel(run, observations), [observations, run]);
+  const model = useMemo(
+    () => timelineModel(run, observations, observedAt),
+    [observations, observedAt, run],
+  );
+  useEffect(() => {
+    setSelectedTimelineBlockId(null);
+    setObservedAt(new Date().toISOString());
+  }, [run.id]);
+  useEffect(() => {
+    const openSpan = run.state.invocations.some(
+      ({ state }) => !['succeeded', 'failed', 'cancelled'].includes(state),
+    );
+    if (!openSpan) return undefined;
+    const timer = window.setInterval(() => setObservedAt(new Date().toISOString()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [run.state.invocations]);
   if (model.tickCount === 0) {
     return (
       <div className="timeline">
@@ -547,10 +568,19 @@ function RunTimeline({
       </div>
     );
   }
-  const tickPercent = 100 / model.tickCount;
-  const ticks = Array.from({ length: model.tickCount }, (_, index) => index + 1);
+  const axisTicks = model.timeBased
+    ? Array.from({ length: 5 }, (_, index) => ({
+        key: index,
+        label: formatDuration((model.span * index) / 4),
+        position: (index * 100) / 4,
+      }))
+    : Array.from({ length: model.tickCount + 1 }, (_, index) => ({
+        key: index,
+        label: index === model.tickCount ? 'end' : String(index + 1),
+        position: (index * 100) / model.tickCount,
+      }));
   const timelineStyle: TimelineStyle = {
-    '--timeline-track-min': `${Math.max(480, model.tickCount * 156)}px`,
+    '--timeline-track-min': `${model.timeBased ? 720 : Math.max(480, model.tickCount * 156)}px`,
   };
   return (
     <div className="timeline" style={timelineStyle}>
@@ -558,18 +588,15 @@ function RunTimeline({
         <header className="timeline-header">
           <span className="timeline-lane-heading">Node · lane</span>
           <div className="timeline-axis">
-            {ticks.map((tick) => (
+            {axisTicks.map((tick) => (
               <span
                 className="timeline-tick"
-                key={tick}
-                style={{ left: `${((tick - 1) * tickPercent).toFixed(3)}%` }}
+                key={tick.key}
+                style={{ left: `${tick.position.toFixed(3)}%` }}
               >
-                {tick}
+                {tick.label}
               </span>
             ))}
-            <span className="timeline-tick timeline-tick-end" style={{ left: '100%' }}>
-              end
-            </span>
           </div>
         </header>
         {model.lanes.map((lane) => (
@@ -577,7 +604,10 @@ function RunTimeline({
             <button
               aria-pressed={selectedNodeId === lane.nodeId}
               className={selectedNodeId === lane.nodeId ? 'timeline-lane-label selected' : 'timeline-lane-label'}
-              onClick={() => onSelectNode(lane.nodeId)}
+              onClick={() => {
+                setSelectedTimelineBlockId(null);
+                onSelectNode(lane.nodeId);
+              }}
               title={`${lane.nodeType} · ${lane.title}`}
               type="button"
             >
@@ -594,18 +624,22 @@ function RunTimeline({
             >
               {lane.blocks.map((block) => (
                 <button
-                  aria-pressed={selectedNodeId === block.nodeId}
-                  className={`timeline-block timeline-block-${block.kind}${block.queued ? ' queued' : ''}${selectedNodeId === block.nodeId ? ' selected' : ''}`}
+                  aria-pressed={isTimelineBlockSelected(selectedTimelineBlockId, block.id)}
+                  className={`timeline-block timeline-block-${block.kind}${block.queued ? ' queued' : ''}${isTimelineBlockSelected(selectedTimelineBlockId, block.id) ? ' selected' : ''}`}
                   key={block.id}
-                  onClick={() => onSelectNode(block.nodeId)}
+                  onClick={() => {
+                    setSelectedTimelineBlockId(block.id);
+                    onSelectNode(block.nodeId);
+                  }}
                   style={{
-                    left: `${((block.invocationSequence - 1) * tickPercent).toFixed(3)}%`,
-                    width: `${tickPercent.toFixed(3)}%`,
+                    left: `${((block.offset / model.span) * 100).toFixed(3)}%`,
+                    minWidth: model.timeBased ? '8px' : undefined,
+                    width: `${((block.duration / model.span) * 100).toFixed(3)}%`,
                     top: `${block.row * 40 + 5}px`,
                     bottom: 'auto',
                     height: '34px',
                   }}
-                  title={`#${block.invocationSequence} · ${block.state} · ${block.attemptCount} attempt${block.attemptCount === 1 ? '' : 's'}${block.model ? ` · ${block.model}` : ''}${block.usage ? ` · ${formatTokenCount(block.usage.inputTokens + block.usage.outputTokens)} tokens` : ''}${block.costUsd !== undefined ? ` · ${formatUsd(block.costUsd)} est.` : ''}`}
+                  title={`#${block.invocationSequence} · ${block.state}${model.timeBased && block.kind === 'workflow' ? ` · ${formatDuration(block.duration)}` : ''} · ${block.attemptCount} attempt${block.attemptCount === 1 ? '' : 's'}${block.model ? ` · ${block.model}` : ''}${block.usage ? ` · ${formatTokenCount(block.usage.inputTokens + block.usage.outputTokens)} tokens` : ''}${block.costUsd !== undefined ? ` · ${formatUsd(block.costUsd)} est.` : ''}`}
                   type="button"
                 >
                   <span className={`timeline-block-fill state-${block.state.replaceAll('_', '-')}`} />
@@ -614,9 +648,12 @@ function RunTimeline({
                       #{block.invocationSequence}
                       {block.kind === 'subagent'
                         ? ` · ${block.callId ?? block.subagentId ?? 'child'}`
-                        : block.attemptCount > 0
+                        : block.attemptCount > 1
                           ? ` · ×${block.attemptCount}`
                           : ''}
+                      {model.timeBased && block.kind === 'workflow'
+                        ? ` · ${formatDuration(block.duration)}`
+                        : ''}
                     </span>
                     {timelineUsageLabel(block) ? <small>{timelineUsageLabel(block)}</small> : null}
                   </span>
@@ -627,7 +664,11 @@ function RunTimeline({
         ))}
       </div>
       <footer className="timeline-legend">
-        <span>Horizontal order is the durable activation sequence, not wall-clock time.</span>
+        <span>
+          {model.timeBased
+            ? 'Workflow width is real elapsed wall-clock time; child calls remain point markers.'
+            : 'Older history has no timing data; width uses durable activation order.'}
+        </span>
         <span className="timeline-legend-swatch state-succeeded">succeeded</span>
         <span className="timeline-legend-swatch state-active">active</span>
         <span className="timeline-legend-swatch state-waiting-for-approval">waiting</span>

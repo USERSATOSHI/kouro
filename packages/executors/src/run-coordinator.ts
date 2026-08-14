@@ -350,6 +350,7 @@ function appendAgentFailure(
   attemptNumber: number,
   error: AgentExecutorError,
   hasFallback: boolean,
+  finishedAt: string,
 ): Result<RunAggregate, ExecutorError> {
   const appended = fromStore(
     store.appendEvent({
@@ -362,6 +363,7 @@ function appendAgentFailure(
         attemptNumber,
         failure: serializedAgentFailure(error),
         retry: hasFallback ? 'fallback' : 'none',
+        ...(hasFallback ? {} : { finishedAt }),
       },
     }),
   );
@@ -494,6 +496,7 @@ function completeAgentInvocation(
   invocationSequence: number,
   attemptNumber: number,
   output: JsonValue,
+  finishedAt: string,
 ): Result<RunAggregate, ExecutorError> {
   const invocation = aggregate.state.invocations.find(
     ({ sequence, state }) => sequence === invocationSequence && state === 'active',
@@ -511,6 +514,7 @@ function completeAgentInvocation(
         invocationSequence,
         outcome: 'success',
         output,
+        finishedAt,
       },
     }),
   );
@@ -599,6 +603,7 @@ function intentEvent(
     OrchestrationIntent,
     { type: 'invocation.activate' | 'approval.request' | 'run.complete' }
   >,
+  now: string,
 ): RunEventInput {
   switch (intent.type) {
     case 'invocation.activate':
@@ -606,6 +611,7 @@ function intentEvent(
         type: 'invocation.activated',
         invocationSequence: intent.invocationSequence,
         nodeId: intent.nodeId,
+        activatedAt: now,
         ...(intent.sourceInvocationSequence === undefined
           ? {}
           : { sourceInvocationSequence: intent.sourceInvocationSequence }),
@@ -620,6 +626,7 @@ function intentEvent(
       return {
         type: 'run.completed',
         result: intent.result,
+        finishedAt: now,
       };
   }
   return unexpectedIntent(intent);
@@ -699,7 +706,7 @@ export class RunCoordinator {
             runId,
             expectedSequence: aggregate.nextEventSequence,
             idempotencyKey: intentKey(intent),
-            event: intentEvent(intent),
+            event: intentEvent(intent, this.clock.now()),
           }),
         );
       case 'session.resume':
@@ -732,10 +739,16 @@ export class RunCoordinator {
     const aggregate = loaded.unwrap();
     const event: RunEventInput =
       decision === 'grant'
-        ? { type: 'approval.granted', binding, actor, reason }
+        ? { type: 'approval.granted', binding, actor, reason, finishedAt: this.clock.now() }
         : decision === 'request_changes'
-          ? { type: 'approval.changes_requested', binding, actor, reason }
-          : { type: 'approval.rejected', binding, actor, reason };
+          ? {
+              type: 'approval.changes_requested',
+              binding,
+              actor,
+              reason,
+              finishedAt: this.clock.now(),
+            }
+          : { type: 'approval.rejected', binding, actor, reason, finishedAt: this.clock.now() };
     return fromStore(
       this.store.appendEvent({
         runId,
@@ -839,6 +852,7 @@ export class RunCoordinator {
       type: 'run.cancelled',
       actor,
       reason,
+      finishedAt: this.clock.now(),
     });
   }
 
@@ -961,7 +975,13 @@ export class RunCoordinator {
         runId,
         expectedSequence: aggregate.nextEventSequence,
         idempotencyKey,
-        event: { type: 'invocation.skipped', binding, actor, reason },
+        event: {
+          type: 'invocation.skipped',
+          binding,
+          actor,
+          reason,
+          finishedAt: this.clock.now(),
+        },
       }),
     );
   }
@@ -1090,6 +1110,7 @@ export class RunCoordinator {
           invocationSequence: intent.invocationSequence,
           outcome: commandExecution.outcome,
           output: commandExecution.output,
+          finishedAt: this.clock.now(),
         },
       }),
     );
@@ -1332,6 +1353,7 @@ export class RunCoordinator {
         attemptNumber,
         failure,
         hasFallback,
+        this.clock.now(),
       );
     }
 
@@ -1383,6 +1405,7 @@ export class RunCoordinator {
       invocationSequence,
       attemptNumber,
       result.output,
+      this.clock.now(),
     );
   }
 }

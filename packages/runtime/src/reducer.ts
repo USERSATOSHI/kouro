@@ -125,6 +125,23 @@ function timestampMilliseconds(value: string | undefined): number | undefined {
     : milliseconds;
 }
 
+function validInvocationFinish(
+  invocation: NodeInvocation,
+  finishedAt: string | undefined,
+): boolean {
+  if (finishedAt === undefined) return true;
+  const finish = timestampMilliseconds(finishedAt);
+  const activation = timestampMilliseconds(invocation.activatedAt);
+  return finish !== undefined && (activation === undefined || finish >= activation);
+}
+
+function invocationFinish(
+  invocation: NodeInvocation,
+  finishedAt: string | undefined,
+): NodeInvocation {
+  return finishedAt === undefined ? invocation : { ...invocation, finishedAt };
+}
+
 function durationLimitReached(artifact: CompiledWorkflowArtifact, state: RunState): boolean {
   const limit = artifact.bundle.runLimits?.maxDurationMs;
   const startedAt = timestampMilliseconds(state.startedAt);
@@ -339,7 +356,16 @@ function reduceEvent(
   }
 
   if (event.type === 'run.cancelled') {
-    if (!event.actor.trim() || !event.reason.trim()) {
+    if (
+      !event.actor.trim() ||
+      !event.reason.trim() ||
+      (event.finishedAt !== undefined && timestampMilliseconds(event.finishedAt) === undefined) ||
+      state.invocations.some(
+        (invocation) =>
+          !['succeeded', 'failed', 'cancelled'].includes(invocation.state) &&
+          !validInvocationFinish(invocation, event.finishedAt),
+      )
+    ) {
       return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
         entity: 'run',
         from: state.status,
@@ -352,13 +378,16 @@ function reduceEvent(
       invocations: state.invocations.map((invocation) =>
         ['succeeded', 'failed', 'cancelled'].includes(invocation.state)
           ? invocation
-          : {
-              ...invocation,
-              state: 'cancelled',
-              attempts: invocation.attempts.map((attempt) =>
-                attempt.state === 'running' ? { ...attempt, state: 'cancelled' } : attempt,
-              ),
-            },
+          : invocationFinish(
+              {
+                ...invocation,
+                state: 'cancelled',
+                attempts: invocation.attempts.map((attempt) =>
+                  attempt.state === 'running' ? { ...attempt, state: 'cancelled' } : attempt,
+                ),
+              },
+              event.finishedAt,
+            ),
       ),
     });
   }
@@ -395,6 +424,13 @@ function reduceEvent(
     if (!artifact.bundle.nodes.some(({ id }) => id === event.nodeId)) {
       return toRuntimeError(RuntimeErrorKind.UnknownNode, {
         nodeId: event.nodeId,
+      });
+    }
+    if (event.activatedAt !== undefined && timestampMilliseconds(event.activatedAt) === undefined) {
+      return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
+        entity: `invocation:${event.invocationSequence}`,
+        from: state.status,
+        event: 'invocation.activated:invalid_timestamp',
       });
     }
 
@@ -472,6 +508,7 @@ function reduceEvent(
           nodeId: event.nodeId,
           state: 'pending',
           attempts: [],
+          ...(event.activatedAt === undefined ? {} : { activatedAt: event.activatedAt }),
         },
       ],
       nextInvocationSequence: state.nextInvocationSequence + 1,
@@ -712,7 +749,9 @@ function reduceEvent(
         attempt.number !== event.attemptNumber ||
         !event.failure.kind.trim() ||
         !event.failure.message.trim() ||
-        (event.retry === 'fallback' && !fallbackExists)
+        (event.retry === 'fallback' && !fallbackExists) ||
+        (event.retry === 'fallback' && event.finishedAt !== undefined) ||
+        (event.retry === 'none' && !validInvocationFinish(invocation, event.finishedAt))
       ) {
         return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
           entity: `attempt:${event.attemptNumber}`,
@@ -720,15 +759,20 @@ function reduceEvent(
           event: event.type,
         });
       }
-      return ok({
-        ...invocation,
-        state: event.retry === 'fallback' ? 'pending' : 'failed',
-        attempts: invocation.attempts.map((candidate) =>
-          candidate.number === attempt.number
-            ? { ...candidate, state: 'failed', failure: event.failure }
-            : candidate,
+      return ok(
+        invocationFinish(
+          {
+            ...invocation,
+            state: event.retry === 'fallback' ? 'pending' : 'failed',
+            attempts: invocation.attempts.map((candidate) =>
+              candidate.number === attempt.number
+                ? { ...candidate, state: 'failed', failure: event.failure }
+                : candidate,
+            ),
+          },
+          event.retry === 'none' ? event.finishedAt : undefined,
         ),
-      });
+      );
     });
   }
 
@@ -885,7 +929,8 @@ function reduceEvent(
       !definition?.skipOutcome ||
       !event.actor.trim() ||
       !event.reason.trim() ||
-      !skipBindingsEqual(event.binding, expected)
+      !skipBindingsEqual(event.binding, expected) ||
+      !validInvocationFinish(invocation, event.finishedAt)
     ) {
       return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
         entity: `invocation:${invocation.sequence}`,
@@ -894,11 +939,16 @@ function reduceEvent(
       });
     }
     const updated = replaceInvocation(state, invocation.sequence, (current) =>
-      ok({
-        ...current,
-        state: 'succeeded',
-        outcome: event.binding.selectedOutcome,
-      }),
+      ok(
+        invocationFinish(
+          {
+            ...current,
+            state: 'succeeded',
+            outcome: event.binding.selectedOutcome,
+          },
+          event.finishedAt,
+        ),
+      ),
     );
     if (updated.isErr()) return updated;
     return ok({ ...updated.unwrap(), status: 'running' });
@@ -911,7 +961,8 @@ function reduceEvent(
       if (
         invocation.state !== 'active' ||
         !attempt ||
-        (definition?.type !== 'agent' && definition?.type !== 'command')
+        (definition?.type !== 'agent' && definition?.type !== 'command') ||
+        !validInvocationFinish(invocation, event.finishedAt)
       ) {
         return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
           entity: `invocation:${invocation.sequence}`,
@@ -919,15 +970,22 @@ function reduceEvent(
           event: event.type,
         });
       }
-      return ok({
-        ...invocation,
-        state: 'succeeded',
-        outcome: event.outcome,
-        ...(event.output !== undefined ? { output: event.output } : {}),
-        attempts: invocation.attempts.map((candidate) =>
-          candidate.number === attempt.number ? { ...candidate, state: 'succeeded' } : candidate,
+      return ok(
+        invocationFinish(
+          {
+            ...invocation,
+            state: 'succeeded',
+            outcome: event.outcome,
+            ...(event.output !== undefined ? { output: event.output } : {}),
+            attempts: invocation.attempts.map((candidate) =>
+              candidate.number === attempt.number
+                ? { ...candidate, state: 'succeeded' }
+                : candidate,
+            ),
+          },
+          event.finishedAt,
         ),
-      });
+      );
     });
   }
 
@@ -1095,7 +1153,8 @@ function reduceEvent(
       !invocation.approval ||
       !approvalBindingsEqual(event.binding, invocation.approval) ||
       !event.actor.trim() ||
-      !event.reason.trim()
+      !event.reason.trim() ||
+      !validInvocationFinish(invocation, event.finishedAt)
     ) {
       return toRuntimeError(RuntimeErrorKind.StaleApproval, {
         invocationSequence: invocation.sequence,
@@ -1120,12 +1179,17 @@ function reduceEvent(
           ? 'changes_requested'
           : 'rejected';
     const updated = replaceInvocation(state, invocation.sequence, (current) =>
-      ok({
-        ...current,
-        state: 'succeeded',
-        outcome,
-        output: { reason: event.reason },
-      }),
+      ok(
+        invocationFinish(
+          {
+            ...current,
+            state: 'succeeded',
+            outcome,
+            output: { reason: event.reason },
+          },
+          event.finishedAt,
+        ),
+      ),
     );
     if (updated.isErr()) return updated;
     const next = updated.unwrap();
@@ -1171,7 +1235,13 @@ function reduceEvent(
       (failedInvocation || invocationLimitReached || durationLimitReached(artifact, state)
         ? 'failed'
         : undefined);
-    if (state.status !== 'running' || event.result !== expectedTerminalResult) {
+    if (
+      state.status !== 'running' ||
+      event.result !== expectedTerminalResult ||
+      (event.finishedAt !== undefined && timestampMilliseconds(event.finishedAt) === undefined) ||
+      (completeInvocation !== undefined &&
+        !validInvocationFinish(completeInvocation, event.finishedAt))
+    ) {
       return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
         entity: 'run',
         from: state.status,
@@ -1181,6 +1251,13 @@ function reduceEvent(
     return ok({
       ...state,
       status: event.result,
+      invocations: completeInvocation
+        ? state.invocations.map((invocation) =>
+            invocation.sequence === completeInvocation.sequence
+              ? invocationFinish(invocation, event.finishedAt)
+              : invocation,
+          )
+        : state.invocations,
     });
   }
 

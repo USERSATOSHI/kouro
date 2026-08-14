@@ -23,7 +23,7 @@ tool exchanges above in-context steering and stop controls.
 - **Resizable inspector** — The execution inspector is a persistent bottom drawer that supports pointer dragging and keyboard resizing
 - **Markdown tool activity** — Structured tool arguments and results become readable Markdown fields, while shell commands and fenced code retain syntax highlighting
 - **Prompt deduplication** — The invocation prompt is added only when the provider transcript did not already emit the same user message
-- **Useful workflow views** — Operators can switch between a layered top-to-bottom or left-to-right flowchart and the durable invocation timeline
+- **Useful workflow views** — Operators can switch between a layered top-to-bottom or left-to-right flowchart and a durable invocation timeline whose block widths reflect recorded wall-clock duration
 - **Derived ticket columns** — The API supplies planning and runtime-owned execution projections; React never persists board state
 - **Markdown ticket details** — Ticket descriptions and comments render headings, lists, links, quotes, inline code, and fenced code without accepting raw HTML
 - **Ticket-scoped workflow launch** — Ticket details launch a workflow against a selected repository with immutable ticket input, optional base-branch and harness routing, and direct navigation to the created run
@@ -190,6 +190,11 @@ The diagram toolbar stores its flowchart/timeline and direction choices as
 device-local preferences. A removed graph preference migrates to flowchart.
 Parallel outgoing transition labels receive separate
 offsets so their outcome titles remain readable.
+
+Timeline blocks select one invocation or subordinate call at a time. Runs
+recorded after ADR-0041 use an elapsed wall-clock axis; older histories retain
+the deterministic activation-order fallback because their durations cannot be
+reconstructed.
 
 ## Vite Dev Proxy
 

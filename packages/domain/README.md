@@ -151,6 +151,10 @@ interface RunState {
 }
 ```
 
+Each `NodeInvocation` may carry durable `activatedAt` and `finishedAt`
+timestamps. They are presentation evidence captured in lifecycle events and do
+not participate in scheduling decisions.
+
 ## Event Types (23 Variants)
 
 The `RunEvent` discriminated union covers the full run lifecycle:

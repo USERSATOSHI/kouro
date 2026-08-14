@@ -2,7 +2,11 @@ import { describe, expect, test } from 'bun:test';
 
 import type { RunDetails } from '@kouro/api-contracts';
 
-import { isTerminalRun, timelineModel } from '../../packages/web/src/timeline.ts';
+import {
+  isTerminalRun,
+  isTimelineBlockSelected,
+  timelineModel,
+} from '../../packages/web/src/timeline.ts';
 
 function runDetails(status: RunDetails['status'] = 'running'): RunDetails {
   return {
@@ -90,6 +94,60 @@ describe('web timeline model', () => {
     const model = timelineModel(runDetails());
     const flattened = model.lanes.flatMap((lane) => lane.blocks);
     expect(flattened.map((block) => block.invocationSequence)).toEqual([1, 2, 3]);
+  });
+
+  test('one repeated node invocation can be selected without selecting its siblings', () => {
+    const blocks = timelineModel(runDetails()).lanes[0]?.blocks ?? [];
+    expect(blocks.map(({ id }) => isTimelineBlockSelected('invocation:2', id))).toEqual([
+      false,
+      true,
+    ]);
+  });
+
+  test('uses durable wall-clock spans when every invocation has timing data', () => {
+    const run = runDetails();
+    const invocations = run.state.invocations.map((invocation, index) => {
+      const timings = [
+        ['2026-08-14T10:00:00.000Z', '2026-08-14T10:00:10.000Z'],
+        ['2026-08-14T10:00:10.000Z', '2026-08-14T10:00:40.000Z'],
+        ['2026-08-14T10:00:40.000Z', undefined],
+      ] as const;
+      return {
+        ...invocation,
+        activatedAt: timings[index]?.[0],
+        ...(timings[index]?.[1] === undefined ? {} : { finishedAt: timings[index][1] }),
+      };
+    });
+    const model = timelineModel(
+      { ...run, state: { ...run.state, invocations } },
+      [],
+      '2026-08-14T10:00:50.000Z',
+    );
+    const blocks = model.lanes.flatMap((lane) => lane.blocks);
+
+    expect(model).toMatchObject({ timeBased: true, span: 50_000 });
+    expect(blocks.map(({ offset, duration }) => ({ offset, duration }))).toEqual([
+      { offset: 0, duration: 10_000 },
+      { offset: 10_000, duration: 30_000 },
+      { offset: 40_000, duration: 10_000 },
+    ]);
+  });
+
+  test('falls back to equal activation slots for histories without timestamps', () => {
+    const model = timelineModel(runDetails());
+    expect(model).toMatchObject({ timeBased: false, span: 3 });
+    expect(
+      model.lanes
+        .flatMap((lane) => lane.blocks)
+        .map(({ offset, duration }) => ({
+          offset,
+          duration,
+        })),
+    ).toEqual([
+      { offset: 0, duration: 1 },
+      { offset: 1, duration: 1 },
+      { offset: 2, duration: 1 },
+    ]);
   });
 
   test('a pending invocation is a queued block without attempts', () => {

@@ -6,11 +6,9 @@ import { invocationDisplayState } from './execution-presentation.ts';
 /**
  * Deterministic swimlane timeline for a run.
  *
- * Kouro persists invocation activation order but no per-attempt wall-clock
- * spans, so the horizontal axis is the logical activation sequence, not
- * elapsed time. A block at tick k means the run's k-th invocation activation
- * belonged to that node. This keeps the view byte-stable for a given durable
- * history: replaying the same events yields the same waterfall.
+ * New histories carry durable invocation wall-clock spans. Older histories
+ * fall back to logical activation sequence because elapsed time cannot be
+ * reconstructed without inventing data.
  */
 
 export interface TimelineBlock {
@@ -21,6 +19,12 @@ export interface TimelineBlock {
   readonly callId?: string;
   readonly subagentId?: string;
   readonly row: number;
+  /** Offset from the model origin, in milliseconds or fallback sequence units. */
+  readonly offset: number;
+  /** Real elapsed milliseconds or one fallback sequence unit. */
+  readonly duration: number;
+  readonly activatedAt?: string;
+  readonly finishedAt?: string;
   readonly state: string;
   readonly attemptCount: number;
   readonly model?: string;
@@ -48,6 +52,8 @@ export interface TimelineModel {
   readonly lanes: readonly TimelineLane[];
   /** Highest reserved invocation sequence; the waterfall spans 1..tickCount. */
   readonly tickCount: number;
+  readonly span: number;
+  readonly timeBased: boolean;
 }
 
 /** Best-effort child activity layered onto the parent's durable timeline tick. */
@@ -67,6 +73,10 @@ export function isTerminalRun(status: RunDetails['status']): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled';
 }
 
+export function isTimelineBlockSelected(selectedBlockId: string | null, blockId: string): boolean {
+  return selectedBlockId === blockId;
+}
+
 function displayedState(
   run: RunDetails,
   node: RunDetails['nodes'][number] | undefined,
@@ -78,11 +88,25 @@ function displayedState(
   return invocationDisplayState(invocation);
 }
 
+type TimelineBlockSource = Omit<TimelineBlock, 'duration' | 'offset'>;
+type TimelineSubagentBlockSource = TimelineBlockSource & { readonly laneId: string };
+
+function timestamp(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function terminalBlock(block: TimelineBlockSource): boolean {
+  return ['succeeded', 'failed', 'cancelled'].includes(block.state);
+}
+
 export function timelineModel(
   run: RunDetails,
   observations: readonly TimelineSubagentObservation[] = [],
+  observedAt = new Date().toISOString(),
 ): TimelineModel {
-  const blocks: TimelineBlock[] = run.state.invocations.map((invocation) => {
+  const blockSources: TimelineBlockSource[] = run.state.invocations.map((invocation) => {
     const node = run.nodes.find(({ id }) => id === invocation.nodeId);
     const attempt = invocation.attempts.at(-1);
     const attemptsWithUsage = invocation.attempts.filter(
@@ -106,6 +130,8 @@ export function timelineModel(
       nodeId: invocation.nodeId,
       kind: 'workflow' as const,
       row: 0,
+      ...(invocation.activatedAt === undefined ? {} : { activatedAt: invocation.activatedAt }),
+      ...(invocation.finishedAt === undefined ? {} : { finishedAt: invocation.finishedAt }),
       state: displayedState(run, node, invocation),
       attemptCount: invocation.attempts.length,
       model: attempt?.model,
@@ -115,36 +141,41 @@ export function timelineModel(
       queued: invocation.state === 'pending',
     };
   });
-  const subagentBlocks = run.state.invocations.flatMap((invocation) =>
-    invocation.attempts.flatMap((attempt) =>
-      (attempt.subagents ?? []).map((subagent) => {
-        const laneId = `subagent:${invocation.nodeId}:${subagent.subagentId}`;
-        const costUsd = subagent.usage
-          ? estimateCostUsd(subagent.usage, subagent.model)
-          : undefined;
-        return {
-          id: `${invocation.sequence}:${attempt.number}:${subagent.callId}`,
-          attemptNumber: attempt.number,
-          invocationSequence: invocation.sequence,
-          nodeId: invocation.nodeId,
-          kind: 'subagent' as const,
-          callId: subagent.callId,
-          subagentId: subagent.subagentId,
-          row: 0,
-          state: subagent.state,
-          attemptCount: 1,
-          model: subagent.model,
-          harnessId: subagent.harnessId,
-          ...(subagent.usage ? { usage: subagent.usage } : {}),
-          ...(costUsd === undefined ? {} : { costUsd }),
-          queued: false,
-          laneId,
-        };
-      }),
-    ),
+  const subagentBlocks: TimelineSubagentBlockSource[] = run.state.invocations.flatMap(
+    (invocation) =>
+      invocation.attempts.flatMap((attempt) =>
+        (attempt.subagents ?? []).map((subagent) => {
+          const laneId = `subagent:${invocation.nodeId}:${subagent.subagentId}`;
+          const costUsd = subagent.usage
+            ? estimateCostUsd(subagent.usage, subagent.model)
+            : undefined;
+          return {
+            id: `${invocation.sequence}:${attempt.number}:${subagent.callId}`,
+            attemptNumber: attempt.number,
+            invocationSequence: invocation.sequence,
+            nodeId: invocation.nodeId,
+            kind: 'subagent' as const,
+            callId: subagent.callId,
+            subagentId: subagent.subagentId,
+            row: 0,
+            ...(invocation.activatedAt === undefined
+              ? {}
+              : { activatedAt: invocation.activatedAt }),
+            ...(invocation.finishedAt === undefined ? {} : { finishedAt: invocation.finishedAt }),
+            state: subagent.state,
+            attemptCount: 1,
+            model: subagent.model,
+            harnessId: subagent.harnessId,
+            ...(subagent.usage ? { usage: subagent.usage } : {}),
+            ...(costUsd === undefined ? {} : { costUsd }),
+            queued: false,
+            laneId,
+          };
+        }),
+      ),
   );
   const durableSubagentIds = new Set(subagentBlocks.map(({ id }) => id));
-  const observedSubagentBlocks = observations
+  const observedSubagentBlocks: TimelineSubagentBlockSource[] = observations
     .filter(
       (observation) =>
         !durableSubagentIds.has(
@@ -152,6 +183,9 @@ export function timelineModel(
         ),
     )
     .map((observation) => {
+      const parent = run.state.invocations.find(
+        ({ sequence }) => sequence === observation.invocationSequence,
+      );
       const costUsd = observation.usage
         ? estimateCostUsd(observation.usage, observation.model)
         : undefined;
@@ -164,6 +198,8 @@ export function timelineModel(
         callId: observation.callId,
         subagentId: observation.subagentId,
         row: 0,
+        ...(parent?.activatedAt === undefined ? {} : { activatedAt: parent.activatedAt }),
+        ...(parent?.finishedAt === undefined ? {} : { finishedAt: parent.finishedAt }),
         state: observation.state,
         attemptCount: 1,
         model: observation.model,
@@ -175,7 +211,45 @@ export function timelineModel(
       };
     });
   const allSubagentBlocks = [...subagentBlocks, ...observedSubagentBlocks];
-  blocks.sort((left, right) => left.invocationSequence - right.invocationSequence);
+  blockSources.sort((left, right) => left.invocationSequence - right.invocationSequence);
+  const timeBased =
+    blockSources.length > 0 &&
+    blockSources.every(
+      (block) =>
+        timestamp(block.activatedAt) !== undefined &&
+        (!terminalBlock(block) || timestamp(block.finishedAt) !== undefined),
+    );
+  const origin = timeBased
+    ? Math.min(...blockSources.map((block) => timestamp(block.activatedAt) ?? 0))
+    : 0;
+  const observation = timestamp(observedAt);
+  const end = timeBased
+    ? Math.max(
+        ...blockSources.map((block) =>
+          Math.max(
+            timestamp(block.activatedAt) ?? origin,
+            timestamp(block.finishedAt) ?? observation ?? timestamp(block.activatedAt) ?? origin,
+          ),
+        ),
+      )
+    : blockSources.reduce((maximum, block) => Math.max(maximum, block.invocationSequence), 0);
+  const span = Math.max(1, end - origin);
+  function positionBlock(block: TimelineBlockSource): TimelineBlock {
+    if (!timeBased) {
+      return { ...block, offset: block.invocationSequence - 1, duration: 1 };
+    }
+    const start = timestamp(block.activatedAt) ?? origin;
+    if (block.kind === 'subagent') {
+      return { ...block, offset: start - origin, duration: 0 };
+    }
+    const finish = timestamp(block.finishedAt) ?? observation ?? start;
+    return { ...block, offset: start - origin, duration: Math.max(0, finish - start) };
+  }
+  const blocks = blockSources.map(positionBlock);
+  const positionedSubagentBlocks = allSubagentBlocks.map((block) => ({
+    ...positionBlock(block),
+    laneId: block.laneId,
+  }));
   const workflowLanes: TimelineLane[] = run.nodes
     .toSorted((left, right) => left.ordinal - right.ordinal)
     .map((node) => ({
@@ -192,7 +266,7 @@ export function timelineModel(
     subagent.parentNodeIds.map((parentNodeId, parentIndex) => {
       const parent = run.nodes.find(({ id }) => id === parentNodeId);
       const laneId = `subagent:${parentNodeId}:${subagent.id}`;
-      const laneBlocks = allSubagentBlocks
+      const laneBlocks = positionedSubagentBlocks
         .filter((block) => block.laneId === laneId)
         .toSorted(
           (left, right) =>
@@ -225,5 +299,5 @@ export function timelineModel(
     (maximum, block) => Math.max(maximum, block.invocationSequence),
     0,
   );
-  return { lanes, tickCount };
+  return { lanes, tickCount, span, timeBased };
 }

@@ -272,6 +272,8 @@ export interface NodeInvocation {
   readonly nodeId: string;
   readonly state: InvocationState;
   readonly attempts: readonly NodeAttempt[];
+  readonly activatedAt?: string;
+  readonly finishedAt?: string;
   readonly outcome?: string;
   readonly output?: JsonValue;
   readonly selectedTransitionId?: string;
@@ -374,6 +376,7 @@ export type RunEvent =
       readonly type: 'run.cancelled';
       readonly actor: string;
       readonly reason: string;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -382,6 +385,7 @@ export type RunEvent =
       readonly nodeId: string;
       readonly sourceInvocationSequence?: number;
       readonly transitionId?: string;
+      readonly activatedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -482,6 +486,7 @@ export type RunEvent =
       readonly attemptNumber: number;
       readonly failure: AttemptFailure;
       readonly retry: 'fallback' | 'none';
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -533,6 +538,7 @@ export type RunEvent =
       readonly binding: SkipBinding;
       readonly actor: string;
       readonly reason: string;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -540,6 +546,7 @@ export type RunEvent =
       readonly invocationSequence: number;
       readonly outcome: string;
       readonly output?: JsonValue;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -552,6 +559,7 @@ export type RunEvent =
       readonly binding: ApprovalBinding;
       readonly actor: string;
       readonly reason: string;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -559,6 +567,7 @@ export type RunEvent =
       readonly binding: ApprovalBinding;
       readonly actor: string;
       readonly reason: string;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -566,11 +575,13 @@ export type RunEvent =
       readonly binding: ApprovalBinding;
       readonly actor: string;
       readonly reason: string;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
       readonly type: 'run.completed';
       readonly result: 'succeeded' | 'failed';
+      readonly finishedAt?: string;
     };
 
 export type RunEventInput = RunEvent extends infer Event

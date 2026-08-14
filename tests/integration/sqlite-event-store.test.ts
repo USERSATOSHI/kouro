@@ -8,6 +8,7 @@ import { compileWorkflow } from '@kouro/adw';
 import type { CompiledWorkflowArtifact, JsonValue, WorkflowSourceBundle } from '@kouro/domain';
 import {
   BunCommandRunner,
+  type Clock,
   type CommandExecution,
   type CommandRunner,
   type CommandRunnerError,
@@ -29,6 +30,16 @@ class ScriptedCommandRunner implements CommandRunner {
       throw new Error(`No scripted result for command: ${command}`);
     }
     return Promise.resolve(ok(scripted));
+  }
+}
+
+class ScriptedClock implements Clock {
+  constructor(private readonly times: string[]) {}
+
+  now(): string {
+    const time = this.times.shift();
+    if (!time) throw new Error('No scripted clock value remains');
+    return time;
   }
 }
 
@@ -124,6 +135,40 @@ runStoreContract('SqliteEventStore', () => {
 });
 
 describe('M2 durable command and approval runtime', () => {
+  test('coordinator records command invocation wall-clock spans', async () => {
+    const location = databasePath();
+    try {
+      const store = initializedStore(location.path);
+      const coordinator = new RunCoordinator(
+        store,
+        new ScriptedCommandRunner([execution('success')]),
+        undefined,
+        process.cwd(),
+        new ScriptedClock(['2026-08-14T10:00:00.000Z', '2026-08-14T10:00:15.000Z']),
+      );
+      coordinator
+        .createRun({
+          runId: 'timed-run',
+          artifact: workflowArtifact(),
+          startingCommit: 'abc123',
+          configuration: {},
+          idempotencyKey: 'create',
+        })
+        .unwrap();
+
+      await coordinator.advance('timed-run');
+      const completed = (await coordinator.advance('timed-run')).unwrap();
+
+      expect(completed.state.invocations[0]).toMatchObject({
+        activatedAt: '2026-08-14T10:00:00.000Z',
+        finishedAt: '2026-08-14T10:00:15.000Z',
+      });
+      store.dispose();
+    } finally {
+      rmSync(location.directory, { recursive: true, force: true });
+    }
+  });
+
   test('Bun command runner records the process exit outcome', async () => {
     const runner = new BunCommandRunner(process.cwd());
     const succeeded = await runner.execute("printf 'kouro'");

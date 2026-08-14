@@ -157,6 +157,10 @@ function hasNumber(record: Readonly<Record<string, unknown>>, key: string): bool
   return typeof record[key] === 'number';
 }
 
+function hasOptionalTimestamp(record: Readonly<Record<string, unknown>>, key: string): boolean {
+  return record[key] === undefined || typeof record[key] === 'string';
+}
+
 function isTokenUsage(value: unknown): boolean {
   if (!isRecord(value)) return false;
   const counts = [
@@ -244,9 +248,17 @@ function isRunEvent(value: unknown): value is RunEvent {
     case 'run.resumed':
       return typeof value.actor === 'string';
     case 'run.cancelled':
-      return typeof value.actor === 'string' && typeof value.reason === 'string';
+      return (
+        typeof value.actor === 'string' &&
+        typeof value.reason === 'string' &&
+        hasOptionalTimestamp(value, 'finishedAt')
+      );
     case 'invocation.activated':
-      return hasNumber(value, 'invocationSequence') && typeof value.nodeId === 'string';
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        typeof value.nodeId === 'string' &&
+        hasOptionalTimestamp(value, 'activatedAt')
+      );
     case 'attempt.started':
       return (
         hasNumber(value, 'invocationSequence') &&
@@ -330,7 +342,8 @@ function isRunEvent(value: unknown): value is RunEvent {
         isRecord(value.failure) &&
         typeof value.failure.kind === 'string' &&
         typeof value.failure.message === 'string' &&
-        (value.retry === 'fallback' || value.retry === 'none')
+        (value.retry === 'fallback' || value.retry === 'none') &&
+        hasOptionalTimestamp(value, 'finishedAt')
       );
     case 'attempt.interrupted':
       return hasNumber(value, 'invocationSequence') && hasNumber(value, 'attemptNumber');
@@ -371,10 +384,15 @@ function isRunEvent(value: unknown): value is RunEvent {
       return (
         isSkipBinding(value.binding) &&
         typeof value.actor === 'string' &&
-        typeof value.reason === 'string'
+        typeof value.reason === 'string' &&
+        hasOptionalTimestamp(value, 'finishedAt')
       );
     case 'invocation.completed':
-      return hasNumber(value, 'invocationSequence') && typeof value.outcome === 'string';
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        typeof value.outcome === 'string' &&
+        hasOptionalTimestamp(value, 'finishedAt')
+      );
     case 'approval.requested':
       return isApprovalBinding(value.binding);
     case 'approval.granted':
@@ -383,10 +401,14 @@ function isRunEvent(value: unknown): value is RunEvent {
       return (
         isApprovalBinding(value.binding) &&
         typeof value.actor === 'string' &&
-        typeof value.reason === 'string'
+        typeof value.reason === 'string' &&
+        hasOptionalTimestamp(value, 'finishedAt')
       );
     case 'run.completed':
-      return value.result === 'succeeded' || value.result === 'failed';
+      return (
+        (value.result === 'succeeded' || value.result === 'failed') &&
+        hasOptionalTimestamp(value, 'finishedAt')
+      );
     default:
       return false;
   }
