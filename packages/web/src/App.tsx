@@ -12,8 +12,15 @@ import type {
   TicketProjectView,
   TicketProviderConfigurationView,
   WorkflowNodeView,
+  WorkflowSubagentView,
 } from '@kouro/api-contracts';
-import type { DeliveryMetadata, DeliveryState } from '@kouro/domain';
+import {
+  type DeliveryMetadata,
+  type DeliveryState,
+  estimateCostUsd,
+  sumUsage,
+  type TokenUsage,
+} from '@kouro/domain';
 import {
   Background,
   BaseEdge,
@@ -80,7 +87,7 @@ import {
   preferredInvocationSequence,
 } from './execution-controls.ts';
 import { newIdempotencyKey } from './idempotency-key.ts';
-import { timelineModel } from './timeline.ts';
+import { timelineModel, type TimelineSubagentObservation } from './timeline.ts';
 import {
   CodeViewer,
   MarkdownContent,
@@ -173,10 +180,12 @@ function repositoryName(path: string): string {
 
 interface WorkflowNodeData extends Record<string, unknown> {
   readonly title: string;
-  readonly nodeType: WorkflowNodeView['type'];
+  readonly nodeType: WorkflowNodeView['type'] | 'subagent';
   readonly state: string;
   readonly direction: DiagramDirection;
   readonly mode: DiagramMode;
+  readonly usageLabel?: string;
+  readonly parentNodeId?: string;
 }
 
 type WorkflowFlowNode = Node<WorkflowNodeData, 'workflow'>;
@@ -189,6 +198,7 @@ function WorkflowGraphNode({ data }: NodeProps<WorkflowFlowNode>) {
       <small>{data.nodeType}</small>
       <strong>{data.title}</strong>
       <span className={stateClass(data.state)}>{data.state}</span>
+      {data.usageLabel ? <small className="flow-node-usage">{data.usageLabel}</small> : null}
       <Handle position={horizontal ? Position.Right : Position.Bottom} type="source" />
     </div>
   );
@@ -284,6 +294,58 @@ function graphDepths(run: RunDetails): ReadonlyMap<string, number> {
   return depths;
 }
 
+function executionUsageLabel(
+  executions: readonly { readonly usage?: TokenUsage; readonly model?: string }[],
+): string | undefined {
+  const reported = executions.filter(
+    (execution): execution is typeof execution & { readonly usage: TokenUsage } =>
+      execution.usage !== undefined,
+  );
+  if (reported.length === 0) return undefined;
+  const usage = sumUsage(reported.map((execution) => execution.usage));
+  const costs = reported.map((execution) => estimateCostUsd(execution.usage, execution.model));
+  const cost = costs.every((candidate): candidate is number => candidate !== undefined)
+    ? costs.reduce((total, candidate) => total + candidate, 0)
+    : undefined;
+  return `${formatTokenCount(usage.inputTokens + usage.outputTokens)} tok · ${cost === undefined ? 'unpriced' : `${formatUsd(cost)} est.`}`;
+}
+
+function workflowNodeUsageLabel(run: RunDetails, nodeId: string): string | undefined {
+  return executionUsageLabel(
+    run.state.invocations
+      .filter((invocation) => invocation.nodeId === nodeId)
+      .flatMap(({ attempts }) => attempts),
+  );
+}
+
+interface DiagramSubagent {
+  readonly id: string;
+  readonly parentNodeId: string;
+  readonly definition: WorkflowSubagentView;
+}
+
+function diagramSubagents(run: RunDetails): readonly DiagramSubagent[] {
+  return (run.subagents ?? []).flatMap((definition) =>
+    definition.parentNodeIds.map((parentNodeId) => ({
+      id: `subagent:${parentNodeId}:${definition.id}`,
+      parentNodeId,
+      definition,
+    })),
+  );
+}
+
+function subagentExecutions(run: RunDetails, child: DiagramSubagent) {
+  return run.state.invocations
+    .filter(({ nodeId }) => nodeId === child.parentNodeId)
+    .flatMap(({ attempts }) => attempts)
+    .flatMap(({ subagents }) => subagents ?? [])
+    .filter(({ subagentId }) => subagentId === child.definition.id);
+}
+
+function subagentState(run: RunDetails, child: DiagramSubagent): string {
+  return subagentExecutions(run, child).at(-1)?.state ?? 'declared';
+}
+
 function flowchartNodes(
   run: RunDetails,
   direction: DiagramDirection,
@@ -299,12 +361,12 @@ function flowchartNodes(
   const widestLayer = Math.max(1, ...[...layers.values()].map((layer) => layer.length));
   const crossAxisGap = 270;
   const depthGap = 180;
-  return [...layers.entries()].flatMap(([depth, layer]) => {
+  const workflowNodes: WorkflowFlowNode[] = [...layers.entries()].flatMap(([depth, layer]) => {
     const sorted = layer.toSorted((left, right) => left.ordinal - right.ordinal);
     const offset = ((widestLayer - sorted.length) * crossAxisGap) / 2;
     return sorted.map((node, index) => ({
       id: node.id,
-      type: 'workflow',
+      type: 'workflow' as const,
       position:
         direction === 'TB'
           ? { x: offset + index * crossAxisGap, y: depth * depthGap }
@@ -313,23 +375,60 @@ function flowchartNodes(
         title: node.title,
         nodeType: node.type,
         state: nodeState(run, node),
+        usageLabel: workflowNodeUsageLabel(run, node.id),
         direction,
         mode: 'flowchart' as const,
       },
     }));
   });
+  const byId = new Map(workflowNodes.map((node) => [node.id, node]));
+  const children = diagramSubagents(run);
+  const childCounts = new Map<string, number>();
+  for (const child of children) {
+    childCounts.set(child.parentNodeId, (childCounts.get(child.parentNodeId) ?? 0) + 1);
+  }
+  const childIndexes = new Map<string, number>();
+  const subagentNodes = children.flatMap((child) => {
+    const parent = byId.get(child.parentNodeId);
+    if (!parent) return [];
+    const index = childIndexes.get(child.parentNodeId) ?? 0;
+    childIndexes.set(child.parentNodeId, index + 1);
+    const count = childCounts.get(child.parentNodeId) ?? 1;
+    const crossOffset = (index - (count - 1) / 2) * 190;
+    const executions = subagentExecutions(run, child);
+    return [{
+      id: child.id,
+      type: 'workflow' as const,
+      position:
+        direction === 'TB'
+          ? { x: parent.position.x + crossOffset, y: parent.position.y + 98 }
+          : { x: parent.position.x + 150, y: parent.position.y + crossOffset },
+      selectable: false,
+      data: {
+        title: child.definition.role,
+        nodeType: 'subagent' as const,
+        state: subagentState(run, child),
+        direction,
+        mode: 'flowchart' as const,
+        usageLabel: executionUsageLabel(executions),
+        parentNodeId: child.parentNodeId,
+      },
+    }];
+  });
+  return [...workflowNodes, ...subagentNodes];
 }
 
 function networkGraphNodes(run: RunDetails): WorkflowFlowNode[] {
-  const count = Math.max(1, run.nodes.length);
+  const subagents = diagramSubagents(run);
+  const count = Math.max(1, run.nodes.length + subagents.length);
   const radius = Math.max(220, count * 42);
-  return run.nodes
+  const nodes: WorkflowFlowNode[] = run.nodes
     .toSorted((left, right) => left.ordinal - right.ordinal)
     .map((node, index) => {
       const angle = (index / count) * Math.PI * 2 - Math.PI / 2;
       return {
         id: node.id,
-        type: 'workflow',
+        type: 'workflow' as const,
         position: {
           x: Math.cos(angle) * radius,
           y: Math.sin(angle) * radius,
@@ -338,11 +437,36 @@ function networkGraphNodes(run: RunDetails): WorkflowFlowNode[] {
           title: node.title,
           nodeType: node.type,
           state: nodeState(run, node),
+          usageLabel: workflowNodeUsageLabel(run, node.id),
           direction: 'TB' as const,
           mode: 'graph' as const,
         },
       };
     });
+  const subagentNodes = subagents.map((child, childIndex) => {
+    const index = run.nodes.length + childIndex;
+    const angle = (index / count) * Math.PI * 2 - Math.PI / 2;
+    const executions = subagentExecutions(run, child);
+    return {
+      id: child.id,
+      type: 'workflow' as const,
+      position: {
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius,
+      },
+      selectable: false,
+      data: {
+        title: child.definition.role,
+        nodeType: 'subagent' as const,
+        state: subagentState(run, child),
+        direction: 'TB' as const,
+        mode: 'graph' as const,
+        usageLabel: executionUsageLabel(executions),
+        parentNodeId: child.parentNodeId,
+      },
+    };
+  });
+  return [...nodes, ...subagentNodes];
 }
 
 function nodeState(run: RunDetails, node: WorkflowNodeView): string {
@@ -383,7 +507,7 @@ function graphEdges(
     outgoingCounts.set(edge.source, (outgoingCounts.get(edge.source) ?? 0) + 1);
   }
   const sourceCounts = new Map<string, number>();
-  return run.edges.map((edge) => {
+  const workflowEdges: WorkflowFlowEdge[] = run.edges.map((edge) => {
     const siblingIndex = sourceCounts.get(edge.source) ?? 0;
     sourceCounts.set(edge.source, siblingIndex + 1);
     const siblingCount = outgoingCounts.get(edge.source) ?? 1;
@@ -393,7 +517,7 @@ function graphEdges(
       id: edge.id,
       source: edge.source,
       target: edge.target,
-      type: 'workflow',
+      type: 'workflow' as const,
       animated: activeNodes.has(edge.source),
       data: {
         direction: edgeDirection,
@@ -412,22 +536,75 @@ function graphEdges(
       },
     };
   });
+  const subagentEdges: WorkflowFlowEdge[] = diagramSubagents(run).map((child) => ({
+    id: `delegates:${child.parentNodeId}:${child.definition.id}`,
+    source: child.parentNodeId,
+    target: child.id,
+    type: 'workflow',
+    animated: activeNodes.has(child.parentNodeId),
+    data: {
+      direction: edgeDirection,
+      label: 'delegates',
+      labelOffset: 0,
+      mode,
+      selected: false,
+    },
+    markerEnd: { type: MarkerType.ArrowClosed, color: '#8957e5' },
+    style: { stroke: '#8957e5', strokeDasharray: '5 4', strokeWidth: 1.5 },
+  }));
+  return [...workflowEdges, ...subagentEdges];
 }
 
 interface TimelineStyle extends CSSProperties {
   readonly '--timeline-track-min': string;
 }
 
+function timelineUsageLabel(block: ReturnType<typeof timelineModel>['lanes'][number]['blocks'][number]): string | undefined {
+  if (!block.usage) return undefined;
+  const tokens = formatTokenCount(block.usage.inputTokens + block.usage.outputTokens);
+  return `${tokens} tok · ${block.costUsd === undefined ? 'unpriced' : `${formatUsd(block.costUsd)} est.`}`;
+}
+
+function timelineSubagentObservations(
+  activities: Readonly<Record<number, InvocationActivityView>>,
+): readonly TimelineSubagentObservation[] {
+  return Object.values(activities).flatMap((activity) =>
+    parseTranscript(activity.transcript).flatMap((entry) => {
+      if (entry.kind !== 'subagent' || !entry.callId || !entry.subagentId) return [];
+      const state =
+        entry.status === 'failed'
+          ? ('failed' as const)
+          : entry.status === 'completed'
+            ? ('succeeded' as const)
+            : ('active' as const);
+      return [{
+        invocationSequence: activity.invocationSequence,
+        attemptNumber: activity.attemptNumber,
+        nodeId: activity.nodeId,
+        callId: entry.callId,
+        subagentId: entry.subagentId,
+        state,
+        ...(entry.harnessId ? { harnessId: entry.harnessId } : {}),
+        ...(entry.model ? { model: entry.model } : {}),
+        ...(entry.usage ? { usage: entry.usage } : {}),
+      }];
+    }),
+  );
+}
+
 function RunTimeline({
+  activities,
   run,
   selectedNodeId,
   onSelectNode,
 }: {
+  readonly activities: Readonly<Record<number, InvocationActivityView>>;
   readonly run: RunDetails;
   readonly selectedNodeId: string | null;
   readonly onSelectNode: (nodeId: string) => void;
 }) {
-  const model = useMemo(() => timelineModel(run), [run]);
+  const observations = useMemo(() => timelineSubagentObservations(activities), [activities]);
+  const model = useMemo(() => timelineModel(run, observations), [observations, run]);
   if (model.tickCount === 0) {
     return (
       <div className="timeline">
@@ -438,7 +615,7 @@ function RunTimeline({
   const tickPercent = 100 / model.tickCount;
   const ticks = Array.from({ length: model.tickCount }, (_, index) => index + 1);
   const timelineStyle: TimelineStyle = {
-    '--timeline-track-min': `${Math.max(320, model.tickCount * 34)}px`,
+    '--timeline-track-min': `${Math.max(480, model.tickCount * 156)}px`,
   };
   return (
     <div className="timeline" style={timelineStyle}>
@@ -461,7 +638,7 @@ function RunTimeline({
           </div>
         </header>
         {model.lanes.map((lane) => (
-          <section className="timeline-lane" key={lane.nodeId}>
+          <section className={`timeline-lane timeline-lane-${lane.kind}`} key={lane.laneId}>
             <button
               aria-pressed={selectedNodeId === lane.nodeId}
               className={selectedNodeId === lane.nodeId ? 'timeline-lane-label selected' : 'timeline-lane-label'}
@@ -469,28 +646,44 @@ function RunTimeline({
               title={`${lane.nodeType} · ${lane.title}`}
               type="button"
             >
-              <small>{lane.nodeType}</small>
+              <small>{lane.kind === 'subagent' ? 'subagent · child' : lane.nodeType}</small>
               <strong>{lane.title}</strong>
-              <span>{lane.blocks.length} invocation{lane.blocks.length === 1 ? '' : 's'}</span>
+              <span>
+                {lane.blocks.length} {lane.kind === 'subagent' ? 'call' : 'invocation'}
+                {lane.blocks.length === 1 ? '' : 's'}
+              </span>
             </button>
-            <div className="timeline-lane-tracks">
+            <div
+              className="timeline-lane-tracks"
+              style={{ minHeight: `${lane.rowCount * 40 + 4}px` }}
+            >
               {lane.blocks.map((block) => (
                 <button
                   aria-pressed={selectedNodeId === block.nodeId}
-                  className={`timeline-block${block.queued ? ' queued' : ''}${selectedNodeId === block.nodeId ? ' selected' : ''}`}
-                  key={block.invocationSequence}
+                  className={`timeline-block timeline-block-${block.kind}${block.queued ? ' queued' : ''}${selectedNodeId === block.nodeId ? ' selected' : ''}`}
+                  key={block.id}
                   onClick={() => onSelectNode(block.nodeId)}
                   style={{
                     left: `${((block.invocationSequence - 1) * tickPercent).toFixed(3)}%`,
                     width: `${tickPercent.toFixed(3)}%`,
+                    top: `${block.row * 40 + 5}px`,
+                    bottom: 'auto',
+                    height: '34px',
                   }}
                   title={`#${block.invocationSequence} · ${block.state} · ${block.attemptCount} attempt${block.attemptCount === 1 ? '' : 's'}${block.model ? ` · ${block.model}` : ''}${block.usage ? ` · ${formatTokenCount(block.usage.inputTokens + block.usage.outputTokens)} tokens` : ''}${block.costUsd !== undefined ? ` · ${formatUsd(block.costUsd)} est.` : ''}`}
                   type="button"
                 >
                   <span className={`timeline-block-fill state-${block.state.replaceAll('_', '-')}`} />
                   <span className="timeline-block-label">
-                    #{block.invocationSequence}
-                    {block.attemptCount > 0 ? ` · ×${block.attemptCount}` : ''}
+                    <span>
+                      #{block.invocationSequence}
+                      {block.kind === 'subagent'
+                        ? ` · ${block.callId ?? block.subagentId ?? 'child'}`
+                        : block.attemptCount > 0
+                          ? ` · ×${block.attemptCount}`
+                          : ''}
+                    </span>
+                    {timelineUsageLabel(block) ? <small>{timelineUsageLabel(block)}</small> : null}
                   </span>
                 </button>
               ))}
@@ -897,6 +1090,10 @@ function TranscriptCard({
 }) {
   const markdown = jsonMarkdown(entry.text);
   const shellInput = entry.kind === 'tool_call' && entry.toolName === 'shell';
+  const subagentCostUsd =
+    entry.kind === 'subagent' && entry.usage
+      ? estimateCostUsd(entry.usage, entry.model)
+      : undefined;
   return (
     <article className={`message message-${entry.kind}${nested ? ' message-nested' : ''}`}>
       <header>
@@ -924,6 +1121,18 @@ function TranscriptCard({
                 <>
                   <dt>Effort</dt>
                   <dd>{entry.reasoningEffort}</dd>
+                </>
+              ) : null}
+              {entry.usage ? (
+                <>
+                  <dt>Usage</dt>
+                  <dd>
+                    {formatTokenCount(entry.usage.inputTokens + entry.usage.outputTokens)} tokens
+                    {' · '}
+                    {subagentCostUsd === undefined
+                      ? 'unpriced'
+                      : `${formatUsd(subagentCostUsd)} est.`}
+                  </dd>
                 </>
               ) : null}
             </dl>
@@ -1566,6 +1775,7 @@ const autoRefreshEvents = new Set([
   'attempt.resume_token_recorded',
   'attempt.artifact_published',
   'attempt.usage_recorded',
+  'attempt.subagents_recorded',
   'attempt.failed',
   'attempt.interrupt_requested',
   'attempt.interrupted',
@@ -2105,6 +2315,7 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
               </div>
               {diagramMode === 'timeline' ? (
                 <RunTimeline
+                  activities={activities}
                   onSelectNode={(nodeId) => {
                     setSelectedNode(nodeId);
                     setTab('details');
@@ -2124,7 +2335,11 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
                   nodesConnectable={false}
                   nodesDraggable={false}
                   onNodeClick={(_, selected) => {
-                    setSelectedNode(selected.id);
+                    setSelectedNode(
+                      typeof selected.data.parentNodeId === 'string'
+                        ? selected.data.parentNodeId
+                        : selected.id,
+                    );
                     setTab('details');
                   }}
                 >

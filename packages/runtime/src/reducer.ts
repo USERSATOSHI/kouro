@@ -8,9 +8,10 @@ import type {
   NodeAttempt,
   NodeInvocation,
   RunEvent,
-  TokenUsage,
   RunState,
   SkipBinding,
+  SubagentExecutionSummary,
+  TokenUsage,
 } from '@kouro/domain';
 import { RuntimeErrorKind, toRuntimeError, type RuntimeError } from './errors.ts';
 import { agentHarnessesForNode } from './harness-routing.ts';
@@ -48,6 +49,42 @@ function validTokenUsage(usage: TokenUsage): boolean {
     ...(usage.reasoningTokens !== undefined ? [usage.reasoningTokens] : []),
   ];
   return counts.length >= 2 && counts.every((count) => Number.isSafeInteger(count) && count >= 0);
+}
+
+function validJsonValue(value: unknown): boolean {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) return value.every(validJsonValue);
+  if (typeof value !== 'object') return false;
+  return Object.values(value).every(validJsonValue);
+}
+
+function validSubagentSummaries(subagents: readonly SubagentExecutionSummary[]): boolean {
+  const callIds = new Set<string>();
+  return subagents.every((subagent, index) => {
+    if (callIds.has(subagent.callId)) return false;
+    callIds.add(subagent.callId);
+    return (
+      subagent.sequence === index + 1 &&
+      subagent.callId.trim().length > 0 &&
+      subagent.subagentId.trim().length > 0 &&
+      subagent.task.trim().length > 0 &&
+      subagent.harnessId.trim().length > 0 &&
+      (subagent.model === undefined || subagent.model.trim().length > 0) &&
+      (subagent.reasoningEffort === undefined ||
+        ['low', 'medium', 'high'].includes(subagent.reasoningEffort)) &&
+      (subagent.state === 'succeeded' || subagent.state === 'failed') &&
+      (subagent.error === undefined || subagent.error.trim().length > 0) &&
+      (subagent.usage === undefined || validTokenUsage(subagent.usage)) &&
+      (subagent.output === undefined || validJsonValue(subagent.output))
+    );
+  });
 }
 
 function validDeliveryMetadata(metadata: DeliveryMetadata): boolean {
@@ -610,6 +647,36 @@ function reduceEvent(
         ...invocation,
         attempts: invocation.attempts.map((candidate) =>
           candidate.number === attempt.number ? { ...candidate, usage: event.usage } : candidate,
+        ),
+      });
+    });
+  }
+
+  if (event.type === 'attempt.subagents_recorded') {
+    return replaceInvocation(state, event.invocationSequence, (invocation) => {
+      const attempt = invocation.attempts.at(-1);
+      const definition = artifact.bundle.nodes.find(({ id }) => id === invocation.nodeId);
+      if (
+        definition?.type !== 'agent' ||
+        invocation.state !== 'active' ||
+        !attempt ||
+        attempt.number !== event.attemptNumber ||
+        attempt.subagents !== undefined ||
+        !validSubagentSummaries(event.subagents) ||
+        event.subagents.some(({ subagentId }) => !definition.allowedSubagents?.includes(subagentId))
+      ) {
+        return toRuntimeError(RuntimeErrorKind.IllegalStateTransition, {
+          entity: `attempt:${event.attemptNumber}`,
+          from: invocation.state,
+          event: event.type,
+        });
+      }
+      return ok({
+        ...invocation,
+        attempts: invocation.attempts.map((candidate) =>
+          candidate.number === attempt.number
+            ? { ...candidate, subagents: event.subagents }
+            : candidate,
         ),
       });
     });

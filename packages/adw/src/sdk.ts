@@ -1,4 +1,5 @@
 import type {
+  AgentContextSource,
   AgentReasoningEffort,
   Expression,
   JsonPrimitive,
@@ -81,6 +82,7 @@ interface AgentNodeAuthoringBase<Harness extends HarnessId> {
   readonly clearContext?: boolean;
   readonly reasoningEffort?: ReasoningEffort;
   readonly allowedSubagents?: readonly string[];
+  readonly contextSources?: readonly AgentContextSource[];
   readonly capabilities?: readonly HarnessCapabilityMap[Harness][];
   readonly priority?: number;
   readonly recoveryPolicy: RecoveryPolicy;
@@ -208,6 +210,7 @@ export const enum WorkflowAuthoringErrorKind {
   ForeignNodeHandle = 'foreign_node_handle',
   ForeignCounterHandle = 'foreign_counter_handle',
   ForeignSubagentHandle = 'foreign_subagent_handle',
+  InvalidContextSource = 'invalid_context_source',
   DuplicateEntry = 'duplicate_entry',
   IncompleteTransition = 'incomplete_transition',
   MissingEntry = 'missing_entry',
@@ -234,7 +237,10 @@ export interface TransitionNodeHandle extends NodeHandle {
 }
 
 export interface AgentNodeHandle extends TransitionNodeHandle {
+  /** Authorizes bounded child roles that this agent may invoke. */
   uses(...subagents: readonly SubagentHandle[]): this;
+  /** Declares prior structured agent or subagent outputs to inject into this agent's prompt. */
+  withContextFrom(...sources: readonly (AgentNodeHandle | SubagentHandle)[]): this;
 }
 
 export interface CompleteNodeHandle extends NodeHandle {}
@@ -270,11 +276,12 @@ interface BuilderContext {
   addTransition(draft: TransitionDraft, target: NodeHandle): void;
   assertCounterOwnership(counter: CounterHandle): void;
   authorizeSubagents(node: AgentNodeHandle, subagents: readonly SubagentHandle[]): void;
+  shareContext(node: AgentNodeHandle, sources: readonly (AgentNodeHandle | SubagentHandle)[]): void;
 }
 
 type AgentNodeConfig = AgentNodeAuthoring extends infer Node
   ? Node extends AgentNodeAuthoring
-    ? Omit<Node, 'type' | 'allowedSubagents'>
+    ? Omit<Node, 'type' | 'allowedSubagents' | 'contextSources'>
     : never
   : never;
 
@@ -313,6 +320,11 @@ class AuthoredAgentNodeHandle implements AgentNodeHandle {
 
   uses(...subagents: readonly SubagentHandle[]): this {
     this.context.authorizeSubagents(this, subagents);
+    return this;
+  }
+
+  withContextFrom(...sources: readonly (AgentNodeHandle | SubagentHandle)[]): this {
+    this.context.shareContext(this, sources);
     return this;
   }
 }
@@ -577,6 +589,51 @@ export class WorkflowBuilder implements BuilderContext {
         ...new Set([...(authored.allowedSubagents ?? []), ...subagents.map(({ id }) => id)]),
       ],
     });
+  }
+
+  shareContext(
+    node: AgentNodeHandle,
+    sources: readonly (AgentNodeHandle | SubagentHandle)[],
+  ): void {
+    this.assertNodeOwnership(node);
+    if (sources.length === 0) {
+      throw authoringError(
+        WorkflowAuthoringErrorKind.InvalidContextSource,
+        'withContextFrom requires at least one source',
+      );
+    }
+    const references: AgentContextSource[] = [];
+    for (const source of sources) {
+      if (source.kind === 'subagent') {
+        if (!this.subagentHandles.has(source)) {
+          throw authoringError(
+            WorkflowAuthoringErrorKind.ForeignSubagentHandle,
+            `Subagent "${source.id}" belongs to another workflow builder`,
+          );
+        }
+        references.push({ type: 'subagent', id: source.id });
+        continue;
+      }
+      this.assertNodeOwnership(source);
+      if (source.id === node.id || this.nodes.get(source.id)?.type !== 'agent') {
+        throw authoringError(
+          WorkflowAuthoringErrorKind.InvalidContextSource,
+          `Context source "${source.id}" must be another agent`,
+        );
+      }
+      references.push({ type: 'agent', id: source.id });
+    }
+    const authored = this.nodes.get(node.id);
+    if (authored?.type !== 'agent') {
+      throw new Error(`Agent handle does not reference an authored agent: ${node.id}`);
+    }
+    const unique = new Map(
+      [...(authored.contextSources ?? []), ...references].map((source) => [
+        `${source.type}:${source.id}`,
+        source,
+      ]),
+    );
+    this.nodes.set(node.id, { ...authored, contextSources: [...unique.values()] });
   }
 
   private addTransitionNode(name: string, node: NodeAuthoring): TransitionNodeHandle {

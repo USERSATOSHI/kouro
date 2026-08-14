@@ -10,6 +10,7 @@ import type {
   OrchestrationIntent,
   RunEventInput,
   SkipBinding,
+  SubagentExecutionSummary,
   TokenUsage,
 } from '@kouro/domain';
 import { agentHarnessesForNode, scheduleRun } from '@kouro/runtime';
@@ -164,6 +165,116 @@ function sourceFeedback(aggregate: RunAggregate, invocationSequence: number): st
   return `Workflow feedback from ${source.nodeId} (${source.outcome ?? 'completed'}):\n${JSON.stringify(source.output, null, 2)}`;
 }
 
+function activationSourceSequence(
+  aggregate: RunAggregate,
+  invocationSequence: number,
+): number | undefined {
+  const activation = aggregate.events.find(
+    (event) =>
+      event.type === 'invocation.activated' && event.invocationSequence === invocationSequence,
+  );
+  return activation?.type === 'invocation.activated'
+    ? activation.sourceInvocationSequence
+    : undefined;
+}
+
+function previousSuccessfulInvocationSequence(
+  aggregate: RunAggregate,
+  nodeId: string,
+  invocationSequence: number,
+): number {
+  return (
+    aggregate.state.invocations
+      .filter(
+        ({ nodeId: candidateId, sequence, state }) =>
+          candidateId === nodeId && sequence < invocationSequence && state === 'succeeded',
+      )
+      .toSorted((left, right) => right.sequence - left.sequence)[0]?.sequence ?? 0
+  );
+}
+
+function priorInvocations(
+  aggregate: RunAggregate,
+  afterSequence: number,
+  invocationSequence: number,
+): readonly NodeInvocation[] {
+  return aggregate.state.invocations
+    .filter(({ sequence }) => sequence > afterSequence && sequence < invocationSequence)
+    .toSorted((left, right) => left.sequence - right.sequence);
+}
+
+function agentContextSection(
+  invocations: readonly NodeInvocation[],
+  sourceId: string,
+  immediateSourceSequence: number | undefined,
+): string | undefined {
+  const invocation = invocations
+    .filter(
+      ({ nodeId, sequence, state, output }) =>
+        nodeId === sourceId &&
+        sequence !== immediateSourceSequence &&
+        state === 'succeeded' &&
+        output !== undefined,
+    )
+    .toSorted((left, right) => right.sequence - left.sequence)[0];
+  return invocation?.output === undefined
+    ? undefined
+    : `Agent ${sourceId} (invocation ${invocation.sequence}):\n${JSON.stringify(invocation.output, null, 2)}`;
+}
+
+function subagentContextSections(
+  invocations: readonly NodeInvocation[],
+  sourceId: string,
+): readonly string[] {
+  const sections: string[] = [];
+  for (const invocation of invocations) {
+    for (const attempt of invocation.attempts.toSorted(
+      (left, right) => left.number - right.number,
+    )) {
+      for (const subagent of attempt.subagents ?? []) {
+        if (
+          subagent.subagentId === sourceId &&
+          subagent.state === 'succeeded' &&
+          subagent.output !== undefined
+        ) {
+          sections.push(
+            `Subagent ${sourceId} (invocation ${invocation.sequence}, call ${subagent.callId}):\n${JSON.stringify(subagent.output, null, 2)}`,
+          );
+        }
+      }
+    }
+  }
+  return sections;
+}
+
+function sharedAgentContext(
+  aggregate: RunAggregate,
+  definition: NodeDefinition,
+  invocationSequence: number,
+  resumesExistingSession: boolean,
+): string | undefined {
+  if (!definition.contextSources?.length) return undefined;
+  const afterSequence = resumesExistingSession
+    ? previousSuccessfulInvocationSequence(aggregate, definition.id, invocationSequence)
+    : 0;
+  const immediateSourceSequence = activationSourceSequence(aggregate, invocationSequence);
+  const invocations = priorInvocations(aggregate, afterSequence, invocationSequence);
+  const sections: string[] = [];
+
+  for (const source of definition.contextSources) {
+    if (source.type === 'agent') {
+      const section = agentContextSection(invocations, source.id, immediateSourceSequence);
+      if (section) sections.push(section);
+      continue;
+    }
+    sections.push(...subagentContextSections(invocations, source.id));
+  }
+
+  return sections.length > 0
+    ? `Declared context from prior agents:\n\n${sections.join('\n\n')}`
+    : undefined;
+}
+
 function promptWithWorkItem(aggregate: RunAggregate, basePrompt: string): string {
   const workItem = aggregate.state.configuration.workItem;
   if (workItem === undefined) return basePrompt;
@@ -172,16 +283,28 @@ function promptWithWorkItem(aggregate: RunAggregate, basePrompt: string): string
 
 function promptForAgent(
   aggregate: RunAggregate,
+  definition: NodeDefinition,
   invocationSequence: number,
   declaredPrompt: string,
   resumesExistingSession: boolean,
 ): string {
   const feedback = sourceFeedback(aggregate, invocationSequence);
+  const sharedContext = sharedAgentContext(
+    aggregate,
+    definition,
+    invocationSequence,
+    resumesExistingSession,
+  );
   if (resumesExistingSession) {
-    return feedback ?? 'Continue the interrupted work.';
+    return (
+      [sharedContext, feedback].filter((section) => section !== undefined).join('\n\n') ||
+      'Continue the interrupted work.'
+    );
   }
   const basePrompt = promptWithWorkItem(aggregate, declaredPrompt);
-  return feedback ? `${basePrompt}\n\n${feedback}` : basePrompt;
+  return [basePrompt, sharedContext, feedback]
+    .filter((section) => section !== undefined)
+    .join('\n\n');
 }
 
 function serializedAgentFailure(error: AgentExecutorError): {
@@ -411,6 +534,29 @@ function recordAttemptUsage(
         invocationSequence,
         attemptNumber,
         usage,
+      },
+    }),
+  );
+}
+
+function recordSubagentExecutions(
+  store: RunStore,
+  aggregate: RunAggregate,
+  invocationSequence: number,
+  attemptNumber: number,
+  subagents: readonly SubagentExecutionSummary[],
+): Result<RunAggregate, ExecutorError> {
+  if (subagents.length === 0) return ok(aggregate);
+  return fromStore(
+    store.appendEvent({
+      runId: aggregate.runId,
+      expectedSequence: aggregate.nextEventSequence,
+      idempotencyKey: `agent:subagents:${invocationSequence}:${attemptNumber}`,
+      event: {
+        type: 'attempt.subagents_recorded',
+        invocationSequence,
+        attemptNumber,
+        subagents,
       },
     }),
   );
@@ -1090,6 +1236,7 @@ export class RunCoordinator {
       aggregate.artifact.bundle.prompts?.[definition.prompt] ?? definition.prompt;
     const prompt = promptForAgent(
       aggregate,
+      definition,
       invocationSequence,
       declaredPrompt,
       resumeToken !== undefined,
@@ -1169,12 +1316,21 @@ export class RunCoordinator {
     if (currentInvocation?.state !== 'active') return ok(current);
 
     if (executed.isErr()) {
-      return appendAgentFailure(
+      const failure = executed.error;
+      const withSubagents = recordSubagentExecutions(
         this.store,
         current,
         invocationSequence,
         attemptNumber,
-        executed.error,
+        failure.subagents ?? [],
+      );
+      if (withSubagents.isErr()) return withSubagents;
+      return appendAgentFailure(
+        this.store,
+        withSubagents.unwrap(),
+        invocationSequence,
+        attemptNumber,
+        failure,
         hasFallback,
       );
     }
@@ -1213,9 +1369,17 @@ export class RunCoordinator {
         )
       : ok(published.unwrap());
     if (withUsage.isErr()) return withUsage;
-    return completeAgentInvocation(
+    const withSubagents = recordSubagentExecutions(
       this.store,
       withUsage.unwrap(),
+      invocationSequence,
+      attemptNumber,
+      result.subagents,
+    );
+    if (withSubagents.isErr()) return withSubagents;
+    return completeAgentInvocation(
+      this.store,
+      withSubagents.unwrap(),
       invocationSequence,
       attemptNumber,
       result.output,

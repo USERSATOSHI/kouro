@@ -61,6 +61,7 @@ const deliveryMetadata = workflow.agent('deliveryMetadata', {
   capabilities: [CAPABILITY.REPOSITORY_READ],
   recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
 });
+deliveryMetadata.withContextFrom(implement);
 const delivery = workflow.deliveryReview('delivery', {
   title: 'Review chore delivery',
   proposalFrom: 'deliveryMetadata',

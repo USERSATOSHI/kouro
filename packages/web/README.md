@@ -29,6 +29,8 @@ tool exchanges above in-context steering and stop controls.
 - **Ticket-scoped workflow launch** — Ticket details launch a workflow against a selected repository with immutable ticket input, optional base-branch and harness routing, and direct navigation to the created run
 - **Portable reasoning effort** — Ticket launch can snapshot a provider-default, low, medium, or high fallback while compiled agent and subagent settings take precedence
 - **Nested subagent sessions** — Active and completed Kouro subagents render as separate live sessions with delegated task, harness/model/effort metadata, reasoning, tool activity, and structured output instead of embedded JSONL
+- **Delegation-aware diagrams** — Flow and graph views show declared child roles with dashed parent edges; timeline lanes show each recorded child call at its parent activation tick
+- **Visible usage attribution** — Workflow and subagent blocks display token usage and derived cost directly, while unpriced models fail closed to an `unpriced` label
 - **Approval proposal context** — Generic approvals include the exact source invocation output, so a plan can be reviewed without leaving the approval workspace
 - **Server-resolved provider secrets** — Provider configuration responses contain status and non-secret scope only
 

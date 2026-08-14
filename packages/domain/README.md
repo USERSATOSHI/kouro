@@ -200,6 +200,22 @@ type ValueReference =
 
 ## Supporting Types
 
+### Subordinate Execution Summaries
+
+Completed bounded subagent calls may be retained on their parent `NodeAttempt`
+as ordered `SubagentExecutionSummary` values. They carry stable call identity,
+harness/model selection, result state, and best-effort token usage for audit and
+operator projections. Successful summaries may retain validated structured
+output when another agent declares that subagent as a context source. They are
+not workflow nodes, attempts, or scheduler inputs; monetary cost remains
+derived at presentation boundaries.
+
+An agent node may declare provider-neutral `contextSources`. Each reference
+names another agent or a workflow subagent whose prior durable structured
+output is eligible for prompt injection. The compiled declarations are part of
+the workflow checksum; raw transcripts, hidden reasoning, and provider session
+state are not shared.
+
 ### Recovery Policies
 
 ```typescript

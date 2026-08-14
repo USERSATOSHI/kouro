@@ -16,8 +16,8 @@ import { compileWorkflow } from './compiler.ts';
 import { CompilerErrorKind, toErr, toCompilerError, type CompilerError } from './errors.ts';
 import type { WorkflowAuthoringDefinition } from './sdk.ts';
 
-export const COMPILER_VERSION = '0.3.0';
-export const IR_VERSION = '3';
+export const COMPILER_VERSION = '0.4.0';
+export const IR_VERSION = '4';
 export const EXPRESSION_VERSION = '1';
 
 interface AdwManifest {

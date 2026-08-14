@@ -28,7 +28,10 @@ function runningColumn(
 
 function runUsage(state: RunState): TicketRunUsage | undefined {
   const usage = state.invocations.flatMap(({ attempts }) =>
-    attempts.flatMap((attempt) => (attempt.usage ? [attempt.usage] : [])),
+    attempts.flatMap((attempt) => [
+      ...(attempt.usage ? [attempt.usage] : []),
+      ...(attempt.subagents ?? []).flatMap((subagent) => (subagent.usage ? [subagent.usage] : [])),
+    ]),
   );
   if (usage.length === 0) return undefined;
   let inputTokens = 0;
@@ -60,9 +63,12 @@ function runUsage(state: RunState): TicketRunUsage | undefined {
 
 function runCostUsd(state: RunState): number | undefined {
   const attempts = state.invocations.flatMap(({ attempts: invocationAttempts }) =>
-    invocationAttempts.flatMap((attempt) =>
-      attempt.usage ? [{ usage: attempt.usage, model: attempt.model }] : [],
-    ),
+    invocationAttempts.flatMap((attempt) => [
+      ...(attempt.usage ? [{ usage: attempt.usage, model: attempt.model }] : []),
+      ...(attempt.subagents ?? []).flatMap((subagent) =>
+        subagent.usage ? [{ usage: subagent.usage, model: subagent.model }] : [],
+      ),
+    ]),
   );
   if (attempts.length === 0) return undefined;
   const costs = attempts.map((attempt) => estimateCostUsd(attempt.usage, attempt.model));

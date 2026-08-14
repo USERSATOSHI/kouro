@@ -398,6 +398,7 @@ export function reconnectEvents(
     'attempt.resume_token_recorded',
     'attempt.artifact_published',
     'attempt.usage_recorded',
+    'attempt.subagents_recorded',
     'run.artifact_published',
     'delivery.proposed',
     'delivery.metadata_updated',

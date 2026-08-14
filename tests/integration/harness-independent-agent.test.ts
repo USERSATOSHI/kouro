@@ -44,6 +44,22 @@ class UnusedCommandRunner implements CommandRunner {
   }
 }
 
+class ContextDelegatingHarness implements AgentHarness {
+  readonly id = 'scout-harness';
+  readonly calls: { readonly request: HarnessExecutionRequest }[] = [];
+
+  async execute(request: HarnessExecutionRequest) {
+    this.calls.push({ request });
+    if (!request.subagents) throw new Error('Expected a declared repository scout');
+    await request.subagents.invoke('repositoryScout', 'Map the relevant domain files');
+    return ok({ output: { files: ['src/domain.ts'] }, transcript: 'scouted' });
+  }
+
+  resume(request: HarnessExecutionRequest) {
+    return this.execute(request);
+  }
+}
+
 class ScriptedCodexAppServerFactory implements CodexAppServerTransportFactory {
   readonly calls: { readonly method: string; readonly params: unknown }[] = [];
 
@@ -355,6 +371,74 @@ function routedAgentArtifact(): CompiledWorkflowArtifact {
       },
     ],
     counterLimits: {},
+  }).unwrap();
+}
+
+function sharedContextArtifact(): CompiledWorkflowArtifact {
+  return compileWorkflow({
+    manifest: { id: 'shared-agent-context', version: '1.0.0' },
+    semanticVersions: { compiler: '0.4.0', ir: '4', expressions: '1' },
+    entryNodeId: 'scout',
+    nodes: [
+      {
+        id: 'scout',
+        type: 'agent',
+        role: 'scout',
+        prompt: 'Inspect the repository.',
+        capabilities: ['repository.read'],
+        allowedSubagents: ['repositoryScout'],
+        recoveryPolicy: 'resume_supported',
+      },
+      {
+        id: 'planner',
+        type: 'agent',
+        role: 'planner',
+        prompt: 'Plan the change.',
+        recoveryPolicy: 'resume_supported',
+      },
+      {
+        id: 'implement',
+        type: 'agent',
+        role: 'implementer',
+        prompt: 'Implement the change.',
+        contextSources: [
+          { type: 'agent', id: 'scout' },
+          { type: 'subagent', id: 'repositoryScout' },
+        ],
+        recoveryPolicy: 'resume_supported',
+      },
+      { id: 'complete', type: 'complete' },
+    ],
+    subagents: [
+      {
+        id: 'repositoryScout',
+        role: 'repository-scout',
+        prompt: 'Inspect delegated repository scope.',
+        harness: 'child-harness',
+        capabilities: ['repository.read'],
+        maxInvocations: 1,
+        maxConcurrent: 1,
+      },
+    ],
+    transitions: [
+      {
+        id: 'scout.success.planner',
+        from: { nodeId: 'scout', outcome: 'success' },
+        toNodeId: 'planner',
+      },
+      {
+        id: 'planner.success.implement',
+        from: { nodeId: 'planner', outcome: 'success' },
+        toNodeId: 'implement',
+      },
+      {
+        id: 'implement.success.complete',
+        from: { nodeId: 'implement', outcome: 'success' },
+        toNodeId: 'complete',
+      },
+    ],
+    counterLimits: {},
+    permissions: ['repository.read'],
   }).unwrap();
 }
 
@@ -748,6 +832,63 @@ describe('M4 harness-independent agent execution', () => {
       expect(implementer.calls[0]?.request.model).toBe('provider/opencode-model');
       expect(planner.calls).toHaveLength(1);
       expect(implementer.calls).toHaveLength(1);
+    } finally {
+      store.dispose();
+      rmSync(paths.directory, { recursive: true, force: true });
+    }
+  });
+
+  test('injects declared structured output across agent and model boundaries', async () => {
+    const paths = location('kouro-shared-agent-context-');
+    const store = storeAt(paths.database);
+    try {
+      const scout = new ContextDelegatingHarness();
+      const child = new ScriptedFakeHarness('child-harness', [
+        { output: { boundary: 'domain' }, transcript: 'child scouted' },
+      ]);
+      const planner = new ScriptedFakeHarness('planner-harness', [
+        { output: { steps: ['Implement domain change'] }, transcript: 'planned' },
+      ]);
+      const implementer = new ScriptedFakeHarness('implementer-harness', [
+        { output: { changed: true }, transcript: 'implemented' },
+      ]);
+      const coordinator = new RunCoordinator(
+        store,
+        new UnusedCommandRunner(),
+        new AgentExecutor(
+          new HarnessRegistry([scout, child, planner, implementer]),
+          new LocalArtifactWriter(paths.artifacts),
+        ),
+        paths.directory,
+      );
+      coordinator
+        .createRun({
+          runId: 'shared-context-run',
+          artifact: sharedContextArtifact(),
+          startingCommit: 'abc123',
+          configuration: {
+            agentHarnessesByNode: {
+              scout: ['scout-harness'],
+              planner: ['planner-harness'],
+              implement: ['implementer-harness'],
+            },
+          },
+          idempotencyKey: 'create',
+        })
+        .unwrap();
+
+      for (let step = 0; step < 12; step += 1) {
+        if (store.loadRun('shared-context-run').unwrap().state.status !== 'running') break;
+        (await coordinator.advance('shared-context-run')).unwrap();
+      }
+
+      const prompt = implementer.calls[0]?.request.prompt ?? '';
+      expect(prompt).toContain('Declared context from prior agents:');
+      expect(prompt).toContain('Agent scout (invocation 1):');
+      expect(prompt).toContain('"src/domain.ts"');
+      expect(prompt).toContain('Subagent repositoryScout (invocation 1, call repositoryScout:1):');
+      expect(prompt).toContain('"boundary": "domain"');
+      expect(prompt).toContain('Workflow feedback from planner');
     } finally {
       store.dispose();
       rmSync(paths.directory, { recursive: true, force: true });

@@ -19,6 +19,7 @@ import type {
   WorkflowDetails,
   WorkflowEdgeView,
   WorkflowNodeView,
+  WorkflowSubagentView,
   WorkflowSummary,
 } from '@kouro/api-contracts';
 import type { ApprovalBinding, ArtifactReference, NodeInvocation } from '@kouro/domain';
@@ -126,6 +127,21 @@ function workflowNodes(aggregate: RunAggregate): readonly WorkflowNodeView[] {
   });
 }
 
+function workflowSubagents(aggregate: RunAggregate): readonly WorkflowSubagentView[] {
+  return (aggregate.artifact.bundle.subagents ?? []).map((subagent) => ({
+    id: subagent.id,
+    role: subagent.role,
+    parentNodeIds: aggregate.artifact.bundle.nodes
+      .filter((node) => node.allowedSubagents?.includes(subagent.id))
+      .map(({ id }) => id),
+    ...(subagent.harness ? { harness: subagent.harness } : {}),
+    ...(subagent.models ? { models: subagent.models } : {}),
+    ...(subagent.reasoningEffort ? { reasoningEffort: subagent.reasoningEffort } : {}),
+    maxInvocations: subagent.maxInvocations,
+    maxConcurrent: subagent.maxConcurrent,
+  }));
+}
+
 function workflowEdges(aggregate: RunAggregate): readonly WorkflowEdgeView[] {
   return aggregate.artifact.bundle.transitions.map((transition) => ({
     id: transition.id,
@@ -189,6 +205,7 @@ export function getRun(services: ApiServices, runId: string): Result<RunDetails,
     repositoryHead: aggregate.state.repositoryHead,
     state: aggregate.state,
     nodes: workflowNodes(aggregate),
+    subagents: workflowSubagents(aggregate),
     edges: workflowEdges(aggregate),
   });
 }

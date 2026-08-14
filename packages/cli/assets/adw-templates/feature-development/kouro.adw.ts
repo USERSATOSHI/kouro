@@ -79,6 +79,8 @@ const review = workflow.agent('review', {
   capabilities: [CAPABILITY.REPOSITORY_READ],
   recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
 });
+implement.withContextFrom(plan, repositoryScout, testScout);
+review.withContextFrom(plan, implement, repositoryScout, testScout);
 const delivery = workflow.deliveryReview('delivery', {
   title: 'Review feature delivery',
   proposalFrom: 'review',

@@ -1,3 +1,5 @@
+import type { TokenUsage } from '@kouro/domain';
+
 export type TranscriptEntryKind =
   | 'user'
   | 'agent'
@@ -19,6 +21,7 @@ export interface TranscriptEntry {
   readonly reasoningEffort?: string;
   readonly task?: string;
   readonly childTranscript?: string;
+  readonly usage?: TokenUsage;
 }
 
 export interface TranscriptGroup {
@@ -35,6 +38,39 @@ function stringAt(value: Readonly<Record<string, unknown>>, ...keys: readonly st
     if (typeof value[key] === 'string') return value[key];
   }
   return undefined;
+}
+
+function tokenUsageAt(value: unknown): TokenUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  const { inputTokens, outputTokens } = value;
+  const required = [inputTokens, outputTokens];
+  const optional = [value.cacheReadTokens, value.cacheWriteTokens, value.reasoningTokens];
+  if (
+    !required.every(
+      (count) => typeof count === 'number' && Number.isSafeInteger(count) && count >= 0,
+    ) ||
+    !optional.every(
+      (count) =>
+        count === undefined ||
+        (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0),
+    )
+  ) {
+    return undefined;
+  }
+  if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') return undefined;
+  return {
+    inputTokens,
+    outputTokens,
+    ...(typeof value.cacheReadTokens === 'number'
+      ? { cacheReadTokens: value.cacheReadTokens }
+      : {}),
+    ...(typeof value.cacheWriteTokens === 'number'
+      ? { cacheWriteTokens: value.cacheWriteTokens }
+      : {}),
+    ...(typeof value.reasoningTokens === 'number'
+      ? { reasoningTokens: value.reasoningTokens }
+      : {}),
+  };
 }
 
 function display(value: unknown): string {
@@ -316,6 +352,7 @@ function parseLiveSubagentEvent(
       text: success
         ? display(event.output) || 'Completed without structured output'
         : stringAt(event, 'error') || 'Subagent failed',
+      ...(tokenUsageAt(event.usage) ? { usage: tokenUsageAt(event.usage) } : {}),
     };
   }
   return true;
@@ -347,6 +384,7 @@ function parseEvent(
         ? display(event.output) || 'Completed without structured output'
         : stringAt(event, 'error') || 'Subagent failed',
       childTranscript: stringAt(event, 'transcript'),
+      ...(tokenUsageAt(event.usage) ? { usage: tokenUsageAt(event.usage) } : {}),
     });
     return;
   }

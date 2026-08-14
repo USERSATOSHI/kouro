@@ -231,15 +231,31 @@ describe('class-based ADW authoring SDK', () => {
         recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
       })
       .uses(architecture, tests);
+    const implement = workflow.agent('implement', {
+      role: 'implementer',
+      prompt: './prompts/implement.md',
+      capabilities: [CAPABILITY.REPOSITORY_READ],
+      recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
+    });
+    implement.withContextFrom(plan, architecture, tests);
     const complete = workflow.complete('complete');
     workflow.startAt(plan);
-    plan.on('success').to(complete);
+    plan.on('success').to(implement);
+    implement.on('success').to(complete);
 
     expect(workflow.build()).toMatchObject({
       nodes: {
         plan: {
           type: 'agent',
           allowedSubagents: ['architecture', 'tests'],
+        },
+        implement: {
+          type: 'agent',
+          contextSources: [
+            { type: 'agent', id: 'plan' },
+            { type: 'subagent', id: 'architecture' },
+            { type: 'subagent', id: 'tests' },
+          ],
         },
         complete: { type: 'complete' },
       },
@@ -321,6 +337,12 @@ describe('class-based ADW authoring SDK', () => {
       maxInvocations: 1,
       maxConcurrent: 1,
     });
+    const secondAgent = second.agent('agent', {
+      role: 'agent',
+      prompt: './agent.md',
+      capabilities: [CAPABILITY.REPOSITORY_READ],
+      recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
+    });
 
     expectAuthoringError(
       () => first.startAt(secondNode),
@@ -337,6 +359,22 @@ describe('class-based ADW authoring SDK', () => {
     expectAuthoringError(
       () => firstAgent.uses(secondSubagent),
       WorkflowAuthoringErrorKind.ForeignSubagentHandle,
+    );
+    expectAuthoringError(
+      () => firstAgent.withContextFrom(secondSubagent),
+      WorkflowAuthoringErrorKind.ForeignSubagentHandle,
+    );
+    expectAuthoringError(
+      () => firstAgent.withContextFrom(secondAgent),
+      WorkflowAuthoringErrorKind.ForeignNodeHandle,
+    );
+    expectAuthoringError(
+      () => firstAgent.withContextFrom(firstAgent),
+      WorkflowAuthoringErrorKind.InvalidContextSource,
+    );
+    expectAuthoringError(
+      () => firstAgent.withContextFrom(),
+      WorkflowAuthoringErrorKind.InvalidContextSource,
     );
   });
 

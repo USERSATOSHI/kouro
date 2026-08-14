@@ -72,6 +72,43 @@ describe('web cost presentation', () => {
     expect(runCostUsd(runDetails())).toBeCloseTo(4.5, 5);
   });
 
+  test('includes subordinate execution usage and cost in run totals', () => {
+    const run = runDetails();
+    const withSubagent = {
+      ...run,
+      state: {
+        ...run.state,
+        invocations: run.state.invocations.map((invocation, index) =>
+          index === 0
+            ? {
+                ...invocation,
+                attempts: invocation.attempts.map((attempt) => ({
+                  ...attempt,
+                  subagents: [
+                    {
+                      sequence: 1,
+                      callId: 'scout:1',
+                      subagentId: 'scout',
+                      task: 'Inspect the repository',
+                      harnessId: 'codex',
+                      model: 'gpt-4o-mini',
+                      state: 'succeeded' as const,
+                      usage: { inputTokens: 100_000, outputTokens: 20_000 },
+                    },
+                  ],
+                })),
+              }
+            : invocation,
+        ),
+      },
+    };
+    expect(runUsage(withSubagent)).toEqual({
+      inputTokens: 1_100_000,
+      outputTokens: 220_000,
+    });
+    expect(runCostUsd(withSubagent)).toBeCloseTo(4.527, 5);
+  });
+
   test('does not present a partial run total when an attempt is unpriced', () => {
     const run = runDetails();
     const mixedPricing = {

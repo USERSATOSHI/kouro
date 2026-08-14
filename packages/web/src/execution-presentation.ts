@@ -68,7 +68,10 @@ export function formatUsd(usd: number): string {
 /** Returns the summed token usage of every attempt in the run, when any was reported. */
 export function runUsage(run: RunDetails): TokenUsage | undefined {
   const usage = run.state.invocations.flatMap(({ attempts }) =>
-    attempts.flatMap((attempt) => (attempt.usage ? [attempt.usage] : [])),
+    attempts.flatMap((attempt) => [
+      ...(attempt.usage ? [attempt.usage] : []),
+      ...(attempt.subagents ?? []).flatMap((subagent) => (subagent.usage ? [subagent.usage] : [])),
+    ]),
   );
   return usage.length > 0 ? sumUsage(usage) : undefined;
 }
@@ -91,9 +94,12 @@ export function attemptCostUsd(
 /** Estimates the USD cost of the whole run only when every reported attempt is priced. */
 export function runCostUsd(run: RunDetails): number | undefined {
   const attempts = run.state.invocations.flatMap(({ attempts: invocationAttempts }) =>
-    invocationAttempts.flatMap((attempt) =>
-      attempt.usage ? [{ usage: attempt.usage, model: attempt.model }] : [],
-    ),
+    invocationAttempts.flatMap((attempt) => [
+      ...(attempt.usage ? [{ usage: attempt.usage, model: attempt.model }] : []),
+      ...(attempt.subagents ?? []).flatMap((subagent) =>
+        subagent.usage ? [{ usage: subagent.usage, model: subagent.model }] : [],
+      ),
+    ]),
   );
   if (attempts.length === 0) return undefined;
   const costs = attempts.map((attempt) => estimateCostUsd(attempt.usage, attempt.model));

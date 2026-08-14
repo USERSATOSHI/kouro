@@ -76,6 +76,8 @@ const deliveryMetadata = workflow.agent('deliveryMetadata', {
   capabilities: [CAPABILITY.REPOSITORY_READ],
   recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
 });
+implement.withContextFrom(assess, repositoryScout, testScout);
+deliveryMetadata.withContextFrom(assess, implement, repositoryScout, testScout);
 const delivery = workflow.deliveryReview('delivery', {
   title: 'Review hotfix delivery',
   proposalFrom: 'deliveryMetadata',

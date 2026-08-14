@@ -159,6 +159,9 @@ stable call ID, harness/model selection, status, and transcript are appended to
 the parent transcript artifact. Children are subordinate read-only effects of
 the parent attempt, not independently scheduled graph attempts, and do not
 receive a nested subagent controller.
+The executor also returns bounded child execution summaries with best-effort
+usage so the coordinator can record operator metadata on the parent attempt;
+these summaries never participate in scheduling or recovery.
 While a child is active, its start, provider transcript chunks, and completion
 are also copied into the parent's best-effort activity stream. Parallel child
 updates carry stable call IDs so presentation can keep their sessions separate.
@@ -168,6 +171,15 @@ latest successful session for the selected harness unless the node declares
 `clearContext: true`. Durable output from the source invocation is appended to
 the base prompt, so validation and review loops carry their failure details
 back to the same engineering agent.
+
+Agents may additionally declare `contextSources` through the SDK's
+`withContextFrom(...)` method. Before execution, the coordinator appends the
+latest successful output from each declared agent and successful prior outputs
+from each declared subagent. Sources are rendered in compiled canonical order.
+Resumed provider sessions receive only values produced since that agent's last
+successful invocation, avoiding repeated prompt context. Missing source output
+is valid, and transcripts, reasoning, tool logs, and resume tokens are never
+included.
 
 Harness selection is a durable run policy. `agentHarnessesByNode` may assign an
 ordered harness list to a compiled agent node ID; otherwise the coordinator

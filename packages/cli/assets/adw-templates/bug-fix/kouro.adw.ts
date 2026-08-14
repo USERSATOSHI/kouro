@@ -76,6 +76,8 @@ const deliveryMetadata = workflow.agent('deliveryMetadata', {
   capabilities: [CAPABILITY.REPOSITORY_READ],
   recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
 });
+fix.withContextFrom(reproduce, repositoryScout, testScout);
+deliveryMetadata.withContextFrom(reproduce, fix, repositoryScout, testScout);
 const delivery = workflow.deliveryReview('delivery', {
   title: 'Review bug-fix delivery',
   proposalFrom: 'deliveryMetadata',

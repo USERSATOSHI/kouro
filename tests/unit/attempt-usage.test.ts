@@ -40,10 +40,21 @@ function agentArtifact() {
           role: 'implementer',
           prompt: 'Implement.',
           capabilities: ['repository.read'],
+          allowedSubagents: ['scout'],
           recoveryPolicy: 'resume_supported',
         },
       ],
       transitions: [],
+      subagents: [
+        {
+          id: 'scout',
+          role: 'scout',
+          prompt: 'Inspect.',
+          capabilities: ['repository.read'],
+          maxInvocations: 2,
+          maxConcurrent: 1,
+        },
+      ],
       permissions: ['repository.read'],
     }),
   );
@@ -194,6 +205,90 @@ describe('ADR: durable attempt usage', () => {
         invocationSequence: 1,
         attemptNumber: 1,
         usage: { inputTokens: 10, outputTokens: 10 },
+      },
+    ]);
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.kind).toBe(RuntimeErrorKind.IllegalStateTransition);
+  });
+});
+
+describe('ADR: durable subordinate execution summaries', () => {
+  test('records ordered subagent usage on the matching active parent attempt', () => {
+    const artifact = agentArtifact();
+    const result = reduceRun(artifact, [
+      ...agentEvents(artifact),
+      {
+        sequence: 4,
+        type: 'attempt.subagents_recorded',
+        invocationSequence: 1,
+        attemptNumber: 1,
+        subagents: [
+          {
+            sequence: 1,
+            callId: 'scout:1',
+            subagentId: 'scout',
+            task: 'Inspect the repository',
+            harnessId: 'codex',
+            model: 'gpt-5',
+            state: 'succeeded',
+            usage: { inputTokens: 1200, outputTokens: 300 },
+          },
+        ],
+      },
+    ]);
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) return;
+    expect(result.unwrap().invocations[0]?.attempts[0]?.subagents).toEqual([
+      expect.objectContaining({
+        callId: 'scout:1',
+        state: 'succeeded',
+        usage: { inputTokens: 1200, outputTokens: 300 },
+      }),
+    ]);
+  });
+
+  test('rejects duplicate call IDs and non-contiguous child sequence numbers', () => {
+    const artifact = agentArtifact();
+    const subagent = {
+      callId: 'scout:1',
+      subagentId: 'scout',
+      task: 'Inspect the repository',
+      harnessId: 'codex',
+      state: 'succeeded' as const,
+    };
+    const result = reduceRun(artifact, [
+      ...agentEvents(artifact),
+      {
+        sequence: 4,
+        type: 'attempt.subagents_recorded',
+        invocationSequence: 1,
+        attemptNumber: 1,
+        subagents: [
+          { ...subagent, sequence: 1 },
+          { ...subagent, sequence: 3 },
+        ],
+      },
+    ]);
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.kind).toBe(RuntimeErrorKind.IllegalStateTransition);
+  });
+
+  test('rejects subordinate summaries after the parent invocation completes', () => {
+    const artifact = agentArtifact();
+    const result = reduceRun(artifact, [
+      ...agentEvents(artifact),
+      {
+        sequence: 4,
+        type: 'invocation.completed',
+        invocationSequence: 1,
+        outcome: 'success',
+      },
+      {
+        sequence: 5,
+        type: 'attempt.subagents_recorded',
+        invocationSequence: 1,
+        attemptNumber: 1,
+        subagents: [],
       },
     ]);
     expect(result.isErr()).toBe(true);

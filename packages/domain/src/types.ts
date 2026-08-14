@@ -84,10 +84,16 @@ export interface SourceNodeDefinition {
   readonly models?: Readonly<Record<string, string>>;
   readonly reasoningEffort?: AgentReasoningEffort;
   readonly allowedSubagents?: readonly string[];
+  readonly contextSources?: readonly AgentContextSource[];
   readonly clearContext?: boolean;
   readonly result?: 'succeeded' | 'failed';
   readonly skipOutcome?: string;
 }
+
+/** Explicit durable structured-output source available to a consuming agent. */
+export type AgentContextSource =
+  | { readonly type: 'agent'; readonly id: string }
+  | { readonly type: 'subagent'; readonly id: string };
 
 export interface SourceSubagentDefinition {
   readonly id: string;
@@ -232,6 +238,21 @@ export interface TokenUsage {
   readonly reasoningTokens?: number;
 }
 
+/** Durable operator metadata for one child execution owned by a parent attempt. */
+export interface SubagentExecutionSummary {
+  readonly sequence: number;
+  readonly callId: string;
+  readonly subagentId: string;
+  readonly task: string;
+  readonly harnessId: string;
+  readonly model?: string;
+  readonly reasoningEffort?: AgentReasoningEffort;
+  readonly state: 'succeeded' | 'failed';
+  readonly error?: string;
+  readonly output?: JsonValue;
+  readonly usage?: TokenUsage;
+}
+
 export interface NodeAttempt {
   readonly number: number;
   readonly state: AttemptState;
@@ -242,6 +263,8 @@ export interface NodeAttempt {
   readonly artifacts?: readonly ArtifactReference[];
   readonly failure?: AttemptFailure;
   readonly usage?: TokenUsage;
+  /** Subordinate executions owned by this attempt; never scheduler inputs. */
+  readonly subagents?: readonly SubagentExecutionSummary[];
 }
 
 export interface NodeInvocation {
@@ -390,6 +413,13 @@ export type RunEvent =
       readonly invocationSequence: number;
       readonly attemptNumber: number;
       readonly usage: TokenUsage;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'attempt.subagents_recorded';
+      readonly invocationSequence: number;
+      readonly attemptNumber: number;
+      readonly subagents: readonly SubagentExecutionSummary[];
     }
   | {
       readonly sequence: number;

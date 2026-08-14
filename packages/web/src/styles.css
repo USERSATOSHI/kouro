@@ -609,6 +609,13 @@ pre,
   border-left: 3px solid var(--purple);
 }
 
+.flow-node-subagent {
+  min-height: 78px;
+  border: 1px dashed #8957e5;
+  border-left: 3px solid #bc8cff;
+  background: color-mix(in srgb, var(--surface) 88%, #8957e5);
+}
+
 .flow-node-approval {
   border-left: 3px solid var(--warning);
 }
@@ -631,6 +638,14 @@ pre,
   font-size: 13px;
   line-height: 1.35;
   text-overflow: ellipsis;
+}
+
+.flow-node .flow-node-usage {
+  color: #c9d1d9;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .flow-node .react-flow__handle {
@@ -3114,6 +3129,15 @@ button:disabled {
   font-size: 10px;
 }
 
+.timeline-lane-subagent .timeline-lane-label {
+  padding-left: 18px;
+  border-left: 2px solid #8957e5;
+}
+
+.timeline-lane-subagent .timeline-lane-label small {
+  color: #bc8cff;
+}
+
 .timeline-lane-tracks {
   position: relative;
   min-width: 0;
@@ -3162,9 +3186,23 @@ button:disabled {
   color: var(--text);
   font-size: 10px;
   font-weight: 600;
-  line-height: 14px;
+  display: flex;
+  flex-direction: column;
+  line-height: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.timeline-block-label small {
+  overflow: hidden;
+  color: #c9d1d9;
+  font-size: 9px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+}
+
+.timeline-block-subagent .timeline-block-fill {
+  border: 1px solid #bc8cff;
 }
 
 .timeline-block.queued .timeline-block-fill {

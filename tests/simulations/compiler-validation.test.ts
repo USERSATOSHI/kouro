@@ -209,6 +209,81 @@ describe('M1 compiler validation', () => {
     }
   });
 
+  test('validates and canonically orders declared agent context sources', () => {
+    const source = workflowSource({
+      entryNodeId: 'scout',
+      permissions: ['repository.read'],
+      nodes: [
+        {
+          id: 'scout',
+          type: 'agent',
+          role: 'scout',
+          prompt: 'Scout.',
+          recoveryPolicy: 'resume_supported',
+          capabilities: ['repository.read'],
+        },
+        {
+          id: 'implement',
+          type: 'agent',
+          role: 'implementer',
+          prompt: 'Implement.',
+          recoveryPolicy: 'resume_supported',
+          capabilities: ['repository.read'],
+          contextSources: [
+            { type: 'subagent', id: 'testScout' },
+            { type: 'agent', id: 'scout' },
+          ],
+        },
+        { id: 'complete', type: 'complete' },
+      ],
+      subagents: [
+        {
+          id: 'testScout',
+          role: 'test-scout',
+          prompt: 'Find tests.',
+          capabilities: ['repository.read'],
+          maxInvocations: 1,
+          maxConcurrent: 1,
+        },
+      ],
+      transitions: [
+        {
+          id: 'scout.success.implement',
+          from: { nodeId: 'scout', outcome: 'success' },
+          toNodeId: 'implement',
+        },
+        {
+          id: 'implement.success.complete',
+          from: { nodeId: 'implement', outcome: 'success' },
+          toNodeId: 'complete',
+        },
+      ],
+    });
+    const compiled = compileWorkflow(source);
+    expect(compiled.isOk()).toBe(true);
+    if (compiled.isOk()) {
+      expect(
+        compiled.unwrap().bundle.nodes.find(({ id }) => id === 'implement')?.contextSources,
+      ).toEqual([
+        { type: 'agent', id: 'scout' },
+        { type: 'subagent', id: 'testScout' },
+      ]);
+    }
+
+    const invalid = compileWorkflow({
+      ...source,
+      nodes: source.nodes.map((node) =>
+        node.id === 'implement'
+          ? { ...node, contextSources: [{ type: 'agent' as const, id: 'missing' }] }
+          : node,
+      ),
+    });
+    expect(invalid.isErr()).toBe(true);
+    if (invalid.isErr()) {
+      expect(invalid.error.kind).toBe(CompilerErrorKind.InvalidNodeConfiguration);
+    }
+  });
+
   test('rejects invalid expression references', () => {
     const result = compileWorkflow(
       workflowSource({

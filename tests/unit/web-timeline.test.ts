@@ -142,6 +142,155 @@ describe('web timeline model', () => {
     expect(block?.costUsd).toBeCloseTo(4.5, 5);
   });
 
+  test('blocks total usage and cost across every attempt in an invocation', () => {
+    const run = runDetails();
+    const model = timelineModel({
+      ...run,
+      state: {
+        ...run.state,
+        invocations: run.state.invocations.map((invocation, index) =>
+          index === 1
+            ? {
+                ...invocation,
+                attempts: [
+                  {
+                    number: 1,
+                    state: 'failed' as const,
+                    model: 'gpt-4o-mini',
+                    usage: { inputTokens: 100_000, outputTokens: 20_000 },
+                  },
+                  {
+                    number: 2,
+                    state: 'failed' as const,
+                    model: 'gpt-4o',
+                    usage: { inputTokens: 200_000, outputTokens: 40_000 },
+                  },
+                ],
+              }
+            : invocation,
+        ),
+      },
+    });
+    const block = model.lanes[0]?.blocks[1];
+    expect(block?.usage).toEqual({ inputTokens: 300_000, outputTokens: 60_000 });
+    expect(block?.costUsd).toBeCloseTo(0.927, 5);
+  });
+
+  test('projects subordinate calls into child lanes at the parent invocation tick', () => {
+    const run = runDetails();
+    const model = timelineModel({
+      ...run,
+      subagents: [
+        {
+          id: 'repositoryScout',
+          role: 'Repository scout',
+          parentNodeIds: ['implement'],
+          maxInvocations: 2,
+          maxConcurrent: 2,
+        },
+      ],
+      state: {
+        ...run.state,
+        invocations: run.state.invocations.map((invocation, index) =>
+          index === 0
+            ? {
+                ...invocation,
+                attempts: invocation.attempts.map((attempt) => ({
+                  ...attempt,
+                  subagents: [
+                    {
+                      sequence: 1,
+                      callId: 'repositoryScout:1',
+                      subagentId: 'repositoryScout',
+                      task: 'Inspect packages',
+                      harnessId: 'codex',
+                      model: 'gpt-4o-mini',
+                      state: 'succeeded' as const,
+                      usage: { inputTokens: 100_000, outputTokens: 20_000 },
+                    },
+                    {
+                      sequence: 2,
+                      callId: 'repositoryScout:2',
+                      subagentId: 'repositoryScout',
+                      task: 'Inspect tests',
+                      harnessId: 'codex',
+                      model: 'gpt-4o-mini',
+                      state: 'failed' as const,
+                      usage: { inputTokens: 50_000, outputTokens: 10_000 },
+                    },
+                  ],
+                })),
+              }
+            : invocation,
+        ),
+      },
+    });
+    const lane = model.lanes.find(({ laneId }) => laneId === 'subagent:implement:repositoryScout');
+    expect(lane).toMatchObject({
+      nodeId: 'implement',
+      nodeType: 'subagent',
+      kind: 'subagent',
+      rowCount: 2,
+    });
+    expect(
+      lane?.blocks.map(({ invocationSequence, callId, row, state }) => ({
+        invocationSequence,
+        callId,
+        row,
+        state,
+      })),
+    ).toEqual([
+      {
+        invocationSequence: 1,
+        callId: 'repositoryScout:1',
+        row: 0,
+        state: 'succeeded',
+      },
+      {
+        invocationSequence: 1,
+        callId: 'repositoryScout:2',
+        row: 1,
+        state: 'failed',
+      },
+    ]);
+    expect(lane?.blocks[0]?.costUsd).toBeCloseTo(0.027, 5);
+  });
+
+  test('layers an active best-effort child observation onto its durable parent tick', () => {
+    const run = {
+      ...runDetails(),
+      subagents: [
+        {
+          id: 'repositoryScout',
+          role: 'Repository scout',
+          parentNodeIds: ['implement'],
+          maxInvocations: 1,
+          maxConcurrent: 1,
+        },
+      ],
+    };
+    const model = timelineModel(run, [
+      {
+        invocationSequence: 1,
+        attemptNumber: 1,
+        nodeId: 'implement',
+        callId: 'repositoryScout:1',
+        subagentId: 'repositoryScout',
+        state: 'active',
+        harnessId: 'codex',
+        model: 'gpt-4o-mini',
+      },
+    ]);
+    const lane = model.lanes.find(({ laneId }) => laneId === 'subagent:implement:repositoryScout');
+    expect(lane?.blocks).toContainEqual(
+      expect.objectContaining({
+        invocationSequence: 1,
+        callId: 'repositoryScout:1',
+        state: 'active',
+      }),
+    );
+  });
+
   test('blocks without usage or an unpriced model carry no cost estimate', () => {
     const run = runDetails();
     const model = timelineModel({

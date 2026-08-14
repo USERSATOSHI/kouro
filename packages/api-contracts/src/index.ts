@@ -47,6 +47,7 @@ export interface RunDetails extends RunSummary {
   readonly repositoryHead: string;
   readonly state: RunState;
   readonly nodes: readonly WorkflowNodeView[];
+  readonly subagents?: readonly WorkflowSubagentView[];
   readonly edges: readonly WorkflowEdgeView[];
 }
 
@@ -59,6 +60,18 @@ export interface WorkflowNodeView {
   readonly recoveryPolicy?: CompiledWorkflowBundle['nodes'][number]['recoveryPolicy'];
   readonly skipOutcome?: string;
   readonly latestState?: RunState['invocations'][number]['state'];
+}
+
+/** Declared subordinate role and the workflow agent nodes allowed to invoke it. */
+export interface WorkflowSubagentView {
+  readonly id: string;
+  readonly role: string;
+  readonly parentNodeIds: readonly string[];
+  readonly harness?: string;
+  readonly models?: Readonly<Record<string, string>>;
+  readonly reasoningEffort?: AgentReasoningEffort;
+  readonly maxInvocations: number;
+  readonly maxConcurrent: number;
 }
 
 export interface WorkflowEdgeView {

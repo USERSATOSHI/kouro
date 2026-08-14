@@ -70,6 +70,7 @@ interface RunDetails extends RunSummary {
   readonly repositoryHead: string;
   readonly state: RunState;
   readonly nodes: readonly WorkflowNodeView[];
+  readonly subagents?: readonly WorkflowSubagentView[];
   readonly edges: readonly WorkflowEdgeView[];
 }
 ```
@@ -93,6 +94,17 @@ interface WorkflowEdgeView {
   readonly source: string;
   readonly target: string;
   readonly outcome: string;
+}
+
+interface WorkflowSubagentView {
+  readonly id: string;
+  readonly role: string;
+  readonly parentNodeIds: readonly string[];
+  readonly harness?: string;
+  readonly models?: Readonly<Record<string, string>>;
+  readonly reasoningEffort?: 'low' | 'medium' | 'high';
+  readonly maxInvocations: number;
+  readonly maxConcurrent: number;
 }
 ```
 

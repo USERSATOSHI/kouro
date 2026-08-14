@@ -172,6 +172,39 @@ function isTokenUsage(value: unknown): boolean {
   );
 }
 
+function isJsonValue(value: unknown): boolean {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function isSubagentExecutionSummary(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    hasNumber(value, 'sequence') &&
+    typeof value.callId === 'string' &&
+    typeof value.subagentId === 'string' &&
+    typeof value.task === 'string' &&
+    typeof value.harnessId === 'string' &&
+    (value.model === undefined || typeof value.model === 'string') &&
+    (value.reasoningEffort === undefined ||
+      (typeof value.reasoningEffort === 'string' &&
+        ['low', 'medium', 'high'].includes(value.reasoningEffort))) &&
+    typeof value.state === 'string' &&
+    ['succeeded', 'failed'].includes(value.state) &&
+    (value.error === undefined || typeof value.error === 'string') &&
+    (value.usage === undefined || isTokenUsage(value.usage)) &&
+    (value.output === undefined || isJsonValue(value.output))
+  );
+}
+
 function isArtifactReference(value: unknown): value is ArtifactReference {
   if (!isRecord(value)) return false;
   return (
@@ -246,6 +279,13 @@ function isRunEvent(value: unknown): value is RunEvent {
         hasNumber(value, 'invocationSequence') &&
         hasNumber(value, 'attemptNumber') &&
         isTokenUsage(value.usage)
+      );
+    case 'attempt.subagents_recorded':
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        hasNumber(value, 'attemptNumber') &&
+        Array.isArray(value.subagents) &&
+        value.subagents.every(isSubagentExecutionSummary)
       );
     case 'run.artifact_published':
       return isArtifactReference(value.artifact);

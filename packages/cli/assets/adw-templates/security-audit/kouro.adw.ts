@@ -44,6 +44,8 @@ const report = workflow.agent('report', {
   capabilities: [CAPABILITY.REPOSITORY_READ],
   recoveryPolicy: RECOVERY_POLICY.RESUME_SUPPORTED,
 });
+analyze.withContextFrom(assess, repositoryScout);
+report.withContextFrom(assess, analyze, repositoryScout);
 const approval = workflow.approval('approval', {
   title: 'Review security audit report',
 });

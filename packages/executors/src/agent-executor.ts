@@ -2,6 +2,7 @@ import type {
   ArtifactReference,
   JsonValue,
   SourceSubagentDefinition,
+  SubagentExecutionSummary,
   TokenUsage,
 } from '@kouro/domain';
 import { err, ok, type Result } from '@usersatoshi/results';
@@ -25,7 +26,7 @@ export const enum AgentExecutorErrorKind {
   Artifact = 2,
 }
 
-export type AgentExecutorError =
+export type AgentExecutorError = (
   | {
       readonly kind: AgentExecutorErrorKind.Harness;
       readonly harnessId: string;
@@ -39,13 +40,15 @@ export type AgentExecutorError =
   | {
       readonly kind: AgentExecutorErrorKind.Artifact;
       readonly error: ArtifactWriterError;
-    };
+    }
+) & { readonly subagents?: readonly SubagentExecutionSummary[] };
 
 export interface AgentAttemptExecution {
   readonly output: JsonValue;
   readonly resumeToken?: string;
   readonly artifacts: readonly ArtifactReference[];
   readonly usage?: TokenUsage;
+  readonly subagents: readonly SubagentExecutionSummary[];
 }
 
 export interface ExecuteAgentAttemptInput extends HarnessExecutionRequest {
@@ -71,6 +74,7 @@ interface SubagentTranscriptRecord {
   readonly output?: JsonValue;
   readonly error?: string;
   readonly transcript?: string;
+  readonly usage?: TokenUsage;
 }
 
 interface SubagentActivityMetadata {
@@ -94,6 +98,7 @@ type SubagentActivityEvent =
       readonly success: boolean;
       readonly output?: JsonValue;
       readonly error?: string;
+      readonly usage?: TokenUsage;
     });
 
 type SubagentActivityObserver = (event: SubagentActivityEvent) => Promise<void>;
@@ -104,18 +109,21 @@ async function reportFailedSubagent(
   metadata: SubagentActivityMetadata,
   error: string,
   transcript?: string,
+  usage?: TokenUsage,
 ): Promise<SubagentInvocationResult> {
   records.push({
     ...metadata,
     success: false,
     error,
     ...(transcript ? { transcript } : {}),
+    ...(usage ? { usage } : {}),
   });
   await activity?.({
     type: 'kouro.subagent.finished',
     ...metadata,
     success: false,
     error,
+    ...(usage ? { usage } : {}),
   });
   return failedSubagent(metadata.callId, error);
 }
@@ -208,6 +216,9 @@ export class AgentExecutor {
         kind: AgentExecutorErrorKind.Harness,
         harnessId: input.harnessId,
         error: execution.error,
+        ...(subagentRecords.length > 0
+          ? { subagents: subagentSummaries(subagentRecords, input.subagentDefinitions) }
+          : {}),
       });
     }
     const completed = execution.unwrap();
@@ -217,6 +228,9 @@ export class AgentExecutor {
         kind: AgentExecutorErrorKind.StructuredOutput,
         harnessId: input.harnessId,
         issue: validated.issue ?? { path: '$', message: 'structured output is invalid' },
+        ...(subagentRecords.length > 0
+          ? { subagents: subagentSummaries(subagentRecords, input.subagentDefinitions) }
+          : {}),
       });
     }
 
@@ -243,6 +257,9 @@ export class AgentExecutor {
         return err({
           kind: AgentExecutorErrorKind.Artifact,
           error: written.error,
+          ...(subagentRecords.length > 0
+            ? { subagents: subagentSummaries(subagentRecords, input.subagentDefinitions) }
+            : {}),
         });
       }
       artifacts.push(written.unwrap());
@@ -252,6 +269,7 @@ export class AgentExecutor {
       output: validated.output,
       ...(completed.resumeToken ? { resumeToken: completed.resumeToken } : {}),
       ...(completed.usage ? { usage: completed.usage } : {}),
+      subagents: subagentSummaries(subagentRecords, input.subagentDefinitions),
       artifacts,
     });
   }
@@ -395,7 +413,14 @@ export class AgentExecutor {
       const error = `Subagent output is invalid at ${validated.issue?.path ?? '$'}: ${
         validated.issue?.message ?? 'structured output is invalid'
       }`;
-      return reportFailedSubagent(records, activity, activityMetadata, error, completed.transcript);
+      return reportFailedSubagent(
+        records,
+        activity,
+        activityMetadata,
+        error,
+        completed.transcript,
+        completed.usage,
+      );
     }
 
     records.push({
@@ -403,12 +428,14 @@ export class AgentExecutor {
       success: true,
       output: validated.output,
       transcript: completed.transcript,
+      ...(completed.usage ? { usage: completed.usage } : {}),
     });
     await activity?.({
       type: 'kouro.subagent.finished',
       ...activityMetadata,
       success: true,
       output: validated.output,
+      ...(completed.usage ? { usage: completed.usage } : {}),
     });
     return { callId, success: true, output: validated.output };
   }
@@ -420,6 +447,33 @@ export class AgentExecutor {
       // Live activity is best-effort and must never change attempt execution.
     }
   }
+}
+
+function subagentSummary(record: SubagentTranscriptRecord): SubagentExecutionSummary {
+  return {
+    sequence: record.sequence,
+    callId: record.callId,
+    subagentId: record.subagentId,
+    task: record.task,
+    harnessId: record.harnessId,
+    ...(record.model ? { model: record.model } : {}),
+    ...(record.reasoningEffort ? { reasoningEffort: record.reasoningEffort } : {}),
+    state: record.success ? 'succeeded' : 'failed',
+    ...(record.error ? { error: record.error } : {}),
+    ...(record.usage ? { usage: record.usage } : {}),
+    ...(record.output === undefined ? {} : { output: record.output }),
+  };
+}
+
+function subagentSummaries(
+  records: readonly SubagentTranscriptRecord[],
+  definitions: readonly ResolvedSubagentDefinition[] | undefined,
+): readonly SubagentExecutionSummary[] {
+  const allowed = new Set((definitions ?? []).map(({ id }) => id));
+  return records
+    .filter(({ subagentId }) => allowed.has(subagentId))
+    .toSorted((left, right) => left.sequence - right.sequence)
+    .map((record, index) => ({ ...subagentSummary(record), sequence: index + 1 }));
 }
 
 function failedSubagent(callId: string, error: string): SubagentInvocationResult {

@@ -119,6 +119,29 @@ function nodeConfigurationError(node: SourceNodeDefinition): string | undefined 
   ) {
     return 'allowedSubagents must not contain duplicates';
   }
+  if (node.contextSources !== undefined && node.type !== 'agent') {
+    return 'contextSources is supported only on agent nodes';
+  }
+  if (
+    node.contextSources !== undefined &&
+    (node.contextSources.length === 0 ||
+      node.contextSources.some(
+        (source) =>
+          !source ||
+          !['agent', 'subagent'].includes(source.type) ||
+          typeof source.id !== 'string' ||
+          !source.id.trim(),
+      ))
+  ) {
+    return 'contextSources must contain typed non-empty source IDs';
+  }
+  if (
+    node.contextSources &&
+    new Set(node.contextSources.map(({ type, id }) => `${type}:${id}`)).size !==
+      node.contextSources.length
+  ) {
+    return 'contextSources must not contain duplicates';
+  }
   if (node.models !== undefined) {
     if (
       typeof node.models !== 'object' ||
@@ -534,6 +557,28 @@ function validateSubagentAuthorization(
   return ok(undefined);
 }
 
+function validateContextSources(
+  nodes: readonly SourceNodeDefinition[],
+  subagents: ReadonlyMap<string, SourceSubagentDefinition>,
+): Result<void, Extract<CompilerError, { kind: CompilerErrorKind.InvalidNodeConfiguration }>> {
+  const definitions = new Map(nodes.map((node) => [node.id, node]));
+  for (const consumer of nodes) {
+    for (const source of consumer.contextSources ?? []) {
+      const valid =
+        source.type === 'subagent'
+          ? subagents.has(source.id)
+          : source.id !== consumer.id && definitions.get(source.id)?.type === 'agent';
+      if (!valid) {
+        return toCompilerError(CompilerErrorKind.InvalidNodeConfiguration, {
+          nodeId: consumer.id,
+          reason: `unknown or invalid ${source.type} context source: ${source.id}`,
+        });
+      }
+    }
+  }
+  return ok(undefined);
+}
+
 function validateTransitionIdentity(
   transition: SourceTransition,
   transitionIds: ReadonlySet<string>,
@@ -678,6 +723,8 @@ function validate(source: WorkflowSourceBundle): Result<void, CompilerError> {
   if (permissions.isErr()) return permissions;
   const authorization = validateSubagentAuthorization(source.nodes, subagents.unwrap());
   if (authorization.isErr()) return authorization;
+  const contextSources = validateContextSources(source.nodes, subagents.unwrap());
+  if (contextSources.isErr()) return contextSources;
 
   const transitions = validateTransitions(source.transitions, nodeIds, source.counterLimits);
   if (transitions.isErr()) return transitions;
@@ -746,6 +793,15 @@ export function compileWorkflow(
         ...(node.capabilities ? { capabilities: node.capabilities.toSorted() } : {}),
         ...(node.allowedSubagents
           ? { allowedSubagents: node.allowedSubagents.toSorted(compareCanonicalText) }
+          : {}),
+        ...(node.contextSources
+          ? {
+              contextSources: node.contextSources.toSorted(
+                (left, right) =>
+                  compareCanonicalText(left.type, right.type) ||
+                  compareCanonicalText(left.id, right.id),
+              ),
+            }
           : {}),
         priority: node.priority ?? 0,
         ordinal,

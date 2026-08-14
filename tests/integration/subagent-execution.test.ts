@@ -71,6 +71,7 @@ class StreamingChildHarness implements AgentHarness {
     return ok({
       output: request.role === 'test-scout' ? { files: ['test.ts'] } : { scope: request.role },
       transcript,
+      usage: { inputTokens: 120, outputTokens: 30 },
     });
   }
 
@@ -148,6 +149,15 @@ describe('bounded workflow subagents', () => {
       });
 
       expect(executed.isOk()).toBe(true);
+      if (executed.isErr()) return;
+      expect(executed.unwrap().subagents).toContainEqual(
+        expect.objectContaining({
+          callId: 'architecture:1',
+          state: 'succeeded',
+          output: { scope: 'architecture-scout' },
+          usage: { inputTokens: 120, outputTokens: 30 },
+        }),
+      );
       expect(parent.results.slice(0, 3).every(({ success }) => success)).toBe(true);
       expect(parent.results[3]).toMatchObject({
         callId: 'tests:4',
@@ -184,6 +194,7 @@ describe('bounded workflow subagents', () => {
       expect(liveTranscript).toContain('"type":"kouro.subagent.finished"');
       expect(liveTranscript).toContain('"callId":"architecture:1"');
       expect(liveTranscript).toContain('"callId":"tests:3"');
+      expect(liveTranscript).toContain('"usage":{"inputTokens":120,"outputTokens":30}');
 
       const runDirectory = createHash('sha256').update('run-subagents').digest('hex');
       const transcript = await readFile(
@@ -195,6 +206,7 @@ describe('bounded workflow subagents', () => {
       expect(transcript).toContain('"callId":"tests:4"');
       expect(transcript).toContain('"task":"Find the lowest useful tests"');
       expect(transcript).toContain('"reasoningEffort":"medium"');
+      expect(transcript).toContain('"usage":{"inputTokens":120,"outputTokens":30}');
       expect(transcript).toContain('Subagent is not authorized: unknown');
     } finally {
       await rm(directory, { recursive: true, force: true });
