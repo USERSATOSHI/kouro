@@ -87,6 +87,11 @@ import {
   preferredInvocationSequence,
 } from './execution-controls.ts';
 import { newIdempotencyKey } from './idempotency-key.ts';
+import {
+  runComparisonColumn,
+  runComparisonWarnings,
+  type RunComparisonColumn,
+} from './run-comparison.ts';
 import { timelineModel, type TimelineSubagentObservation } from './timeline.ts';
 import {
   CodeViewer,
@@ -720,11 +725,19 @@ function RunCostStat({ run }: { readonly run: RunDetails }) {
 function RunList({
   runs,
   selected,
+  comparisonSelection,
+  comparisonBusy,
   onSelect,
+  onToggleComparison,
+  onCompare,
 }: {
   readonly runs: readonly RunSummary[];
   readonly selected?: string;
+  readonly comparisonSelection: ReadonlySet<string>;
+  readonly comparisonBusy: boolean;
   readonly onSelect: (id: string) => void;
+  readonly onToggleComparison: (id: string) => void;
+  readonly onCompare: () => void;
 }) {
   return (
     <aside className="run-list">
@@ -734,25 +747,170 @@ function RunList({
       </header>
       <div className="run-list-heading">
         <span>Runs</span>
-        <span className="count">{runs.length}</span>
-      </div>
-      <nav>
-        {runs.map((run) => (
+        <div className="run-list-actions">
           <button
-            className={run.id === selected ? 'run selected' : 'run'}
-            key={run.id}
-            onClick={() => onSelect(run.id)}
+            disabled={comparisonBusy || comparisonSelection.size < 2}
+            onClick={onCompare}
             type="button"
           >
-            <span className="run-name">{run.id}</span>
-            <span className="run-meta">
-              {repositoryName(run.repositoryPath)} · {run.workflowId}
-            </span>
-            <span className={stateClass(run.status)}>{run.status}</span>
+            Compare {comparisonSelection.size > 0 ? comparisonSelection.size : ''}
           </button>
-        ))}
+          <span className="count">{runs.length}</span>
+        </div>
+      </div>
+      <nav>
+        {runs.map((run) => {
+          const included = comparisonSelection.has(run.id);
+          return (
+            <div className="run-list-item" key={run.id}>
+              <button
+                className={run.id === selected ? 'run selected' : 'run'}
+                onClick={() => onSelect(run.id)}
+                type="button"
+              >
+                <span className="run-name">{run.id}</span>
+                <span className="run-meta">
+                  {repositoryName(run.repositoryPath)} · {run.workflowId}
+                </span>
+                <span className={stateClass(run.status)}>{run.status}</span>
+              </button>
+              <button
+                aria-label={`${included ? 'Remove' : 'Add'} ${run.id} ${included ? 'from' : 'to'} comparison`}
+                aria-pressed={included}
+                className={`run-compare-toggle${included ? ' selected' : ''}`}
+                onClick={() => onToggleComparison(run.id)}
+                title={included ? 'Remove from comparison' : 'Add to comparison'}
+                type="button"
+              >
+                {included ? '✓' : '+'}
+              </button>
+            </div>
+          );
+        })}
       </nav>
     </aside>
+  );
+}
+
+function comparisonMetric(
+  columns: readonly RunComparisonColumn[],
+  label: string,
+  value: (column: RunComparisonColumn) => ReactNode,
+) {
+  return (
+    <tr key={label}>
+      <th scope="row">{label}</th>
+      {columns.map((column) => <td key={column.runId}>{value(column)}</td>)}
+    </tr>
+  );
+}
+
+function formatDuration(milliseconds: number | undefined): string {
+  if (milliseconds === undefined) return '—';
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  const seconds = Math.round(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
+}
+
+function comparisonUsage(column: RunComparisonColumn): string {
+  return column.usage
+    ? `${formatTokenCount(column.usage.inputTokens + column.usage.outputTokens)} tokens`
+    : '—';
+}
+
+function ComparisonOverview({ columns }: { readonly columns: readonly RunComparisonColumn[] }) {
+  return (
+    <div className="comparison-table-scroll">
+      <table className="comparison-table">
+        <thead>
+          <tr>
+            <th scope="col">Metric</th>
+            {columns.map((column) => <th scope="col" key={column.runId}>{column.runId}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {comparisonMetric(columns, 'Status', (column) => <span className={stateClass(column.status)}>{column.status}</span>)}
+          {comparisonMetric(columns, 'Workflow', (column) => column.workflowId)}
+          {comparisonMetric(columns, 'Workflow checksum', (column) => <code>{column.workflowChecksum.slice(0, 19)}…</code>)}
+          {comparisonMetric(columns, 'Starting commit', (column) => <code>{column.startingCommit.slice(0, 12)}</code>)}
+          {comparisonMetric(columns, 'Observed duration', (column) => formatDuration(column.durationMs))}
+          {comparisonMetric(columns, 'Invocations', (column) => column.invocationCount)}
+          {comparisonMetric(columns, 'Attempts', (column) => column.attemptCount)}
+          {comparisonMetric(columns, 'Subagent calls', (column) => column.subagentCallCount)}
+          {comparisonMetric(columns, 'Reported usage', comparisonUsage)}
+          {comparisonMetric(columns, 'Estimated cost', (column) => column.usage ? column.costUsd === undefined ? 'unpriced' : formatUsd(column.costUsd) : '—')}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ComparisonExecutionValue({ column, executionKey }: { readonly column: RunComparisonColumn; readonly executionKey: string }) {
+  const execution = column.executions.find(({ key }) => key === executionKey);
+  if (!execution) return <>—</>;
+  const tokens = execution.usage
+    ? `${formatTokenCount(execution.usage.inputTokens + execution.usage.outputTokens)} tok`
+    : 'no usage';
+  const cost = execution.usage
+    ? execution.costUsd === undefined ? 'unpriced' : formatUsd(execution.costUsd)
+    : '—';
+  return (
+    <span className="comparison-execution-value">
+      <strong>{execution.count} {execution.kind === 'agent' ? 'invocations' : 'calls'}</strong>
+      <small>{execution.failedCount} failed · {tokens} · {cost}</small>
+    </span>
+  );
+}
+
+function ComparisonBreakdown({ columns }: { readonly columns: readonly RunComparisonColumn[] }) {
+  const executions = columns.flatMap((column) => column.executions);
+  const executionKeys = [...new Set(executions.map(({ key }) => key))].toSorted();
+  return (
+    <section className="comparison-breakdown">
+      <header>
+        <p className="eyebrow">Execution breakdown</p>
+        <h3>Agents and subordinate calls</h3>
+      </header>
+      <div className="comparison-table-scroll">
+        <table className="comparison-table comparison-executions">
+          <thead>
+            <tr>
+              <th scope="col">Role</th>
+              {columns.map((column) => <th scope="col" key={column.runId}>{column.runId}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {executionKeys.map((key) => (
+              <tr key={key}>
+                <th scope="row">{executions.find((execution) => execution.key === key)?.label ?? key}</th>
+                {columns.map((column) => (
+                  <td key={column.runId}><ComparisonExecutionValue column={column} executionKey={key} /></td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function RunComparisonModal({ runs, onClose }: { readonly runs: readonly RunDetails[]; readonly onClose: () => void }) {
+  const columns = runs.map(runComparisonColumn);
+  const warnings = runComparisonWarnings(runs);
+  return (
+    <InspectorModal contentClassName="run-comparison-content" metadata={`${runs.length} durable runs · read-only projection`} modalClassName="run-comparison-dialog" onClose={onClose} title="Run comparison">
+      {warnings.length > 0 ? (
+        <div className="comparison-warning"><strong>Inputs are not identical</strong><span>{warnings.join(' ')}</span></div>
+      ) : (
+        <div className="comparison-compatible">Comparable repository, commit, workflow, and work item.</div>
+      )}
+      <ComparisonOverview columns={columns} />
+      <ComparisonBreakdown columns={columns} />
+      <p className="comparison-footnote">Kouro does not infer a winner. Cost is shown only when every reported source in that total has known pricing.</p>
+    </InspectorModal>
   );
 }
 
@@ -1851,6 +2009,9 @@ function workspaceStyle(inspectorHeight: number): WorkspaceStyle {
 function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) {
   const [runs, setRuns] = useState<readonly RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
+  const [comparisonRunIds, setComparisonRunIds] = useState<ReadonlySet<string>>(new Set());
+  const [comparisonRuns, setComparisonRuns] = useState<readonly RunDetails[]>();
+  const [comparisonBusy, setComparisonBusy] = useState(false);
   const [run, setRun] = useState<RunDetails>();
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('details');
@@ -1994,6 +2155,34 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
     setArtifacts(nextArtifacts);
     setApprovals(nextApprovals);
     setRuns(nextRuns);
+  }
+
+  function toggleComparison(runId: string): void {
+    const next = new Set(comparisonRunIds);
+    if (next.delete(runId)) {
+      setComparisonRunIds(next);
+      return;
+    }
+    if (next.size >= 4) {
+      setError('Compare up to four runs at a time.');
+      return;
+    }
+    next.add(runId);
+    setComparisonRunIds(next);
+  }
+
+  async function openComparison(): Promise<void> {
+    if (comparisonRunIds.size < 2) return;
+    setComparisonBusy(true);
+    setError(undefined);
+    try {
+      const details = await Promise.all([...comparisonRunIds].map(fetchRun));
+      setComparisonRuns(details);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Run comparison could not be loaded');
+    } finally {
+      setComparisonBusy(false);
+    }
   }
 
   async function submitRunAction(
@@ -2205,7 +2394,15 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
 
   return (
     <div className="execution-layout">
-      <RunList runs={runs} selected={selectedRunId} onSelect={setSelectedRunId} />
+      <RunList
+        comparisonBusy={comparisonBusy}
+        comparisonSelection={comparisonRunIds}
+        onCompare={() => void openComparison()}
+        onSelect={setSelectedRunId}
+        onToggleComparison={toggleComparison}
+        runs={runs}
+        selected={selectedRunId}
+      />
       <section className="workspace" style={workspaceStyle(inspectorHeight)}>
         {error ? <div className="error-banner">{error}</div> : null}
         {run ? (
@@ -2508,6 +2705,9 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
               : false
           }
         />
+      ) : null}
+      {comparisonRuns ? (
+        <RunComparisonModal onClose={() => setComparisonRuns(undefined)} runs={comparisonRuns} />
       ) : null}
     </div>
   );

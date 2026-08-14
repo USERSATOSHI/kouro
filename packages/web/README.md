@@ -31,6 +31,7 @@ tool exchanges above in-context steering and stop controls.
 - **Nested subagent sessions** — Active and completed Kouro subagents render as separate live sessions with delegated task, harness/model/effort metadata, reasoning, tool activity, and structured output instead of embedded JSONL
 - **Delegation-aware diagrams** — Flow and graph views show declared child roles with dashed parent edges; timeline lanes show each recorded child call at its parent activation tick
 - **Visible usage attribution** — Workflow and subagent blocks display token usage and derived cost directly, while unpriced models fail closed to an `unpriced` label
+- **Read-only run comparison** — Operators can select two to four durable runs and compare status, inputs, duration, invocations, attempts, subagent calls, tokens, estimated cost, and per-role attribution without creating evaluation state or inferring a winner
 - **Approval proposal context** — Generic approvals include the exact source invocation output, so a plan can be reviewed without leaving the approval workspace
 - **Server-resolved provider secrets** — Provider configuration responses contain status and non-secret scope only
 
@@ -51,7 +52,8 @@ Output goes to `dist/` (static files served by the Kouro CLI's `serve` command o
 ```
 App (root component)
 ├── RunList (sidebar)
-│   └── All runs with status badges
+│   ├── All runs with status badges
+│   └── Multi-run comparison selection
 └── Workspace (main area)
     ├── Error banner (conditional)
     ├── Run Header
@@ -71,8 +73,9 @@ App (root component)
             └── Grant/reject with reason
     └── IDE status bar
         └── Repository, workflow checksum, invocation count, and approval count
-    └── Agent session / artifact modal
-        └── Full-size readable transcript with call-ID-correlated tool results and in-context steering
+    └── Agent session / artifact / comparison modal
+        ├── Full-size readable transcript with call-ID-correlated tool results and in-context steering
+        └── Side-by-side durable metrics with experiment-compatibility warnings
 ```
 
 ## Data Flow
