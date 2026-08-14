@@ -33,6 +33,7 @@ import {
 import { ok, type Result } from '@usersatoshi/results';
 
 import { ApiErrorKind, apiErr, type ApiError } from './errors.ts';
+import { listRunEvaluations } from './evaluation-use-cases.ts';
 import type {
   ArtifactContentReader,
   InvocationActivityReader,
@@ -43,6 +44,7 @@ import type {
   RepositoryQuery,
   TicketProviderConfigurationQuery,
   TicketReadServices,
+  EvaluationServices,
 } from './ports.ts';
 
 export interface ApiServices {
@@ -56,6 +58,7 @@ export interface ApiServices {
   readonly runPublisher?: LocalRunPublisher;
   readonly tickets?: TicketReadServices;
   readonly ticketProviders?: TicketProviderConfigurationQuery;
+  readonly evaluations?: EvaluationServices;
 }
 
 function fromStore<T>(result: Result<T, RunStoreError>): Result<T, ApiError> {
@@ -199,7 +202,7 @@ export function getRun(services: ApiServices, runId: string): Result<RunDetails,
   const loaded = fromStore(services.runs.loadRun(runId));
   if (loaded.isErr()) return loaded;
   const aggregate = loaded.unwrap();
-  return ok({
+  const details: RunDetails = {
     ...summarizeRun(aggregate),
     entryNodeId: aggregate.artifact.bundle.entryNodeId,
     repositoryHead: aggregate.state.repositoryHead,
@@ -207,7 +210,10 @@ export function getRun(services: ApiServices, runId: string): Result<RunDetails,
     nodes: workflowNodes(aggregate),
     subagents: workflowSubagents(aggregate),
     edges: workflowEdges(aggregate),
-  });
+  };
+  if (!services.evaluations) return ok(details);
+  const evaluations = listRunEvaluations(services.evaluations, runId);
+  return evaluations.isErr() ? evaluations : ok({ ...details, evaluations: evaluations.value });
 }
 
 export function listEvents(

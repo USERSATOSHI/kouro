@@ -330,6 +330,23 @@ Status: **Complete** (accepted 2026-07-28)
 
 ---
 
+## M10 — Repository-local evaluations
+
+Status: **Complete** (accepted 2026-08-14)
+
+- [x] ADR for repository-local datasets and observational evaluator authority
+- [x] Scaffold public `@kouro/evaluations` package
+- [x] Validate and canonically checksum versioned dataset definitions
+- [x] Deterministic run status, invocation budget, token budget, and node outcome rules
+- [x] Preserve `unavailable` when best-effort usage evidence is incomplete
+- [x] Load checked-in datasets from repository `.kouro/evaluations/`
+- [x] Bind experiment execution to commit, workflow, dataset, case, and configuration checksums
+- [x] Persist experiment reports and expose API/CLI queries
+- [x] Connect evaluator reports to the existing run-comparison workspace
+- [x] Add human annotations and pairwise preferences
+
+---
+
 ## Ticket system
 
 ### T1 — Local ticket foundation
@@ -401,9 +418,10 @@ Status: **Complete** (accepted 2026-07-26)
 - [ ] Parallel branches, joins, branch cancellation, and leases
 - [ ] Installable Git-based ADW packs and lockfiles
 - [ ] Hosted registry or marketplace
-- [ ] Kyuki and Vedh integrations
+- [ ] Optional Vedh integration
 - [ ] Additional ticket providers and Git hosting integrations
 - [ ] Docker, VM, SSH, or remote-worker sandboxes
 - [ ] PostgreSQL and separate workers
 - [ ] Visual workflow editing
 - [ ] Deployment and merge automation
+- [ ] Recovery-aware artifact evaluators and model judges

@@ -21,6 +21,7 @@
     "@kouro/api-contracts": "0.1.17",
     "@kouro/delivery": "0.1.17",
     "@kouro/domain": "0.1.17",
+    "@kouro/evaluations": "0.1.17",
     "@kouro/executors": "0.1.17",
     "@kouro/persistence-sqlite": "0.1.17",
     "@kouro/tickets": "0.1.17",

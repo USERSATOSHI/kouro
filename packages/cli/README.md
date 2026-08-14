@@ -42,6 +42,14 @@ bun run kouro runs
 # Check run status
 bun run kouro status <run-id>
 
+# Evaluate a terminal run against a checked-in dataset case
+bun run kouro eval run <run-id> --dataset feature-regression \
+  --case add-health-check --experiment prompt-v2
+
+# Inspect and annotate evaluation evidence
+bun run kouro eval reports --experiment prompt-v2
+bun run kouro eval annotate <report-id> --verdict pass --note "Meets acceptance criteria"
+
 # Permanently remove a terminal run
 bun run kouro delete <run-id> --yes
 
@@ -192,6 +200,15 @@ Permanently removes a terminal run, its Kouro-owned worktree, local artifacts,
 events, idempotency records, and projections. Active and paused runs must first
 be cancelled or otherwise reach a terminal state. The source repository and a
 completed run's delivery branch are preserved.
+
+### `kouro eval ...`
+
+Evaluation datasets are regular JSON files directly under
+`.kouro/evaluations/`. `eval datasets` lists compiled IDs, versions, checksums,
+and cases. `eval run` records deterministic evidence for a terminal run and
+binds it to repository, workflow, configuration, dataset, and case checksums.
+`eval reports`, `eval annotate`, and `eval prefer` query or append human
+evidence without changing the deterministic report or run history.
 
 ### `kouro ticket ...`
 

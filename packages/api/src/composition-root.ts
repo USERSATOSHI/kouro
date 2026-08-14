@@ -1,6 +1,6 @@
 import { treaty } from '@elysiajs/eden';
 import { BunCommandRunner, RunCoordinator } from '@kouro/executors';
-import { SqliteEventStore } from '@kouro/persistence-sqlite';
+import { SqliteEvaluationStore, SqliteEventStore } from '@kouro/persistence-sqlite';
 import {
   SqliteTicketRepository,
   SqliteTicketRunStore,
@@ -10,6 +10,7 @@ import { err, ok, type Result } from '@usersatoshi/results';
 
 import { createKouroApp, type KouroApp } from './app.ts';
 import { LocalArtifactContentReader } from './local-artifact-content-reader.ts';
+import { LocalEvaluationDatasetSource } from './local-evaluation-dataset-source.ts';
 import { KouroTicketRunQuery } from './ticket-run-query.ts';
 
 export interface ComposedKouroApp {
@@ -34,6 +35,13 @@ export function composeKouroApp(
     return err({ kind: 0, message: 'The SQLite run store could not be initialized' });
   }
   const coordinator = new RunCoordinator(store, new BunCommandRunner(process.cwd()));
+  const evaluations = new SqliteEvaluationStore(databasePath);
+  const evaluationsInitialized = evaluations.initialize();
+  if (evaluationsInitialized.isErr()) {
+    evaluations.dispose();
+    store.dispose();
+    return err({ kind: 0, message: 'The SQLite evaluation store could not be initialized' });
+  }
   const tickets = new SqliteTicketRepository(databasePath);
   const ticketRuns = new SqliteTicketRunStore(databasePath);
   const ticketSync = new SqliteTicketSyncStore(databasePath);
@@ -46,6 +54,7 @@ export function composeKouroApp(
       ticketSync.dispose();
       ticketRuns.dispose();
       tickets.dispose();
+      evaluations.dispose();
       store.dispose();
       return err({ kind: 0, message: 'The SQLite ticket stores could not be initialized' });
     }
@@ -61,11 +70,17 @@ export function composeKouroApp(
         runQuery: new KouroTicketRunQuery(store),
         sync: ticketSync,
       },
+      evaluations: {
+        datasets: new LocalEvaluationDatasetSource(),
+        store: evaluations,
+        clock: { now: () => new Date().toISOString() },
+      },
     }),
     dispose(): void {
       ticketSync.dispose();
       ticketRuns.dispose();
       tickets.dispose();
+      evaluations.dispose();
       store.dispose();
     },
   });

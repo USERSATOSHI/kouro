@@ -20,6 +20,11 @@ import type {
   TicketSyncOperation,
   TicketSyncState,
 } from '@kouro/tickets';
+import type {
+  EvaluationAnnotation,
+  EvaluationPreference,
+  EvaluationRecord,
+} from '@kouro/evaluations';
 
 export interface ApiErrorResponse {
   readonly error: {
@@ -49,6 +54,48 @@ export interface RunDetails extends RunSummary {
   readonly nodes: readonly WorkflowNodeView[];
   readonly subagents?: readonly WorkflowSubagentView[];
   readonly edges: readonly WorkflowEdgeView[];
+  readonly evaluations?: readonly EvaluationRecordView[];
+}
+
+export interface EvaluationDatasetSummary {
+  readonly id: string;
+  readonly version: string;
+  readonly checksum: `sha256:${string}`;
+  readonly caseIds: readonly string[];
+}
+
+export interface EvaluationRecordView extends EvaluationRecord {
+  readonly annotations: readonly EvaluationAnnotation[];
+}
+
+export interface EvaluateRunRequest {
+  readonly datasetId: string;
+  readonly caseId: string;
+  readonly experimentId: string;
+  readonly actor: string;
+  readonly idempotencyKey: string;
+}
+
+export interface EvaluationAnnotationRequest {
+  readonly verdict: EvaluationAnnotation['verdict'];
+  readonly note: string;
+  readonly actor: string;
+  readonly idempotencyKey: string;
+}
+
+export interface EvaluationPreferenceRequest {
+  readonly leftReportId: string;
+  readonly rightReportId: string;
+  readonly preferredReportId?: string;
+  readonly actor: string;
+  readonly reason: string;
+  readonly idempotencyKey: string;
+}
+
+export interface EvaluationExperimentView {
+  readonly id: string;
+  readonly reports: readonly EvaluationRecordView[];
+  readonly preferences: readonly EvaluationPreference[];
 }
 
 export interface WorkflowNodeView {

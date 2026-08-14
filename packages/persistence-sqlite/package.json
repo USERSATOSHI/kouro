@@ -19,6 +19,7 @@
   "dependencies": {
     "@kouro/adw": "0.1.17",
     "@kouro/domain": "0.1.17",
+    "@kouro/evaluations": "0.1.17",
     "@kouro/executors": "0.1.17",
     "@kouro/runtime": "0.1.17",
     "@usersatoshi/results": "^1.0.0"

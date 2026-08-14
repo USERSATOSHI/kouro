@@ -22,11 +22,12 @@ Kouro is separate from the surrounding products:
 | --- | --- |
 | Kouro | Deterministic coding-workflow orchestration |
 | Yumi | Personal and home assistance |
-| Kyuki | Optional project-memory provider |
+| Kyuki | Company/team-wide organizational memory; outside Kouro |
 | Vedh | Optional repository-intelligence provider |
 
-Kyuki and Vedh are optional future integrations. Neither is required for the
-initial release.
+Kouro does not use Kyuki for workflow context, repository-local evaluations,
+or agent memory. Vedh remains an optional future repository-intelligence
+integration and is not required for the initial release.
 
 ## 2. Determinism contract
 
@@ -582,6 +583,31 @@ Exit criteria:
 - detached repositories require an explicit base branch;
 - publication retries do not duplicate branches or pull requests.
 
+### M10 — Repository-local evaluations
+
+Status: Complete.
+
+Deliver in coherent slices:
+
+- checked-in evaluation datasets with stable IDs, author-controlled versions,
+  canonical compilation, and content checksums;
+- deterministic rule evaluation over durable run state;
+- experiment execution that binds repository commit, workflow checksum,
+  dataset checksum, case, and run configuration;
+- durable experiment reports and side-by-side comparison;
+- human annotations and pairwise preference;
+- optional artifact rubrics and model judges after deterministic evidence is
+  established.
+
+Exit criteria:
+
+- declaration order does not change a compiled dataset checksum;
+- missing best-effort telemetry cannot make a budget evaluator pass;
+- evaluator output cannot schedule work, grant approval, or publish delivery;
+- the same repository commit, workflow checksum, dataset checksum, and run
+  configuration can be compared as one controlled experiment;
+- no evaluation or context feature depends on company/team-wide Kyuki state.
+
 ## 14. Ticket-system roadmap
 
 The ticket system is a planning bounded domain beside the existing runtime:
@@ -621,7 +647,7 @@ After the core is stable:
 - parallel branches, joins, branch cancellation, and leases;
 - installable Git-based ADW packs and lockfiles;
 - hosted registry or marketplace;
-- Kyuki and Vedh integrations;
+- optional Vedh integration;
 - provider-backed ticket synchronization beyond the ticket roadmap;
 - Docker, VM, SSH, or remote-worker sandboxes;
 - PostgreSQL and separate workers;

@@ -17,6 +17,7 @@ import type { DeliveryMetadata } from '@kouro/domain';
 import { SandboxRuntimeAgentCommandSandbox } from '@kouro/sandbox-worktree';
 
 import { ADW_TEMPLATES, createAdw, isAdwTemplate } from './create-adw.ts';
+import { executeEvaluationCommand } from './evaluation-command.ts';
 import { LocalKouroHost } from './local-host.ts';
 import { executeTicketCommand } from './ticket-command.ts';
 
@@ -55,6 +56,9 @@ Runs:
 
 Planning:
   ticket          Create, inspect, move, sync, and migrate tickets
+
+Evaluation:
+  eval            List datasets, evaluate runs, and record human evidence
 
 Host:
   serve           Serve the current repository dashboard and API
@@ -130,6 +134,12 @@ The source repository and delivery branch are preserved.`,
   kouro ticket import <github|forgejo> --project <id>
   kouro ticket pull|push <ticket-id>
   kouro ticket migrate <ticket-id> --to <github|forgejo> --project <id>`,
+  eval: `Usage:
+  kouro eval datasets [--repo <path>]
+  kouro eval run <run-id> --dataset <id> --case <id> --experiment <id> [--repo <path>]
+  kouro eval reports (--run <run-id> | --experiment <id>)
+  kouro eval annotate <report-id> --verdict pass|fail|unsure --note <text>
+  kouro eval prefer <experiment-id> <left-report-id> <right-report-id> --winner left|right|tie --reason <text>`,
   serve: `Usage:
   kouro serve [--port <number>] [--repo <path> | --all-repos]
 
@@ -532,6 +542,10 @@ export async function runCli(args: readonly string[] = process.argv.slice(2)): P
   try {
     if (command === 'ticket') {
       print(await executeTicketCommand(host, args.slice(1), actor));
+      return 0;
+    }
+    if (command === 'eval') {
+      print(await executeEvaluationCommand(host, args.slice(1), actor));
       return 0;
     }
     if (command === 'run') {

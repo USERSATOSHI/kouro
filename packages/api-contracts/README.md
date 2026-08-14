@@ -197,6 +197,13 @@ interface RepositorySummary {
 }
 ```
 
+### Evaluations
+
+Evaluation contracts expose compiled dataset summaries, idempotent terminal-run
+evaluation requests, checksum-bound report views, append-only annotation and
+pairwise-preference requests, and experiment views. Deterministic reports and
+human evidence remain separate fields.
+
 ### Server-Sent Events
 
 ```typescript

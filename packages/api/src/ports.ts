@@ -10,6 +10,7 @@ import type {
   TicketProjectView,
 } from '@kouro/api-contracts';
 import type { ArtifactReference } from '@kouro/domain';
+import type { CompiledEvaluationDataset, EvaluationStore } from '@kouro/evaluations';
 import type { RunAggregate, RunStoreError } from '@kouro/executors';
 import type { Result } from '@usersatoshi/results';
 import type {
@@ -109,4 +110,35 @@ export interface TicketReadServices {
 
 export interface TicketProviderConfigurationQuery {
   list(): readonly TicketProviderConfigurationView[];
+}
+
+export const enum EvaluationDatasetSourceErrorKind {
+  NotFound = 0,
+  InvalidDataset = 1,
+  ReadFailure = 2,
+}
+
+export interface EvaluationDatasetSourceError {
+  readonly kind: EvaluationDatasetSourceErrorKind;
+  readonly message: string;
+}
+
+export interface EvaluationDatasetSource {
+  list(
+    repositoryPath: string,
+  ): Promise<Result<readonly CompiledEvaluationDataset[], EvaluationDatasetSourceError>>;
+  load(
+    repositoryPath: string,
+    datasetId: string,
+  ): Promise<Result<CompiledEvaluationDataset, EvaluationDatasetSourceError>>;
+}
+
+export interface EvaluationClock {
+  now(): string;
+}
+
+export interface EvaluationServices {
+  readonly datasets: EvaluationDatasetSource;
+  readonly store: EvaluationStore;
+  readonly clock: EvaluationClock;
 }

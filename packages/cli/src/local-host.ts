@@ -9,7 +9,9 @@ import {
   createKouroApp,
   KouroTicketRunQuery,
   LocalArtifactContentReader,
+  LocalEvaluationDatasetSource,
   type KouroApp,
+  type EvaluationServices,
   type ObservableRunStore,
 } from '@kouro/api';
 import type {
@@ -47,7 +49,7 @@ import {
   OpenCodeHarness,
   PiHarness,
 } from '@kouro/harnesses';
-import { SqliteEventStore } from '@kouro/persistence-sqlite';
+import { SqliteEvaluationStore, SqliteEventStore } from '@kouro/persistence-sqlite';
 import {
   SandboxRuntimeAgentCommandSandbox,
   WorktreeSandboxProvider,
@@ -282,6 +284,8 @@ export function createLocalRequestHandler(
       url.pathname.startsWith('/runs') ||
       url.pathname.startsWith('/workflows') ||
       url.pathname.startsWith('/repositories') ||
+      url.pathname.startsWith('/evaluations') ||
+      url.pathname.startsWith('/evaluation-experiments') ||
       url.pathname.startsWith('/tickets') ||
       url.pathname.startsWith('/ticket-projects') ||
       url.pathname.startsWith('/ticket-providers')
@@ -297,6 +301,8 @@ export function createLocalRequestHandler(
 
 export class LocalKouroHost {
   readonly store: SqliteEventStore;
+  readonly evaluations: SqliteEvaluationStore;
+  readonly evaluationDatasets: LocalEvaluationDatasetSource;
   readonly sandbox: WorktreeSandboxProvider;
   readonly worker: LocalWorker;
   private readonly tickets: SqliteTicketRepository;
@@ -325,6 +331,8 @@ export class LocalKouroHost {
   ) {
     mkdirSync(paths.dataDirectory, { recursive: true });
     this.store = new SqliteEventStore(paths.databasePath);
+    this.evaluations = new SqliteEvaluationStore(paths.databasePath);
+    this.evaluationDatasets = new LocalEvaluationDatasetSource();
     this.tickets = new SqliteTicketRepository(paths.databasePath);
     this.ticketRuns = new SqliteTicketRunStore(paths.databasePath);
     this.ticketSync = new SqliteTicketSyncStore(paths.databasePath);
@@ -374,6 +382,14 @@ export class LocalKouroHost {
           CliErrorKind.Initialization,
           'sqlite_initialization_failed',
           'The SQLite store could not be initialized',
+        );
+      }
+      const evaluations = this.evaluations.initialize();
+      if (evaluations.isErr()) {
+        return cliErr(
+          CliErrorKind.Initialization,
+          'sqlite_evaluation_initialization_failed',
+          'The SQLite evaluation store could not be initialized',
         );
       }
       for (const ticketStore of [this.tickets, this.ticketRuns, this.ticketSync]) {
@@ -903,7 +919,16 @@ export class LocalKouroHost {
         sync: this.ticketSync,
       },
       ticketProviders: { list: () => this.ticketProviderViews },
+      evaluations: this.evaluationServices(),
     });
+  }
+
+  evaluationServices(): EvaluationServices {
+    return {
+      datasets: this.evaluationDatasets,
+      store: this.evaluations,
+      clock: { now: () => new Date().toISOString() },
+    };
   }
 
   runStoreForRepository(repositoryPath: string): ObservableRunStore {
@@ -1197,6 +1222,7 @@ export class LocalKouroHost {
 
   dispose(): void {
     this.worker.dispose();
+    this.evaluations.dispose();
     this.ticketSync.dispose();
     this.ticketRuns.dispose();
     this.tickets.dispose();

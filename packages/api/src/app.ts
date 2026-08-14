@@ -3,6 +3,14 @@ import { Elysia, t } from 'elysia';
 
 import { ApiErrorKind, type ApiError } from './errors.ts';
 import {
+  annotateEvaluation,
+  evaluateStoredRun,
+  getEvaluationExperiment,
+  listEvaluationDatasets,
+  listStoredRunEvaluations,
+  preferEvaluation,
+} from './evaluation-use-cases.ts';
+import {
   controlInvocation,
   controlRun,
   createRun,
@@ -59,6 +67,16 @@ function encodeEventStream(messages: readonly EventStreamMessage[]): string {
   return `retry: 1000\n\n${messages
     .map(({ id, event, data }) => `id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     .join('')}`;
+}
+
+function evaluationUnavailable(set: { status?: number | string }): ApiErrorResponse {
+  set.status = 404;
+  return {
+    error: {
+      code: 'evaluation_services_unavailable',
+      message: 'Evaluation services are not configured',
+    },
+  };
 }
 
 /** Creates an in-process-testable Elysia application around application use cases. */
@@ -147,6 +165,72 @@ export function createKouroApp(services: ApiServices) {
       const result = listApprovals(services, params.runId);
       return result.isErr() ? failure(result.error, set) : result.value;
     })
+    .get('/runs/:runId/evaluations', ({ params, set }) => {
+      if (!services.evaluations) return evaluationUnavailable(set);
+      const result = listStoredRunEvaluations(services.evaluations, services.runs, params.runId);
+      return result.isErr() ? failure(result.error, set) : result.value;
+    })
+    .post(
+      '/runs/:runId/evaluations',
+      async ({ params, body, set }) => {
+        if (!services.evaluations) return evaluationUnavailable(set);
+        const result = await evaluateStoredRun(
+          services.evaluations,
+          services.runs,
+          params.runId,
+          body,
+        );
+        return result.isErr() ? failure(result.error, set) : result.value;
+      },
+      {
+        body: t.Object({
+          datasetId: t.String({ minLength: 1 }),
+          caseId: t.String({ minLength: 1 }),
+          experimentId: t.String({ minLength: 1 }),
+          actor: t.String({ minLength: 1 }),
+          idempotencyKey: t.String({ minLength: 1 }),
+        }),
+      },
+    )
+    .post(
+      '/evaluations/:reportId/annotations',
+      ({ params, body, set }) => {
+        if (!services.evaluations) return evaluationUnavailable(set);
+        const result = annotateEvaluation(services.evaluations, params.reportId, body);
+        return result.isErr() ? failure(result.error, set) : result.value;
+      },
+      {
+        body: t.Object({
+          verdict: t.Union([t.Literal('pass'), t.Literal('fail'), t.Literal('unsure')]),
+          note: t.String({ minLength: 1 }),
+          actor: t.String({ minLength: 1 }),
+          idempotencyKey: t.String({ minLength: 1 }),
+        }),
+      },
+    )
+    .get('/evaluation-experiments/:experimentId', ({ params, set }) => {
+      if (!services.evaluations) return evaluationUnavailable(set);
+      const result = getEvaluationExperiment(services.evaluations, params.experimentId);
+      return result.isErr() ? failure(result.error, set) : result.value;
+    })
+    .post(
+      '/evaluation-experiments/:experimentId/preferences',
+      ({ params, body, set }) => {
+        if (!services.evaluations) return evaluationUnavailable(set);
+        const result = preferEvaluation(services.evaluations, params.experimentId, body);
+        return result.isErr() ? failure(result.error, set) : result.value;
+      },
+      {
+        body: t.Object({
+          leftReportId: t.String({ minLength: 1 }),
+          rightReportId: t.String({ minLength: 1 }),
+          preferredReportId: t.Optional(t.String({ minLength: 1 })),
+          actor: t.String({ minLength: 1 }),
+          reason: t.String({ minLength: 1 }),
+          idempotencyKey: t.String({ minLength: 1 }),
+        }),
+      },
+    )
     .post(
       '/runs/:runId/approvals/:invocationSequence',
       ({ params, body, set }) => {
@@ -252,6 +336,15 @@ export function createKouroApp(services: ApiServices) {
     .get('/repositories', () => listRepositories(services))
     .get('/repositories/:repositoryId', async ({ params, set }) => {
       const result = await getRepository(services, params.repositoryId);
+      return result.isErr() ? failure(result.error, set) : result.value;
+    })
+    .get('/repositories/:repositoryId/evaluation-datasets', async ({ params, set }) => {
+      if (!services.evaluations) return evaluationUnavailable(set);
+      const result = await listEvaluationDatasets(
+        services.evaluations,
+        services.repositories,
+        params.repositoryId,
+      );
       return result.isErr() ? failure(result.error, set) : result.value;
     })
     .get('/tickets', ({ query, set }) => {

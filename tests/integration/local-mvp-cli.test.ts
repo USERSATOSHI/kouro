@@ -24,6 +24,7 @@ import {
 } from '@kouro/executors';
 import { ScriptedFakeHarness } from '@kouro/harnesses';
 import { ok, type Result } from '@usersatoshi/results';
+import { executeEvaluationCommand } from '../../packages/cli/src/evaluation-command.ts';
 
 class BlockingHarness implements AgentHarness {
   readonly id = 'blocking';
@@ -161,6 +162,7 @@ describe('M7 runnable local MVP and operator CLI', () => {
     expect(help.stdout).toContain('kouro pause|resume|cancel <run-id>');
     expect(help.stdout).toContain('attach          Reconnect to an interactive run session');
     expect(help.stdout).toContain('publish         Push a delivered branch');
+    expect(help.stdout).toContain('eval            List datasets, evaluate runs');
 
     const runHelp = await process(
       ['bun', 'run', resolve(root, 'packages', 'cli', 'src', 'main.ts'), 'help', 'run'],
@@ -170,11 +172,57 @@ describe('M7 runnable local MVP and operator CLI', () => {
     expect(runHelp.stdout).toContain('Usage:\n  kouro run <adw>');
     expect(runHelp.stdout).toContain('Examples:');
 
+    const evaluationHelp = await process(
+      ['bun', 'run', resolve(root, 'packages', 'cli', 'src', 'main.ts'), 'help', 'eval'],
+      root,
+    );
+    expect(evaluationHelp.exitCode).toBe(0);
+    expect(evaluationHelp.stdout).toContain('kouro eval run <run-id>');
+    expect(evaluationHelp.stdout).toContain('kouro eval prefer <experiment-id>');
+
     const version = await process(
       ['bun', 'run', resolve(root, 'packages', 'cli', 'src', 'main.ts'), '--version'],
       root,
     );
     expect(version).toEqual({ exitCode: 0, stdout: `${cliPackageManifest.version}\n`, stderr: '' });
+  });
+
+  test('evaluation command lists checked-in repository datasets', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'kouro-evaluation-cli-'));
+    roots.push(root);
+    const repository = resolve(root, 'repository');
+    const evaluationDirectory = resolve(repository, '.kouro', 'evaluations');
+    await mkdir(evaluationDirectory, { recursive: true });
+    await writeFile(
+      resolve(evaluationDirectory, 'regression.json'),
+      JSON.stringify({
+        schemaVersion: '1',
+        id: 'cli-regression',
+        version: '1.0.0',
+        cases: [
+          {
+            id: 'case-a',
+            workItem: { title: 'Exercise CLI dataset loading' },
+            expectations: [{ type: 'run_status', value: 'succeeded' }],
+          },
+        ],
+      }),
+    );
+    const host = new LocalKouroHost(localPaths(root), [], []);
+    expect((await host.initialize()).isOk()).toBe(true);
+    try {
+      expect(
+        await executeEvaluationCommand(host, ['datasets', '--repo', repository], 'tester'),
+      ).toEqual([
+        expect.objectContaining({
+          id: 'cli-regression',
+          version: '1.0.0',
+          caseIds: ['case-a'],
+        }),
+      ]);
+    } finally {
+      host.dispose();
+    }
   });
 
   test('package launcher exposes the CLI and packaged templates', async () => {

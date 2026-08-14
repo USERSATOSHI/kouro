@@ -15,6 +15,7 @@
       "@kouro/delivery-provider-forgejo": "0.1.17",
       "@kouro/delivery-provider-github": "0.1.17",
       "@kouro/domain": "0.1.17",
+      "@kouro/evaluations": "0.1.17",
       "@kouro/executors": "0.1.17",
       "@kouro/harnesses": "0.1.17",
       "@kouro/persistence-sqlite": "0.1.17",
@@ -51,6 +52,7 @@
       "@kouro/api-contracts": "0.1.17",
       "@kouro/delivery": "0.1.17",
       "@kouro/domain": "0.1.17",
+      "@kouro/evaluations": "0.1.17",
       "@kouro/executors": "0.1.17",
       "@kouro/persistence-sqlite": "0.1.17",
       "@kouro/tickets": "0.1.17",
@@ -63,6 +65,7 @@
     "version": "0.1.17",
     "dependencies": {
       "@kouro/domain": "0.1.17",
+      "@kouro/evaluations": "0.1.17",
       "@kouro/tickets": "0.1.17"
     }
   },
@@ -119,6 +122,15 @@
     "name": "@kouro/domain",
     "version": "0.1.17"
   },
+  "packages/evaluations": {
+    "name": "@kouro/evaluations",
+    "version": "0.1.17",
+    "dependencies": {
+      "@kouro/adw": "0.1.17",
+      "@kouro/domain": "0.1.17",
+      "@usersatoshi/results": "^1.0.0"
+    }
+  },
   "packages/executors": {
     "name": "@kouro/executors",
     "version": "0.1.17",
@@ -150,6 +162,7 @@
     "dependencies": {
       "@kouro/adw": "0.1.17",
       "@kouro/domain": "0.1.17",
+      "@kouro/evaluations": "0.1.17",
       "@kouro/executors": "0.1.17",
       "@kouro/runtime": "0.1.17",
       "@usersatoshi/results": "^1.0.0"
@@ -331,6 +344,8 @@
     "@kouro/delivery-provider-github": ["@kouro/delivery-provider-github@workspace:packages/delivery-provider-github"],
 
     "@kouro/domain": ["@kouro/domain@workspace:packages/domain"],
+
+    "@kouro/evaluations": ["@kouro/evaluations@workspace:packages/evaluations"],
 
     "@kouro/executors": ["@kouro/executors@workspace:packages/executors"],
 

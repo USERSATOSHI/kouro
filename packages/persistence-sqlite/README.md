@@ -2,6 +2,10 @@
 
 SQLite-backed event-sourcing persistence for Kouro runs. Implements the `RunStore` port from `@kouro/executors` with append-only event storage, transactional materialized projections, idempotency tracking, and restart-safe loading with corruption detection.
 
+The package also implements `EvaluationStore` with additive tables for bound
+evaluation reports, human annotations, pairwise preferences, and evaluation
+idempotency records. Evaluation writes never modify the run event stream.
+
 ## Architecture
 
 ```
@@ -157,6 +161,7 @@ Each write operation (`createRun`, `appendEvent`) stores the canonical request J
 | Export | Kind | Source |
 |--------|------|--------|
 | `SqliteEventStore` | class | `sqlite-event-store.ts` |
+| `SqliteEvaluationStore` | class | `sqlite-evaluation-store.ts` |
 
 ```typescript
 class SqliteEventStore implements RunStore {

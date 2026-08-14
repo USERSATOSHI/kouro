@@ -1,5 +1,5 @@
 {
-  "name": "@kouro/api-contracts",
+  "name": "@kouro/evaluations",
   "version": "0.1.17",
   "license": "Apache-2.0",
   "repository": {
@@ -8,8 +8,7 @@
   },
   "files": [
     "src",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "type": "module",
   "module": "./src/index.ts",
@@ -17,8 +16,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@kouro/adw": "0.1.17",
     "@kouro/domain": "0.1.17",
-    "@kouro/evaluations": "0.1.17",
-    "@kouro/tickets": "0.1.17"
+    "@usersatoshi/results": "^1.0.0"
   }
 }

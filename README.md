@@ -22,6 +22,14 @@ finishes successfully.
 Kouro runs locally. Repository worktrees, run history, logs, and artifacts stay
 on your machine.
 
+Repository-local evaluation datasets can be compiled into stable checksums and
+applied to durable run state with deterministic status, node-outcome,
+invocation-budget, and token-budget rules. Evaluation reports are observational:
+they do not schedule nodes, grant approvals, or publish changes.
+Reports bind repository, workflow, configuration, dataset, and case checksums,
+persist in SQLite, appear in run comparison, and retain append-only human
+annotations and pairwise preferences separately from deterministic results.
+
 Kouro also contains the accepted T1–T6 ticket system: local greenfield
 planning, immutable run snapshots, GitHub Issues synchronization, and
 capability-aware Forgejo Issues synchronization, including resumable migration

@@ -1,6 +1,6 @@
 # `@kouro/api` — HTTP API and Application Use Cases
 
-The application layer of Kouro, implementing a hexagonal/ports-and-adapters architecture. Provides an Elysia HTTP server with 21 routes, application use cases, declared port interfaces, a single-process composition root, and checksum-verifying local artifact reader.
+The application layer of Kouro, implementing a hexagonal/ports-and-adapters architecture. Provides an Elysia HTTP server, application use cases, declared port interfaces, a single-process composition root, and checksum-verifying local artifact and evaluation-dataset readers.
 
 ## Architecture
 
@@ -60,6 +60,17 @@ The `createKouroApp(services)` factory produces an Elysia instance with **21 rou
 |--------|------|-------------|
 | `GET` | `/repositories` | List registered git repositories |
 | `GET` | `/repositories/:repositoryId` | Get repository details |
+| `GET` | `/repositories/:repositoryId/evaluation-datasets` | List compiled repository datasets |
+
+### Evaluations
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/runs/:runId/evaluations` | List durable reports for a run |
+| `POST` | `/runs/:runId/evaluations` | Evaluate a terminal run against an exact dataset case |
+| `POST` | `/evaluations/:reportId/annotations` | Append human evidence |
+| `GET` | `/evaluation-experiments/:experimentId` | Get reports and preferences for an experiment |
+| `POST` | `/evaluation-experiments/:experimentId/preferences` | Append a pairwise preference |
 
 ### Tickets
 
