@@ -1,6 +1,6 @@
 {
   "name": "@kouro/persistence-sqlite",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -17,11 +17,11 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@kouro/adw": "0.1.17",
-    "@kouro/domain": "0.1.17",
-    "@kouro/evaluations": "0.1.17",
-    "@kouro/executors": "0.1.17",
-    "@kouro/runtime": "0.1.17",
+    "@kouro/adw": "0.1.18",
+    "@kouro/domain": "0.1.18",
+    "@kouro/evaluations": "0.1.18",
+    "@kouro/executors": "0.1.18",
+    "@kouro/runtime": "0.1.18",
     "@usersatoshi/results": "^1.0.0"
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@kouro/api",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -18,13 +18,13 @@
   },
   "dependencies": {
     "@elysiajs/eden": "^1.4.9",
-    "@kouro/api-contracts": "0.1.17",
-    "@kouro/delivery": "0.1.17",
-    "@kouro/domain": "0.1.17",
-    "@kouro/evaluations": "0.1.17",
-    "@kouro/executors": "0.1.17",
-    "@kouro/persistence-sqlite": "0.1.17",
-    "@kouro/tickets": "0.1.17",
+    "@kouro/api-contracts": "0.1.18",
+    "@kouro/delivery": "0.1.18",
+    "@kouro/domain": "0.1.18",
+    "@kouro/evaluations": "0.1.18",
+    "@kouro/executors": "0.1.18",
+    "@kouro/persistence-sqlite": "0.1.18",
+    "@kouro/tickets": "0.1.18",
     "@usersatoshi/results": "^1.0.0",
     "elysia": "^1.4.29"
   }
