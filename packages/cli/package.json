@@ -1,6 +1,6 @@
 {
   "name": "@kouro/cli",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -20,21 +20,21 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@kouro/adw": "0.1.18",
-    "@kouro/api": "0.1.18",
-    "@kouro/api-contracts": "0.1.18",
-    "@kouro/delivery": "0.1.18",
-    "@kouro/delivery-provider-forgejo": "0.1.18",
-    "@kouro/delivery-provider-github": "0.1.18",
-    "@kouro/domain": "0.1.18",
-    "@kouro/executors": "0.1.18",
-    "@kouro/harnesses": "0.1.18",
-    "@kouro/persistence-sqlite": "0.1.18",
-    "@kouro/sandbox-worktree": "0.1.18",
-    "@kouro/ticket-provider-forgejo": "0.1.18",
-    "@kouro/ticket-provider-github": "0.1.18",
-    "@kouro/tickets": "0.1.18",
-    "@kouro/web": "0.1.18",
+    "@kouro/adw": "0.1.19",
+    "@kouro/api": "0.1.19",
+    "@kouro/api-contracts": "0.1.19",
+    "@kouro/delivery": "0.1.19",
+    "@kouro/delivery-provider-forgejo": "0.1.19",
+    "@kouro/delivery-provider-github": "0.1.19",
+    "@kouro/domain": "0.1.19",
+    "@kouro/executors": "0.1.19",
+    "@kouro/harnesses": "0.1.19",
+    "@kouro/persistence-sqlite": "0.1.19",
+    "@kouro/sandbox-worktree": "0.1.19",
+    "@kouro/ticket-provider-forgejo": "0.1.19",
+    "@kouro/ticket-provider-github": "0.1.19",
+    "@kouro/tickets": "0.1.19",
+    "@kouro/web": "0.1.19",
     "@usersatoshi/results": "^1.0.0"
   }
 }

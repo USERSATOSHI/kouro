@@ -1,6 +1,6 @@
 {
   "name": "@kouro/harnesses",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -20,9 +20,9 @@
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",
     "@anthropic-ai/sdk": "^0.93.0",
     "@earendil-works/pi-coding-agent": "^0.82.1",
-    "@kouro/domain": "0.1.18",
-    "@kouro/executors": "0.1.18",
-    "@kouro/sandbox-worktree": "0.1.18",
+    "@kouro/domain": "0.1.19",
+    "@kouro/executors": "0.1.19",
+    "@kouro/sandbox-worktree": "0.1.19",
     "@opencode-ai/sdk": "^1.18.9",
     "@usersatoshi/results": "^1.0.0",
     "typebox": "1.1.38",
