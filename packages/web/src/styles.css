@@ -478,11 +478,68 @@ pre,
   white-space: nowrap;
 }
 
+.run-heading {
+  min-width: 0;
+}
+
+.run-heading > .eyebrow {
+  margin-bottom: 5px;
+}
+
+.run-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  margin-top: 7px;
+  color: var(--text-muted);
+}
+
+.run-identity code {
+  overflow: hidden;
+  max-width: 180px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--canvas-inset);
+  padding: 2px 7px;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .repository-path {
   display: block;
   overflow: hidden;
   max-width: min(760px, 64vw);
-  margin-top: 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-focus {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 11px;
+}
+
+.run-focus-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.run-focus-copy strong {
+  overflow: hidden;
+  color: #c9d1d9;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-focus-copy small {
+  overflow: hidden;
   color: var(--text-muted);
   font-size: 11px;
   text-overflow: ellipsis;
@@ -550,6 +607,78 @@ pre,
 }
 
 .run-stat small {
+  font-size: 11px;
+}
+
+.run-empty {
+  display: grid;
+  max-width: 540px;
+  align-self: center;
+  justify-self: center;
+  justify-items: center;
+  padding: 48px 28px;
+  text-align: center;
+}
+
+.run-empty-mark {
+  position: relative;
+  display: flex;
+  width: 92px;
+  height: 46px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.run-empty-mark::before {
+  position: absolute;
+  right: 13px;
+  left: 13px;
+  height: 1px;
+  background: var(--border);
+  content: '';
+}
+
+.run-empty-mark span {
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #58a6ff;
+  border-radius: 50%;
+  background: var(--canvas);
+  box-shadow: 0 0 0 5px var(--accent-muted);
+}
+
+.run-empty .eyebrow {
+  margin-bottom: 7px;
+}
+
+.run-empty h2 {
+  margin-bottom: 9px;
+  font-size: 22px;
+}
+
+.run-empty > p:not(.eyebrow) {
+  max-width: 470px;
+  margin-bottom: 22px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.run-empty-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.run-empty-actions code {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas-inset);
+  padding: 8px 10px;
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -2834,6 +2963,12 @@ button:disabled {
     max-width: calc(100vw - 32px);
   }
 
+  .run-identity {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
   .run-header-actions {
     width: 100%;
     justify-content: space-between;
@@ -3090,6 +3225,17 @@ button:disabled {
 
   .run-header-actions {
     align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .run-empty {
+    min-height: 60vh;
+    padding: 36px 20px;
+  }
+
+  .run-empty-actions {
+    width: 100%;
+    align-items: stretch;
     flex-direction: column;
   }
 

@@ -6,6 +6,7 @@ import {
   invocationControlAvailability,
   preferredInvocationSequence,
 } from '../../packages/web/src/execution-controls.ts';
+import { runFocus } from '../../packages/web/src/execution-presentation.ts';
 
 function runDetails(status: RunDetails['status'] = 'running'): RunDetails {
   return {
@@ -102,6 +103,21 @@ describe('web execution controls', () => {
       interruptible: true,
       retryable: false,
       skippable: false,
+    });
+  });
+
+  test('summarizes the operator-relevant run position in plain language', () => {
+    expect(runFocus(runDetails())).toEqual({
+      title: 'Implement',
+      detail: 'The workflow is actively working on this step.',
+    });
+    expect(runFocus(runDetails('waiting_for_approval'))).toEqual({
+      title: 'Approval required',
+      detail: 'Review Implement to continue.',
+    });
+    expect(runFocus(runDetails('failed'))).toEqual({
+      title: 'Stopped at Implement',
+      detail: 'Inspect the latest invocation for the failure and recovery options.',
     });
   });
 });

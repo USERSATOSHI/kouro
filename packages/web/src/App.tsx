@@ -79,6 +79,7 @@ import {
   invocationDisplayState,
   invocationFailure,
   runCostUsd,
+  runFocus,
   runUsage,
 } from './execution-presentation.ts';
 import {
@@ -1996,8 +1997,15 @@ function workspaceStyle(inspectorHeight: number): WorkspaceStyle {
   return { '--inspector-height': `${inspectorHeight}px` };
 }
 
-function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) {
+function ExecutionConsole({
+  initialRunId,
+  onOpenTickets,
+}: {
+  readonly initialRunId?: string;
+  readonly onOpenTickets: () => void;
+}) {
   const [runs, setRuns] = useState<readonly RunSummary[]>([]);
+  const [runsLoaded, setRunsLoaded] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
   const [comparisonRunIds, setComparisonRunIds] = useState<ReadonlySet<string>>(new Set());
   const [comparisonRuns, setComparisonRuns] = useState<readonly RunDetails[]>();
@@ -2031,7 +2039,8 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
         setRuns(next);
         setSelectedRunId((current) => current ?? next[0]?.id);
       })
-      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : 'Load failed'));
+      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : 'Load failed'))
+      .finally(() => setRunsLoaded(true));
   }, []);
 
   const refreshTimerRef = useRef<number | undefined>(undefined);
@@ -2126,6 +2135,8 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
     [diagramDirection, diagramMode, run],
   );
   const node = run?.nodes.find(({ id }) => id === selectedNode) ?? null;
+  const focus = run ? runFocus(run) : undefined;
+  const workItem = run ? workItemFor(run) : undefined;
   const activeActivity =
     activeActivitySequence === null ? undefined : activities[activeActivitySequence];
 
@@ -2393,13 +2404,39 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
         {run ? (
           <>
             <header className="run-header">
-              <div>
-                <p className="eyebrow">{run.workflowId}</p>
-                <h2>{run.id}</h2>
-                <small className="repository-path">{run.repositoryPath}</small>
+              <div className="run-heading">
+                <p className="eyebrow">{run.workflowId.replaceAll('-', ' ')}</p>
+                <h2>{workItem?.title ?? run.workflowId.replaceAll('-', ' ')}</h2>
+                <div className="run-identity">
+                  <code title={run.id}>{run.id}</code>
+                  <small className="repository-path">{run.repositoryPath}</small>
+                </div>
+                {focus ? (
+                  <div aria-live="polite" className="run-focus">
+                    <span className={stateClass(run.status)}>
+                      {run.status.replaceAll('_', ' ')}
+                    </span>
+                    <span className="run-focus-copy">
+                      <strong>{focus.title}</strong>
+                      <small>{focus.detail}</small>
+                    </span>
+                  </div>
+                ) : null}
               </div>
               <div className="run-header-actions">
                 <div aria-label="Run controls" className="run-controls" role="group">
+                  {run.pendingApprovalCount > 0 ? (
+                    <button
+                      className="primary-button"
+                      disabled={busy}
+                      onClick={() => setTab('approval')}
+                      type="button"
+                    >
+                      {run.pendingApprovalCount === 1
+                        ? 'Review approval'
+                        : `Review ${run.pendingApprovalCount} approvals`}
+                    </button>
+                  ) : null}
                   {run.status === 'paused' ? (
                     <button
                       className="primary-button"
@@ -2657,7 +2694,29 @@ function ExecutionConsole({ initialRunId }: { readonly initialRunId?: string }) 
             </footer>
           </>
         ) : (
-          <div className="loading">Waiting for durable run state…</div>
+          runsLoaded && runs.length === 0 ? (
+            <div className="run-empty">
+              <div aria-hidden="true" className="run-empty-mark">
+                <span />
+                <span />
+                <span />
+              </div>
+              <p className="eyebrow">Runs</p>
+              <h2>No workflow runs yet</h2>
+              <p>
+                Start from a ticket to preserve the work-item context, or launch a workflow from
+                the terminal.
+              </p>
+              <div className="run-empty-actions">
+                <button className="primary-button" onClick={onOpenTickets} type="button">
+                  Open tickets
+                </button>
+                <code>kouro run &lt;adw&gt; --repo . &lt;work-item&gt;</code>
+              </div>
+            </div>
+          ) : (
+            <div className="loading">Loading workflow runs…</div>
+          )
         )}
       </section>
       {activeArtifact ? (
@@ -3335,7 +3394,7 @@ export function App() {
             }}
             type="button"
           >
-            Actions
+            Runs
           </button>
         </nav>
         <span className="environment-badge">
@@ -3346,7 +3405,7 @@ export function App() {
       {surface === 'tickets' ? (
         <TicketConsole onOpenRun={openRun} />
       ) : (
-        <ExecutionConsole initialRunId={targetRunId} />
+        <ExecutionConsole initialRunId={targetRunId} onOpenTickets={() => setSurface('tickets')} />
       )}
     </main>
   );
