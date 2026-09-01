@@ -6,3 +6,4 @@ export * from './paths.ts';
 export * from './ticket-composition.ts';
 export * from './work-item.ts';
 export * from './worker.ts';
+export * from './parallel-worktree-manager.ts';

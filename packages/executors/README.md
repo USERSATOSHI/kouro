@@ -41,6 +41,8 @@ const coordinator = new RunCoordinator(
 | `agentExecutor` | `AgentExecutor?` | AI agent execution (optional — needed for agent nodes) |
 | `workingDirectory` | `string` | CWD for command execution (default `process.cwd()`) |
 | `clock` | `Clock` | Time source (default: `new Date().toISOString()`) |
+| `parallelWorkspaces` | `ParallelWorkspaceManager?` | Recoverable isolated branch worktrees |
+| `traceExporter` | `TraceExporter?` | Best-effort observable trace export |
 
 ### Public Methods
 
@@ -58,6 +60,9 @@ const result = coordinator.createRun({
 
 // Advance a run (main loop tick) — loads run, calls scheduleRun, dispatches intent
 const advanced = await coordinator.advance('run-abc');
+
+// Worker tick — batches canonical branch starts and runs isolated effects concurrently
+const batch = await coordinator.advanceAvailable('run-abc');
 
 // Recovery — interrupts active invocations for restart safety
 coordinator.recoverRun('run-abc');

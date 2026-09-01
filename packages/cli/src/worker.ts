@@ -13,9 +13,28 @@ export interface WorkerClock {
   nowMs(): number;
 }
 
-function stableBoundary(aggregate: RunAggregate): boolean {
+function waitingDue(aggregate: RunAggregate, nowMs: number): boolean {
+  return aggregate.state.invocations.some(({ state, wait }) => {
+    if (state !== 'waiting' || wait?.dueAt === undefined) return false;
+    const due = Date.parse(wait.dueAt);
+    return !Number.isNaN(due) && nowMs >= due;
+  });
+}
+
+function runDurationDue(aggregate: RunAggregate, nowMs: number): boolean {
+  const limit = aggregate.artifact.bundle.runLimits?.maxDurationMs;
+  if (limit === undefined || aggregate.state.startedAt === undefined) return false;
+  const startedAt = Date.parse(aggregate.state.startedAt);
+  return !Number.isNaN(startedAt) && nowMs - startedAt >= limit;
+}
+
+function stableBoundary(aggregate: RunAggregate, nowMs: number): boolean {
   return (
-    aggregate.state.status !== 'running' ||
+    (aggregate.state.status !== 'running' &&
+      !(
+        aggregate.state.status === 'waiting' &&
+        (waitingDue(aggregate, nowMs) || runDurationDue(aggregate, nowMs))
+      )) ||
     aggregate.state.invocations.some(
       ({ state }) => state === 'waiting_for_approval' || state === 'interrupted',
     )
@@ -55,7 +74,7 @@ export class LocalWorker {
     for (;;) {
       const loaded = this.store.loadRun(runId);
       if (loaded.isErr()) throw new Error(`Run ${runId} could not be loaded`);
-      if (stableBoundary(loaded.unwrap())) return loaded.unwrap();
+      if (stableBoundary(loaded.unwrap(), this.clock.nowMs())) return loaded.unwrap();
       if ((await this.ensureOwnership()) && !this.advancing) {
         this.advancing = true;
         try {
@@ -91,7 +110,7 @@ export class LocalWorker {
       const loaded = this.store.loadRun(runId);
       if (loaded.isErr()) throw new Error(`Run ${runId} could not be loaded`);
       const aggregate = loaded.unwrap();
-      if (stableBoundary(aggregate)) return aggregate;
+      if (stableBoundary(aggregate, this.clock.nowMs())) return aggregate;
       const pendingDelivery = aggregate.state.invocations.find(({ state, nodeId }) => {
         const definition = aggregate.artifact.bundle.nodes.find(({ id }) => id === nodeId);
         return state === 'pending' && definition?.type === 'delivery_review';
@@ -107,7 +126,7 @@ export class LocalWorker {
         );
       });
       if (pendingComplete) await this.services.finalize(aggregate);
-      const advanced = await this.services.coordinatorFor(aggregate).advance(runId);
+      const advanced = await this.services.coordinatorFor(aggregate).advanceAvailable(runId);
       if (advanced.isErr()) {
         this.blockedAtSequence.set(runId, aggregate.nextEventSequence);
         return aggregate;
@@ -126,7 +145,12 @@ export class LocalWorker {
         const blockedAt = this.blockedAtSequence.get(aggregate.runId);
         if (blockedAt !== undefined && blockedAt === aggregate.nextEventSequence) continue;
         this.blockedAtSequence.delete(aggregate.runId);
-        if (aggregate.state.status === 'running') {
+        if (
+          aggregate.state.status === 'running' ||
+          (aggregate.state.status === 'waiting' &&
+            (waitingDue(aggregate, this.clock.nowMs()) ||
+              runDurationDue(aggregate, this.clock.nowMs())))
+        ) {
           await this.advanceUntilStable(aggregate.runId);
         }
       }

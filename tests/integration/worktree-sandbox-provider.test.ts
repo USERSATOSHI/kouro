@@ -1,16 +1,46 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
   SandboxErrorKind,
+  GitCommandRunner,
   WorktreeSandboxProvider,
+  toErr,
+  type GitCommandOutput,
   type PinnedRepository,
   type RegisteredRepository,
+  type SandboxError,
   type RunWorktree,
 } from '@kouro/sandbox-worktree';
+import { ParallelWorktreeManager } from '../../packages/cli/src/parallel-worktree-manager.ts';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { err, type Result } from '@usersatoshi/results';
+
+class FailAfterApplyingTreeGitRunner extends GitCommandRunner {
+  private failed = false;
+
+  override async run(
+    cwd: string,
+    operation: string,
+    args: readonly string[],
+    environment: Readonly<Record<string, string>> = {},
+  ): Promise<Result<GitCommandOutput, SandboxError>> {
+    const result = await super.run(cwd, operation, args, environment);
+    if (!this.failed && operation === 'apply integrated tree' && result.isOk()) {
+      this.failed = true;
+      return err(
+        toErr(SandboxErrorKind.GitFailure, {
+          operation,
+          exitCode: 137,
+          message: 'simulated process interruption after applying tree',
+        }),
+      );
+    }
+    return result;
+  }
+}
 
 async function git(cwd: string, ...args: readonly string[]): Promise<string> {
   const child = Bun.spawn(['git', ...args], {
@@ -107,7 +137,7 @@ describe('WorktreeSandboxProvider', () => {
     expect(recovered.isOk()).toBe(true);
     expect(recovered.unwrap()).toEqual(first);
     const listed = await git(repositoryPath, 'worktree', 'list', '--porcelain');
-    expect(listed.split(`worktree ${first.path}`).length - 1).toBe(1);
+    expect(listed.split(`worktree ${await realpath(first.path)}`).length - 1).toBe(1);
   });
 
   test('writes checksum-bearing status and binary diff artifacts atomically', async () => {
@@ -229,5 +259,109 @@ describe('WorktreeSandboxProvider', () => {
     expect(await git(repositoryPath, 'worktree', 'list', '--porcelain')).not.toContain(
       worktree.path,
     );
+  });
+
+  test('joins disjoint isolated branch trees onto the verified parent checkpoint', async () => {
+    const parent = (await provider.createWorktree(pinned, 'parallel-parent')).unwrap();
+    await writeFile(join(parent.path, 'checkpoint.txt'), 'checkpoint\n');
+    const manager = new ParallelWorktreeManager(
+      provider,
+      repository.repositoryId,
+      repository.repositoryPath,
+      parent.path,
+      parent.runId,
+    );
+    const prepared = await manager.prepare(parent.runId, 'group-1', pinned.startingCommit, [
+      'b',
+      'a',
+    ]);
+    expect(prepared.isOk()).toBe(true);
+    const workspaces = prepared.unwrap().workspaces;
+    const a = workspaces.find(({ branchId }) => branchId === 'a');
+    const b = workspaces.find(({ branchId }) => branchId === 'b');
+    if (!a || !b) throw new Error('branch workspaces were not prepared');
+    await writeFile(join(a.workingDirectory, 'a.txt'), 'a\n');
+    await writeFile(join(b.workingDirectory, 'b.txt'), 'b\n');
+    expect(
+      (await manager.inspectBranch(parent.runId, 'group-1', 'a')).unwrap().changedPaths,
+    ).toEqual(['a.txt']);
+    expect(
+      (await manager.inspectBranch(parent.runId, 'group-1', 'b')).unwrap().changedPaths,
+    ).toEqual(['b.txt']);
+
+    const joined = await manager.join(parent.runId, 'group-1', ['b', 'a'], pinned.startingCommit);
+
+    expect(joined.isOk()).toBe(true);
+    expect(joined.unwrap().outcome).toBe('succeeded');
+    expect(await readFile(join(parent.path, 'checkpoint.txt'), 'utf8')).toBe('checkpoint\n');
+    expect(await readFile(join(parent.path, 'a.txt'), 'utf8')).toBe('a\n');
+    expect(await readFile(join(parent.path, 'b.txt'), 'utf8')).toBe('b\n');
+    await manager.cleanupSuccessful(parent.runId, 'group-1');
+    const listed = await git(repositoryPath, 'worktree', 'list', '--porcelain');
+    expect(listed).not.toContain(a.workingDirectory);
+    expect(listed).not.toContain(b.workingDirectory);
+  });
+
+  test('retries a join after interruption between tree application and durable completion', async () => {
+    const parent = (await provider.createWorktree(pinned, 'parallel-recovery-parent')).unwrap();
+    const interrupted = new ParallelWorktreeManager(
+      provider,
+      repository.repositoryId,
+      repository.repositoryPath,
+      parent.path,
+      parent.runId,
+      new FailAfterApplyingTreeGitRunner(),
+    );
+    const prepared = (
+      await interrupted.prepare(parent.runId, 'recovery-group', pinned.startingCommit, ['a', 'b'])
+    ).unwrap();
+    const a = prepared.workspaces.find(({ branchId }) => branchId === 'a');
+    const b = prepared.workspaces.find(({ branchId }) => branchId === 'b');
+    if (!a || !b) throw new Error('branch workspaces were not prepared');
+    await writeFile(join(a.workingDirectory, 'a.txt'), 'a\n');
+    await writeFile(join(b.workingDirectory, 'b.txt'), 'b\n');
+
+    const firstJoin = await interrupted.join(
+      parent.runId,
+      'recovery-group',
+      ['a', 'b'],
+      pinned.startingCommit,
+    );
+    expect(firstJoin.isErr()).toBe(true);
+    expect(await readFile(join(parent.path, 'a.txt'), 'utf8')).toBe('a\n');
+    expect(await readFile(join(parent.path, 'b.txt'), 'utf8')).toBe('b\n');
+
+    const restarted = new ParallelWorktreeManager(
+      provider,
+      repository.repositoryId,
+      repository.repositoryPath,
+      parent.path,
+      parent.runId,
+    );
+    const recovered = await restarted.recover(
+      parent.runId,
+      'recovery-group',
+      pinned.startingCommit,
+      prepared.baseTree,
+      prepared.checkpoint,
+      prepared.workspaces.map(({ branchId, workspaceId }) => ({ branchId, workspaceId })),
+    );
+    expect(recovered.isOk()).toBe(true);
+    const retry = await restarted.join(
+      parent.runId,
+      'recovery-group',
+      ['b', 'a'],
+      pinned.startingCommit,
+    );
+    expect(retry.isOk()).toBe(true);
+    if (retry.isOk()) {
+      expect(retry.value.outcome).toBe('succeeded');
+      expect(retry.value.head).toBe(pinned.startingCommit);
+      expect(retry.value.tree).toMatch(/^[0-9a-f]{40}$/);
+    }
+    await restarted.cleanupSuccessful(parent.runId, 'recovery-group');
+    const listed = await git(repositoryPath, 'worktree', 'list', '--porcelain');
+    expect(listed).not.toContain(a.workingDirectory);
+    expect(listed).not.toContain(b.workingDirectory);
   });
 });

@@ -16,10 +16,12 @@ import {
   createRun,
   deleteRun,
   decideApproval,
+  deliverExternalEvent,
   getArtifact,
   getInvocationActivity,
   getRepository,
   getRun,
+  getRunTrace,
   getWorkflow,
   listApprovals,
   listArtifacts,
@@ -118,6 +120,10 @@ export function createKouroApp(services: ApiServices) {
       const result = getRun(services, params.runId);
       return result.isErr() ? failure(result.error, set) : result.value;
     })
+    .get('/runs/:runId/trace', ({ params, set }) => {
+      const result = getRunTrace(services, params.runId);
+      return result.isErr() ? failure(result.error, set) : result.value;
+    })
     .delete('/runs/:runId', async ({ params, set }) => {
       const result = await deleteRun(services, params.runId);
       return result.isErr() ? failure(result.error, set) : result.value;
@@ -161,6 +167,27 @@ export function createKouroApp(services: ApiServices) {
       );
       return result.isErr() ? failure(result.error, set) : result.value;
     })
+    .post(
+      '/runs/:runId/invocations/:invocationSequence/events/:event',
+      ({ params, body, set }) => {
+        const result = deliverExternalEvent(
+          services,
+          params.runId,
+          Number(params.invocationSequence),
+          params.event,
+          body,
+        );
+        return result.isErr() ? failure(result.error, set) : result.value;
+      },
+      {
+        body: t.Object({
+          payload: t.Any(),
+          actor: t.String({ minLength: 1 }),
+          idempotencyKey: t.String({ minLength: 1 }),
+          expectedEventSequence: t.Optional(t.Number({ minimum: 1 })),
+        }),
+      },
+    )
     .get('/runs/:runId/approvals', ({ params, set }) => {
       const result = listApprovals(services, params.runId);
       return result.isErr() ? failure(result.error, set) : result.value;

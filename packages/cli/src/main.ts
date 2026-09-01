@@ -13,7 +13,7 @@ import {
   listRuns,
   LocalArtifactContentReader,
 } from '@kouro/api';
-import type { DeliveryMetadata } from '@kouro/domain';
+import type { DeliveryMetadata, JsonValue } from '@kouro/domain';
 import { SandboxRuntimeAgentCommandSandbox } from '@kouro/sandbox-worktree';
 
 import { ADW_TEMPLATES, createAdw, isAdwTemplate } from './create-adw.ts';
@@ -53,6 +53,7 @@ Runs:
   steer           Send guidance to an active agent invocation
   retry           Retry an interrupted invocation
   skip            Skip a policy-eligible invocation
+  event           Deliver a targeted external event
 
 Planning:
   ticket          Create, inspect, move, sync, and migrate tickets
@@ -122,6 +123,8 @@ The source repository and delivery branch are preserved.`,
   kouro interrupt|retry|skip <run-id> <invocation> --reason <text>`,
   skip: `Usage:
   kouro interrupt|retry|skip <run-id> <invocation> --reason <text>`,
+  event: `Usage:
+  kouro event <run-id> <invocation> <event> (--payload <json> | --payload-file <path>) [--idempotency-key <key>]`,
   ticket: `Usage:
   kouro ticket create --project <id> --title <text> (--description <text> | --description-file <path>) [options]
   kouro ticket list --project <id>
@@ -171,6 +174,17 @@ function print(value: unknown): void {
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  return (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value)) ||
+    (Array.isArray(value) && value.every(isJsonValue)) ||
+    (isRecord(value) && Object.values(value).every(isJsonValue))
+  );
 }
 
 function deliveryMetadata(value: unknown): DeliveryMetadata | undefined {
@@ -753,6 +767,38 @@ export async function runCli(args: readonly string[] = process.argv.slice(2)): P
           ? await host.worker.runUntilStable(runId)
           : result.unwrap();
       print({ runId, status: stable.state.status });
+      return 0;
+    }
+    if (command === 'event') {
+      const runId = required(args[1], 'run-id');
+      const invocation = Number(required(args[2], 'invocation'));
+      const event = required(args[3], 'event');
+      const inline = option(args, '--payload');
+      const payloadFile = option(args, '--payload-file');
+      const idempotencyKey = option(args, '--idempotency-key') ?? `event:${randomUUID()}`;
+      if ((inline === undefined) === (payloadFile === undefined)) {
+        throw new Error('Use exactly one of --payload and --payload-file');
+      }
+      const parsed: unknown = JSON.parse(
+        payloadFile ? await readFile(resolve(payloadFile), 'utf8') : String(inline),
+      );
+      if (!isJsonValue(parsed)) throw new Error('Event payload must be finite JSON');
+      const loaded = host.store.loadRun(runId);
+      if (loaded.isErr()) throw new Error(`Run ${runId} was not found`);
+      const delivered = host
+        .coordinatorFor(loaded.value)
+        .receiveEvent(
+          runId,
+          invocation,
+          event,
+          parsed,
+          actor,
+          idempotencyKey,
+          loaded.value.nextEventSequence,
+        );
+      if (delivered.isErr()) throw new Error('event delivery conflicted with current run state');
+      const stable = await host.worker.runUntilStable(runId);
+      print({ runId, invocationSequence: invocation, event, status: stable.state.status });
       return 0;
     }
     if (command === 'diagnostics') {

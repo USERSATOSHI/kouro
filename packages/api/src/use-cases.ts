@@ -21,8 +21,12 @@ import type {
   WorkflowNodeView,
   WorkflowSubagentView,
   WorkflowSummary,
+  ExternalEventRequest,
+  ExternalEventResponse,
+  RunTraceView,
 } from '@kouro/api-contracts';
 import type { ApprovalBinding, ArtifactReference, NodeInvocation } from '@kouro/domain';
+import { deriveRunTrace } from '@kouro/runtime';
 import { deliveryMetadataChecksum, validateDeliveryMetadata } from '@kouro/delivery';
 import {
   RunStoreErrorKind,
@@ -214,6 +218,56 @@ export function getRun(services: ApiServices, runId: string): Result<RunDetails,
   if (!services.evaluations) return ok(details);
   const evaluations = listRunEvaluations(services.evaluations, runId);
   return evaluations.isErr() ? evaluations : ok({ ...details, evaluations: evaluations.value });
+}
+
+export function getRunTrace(services: ApiServices, runId: string): Result<RunTraceView, ApiError> {
+  const loaded = fromStore(services.runs.loadRun(runId));
+  return loaded.isErr()
+    ? loaded
+    : ok(deriveRunTrace(runId, loaded.value.artifact, loaded.value.state));
+}
+
+export function deliverExternalEvent(
+  services: ApiServices,
+  runId: string,
+  invocationSequence: number,
+  event: string,
+  request: ExternalEventRequest,
+): Result<ExternalEventResponse, ApiError> {
+  if (
+    !Number.isSafeInteger(invocationSequence) ||
+    invocationSequence < 1 ||
+    !event.trim() ||
+    !request.actor.trim() ||
+    !request.idempotencyKey.trim()
+  ) {
+    return apiErr(
+      ApiErrorKind.InvalidInput,
+      'invalid_external_event',
+      'invocation, event, actor, and idempotencyKey are required',
+    );
+  }
+  const delivered = services.coordinator.receiveEvent(
+    runId,
+    invocationSequence,
+    event,
+    request.payload,
+    request.actor,
+    request.idempotencyKey,
+    request.expectedEventSequence,
+  );
+  return delivered.isErr()
+    ? apiErr(
+        ApiErrorKind.Conflict,
+        'external_event_conflict',
+        'The invocation is not waiting for this event or another commit won the race',
+      )
+    : ok({
+        runId,
+        invocationSequence,
+        event,
+        status: delivered.value.state.status,
+      });
 }
 
 export function listEvents(

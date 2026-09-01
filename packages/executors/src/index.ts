@@ -5,3 +5,4 @@ export * from './ports.ts';
 export * from './run-coordinator.ts';
 export * from './scripted-fake-ticket-provider.ts';
 export * from './structured-output.ts';
+export * from './otlp-trace-exporter.ts';

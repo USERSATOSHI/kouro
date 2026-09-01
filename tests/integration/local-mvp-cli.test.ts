@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import cliPackageManifest from '../../packages/cli/package.json' with { type: 'json' };
@@ -528,7 +528,9 @@ inspect.on('failure').to(failed);`,
     );
 
     expect(created.exitCode).toBe(0);
-    expect(JSON.parse(created.stdout).path).toBe(resolve(repository, '.kouro', 'default-location'));
+    expect(JSON.parse(created.stdout).path).toBe(
+      await realpath(resolve(repository, '.kouro', 'default-location')),
+    );
     expect(
       await readFile(resolve(repository, '.kouro', 'default-location', 'manifest.json'), 'utf8'),
     ).toContain('"id": "default-location"');
@@ -673,7 +675,7 @@ inspect.on('failure').to(failed);`,
         await listed.json();
       expect(body).toHaveLength(1);
       expect(body[0]?.id).toBe(first.unwrap().runId);
-      expect(body[0]?.repositoryPath).toBe(firstRepository);
+      expect(body[0]?.repositoryPath).toBe(await realpath(firstRepository));
 
       const hidden = await app.handle(
         new Request(`http://kouro.local/runs/${second.unwrap().runId}`),

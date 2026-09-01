@@ -13,11 +13,12 @@ import type {
 } from '@kouro/domain';
 import { compareCanonicalText, sha256 } from './canonical.ts';
 import { compileWorkflow } from './compiler.ts';
+import { expandWorkflowComposition } from './composition.ts';
 import { CompilerErrorKind, toErr, toCompilerError, type CompilerError } from './errors.ts';
 import type { WorkflowAuthoringDefinition } from './sdk.ts';
 
-export const COMPILER_VERSION = '0.4.0';
-export const IR_VERSION = '4';
+export const COMPILER_VERSION = '0.5.0';
+export const IR_VERSION = '5';
 export const EXPRESSION_VERSION = '1';
 
 interface AdwManifest {
@@ -151,6 +152,63 @@ function validateDefinition(
       return toCompilerError(CompilerErrorKind.DefinitionInvalid, {
         file,
         reason: `node ${nodeId} must be a node object`,
+      });
+    }
+    if (
+      node.type === 'call' &&
+      (typeof node.workflow !== 'string' || node.workflow.trim().length === 0)
+    ) {
+      return toCompilerError(CompilerErrorKind.DefinitionInvalid, {
+        file,
+        reason: `call node ${nodeId} must name a subworkflow`,
+      });
+    }
+    if (node.type === 'parallel') {
+      if (
+        !isRecord(node.branches) ||
+        Object.keys(node.branches).length === 0 ||
+        Object.values(node.branches).some(
+          (alias) => typeof alias !== 'string' || alias.trim().length === 0,
+        )
+      ) {
+        return toCompilerError(CompilerErrorKind.DefinitionInvalid, {
+          file,
+          reason: `parallel node ${nodeId} must map branch IDs to subworkflow aliases`,
+        });
+      }
+    }
+    if (node.type === 'for_each') {
+      const itemsFrom = node.itemsFrom;
+      const sourceNode = isRecord(itemsFrom) ? itemsFrom.node : undefined;
+      const path = isRecord(itemsFrom) ? itemsFrom.path : undefined;
+      if (
+        !isRecord(itemsFrom) ||
+        (typeof sourceNode !== 'string' &&
+          (!isRecord(sourceNode) || typeof sourceNode.id !== 'string')) ||
+        !Array.isArray(path) ||
+        path.some((segment) => typeof segment !== 'string')
+      ) {
+        return toCompilerError(CompilerErrorKind.DefinitionInvalid, {
+          file,
+          reason: `forEach node ${nodeId} must declare itemsFrom node and JSON path`,
+        });
+      }
+    }
+    if (
+      node.type === 'sleep' &&
+      (typeof node.durationMs !== 'number' ||
+        !Number.isSafeInteger(node.durationMs) ||
+        node.durationMs <= 0)
+    ) {
+      return toCompilerError(CompilerErrorKind.DefinitionInvalid, {
+        file,
+        reason: `sleep node ${nodeId} must declare a positive durationMs`,
+      });
+    }
+    if (node.type === 'wait_for_event' && typeof node.event !== 'string') {
+      return toCompilerError(CompilerErrorKind.DefinitionInvalid, {
+        file,
+        reason: `waitForEvent node ${nodeId} must declare an event`,
       });
     }
   }
@@ -379,7 +437,22 @@ async function compilePackage(
         schemas[node.outputSchema] = schema.unwrap();
       }
     }
-    nodes.push({ id, ...node });
+    if (node.type === 'wait_for_event' && node.payloadSchema) {
+      const schema = await resolveSchema(absolutePackage, node.payloadSchema);
+      if (schema.isErr()) return schema;
+      schemas[node.payloadSchema] = schema.unwrap();
+    }
+    if (node.type === 'for_each') {
+      const sourceNodeId =
+        typeof node.itemsFrom.node === 'string' ? node.itemsFrom.node : node.itemsFrom.node.id;
+      nodes.push({
+        id,
+        ...node,
+        itemsFrom: { nodeId: sourceNodeId, path: [...node.itemsFrom.path] },
+      });
+    } else {
+      nodes.push({ id, ...node });
+    }
   }
   const subagents: SourceSubagentDefinition[] = [];
   for (const [id, authoringSubagent] of Object.entries(definition.subagents ?? {}).toSorted(
@@ -444,7 +517,8 @@ async function compilePackage(
     transitions: definition.transitions,
     counterLimits: definition.limits?.counters ?? {},
     ...(definition.limits?.maxDurationMs === undefined &&
-    definition.limits?.maxNodeInvocations === undefined
+    definition.limits?.maxNodeInvocations === undefined &&
+    definition.limits?.maxConcurrentInvocations === undefined
       ? {}
       : {
           runLimits: {
@@ -454,6 +528,9 @@ async function compilePackage(
             ...(definition.limits.maxNodeInvocations === undefined
               ? {}
               : { maxNodeInvocations: definition.limits.maxNodeInvocations }),
+            ...(definition.limits.maxConcurrentInvocations === undefined
+              ? {}
+              : { maxConcurrentInvocations: definition.limits.maxConcurrentInvocations }),
           },
         }),
     prompts,
@@ -463,7 +540,8 @@ async function compilePackage(
     subworkflows,
   };
 
-  return compileWorkflow(source);
+  const expanded = expandWorkflowComposition(source);
+  return expanded.isErr() ? expanded : compileWorkflow(expanded.unwrap());
 }
 
 export function compileAdwPackage(

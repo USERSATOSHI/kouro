@@ -101,10 +101,51 @@ function decodeRequest(value: string | undefined): HelperRequest {
 async function check(): Promise<void> {
   const dependencies = await SandboxManager.checkDependenciesAsync();
   const failures = [...dependencies.errors, ...dependencies.warnings];
+  let available = dependencies.errors.length === 0;
+  let reason = failures.length > 0 ? failures.join('; ') : undefined;
+  if (available) {
+    try {
+      const environment = Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => typeof entry[1] === 'string',
+        ),
+      );
+      await SandboxManager.initialize(
+        sandboxRuntimeConfig({
+          command: 'true',
+          workingDirectory: process.cwd(),
+          writable: false,
+          network: false,
+          environment,
+        }),
+      );
+      const wrapped = await SandboxManager.wrapWithSandboxArgv(
+        'true',
+        undefined,
+        undefined,
+        undefined,
+        process.cwd(),
+      );
+      const child = Bun.spawn(wrapped.argv, {
+        cwd: process.cwd(),
+        env: wrapped.env,
+        stdout: 'ignore',
+        stderr: 'pipe',
+      });
+      const exitCode = await child.exited;
+      if (exitCode !== 0) {
+        available = false;
+        reason = `sandbox probe exited ${exitCode}`;
+      }
+    } catch (error) {
+      available = false;
+      reason = messageFor(error);
+    }
+  }
   process.stdout.write(
     JSON.stringify({
-      available: dependencies.errors.length === 0,
-      ...(failures.length > 0 ? { reason: failures.join('; ') } : {}),
+      available,
+      ...(reason ? { reason } : {}),
     }),
   );
 }

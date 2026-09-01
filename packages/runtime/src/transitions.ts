@@ -33,7 +33,12 @@ export function selectTransition(
       continue;
     }
 
-    const evaluated = evaluateExpression(transition.condition, state, invocation.output);
+    const evaluated = evaluateExpression(
+      transition.condition,
+      state,
+      invocation.output,
+      invocation.input,
+    );
     if (evaluated.isErr()) {
       return evaluated;
     }

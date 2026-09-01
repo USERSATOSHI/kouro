@@ -105,7 +105,9 @@ export class KouroTicketRunQuery implements TicketRunQuery {
               ? 'cancelled'
               : status === 'paused'
                 ? 'blocked'
-                : runningColumn(aggregate.state, aggregate.artifact.bundle.nodes),
+                : status === 'waiting'
+                  ? 'blocked'
+                  : runningColumn(aggregate.state, aggregate.artifact.bundle.nodes),
       ...(usage ? { usage } : {}),
       ...(costUsd === undefined ? {} : { costUsd }),
     });

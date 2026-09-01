@@ -17,10 +17,10 @@ function processFailure(error: unknown): CommandRunnerError {
 export class BunCommandRunner implements CommandRunner {
   constructor(private readonly workingDirectory: string) {}
 
-  async execute(command: string) {
+  async execute(command: string, workingDirectory = this.workingDirectory) {
     return fromAsync<CommandExecution, CommandRunnerError>(async () => {
       const subprocess = Bun.spawn(['bash', '-lc', command], {
-        cwd: this.workingDirectory,
+        cwd: workingDirectory,
         stdout: 'pipe',
         stderr: 'pipe',
       });

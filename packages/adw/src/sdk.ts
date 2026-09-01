@@ -156,12 +156,60 @@ export interface CompleteNodeAuthoring {
   readonly result?: 'succeeded' | 'failed';
 }
 
+export interface CallNodeAuthoring {
+  readonly type: 'call';
+  readonly workflow: string;
+  readonly priority?: number;
+}
+
+export interface ParallelNodeAuthoring {
+  readonly type: 'parallel';
+  readonly branches: Readonly<Record<string, string>>;
+  readonly maxConcurrent: number;
+  readonly workspace: 'isolated';
+  readonly join: 'disjoint';
+  readonly priority?: number;
+}
+
+export interface ForEachNodeAuthoring {
+  readonly type: 'for_each';
+  readonly workflow: string;
+  readonly itemsFrom: {
+    readonly node: NodeHandle | string;
+    readonly path: readonly string[];
+  };
+  readonly maxItems: number;
+  readonly maxConcurrent: number;
+  readonly workspace: 'isolated';
+  readonly join: 'disjoint';
+  readonly priority?: number;
+}
+
+export interface SleepNodeAuthoring {
+  readonly type: 'sleep';
+  readonly durationMs: number;
+  readonly priority?: number;
+}
+
+export interface WaitForEventNodeAuthoring {
+  readonly type: 'wait_for_event';
+  readonly event: string;
+  readonly payloadSchema?: string;
+  readonly timeoutMs?: number;
+  readonly priority?: number;
+}
+
 export type NodeAuthoring =
   | AgentNodeAuthoring
   | ApprovalNodeAuthoring
   | DeliveryReviewNodeAuthoring
   | CommandNodeAuthoring
-  | CompleteNodeAuthoring;
+  | CompleteNodeAuthoring
+  | CallNodeAuthoring
+  | ParallelNodeAuthoring
+  | ForEachNodeAuthoring
+  | SleepNodeAuthoring
+  | WaitForEventNodeAuthoring;
 
 export interface WorkflowAuthoringDefinition {
   readonly id: string;
@@ -175,6 +223,7 @@ export interface WorkflowAuthoringDefinition {
     readonly counters?: Readonly<Record<string, number>>;
     readonly maxDurationMs?: number;
     readonly maxNodeInvocations?: number;
+    readonly maxConcurrentInvocations?: number;
   };
   readonly subworkflows?: Readonly<
     Record<
@@ -196,6 +245,7 @@ export interface WorkflowBuilderOptions {
 export interface RunLimitsAuthoring {
   readonly maxDurationMs?: number;
   readonly maxNodeInvocations?: number;
+  readonly maxConcurrentInvocations?: number;
 }
 
 export interface SubworkflowAuthoring {
@@ -207,6 +257,7 @@ export const enum WorkflowAuthoringErrorKind {
   DuplicateNode = 'duplicate_node',
   DuplicateCounter = 'duplicate_counter',
   DuplicateSubagent = 'duplicate_subagent',
+  DuplicateSubworkflow = 'duplicate_subworkflow',
   ForeignNodeHandle = 'foreign_node_handle',
   ForeignCounterHandle = 'foreign_counter_handle',
   ForeignSubagentHandle = 'foreign_subagent_handle',
@@ -438,6 +489,12 @@ export class WorkflowBuilder implements BuilderContext {
   }
 
   subworkflow(name: string, definition: SubworkflowAuthoring): this {
+    if (this.subworkflows.has(name)) {
+      throw authoringError(
+        WorkflowAuthoringErrorKind.DuplicateSubworkflow,
+        `Subworkflow "${name}" is already declared`,
+      );
+    }
     this.subworkflows.set(name, { ...definition });
     return this;
   }
@@ -480,6 +537,41 @@ export class WorkflowBuilder implements BuilderContext {
 
   command(name: string, config: Omit<CommandNodeAuthoring, 'type'>): TransitionNodeHandle {
     return this.addTransitionNode(name, { type: 'command', ...config });
+  }
+
+  call(name: string, config: Omit<CallNodeAuthoring, 'type'>): TransitionNodeHandle {
+    return this.addTransitionNode(name, { type: 'call', ...config });
+  }
+
+  parallel(name: string, config: Omit<ParallelNodeAuthoring, 'type'>): TransitionNodeHandle {
+    return this.addTransitionNode(name, { type: 'parallel', ...config });
+  }
+
+  forEach(name: string, config: Omit<ForEachNodeAuthoring, 'type'>): TransitionNodeHandle {
+    this.assertUniqueNode(name);
+    const source =
+      typeof config.itemsFrom.node === 'string'
+        ? config.itemsFrom.node
+        : (this.assertNodeOwnership(config.itemsFrom.node), config.itemsFrom.node.id);
+    const handle = new AuthoredNodeHandle(name, this);
+    this.nodes.set(name, {
+      type: 'for_each',
+      ...config,
+      itemsFrom: { node: source, path: [...config.itemsFrom.path] },
+    });
+    this.nodeHandles.add(handle);
+    return handle;
+  }
+
+  sleep(name: string, config: Omit<SleepNodeAuthoring, 'type'>): TransitionNodeHandle {
+    return this.addTransitionNode(name, { type: 'sleep', ...config });
+  }
+
+  waitForEvent(
+    name: string,
+    config: Omit<WaitForEventNodeAuthoring, 'type'>,
+  ): TransitionNodeHandle {
+    return this.addTransitionNode(name, { type: 'wait_for_event', ...config });
   }
 
   complete(name: string, config: Omit<CompleteNodeAuthoring, 'type'> = {}): CompleteNodeHandle {
@@ -681,6 +773,16 @@ interface OutputExpression {
 /** Creates an output reference rooted at the provided non-empty path. */
 export function output(...path: readonly string[]): OutputExpression {
   const reference = Object.freeze({ scope: 'output' as const, path: Object.freeze([...path]) });
+  return Object.freeze({
+    equals(value: JsonPrimitive): Expression {
+      return Object.freeze({ op: 'eq', left: reference, right: value });
+    },
+  });
+}
+
+/** Creates an immutable invocation-input reference rooted at a non-empty path. */
+export function input(...path: readonly string[]): OutputExpression {
+  const reference = Object.freeze({ scope: 'input' as const, path: Object.freeze([...path]) });
   return Object.freeze({
     equals(value: JsonPrimitive): Expression {
       return Object.freeze({ op: 'eq', left: reference, right: value });

@@ -201,6 +201,13 @@ events, idempotency records, and projections. Active and paused runs must first
 be cancelled or otherwise reach a terminal state. The source repository and a
 completed run's delivery branch are preserved.
 
+### `kouro event <run-id> <invocation> <event> ...`
+
+Delivers JSON to the exact invocation waiting for the named external event.
+Use exactly one of `--payload <json>` or `--payload-file <path>`. Supplying
+`--idempotency-key <key>` makes retries return the original durable result
+without committing another event; omitted keys are generated per submission.
+
 ### `kouro eval ...`
 
 Evaluation datasets are regular JSON files directly under

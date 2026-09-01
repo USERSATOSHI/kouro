@@ -13,10 +13,18 @@ function readOutputPath(
 ): JsonValue | undefined {
   let current = output;
   for (const segment of path) {
-    if (current === undefined || !isJsonObject(current)) {
+    if (current === undefined) {
       return undefined;
     }
-    current = current[segment];
+    if (isJsonObject(current)) {
+      current = current[segment];
+      continue;
+    }
+    if (Array.isArray(current) && /^\d+$/.test(segment)) {
+      current = current[Number(segment)];
+      continue;
+    }
+    return undefined;
   }
   return current;
 }
@@ -25,6 +33,7 @@ function resolveLeft(
   expression: Extract<Expression, { left: unknown }>,
   state: RunState,
   output: JsonValue | undefined,
+  input: JsonValue | undefined,
 ): Result<JsonValue | undefined, RuntimeError> {
   if (expression.left.scope === 'counter') {
     const value = state.counters[expression.left.name];
@@ -36,7 +45,9 @@ function resolveLeft(
     return ok(value);
   }
 
-  return ok(readOutputPath(output, expression.left.path));
+  return ok(
+    readOutputPath(expression.left.scope === 'input' ? input : output, expression.left.path),
+  );
 }
 
 function compare(
@@ -59,16 +70,17 @@ export function evaluateExpression(
   expression: Expression,
   state: RunState,
   output: JsonValue | undefined,
+  input?: JsonValue,
 ): Result<boolean, RuntimeError> {
   if (expression.op === 'not') {
-    const result = evaluateExpression(expression.expression, state, output);
+    const result = evaluateExpression(expression.expression, state, output, input);
     return result.isErr() ? result : ok(!result.unwrap());
   }
 
   if (expression.op === 'and' || expression.op === 'or') {
     const target = expression.op === 'and';
     for (const child of expression.expressions) {
-      const result = evaluateExpression(child, state, output);
+      const result = evaluateExpression(child, state, output, input);
       if (result.isErr()) {
         return result;
       }
@@ -79,7 +91,7 @@ export function evaluateExpression(
     return ok(target);
   }
 
-  const left = resolveLeft(expression, state, output);
+  const left = resolveLeft(expression, state, output, input);
   if (left.isErr()) {
     return left;
   }

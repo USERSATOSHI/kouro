@@ -37,6 +37,10 @@ export type ValueReference =
   | {
       readonly scope: 'output';
       readonly path: readonly string[];
+    }
+  | {
+      readonly scope: 'input';
+      readonly path: readonly string[];
     };
 
 export type Expression =
@@ -70,7 +74,19 @@ export type Expression =
 
 export interface SourceNodeDefinition {
   readonly id: string;
-  readonly type: 'agent' | 'approval' | 'command' | 'complete' | 'delivery_review';
+  readonly type:
+    | 'agent'
+    | 'approval'
+    | 'command'
+    | 'complete'
+    | 'delivery_review'
+    | 'parallel'
+    | 'for_each'
+    | 'sleep'
+    | 'wait_for_event'
+    | 'gateway'
+    | 'branch_return'
+    | 'call';
   readonly priority?: number;
   readonly recoveryPolicy?: RecoveryPolicy;
   readonly capabilities?: readonly string[];
@@ -88,6 +104,44 @@ export interface SourceNodeDefinition {
   readonly clearContext?: boolean;
   readonly result?: 'succeeded' | 'failed';
   readonly skipOutcome?: string;
+  /** Compiler-only reference used before a call is expanded. */
+  readonly workflow?: string;
+  readonly automaticOutcome?: string;
+  readonly durationMs?: number;
+  readonly event?: string;
+  readonly payloadSchema?: string;
+  readonly timeoutMs?: number;
+  readonly maxConcurrent?: number;
+  readonly maxItems?: number;
+  readonly workspace?: 'isolated';
+  readonly join?: 'disjoint';
+  readonly itemsFrom?: CollectionSource;
+  readonly branches?: readonly CompiledBranchDefinition[] | Readonly<Record<string, string>>;
+  readonly template?: CompiledBranchTemplate;
+  readonly scope?: InvocationScope;
+}
+
+export interface CollectionSource {
+  readonly nodeId: string;
+  readonly path: readonly string[];
+}
+
+export interface InvocationScope {
+  readonly kind: 'call' | 'parallel' | 'for_each';
+  readonly ownerNodeId: string;
+  readonly branchId?: string;
+  readonly parent?: InvocationScope;
+}
+
+export interface CompiledBranchDefinition {
+  readonly id: string;
+  readonly entryNodeId: string;
+  readonly returnNodeIds: readonly string[];
+}
+
+export interface CompiledBranchTemplate {
+  readonly entryNodeId: string;
+  readonly returnNodeIds: readonly string[];
 }
 
 /** Explicit durable structured-output source available to a consuming agent. */
@@ -146,6 +200,7 @@ export interface WorkflowSourceBundle {
   readonly runLimits?: {
     readonly maxDurationMs?: number;
     readonly maxNodeInvocations?: number;
+    readonly maxConcurrentInvocations?: number;
   };
   readonly prompts?: Readonly<Record<string, string>>;
   readonly schemas?: Readonly<Record<string, JsonValue>>;
@@ -180,6 +235,7 @@ export type RunStatus =
   | 'created'
   | 'running'
   | 'waiting_for_approval'
+  | 'waiting'
   | 'paused'
   | 'succeeded'
   | 'failed'
@@ -189,6 +245,7 @@ export type InvocationState =
   | 'pending'
   | 'active'
   | 'waiting_for_approval'
+  | 'waiting'
   | 'interrupted'
   | 'succeeded'
   | 'failed'
@@ -265,6 +322,19 @@ export interface NodeAttempt {
   readonly usage?: TokenUsage;
   /** Subordinate executions owned by this attempt; never scheduler inputs. */
   readonly subagents?: readonly SubagentExecutionSummary[];
+  readonly startedAt?: string;
+  readonly finishedAt?: string;
+}
+
+export interface InvocationWait {
+  readonly kind: 'timer' | 'event';
+  readonly scheduledAt: string;
+  readonly dueAt?: string;
+  readonly event?: string;
+  readonly receivedAt?: string;
+  readonly payload?: JsonValue;
+  readonly actor?: string;
+  readonly idempotencyKey?: string;
 }
 
 export interface NodeInvocation {
@@ -278,6 +348,39 @@ export interface NodeInvocation {
   readonly output?: JsonValue;
   readonly selectedTransitionId?: string;
   readonly approval?: ApprovalBinding;
+  readonly input?: JsonValue;
+  readonly scope?: InvocationScope;
+  readonly parallelGroupId?: string;
+  readonly branchId?: string;
+  readonly wait?: InvocationWait;
+  readonly sourceInvocationSequence?: number;
+}
+
+export interface ParallelBranchState {
+  readonly id: string;
+  readonly entryNodeId: string;
+  readonly state: 'pending' | 'active' | 'succeeded' | 'failed';
+  readonly invocationSequence?: number;
+  readonly input?: JsonValue;
+  readonly output?: JsonValue;
+  readonly changedPaths?: readonly string[];
+  readonly workspaceId?: string;
+}
+
+export interface ParallelGroup {
+  readonly id: string;
+  readonly ownerInvocationSequence: number;
+  readonly ownerNodeId: string;
+  readonly kind: 'parallel' | 'for_each';
+  readonly forkSequence: number;
+  readonly maxConcurrent: number;
+  readonly baseHead: string;
+  readonly baseTree: string;
+  readonly checkpoint: string;
+  readonly branches: readonly ParallelBranchState[];
+  readonly state: 'active' | 'succeeded' | 'failed' | 'conflict';
+  readonly joinedHead?: string;
+  readonly joinedTree?: string;
 }
 
 export interface ApprovalBinding {
@@ -339,12 +442,14 @@ export interface RunState {
   readonly configuration: Readonly<Record<string, JsonValue>>;
   readonly startedAt?: string;
   readonly observedAt?: string;
+  readonly finishedAt?: string;
   readonly status: RunStatus;
   readonly nextInvocationSequence: number;
   readonly counters: Readonly<Record<string, number>>;
   readonly invocations: readonly NodeInvocation[];
   readonly artifacts?: readonly ArtifactReference[];
   readonly delivery?: DeliveryState;
+  readonly parallelGroups?: readonly ParallelGroup[];
 }
 
 export type RunEvent =
@@ -386,6 +491,9 @@ export type RunEvent =
       readonly sourceInvocationSequence?: number;
       readonly transitionId?: string;
       readonly activatedAt?: string;
+      readonly parallelGroupId?: string;
+      readonly branchId?: string;
+      readonly input?: JsonValue;
     }
   | {
       readonly sequence: number;
@@ -395,6 +503,7 @@ export type RunEvent =
       readonly harnessId?: string;
       readonly model?: string;
       readonly resumeToken?: string;
+      readonly startedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -403,6 +512,7 @@ export type RunEvent =
       readonly attemptNumber: number;
       readonly harnessId: string;
       readonly resumeToken: string;
+      readonly startedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -487,12 +597,14 @@ export type RunEvent =
       readonly failure: AttemptFailure;
       readonly retry: 'fallback' | 'none';
       readonly finishedAt?: string;
+      readonly attemptFinishedAt?: string;
     }
   | {
       readonly sequence: number;
       readonly type: 'attempt.interrupted';
       readonly invocationSequence: number;
       readonly attemptNumber: number;
+      readonly finishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -542,11 +654,101 @@ export type RunEvent =
     }
   | {
       readonly sequence: number;
+      readonly type: 'parallel.forked';
+      readonly groupId: string;
+      readonly invocationSequence: number;
+      readonly kind: 'parallel' | 'for_each';
+      readonly branches: readonly {
+        readonly id: string;
+        readonly entryNodeId: string;
+        readonly input?: JsonValue;
+        readonly workspaceId: string;
+      }[];
+      readonly maxConcurrent: number;
+      readonly baseHead: string;
+      readonly baseTree: string;
+      readonly checkpoint: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'parallel.branch_completed';
+      readonly groupId: string;
+      readonly branchId: string;
+      readonly invocationSequence: number;
+      readonly outcome: 'succeeded' | 'failed';
+      readonly output?: JsonValue;
+      readonly changedPaths?: readonly string[];
+      readonly finishedAt?: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'parallel.joined';
+      readonly groupId: string;
+      readonly outcome: 'succeeded' | 'failed' | 'conflict';
+      readonly joinedHead?: string;
+      readonly joinedTree?: string;
+      readonly finishedAt?: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'collection.expanded';
+      readonly invocationSequence: number;
+      readonly groupId: string;
+      readonly items: readonly JsonValue[];
+      readonly workspaces: readonly {
+        readonly branchId: string;
+        readonly workspaceId: string;
+      }[];
+      readonly maxConcurrent: number;
+      readonly baseHead: string;
+      readonly baseTree: string;
+      readonly checkpoint: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'timer.scheduled';
+      readonly invocationSequence: number;
+      readonly scheduledAt: string;
+      readonly dueAt: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'timer.elapsed';
+      readonly invocationSequence: number;
+      readonly observedAt: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'event.waiting';
+      readonly invocationSequence: number;
+      readonly event: string;
+      readonly scheduledAt: string;
+      readonly timeoutAt?: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'external_event.received';
+      readonly invocationSequence: number;
+      readonly event: string;
+      readonly payload: JsonValue;
+      readonly actor: string;
+      readonly receivedAt: string;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly sequence: number;
+      readonly type: 'event.timed_out';
+      readonly invocationSequence: number;
+      readonly observedAt: string;
+    }
+  | {
+      readonly sequence: number;
       readonly type: 'invocation.completed';
       readonly invocationSequence: number;
       readonly outcome: string;
       readonly output?: JsonValue;
       readonly finishedAt?: string;
+      readonly attemptFinishedAt?: string;
     }
   | {
       readonly sequence: number;
@@ -597,6 +799,9 @@ export type OrchestrationIntent =
       readonly invocationSequence: number;
       readonly sourceInvocationSequence?: number;
       readonly transitionId?: string;
+      readonly parallelGroupId?: string;
+      readonly branchId?: string;
+      readonly input?: JsonValue;
     }
   | {
       readonly type: 'attempt.schedule';
@@ -629,4 +834,74 @@ export type OrchestrationIntent =
   | {
       readonly type: 'run.complete';
       readonly result: 'succeeded' | 'failed';
+    }
+  | {
+      readonly type: 'parallel.fork';
+      readonly invocationSequence: number;
+      readonly groupId: string;
+      readonly branches: readonly { readonly id: string; readonly entryNodeId: string }[];
+      readonly maxConcurrent: number;
+    }
+  | {
+      readonly type: 'collection.expand';
+      readonly invocationSequence: number;
+      readonly groupId: string;
+      readonly items: readonly JsonValue[];
+      readonly entryNodeId: string;
+      readonly maxConcurrent: number;
+    }
+  | {
+      readonly type: 'parallel.branch.complete';
+      readonly groupId: string;
+      readonly branchId: string;
+      readonly invocationSequence: number;
+      readonly outcome: 'succeeded' | 'failed';
+    }
+  | {
+      readonly type: 'parallel.join';
+      readonly groupId: string;
+      readonly outcome: 'succeeded' | 'failed' | 'conflict';
+    }
+  | {
+      readonly type: 'timer.schedule';
+      readonly invocationSequence: number;
+      readonly durationMs: number;
+    }
+  | {
+      readonly type: 'timer.elapse';
+      readonly invocationSequence: number;
+    }
+  | {
+      readonly type: 'event.wait';
+      readonly invocationSequence: number;
+      readonly event: string;
+      readonly timeoutMs?: number;
+    }
+  | {
+      readonly type: 'event.timeout';
+      readonly invocationSequence: number;
+    }
+  | {
+      readonly type: 'invocation.complete';
+      readonly invocationSequence: number;
+      readonly outcome: string;
+      readonly output?: JsonValue;
     };
+
+export interface TraceSpan {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly parentSpanId?: string;
+  readonly name: string;
+  readonly kind: 'run' | 'invocation' | 'attempt';
+  readonly status: 'unset' | 'ok' | 'error';
+  readonly startedAt?: string;
+  readonly finishedAt?: string;
+  readonly attributes: Readonly<Record<string, JsonValue>>;
+}
+
+export interface RunTrace {
+  readonly runId: string;
+  readonly traceId: string;
+  readonly spans: readonly TraceSpan[];
+}

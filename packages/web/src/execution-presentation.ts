@@ -46,7 +46,7 @@ export function invocationFailure(
 export function runFocus(run: RunDetails): RunFocus {
   const invocation =
     run.state.invocations.findLast(({ state }) =>
-      ['active', 'waiting_for_approval'].includes(state),
+      ['active', 'waiting', 'waiting_for_approval'].includes(state),
     ) ?? run.state.invocations.at(-1);
   const node = run.nodes.find(({ id }) => id === invocation?.nodeId);
   const nodeTitle = node?.title ?? invocation?.nodeId;
@@ -57,6 +57,14 @@ export function runFocus(run: RunDetails): RunFocus {
       detail: nodeTitle
         ? `Review ${nodeTitle} to continue.`
         : 'Review the pending decision to continue.',
+    };
+  }
+  if (run.status === 'waiting') {
+    return {
+      title: 'Waiting for workflow input',
+      detail: nodeTitle
+        ? `${nodeTitle} is waiting for its timer or external event.`
+        : 'The workflow is waiting for a timer or external event.',
     };
   }
   if (run.status === 'paused') {
