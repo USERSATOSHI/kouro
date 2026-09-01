@@ -35,7 +35,8 @@ These invariants are the acceptance boundary for the deterministic simulator.
     `missing_transition` failure.
 15. Transition declaration order does not affect selection.
 16. A default is considered only when no non-default transition matches.
-17. Parallel fan-out and joins are outside the first runtime.
+17. Parallel fan-out is explicit, bounded, isolated, and joined in canonical
+    branch-identity order.
 18. Conditions use a versioned restricted expression language.
 
 ## Counters and limits
@@ -87,3 +88,12 @@ These invariants are the acceptance boundary for the deterministic simulator.
 44. Agent steering binds to one active invocation and attempt, is recorded
     before delivery, and never changes graph structure, permissions, limits, or
     scheduler counters.
+45. Nested calls and branch templates are compiler-expanded and cannot increase
+    parent permissions, defaults, or run limits.
+46. Collection expansion, timer scheduling, observed time, and external event
+    receipt are durable facts before they influence scheduling.
+47. Parallel writers use distinct workspaces and auto-join only disjoint paths.
+48. External events target one waiting invocation; expected sequence and
+    idempotency make the first durable timeout or receipt win.
+49. Trace identifiers and parent relationships are derived only from durable
+    Kouro identities.

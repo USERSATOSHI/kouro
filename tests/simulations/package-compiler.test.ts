@@ -48,8 +48,8 @@ describe('M1 content-addressed TypeScript ADW compiler', () => {
       },
     ]);
     expect(compiled.unwrap().bundle.semanticVersions).toEqual({
-      compiler: '0.4.0',
-      ir: '4',
+      compiler: '0.5.0',
+      ir: '5',
       expressions: '1',
     });
   });

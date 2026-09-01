@@ -55,6 +55,7 @@ import {
   WorktreeSandboxProvider,
   type RunWorktree,
 } from '@kouro/sandbox-worktree';
+import { ParallelWorktreeManager } from './parallel-worktree-manager.ts';
 import {
   SqliteTicketRepository,
   SqliteTicketRunStore,
@@ -317,6 +318,7 @@ export class LocalKouroHost {
   private readonly ticketProviders: ReadonlyMap<string, TicketProvider>;
   private readonly artifactWriter: LocalArtifactWriter;
   private readonly activityStore: LocalInvocationActivityStore;
+  private readonly parallelManagers = new Map<string, ParallelWorktreeManager>();
   private initialized = false;
 
   constructor(
@@ -549,7 +551,15 @@ export class LocalKouroHost {
     const harnesses = request.harnesses?.length
       ? request.harnesses
       : ['codex', 'claude-code', 'opencode', 'pi'];
-    const created = this.coordinator(worktree.unwrap().path).createRun({
+    const parallelManager = new ParallelWorktreeManager(
+      this.sandbox,
+      repoId,
+      request.repositoryPath,
+      worktree.unwrap().path,
+      id,
+    );
+    this.parallelManagers.set(id, parallelManager);
+    const created = this.coordinator(worktree.unwrap().path, parallelManager).createRun({
       runId: id,
       artifact: compiled.unwrap(),
       startingCommit: pinned.unwrap().startingCommit,
@@ -661,15 +671,32 @@ export class LocalKouroHost {
 
   coordinatorFor(aggregate: RunAggregate): RunCoordinator {
     const configuration = runConfiguration(aggregate);
-    return this.coordinator(configuration?.worktreePath ?? process.cwd());
+    const workingDirectory = configuration?.worktreePath ?? process.cwd();
+    const parallelManager = configuration
+      ? (this.parallelManagers.get(aggregate.runId) ??
+        new ParallelWorktreeManager(
+          this.sandbox,
+          configuration.repositoryId,
+          configuration.repositoryPath,
+          workingDirectory,
+          aggregate.runId,
+        ))
+      : undefined;
+    if (parallelManager) this.parallelManagers.set(aggregate.runId, parallelManager);
+    return this.coordinator(workingDirectory, parallelManager);
   }
 
-  coordinator(workingDirectory = process.cwd()): RunCoordinator {
+  coordinator(
+    workingDirectory = process.cwd(),
+    parallelWorkspaces?: ParallelWorktreeManager,
+  ): RunCoordinator {
     return new RunCoordinator(
       this.store,
       new BunCommandRunner(workingDirectory),
       new AgentExecutor(this.registry, this.artifactWriter, this.activityStore),
       workingDirectory,
+      undefined,
+      parallelWorkspaces,
     );
   }
 
@@ -1227,6 +1254,7 @@ export class LocalKouroHost {
     this.ticketRuns.dispose();
     this.tickets.dispose();
     this.store.dispose();
+    this.parallelManagers.clear();
     this.initialized = false;
   }
 

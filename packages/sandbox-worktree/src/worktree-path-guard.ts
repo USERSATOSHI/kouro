@@ -38,10 +38,11 @@ export class WorktreePathGuard {
     return fromAsync(
       async () => {
         const canonicalRoot = await realpath(root);
-        const lexical = resolve(canonicalRoot, path);
-        if (!isWithin(canonicalRoot, lexical)) {
-          throw new Error('Path is outside the worktree');
-        }
+        // Resolve absolute caller paths before canonicalizing the existing
+        // target. On macOS `/var` is commonly a symlink to `/private/var`, so
+        // comparing the caller's lexical spelling with the canonical root
+        // would reject an otherwise valid path inside the worktree.
+        const lexical = isAbsolute(path) ? resolve(path) : resolve(canonicalRoot, path);
         const existing = operation === 'read' ? lexical : await nearestExistingParent(lexical);
         const canonicalExisting = await realpath(existing);
         if (!isWithin(canonicalRoot, canonicalExisting)) {

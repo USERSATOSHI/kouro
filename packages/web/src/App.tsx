@@ -441,7 +441,9 @@ function flowEdges(run: RunDetails, direction: DiagramDirection): WorkflowFlowEd
   );
   const activeNodes = new Set(
     run.nodes
-      .filter(({ latestState }) => ['active', 'waiting_for_approval'].includes(latestState ?? ''))
+      .filter(({ latestState }) =>
+        ['active', 'waiting', 'waiting_for_approval'].includes(latestState ?? ''),
+      )
       .map(({ id }) => id),
   );
   const outgoingCounts = new Map<string, number>();
@@ -2450,7 +2452,7 @@ function ExecutionConsole({
                     <button
                       disabled={
                         busy ||
-                        !['running', 'waiting_for_approval'].includes(run.status)
+                        !['running', 'waiting', 'waiting_for_approval'].includes(run.status)
                       }
                       onClick={() => void submitRunAction('pause')}
                       type="button"

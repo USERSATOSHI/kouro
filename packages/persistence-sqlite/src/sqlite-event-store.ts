@@ -101,7 +101,19 @@ function isNodeDefinition(value: unknown): value is NodeDefinition {
   if (!isRecord(value)) return false;
   return (
     typeof value.id === 'string' &&
-    ['agent', 'approval', 'command', 'complete', 'delivery_review'].includes(String(value.type)) &&
+    [
+      'agent',
+      'approval',
+      'command',
+      'complete',
+      'delivery_review',
+      'parallel',
+      'for_each',
+      'sleep',
+      'wait_for_event',
+      'gateway',
+      'branch_return',
+    ].includes(String(value.type)) &&
     typeof value.ordinal === 'number' &&
     typeof value.priority === 'number'
   );
@@ -257,7 +269,10 @@ function isRunEvent(value: unknown): value is RunEvent {
       return (
         hasNumber(value, 'invocationSequence') &&
         typeof value.nodeId === 'string' &&
-        hasOptionalTimestamp(value, 'activatedAt')
+        hasOptionalTimestamp(value, 'activatedAt') &&
+        (value.parallelGroupId === undefined || typeof value.parallelGroupId === 'string') &&
+        (value.branchId === undefined || typeof value.branchId === 'string') &&
+        (value.input === undefined || isJsonValue(value.input))
       );
     case 'attempt.started':
       return (
@@ -265,14 +280,16 @@ function isRunEvent(value: unknown): value is RunEvent {
         hasNumber(value, 'attemptNumber') &&
         (value.harnessId === undefined || typeof value.harnessId === 'string') &&
         (value.model === undefined || typeof value.model === 'string') &&
-        (value.resumeToken === undefined || typeof value.resumeToken === 'string')
+        (value.resumeToken === undefined || typeof value.resumeToken === 'string') &&
+        hasOptionalTimestamp(value, 'startedAt')
       );
     case 'attempt.resumed':
       return (
         hasNumber(value, 'invocationSequence') &&
         hasNumber(value, 'attemptNumber') &&
         typeof value.harnessId === 'string' &&
-        typeof value.resumeToken === 'string'
+        typeof value.resumeToken === 'string' &&
+        hasOptionalTimestamp(value, 'startedAt')
       );
     case 'attempt.resume_token_recorded':
       return (
@@ -343,10 +360,15 @@ function isRunEvent(value: unknown): value is RunEvent {
         typeof value.failure.kind === 'string' &&
         typeof value.failure.message === 'string' &&
         (value.retry === 'fallback' || value.retry === 'none') &&
-        hasOptionalTimestamp(value, 'finishedAt')
+        hasOptionalTimestamp(value, 'finishedAt') &&
+        hasOptionalTimestamp(value, 'attemptFinishedAt')
       );
     case 'attempt.interrupted':
-      return hasNumber(value, 'invocationSequence') && hasNumber(value, 'attemptNumber');
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        hasNumber(value, 'attemptNumber') &&
+        hasOptionalTimestamp(value, 'finishedAt')
+      );
     case 'attempt.interrupt_requested':
       return (
         hasNumber(value, 'invocationSequence') &&
@@ -391,7 +413,88 @@ function isRunEvent(value: unknown): value is RunEvent {
       return (
         hasNumber(value, 'invocationSequence') &&
         typeof value.outcome === 'string' &&
+        hasOptionalTimestamp(value, 'finishedAt') &&
+        hasOptionalTimestamp(value, 'attemptFinishedAt')
+      );
+    case 'parallel.forked':
+      return (
+        typeof value.groupId === 'string' &&
+        hasNumber(value, 'invocationSequence') &&
+        (value.kind === 'parallel' || value.kind === 'for_each') &&
+        Array.isArray(value.branches) &&
+        value.branches.every(
+          (branch) =>
+            isRecord(branch) &&
+            typeof branch.id === 'string' &&
+            typeof branch.entryNodeId === 'string' &&
+            typeof branch.workspaceId === 'string' &&
+            (branch.input === undefined || isJsonValue(branch.input)),
+        ) &&
+        hasNumber(value, 'maxConcurrent') &&
+        typeof value.baseHead === 'string' &&
+        typeof value.baseTree === 'string' &&
+        typeof value.checkpoint === 'string'
+      );
+    case 'collection.expanded':
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        typeof value.groupId === 'string' &&
+        Array.isArray(value.items) &&
+        value.items.every(isJsonValue) &&
+        Array.isArray(value.workspaces) &&
+        value.workspaces.every(
+          (workspace) =>
+            isRecord(workspace) &&
+            typeof workspace.branchId === 'string' &&
+            typeof workspace.workspaceId === 'string',
+        ) &&
+        hasNumber(value, 'maxConcurrent') &&
+        typeof value.baseHead === 'string' &&
+        typeof value.baseTree === 'string' &&
+        typeof value.checkpoint === 'string'
+      );
+    case 'parallel.branch_completed':
+      return (
+        typeof value.groupId === 'string' &&
+        typeof value.branchId === 'string' &&
+        hasNumber(value, 'invocationSequence') &&
+        (value.outcome === 'succeeded' || value.outcome === 'failed') &&
+        (value.output === undefined || isJsonValue(value.output)) &&
+        (value.changedPaths === undefined ||
+          (Array.isArray(value.changedPaths) &&
+            value.changedPaths.every((path) => typeof path === 'string'))) &&
         hasOptionalTimestamp(value, 'finishedAt')
+      );
+    case 'parallel.joined':
+      return (
+        typeof value.groupId === 'string' &&
+        ['succeeded', 'failed', 'conflict'].includes(String(value.outcome)) &&
+        hasOptionalTimestamp(value, 'finishedAt')
+      );
+    case 'timer.scheduled':
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        typeof value.scheduledAt === 'string' &&
+        typeof value.dueAt === 'string'
+      );
+    case 'timer.elapsed':
+    case 'event.timed_out':
+      return hasNumber(value, 'invocationSequence') && typeof value.observedAt === 'string';
+    case 'event.waiting':
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        typeof value.event === 'string' &&
+        typeof value.scheduledAt === 'string' &&
+        hasOptionalTimestamp(value, 'timeoutAt')
+      );
+    case 'external_event.received':
+      return (
+        hasNumber(value, 'invocationSequence') &&
+        typeof value.event === 'string' &&
+        isJsonValue(value.payload) &&
+        typeof value.actor === 'string' &&
+        typeof value.receivedAt === 'string' &&
+        typeof value.idempotencyKey === 'string'
       );
     case 'approval.requested':
       return isApprovalBinding(value.binding);

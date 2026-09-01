@@ -7,6 +7,7 @@ import type {
   RunEventInput,
   RunState,
   TokenUsage,
+  RunTrace,
 } from '@kouro/domain';
 import type { Result } from '@usersatoshi/results';
 
@@ -136,11 +137,71 @@ export interface CommandExecution {
 }
 
 export interface CommandRunner {
-  execute(command: string): Promise<Result<CommandExecution, CommandRunnerError>>;
+  execute(
+    command: string,
+    workingDirectory?: string,
+  ): Promise<Result<CommandExecution, CommandRunnerError>>;
 }
 
 export interface Clock {
   now(): string;
+}
+
+export interface ParallelWorkspacePreparation {
+  readonly baseTree: string;
+  readonly checkpoint: string;
+  readonly workspaces: readonly {
+    readonly branchId: string;
+    readonly workspaceId: string;
+    readonly workingDirectory: string;
+  }[];
+}
+
+export interface ParallelBranchResult {
+  readonly changedPaths: readonly string[];
+}
+
+export interface ParallelJoinResult {
+  readonly outcome: 'succeeded' | 'conflict';
+  readonly head?: string;
+  readonly tree?: string;
+}
+
+/** Recoverable isolated-worktree operations owned by infrastructure. */
+export interface ParallelWorkspaceManager {
+  recover(
+    runId: string,
+    groupId: string,
+    baseHead: string,
+    baseTree: string,
+    checkpoint: string,
+    workspaces: readonly { readonly branchId: string; readonly workspaceId: string }[],
+  ): Promise<Result<void, CommandRunnerError>>;
+  prepare(
+    runId: string,
+    groupId: string,
+    baseHead: string,
+    branchIds: readonly string[],
+  ): Promise<Result<ParallelWorkspacePreparation, CommandRunnerError>>;
+  inspectBranch(
+    runId: string,
+    groupId: string,
+    branchId: string,
+  ): Promise<Result<ParallelBranchResult, CommandRunnerError>>;
+  join(
+    runId: string,
+    groupId: string,
+    branchIds: readonly string[],
+    expectedHead: string,
+  ): Promise<Result<ParallelJoinResult, CommandRunnerError>>;
+  workingDirectory(runId: string, groupId: string, branchId: string): string | undefined;
+  cleanupSuccessful(runId: string, groupId: string): Promise<void>;
+}
+
+/** Best-effort trace sink. Export failures are observable but non-authoritative. */
+export interface TraceExporter {
+  export(trace: RunTrace): Promise<Result<void, CommandRunnerError>>;
+  observeFailure(error: CommandRunnerError): void;
 }
 
 export const enum HarnessErrorKind {

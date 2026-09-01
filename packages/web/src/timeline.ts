@@ -25,6 +25,9 @@ export interface TimelineBlock {
   readonly duration: number;
   readonly activatedAt?: string;
   readonly finishedAt?: string;
+  readonly parallelGroupId?: string;
+  readonly branchId?: string;
+  readonly workspaceId?: string;
   readonly state: string;
   readonly attemptCount: number;
   readonly model?: string;
@@ -109,6 +112,11 @@ export function timelineModel(
   const blockSources: TimelineBlockSource[] = run.state.invocations.map((invocation) => {
     const node = run.nodes.find(({ id }) => id === invocation.nodeId);
     const attempt = invocation.attempts.at(-1);
+    const branch = invocation.parallelGroupId
+      ? run.state.parallelGroups
+          ?.find(({ id }) => id === invocation.parallelGroupId)
+          ?.branches.find(({ id }) => id === invocation.branchId)
+      : undefined;
     const attemptsWithUsage = invocation.attempts.filter(
       (candidate): candidate is typeof candidate & { readonly usage: TokenUsage } =>
         candidate.usage !== undefined,
@@ -132,6 +140,11 @@ export function timelineModel(
       row: 0,
       ...(invocation.activatedAt === undefined ? {} : { activatedAt: invocation.activatedAt }),
       ...(invocation.finishedAt === undefined ? {} : { finishedAt: invocation.finishedAt }),
+      ...(invocation.parallelGroupId === undefined
+        ? {}
+        : { parallelGroupId: invocation.parallelGroupId }),
+      ...(invocation.branchId === undefined ? {} : { branchId: invocation.branchId }),
+      ...(branch?.workspaceId === undefined ? {} : { workspaceId: branch.workspaceId }),
       state: displayedState(run, node, invocation),
       attemptCount: invocation.attempts.length,
       model: attempt?.model,

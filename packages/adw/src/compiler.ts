@@ -17,6 +17,7 @@ import { CompilerErrorKind, toCompilerError, type CompilerError } from './errors
 import { canonicalJson, compareCanonicalText, sha256 } from './canonical.ts';
 
 const NODE_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const GENERATED_NODE_ID_PATTERN = /^@(call|parallel|forEach)\/[A-Za-z0-9_@/-]+$/;
 const SUBAGENT_CAPABILITIES = new Set(['repository.read']);
 
 function isAgentReasoningEffort(value: unknown): value is AgentReasoningEffort {
@@ -55,8 +56,8 @@ function expressionError(
   if (expression.left.scope === 'counter' && counters[expression.left.name] === undefined) {
     return `unknown counter: ${expression.left.name}`;
   }
-  if (expression.left.scope === 'output' && expression.left.path.length === 0) {
-    return 'output reference path must not be empty';
+  if (expression.left.scope !== 'counter' && expression.left.path.length === 0) {
+    return `${expression.left.scope} reference path must not be empty`;
   }
   if (
     (expression.op === 'gte' || expression.op === 'lt') &&
@@ -185,6 +186,55 @@ function nodeConfigurationError(node: SourceNodeDefinition): string | undefined 
       return node.result === undefined || node.result === 'succeeded' || node.result === 'failed'
         ? undefined
         : 'complete result must be succeeded or failed';
+    case 'parallel':
+      if (!Array.isArray(node.branches) || node.branches.length === 0) {
+        return 'parallel requires at least one compiled branch';
+      }
+      if (!Number.isSafeInteger(node.maxConcurrent) || (node.maxConcurrent ?? 0) <= 0) {
+        return 'parallel maxConcurrent must be a positive safe integer';
+      }
+      if (node.workspace !== 'isolated' || node.join !== 'disjoint') {
+        return 'parallel requires isolated workspace and disjoint join';
+      }
+      return undefined;
+    case 'for_each':
+      if (
+        !node.template ||
+        !node.itemsFrom ||
+        node.itemsFrom.path.some((segment) => typeof segment !== 'string')
+      ) {
+        return 'forEach requires a compiled template and valid itemsFrom path';
+      }
+      if (!Number.isSafeInteger(node.maxItems) || (node.maxItems ?? 0) <= 0) {
+        return 'forEach maxItems must be a positive safe integer';
+      }
+      if (!Number.isSafeInteger(node.maxConcurrent) || (node.maxConcurrent ?? 0) <= 0) {
+        return 'forEach maxConcurrent must be a positive safe integer';
+      }
+      if (node.workspace !== 'isolated' || node.join !== 'disjoint') {
+        return 'forEach requires isolated workspace and disjoint join';
+      }
+      return undefined;
+    case 'sleep':
+      return Number.isSafeInteger(node.durationMs) && (node.durationMs ?? 0) > 0
+        ? undefined
+        : 'sleep durationMs must be a positive safe integer';
+    case 'wait_for_event':
+      if (!node.event?.trim()) return 'waitForEvent event is required';
+      if (
+        node.timeoutMs !== undefined &&
+        (!Number.isSafeInteger(node.timeoutMs) || node.timeoutMs <= 0)
+      ) {
+        return 'waitForEvent timeoutMs must be a positive safe integer';
+      }
+      return undefined;
+    case 'gateway':
+    case 'branch_return':
+      return node.automaticOutcome === 'succeeded' || node.automaticOutcome === 'failed'
+        ? undefined
+        : `${node.type} requires a compiled completion outcome`;
+    case 'call':
+      return 'call nodes must be expanded by the package compiler';
     default:
       return 'node type is unsupported';
   }
@@ -393,7 +443,10 @@ function validateNodes(
 ): Result<ReadonlySet<string>, NodeValidationError> {
   const nodeIds = new Set<string>();
   for (const node of nodes) {
-    if (!NODE_ID_PATTERN.test(node.id)) {
+    if (
+      !NODE_ID_PATTERN.test(node.id) &&
+      !(node.scope && GENERATED_NODE_ID_PATTERN.test(node.id))
+    ) {
       return toCompilerError(CompilerErrorKind.InvalidNodeId, {
         nodeId: node.id,
       });
@@ -430,7 +483,7 @@ function validateSubagents(subagents: readonly SourceSubagentDefinition[]): Resu
 > {
   const definitions = new Map<string, SourceSubagentDefinition>();
   for (const subagent of subagents) {
-    if (!NODE_ID_PATTERN.test(subagent.id)) {
+    if (!NODE_ID_PATTERN.test(subagent.id) && !GENERATED_NODE_ID_PATTERN.test(subagent.id)) {
       return toCompilerError(CompilerErrorKind.InvalidSubagentId, {
         subagentId: subagent.id,
       });
@@ -484,7 +537,12 @@ function validateRunLimits(
   for (const [limit, value] of Object.entries(source.runLimits ?? {})) {
     if (!Number.isSafeInteger(value) || value <= 0) {
       return toCompilerError(CompilerErrorKind.InvalidRunLimit, {
-        limit: limit === 'maxDurationMs' ? 'maxDurationMs' : 'maxNodeInvocations',
+        limit:
+          limit === 'maxDurationMs'
+            ? 'maxDurationMs'
+            : limit === 'maxConcurrentInvocations'
+              ? 'maxConcurrentInvocations'
+              : 'maxNodeInvocations',
         value,
       });
     }
@@ -683,7 +741,22 @@ function validateGraph(
     { kind: CompilerErrorKind.UnreachableNode | CompilerErrorKind.UnboundedCycle }
   >
 > {
-  const unreachable = unreachableNodes(source.entryNodeId, nodeIds, source.transitions);
+  const compositionTransitions: SourceTransition[] = source.nodes.flatMap((node) => {
+    const entries = Array.isArray(node.branches)
+      ? node.branches.map(({ entryNodeId }) => entryNodeId)
+      : node.template
+        ? [node.template.entryNodeId]
+        : [];
+    return entries.map((entryNodeId, index) => ({
+      id: `@reach/${node.id}/${index}`,
+      from: { nodeId: node.id, outcome: '@fork' },
+      toNodeId: entryNodeId,
+    }));
+  });
+  const unreachable = unreachableNodes(source.entryNodeId, nodeIds, [
+    ...source.transitions,
+    ...compositionTransitions,
+  ]);
   if (unreachable.length > 0) {
     return toCompilerError(CompilerErrorKind.UnreachableNode, {
       nodeIds: unreachable,
@@ -766,6 +839,45 @@ function validate(source: WorkflowSourceBundle): Result<void, CompilerError> {
         nodeId: node.id,
         reason: `skipOutcome has no declared transition: ${node.skipOutcome}`,
       });
+    }
+    const requiredOutcomes =
+      node.type === 'sleep'
+        ? ['elapsed']
+        : node.type === 'wait_for_event'
+          ? node.timeoutMs === undefined
+            ? ['received']
+            : ['received', 'timed_out']
+          : node.type === 'parallel' || node.type === 'for_each'
+            ? ['succeeded', 'failed', 'conflict']
+            : [];
+    const missingOutcome = requiredOutcomes.find(
+      (outcome) =>
+        !source.transitions.some(({ from }) => from.nodeId === node.id && from.outcome === outcome),
+    );
+    if (missingOutcome) {
+      return toCompilerError(CompilerErrorKind.InvalidNodeConfiguration, {
+        nodeId: node.id,
+        reason: `${node.type} requires a ${missingOutcome} transition`,
+      });
+    }
+    if (
+      node.type === 'wait_for_event' &&
+      node.payloadSchema &&
+      !source.schemas?.[node.payloadSchema]
+    ) {
+      return toCompilerError(CompilerErrorKind.InvalidNodeConfiguration, {
+        nodeId: node.id,
+        reason: `payloadSchema was not compiled: ${node.payloadSchema}`,
+      });
+    }
+    if (node.type === 'for_each') {
+      const sourceNode = source.nodes.find(({ id }) => id === node.itemsFrom?.nodeId);
+      if (!sourceNode || sourceNode.id === node.id) {
+        return toCompilerError(CompilerErrorKind.InvalidNodeConfiguration, {
+          nodeId: node.id,
+          reason: `itemsFrom must name a prior node: ${node.itemsFrom?.nodeId ?? ''}`,
+        });
+      }
     }
   }
 

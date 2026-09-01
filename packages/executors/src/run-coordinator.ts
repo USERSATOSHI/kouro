@@ -13,7 +13,7 @@ import type {
   SubagentExecutionSummary,
   TokenUsage,
 } from '@kouro/domain';
-import { agentHarnessesForNode, scheduleRun } from '@kouro/runtime';
+import { agentHarnessesForNode, deriveRunTrace, scheduleRun } from '@kouro/runtime';
 import { ok, type Result } from '@usersatoshi/results';
 
 import { ExecutorErrorKind, toExecutorError, type ExecutorError } from './errors.ts';
@@ -30,8 +30,10 @@ import type {
   RunAggregate,
   RunStore,
   RunStoreError,
+  ParallelWorkspaceManager,
+  TraceExporter,
 } from './ports.ts';
-import { RunStoreErrorKind } from './ports.ts';
+import { CommandRunnerErrorKind, RunStoreErrorKind } from './ports.ts';
 
 const systemClock: Clock = {
   now(): string {
@@ -289,6 +291,13 @@ function promptForAgent(
   resumesExistingSession: boolean,
 ): string {
   const feedback = sourceFeedback(aggregate, invocationSequence);
+  const invocationInput = aggregate.state.invocations.find(
+    ({ sequence }) => sequence === invocationSequence,
+  )?.input;
+  const inputSection =
+    invocationInput === undefined
+      ? undefined
+      : `Immutable invocation input:\n${JSON.stringify(invocationInput, null, 2)}`;
   const sharedContext = sharedAgentContext(
     aggregate,
     definition,
@@ -297,12 +306,13 @@ function promptForAgent(
   );
   if (resumesExistingSession) {
     return (
-      [sharedContext, feedback].filter((section) => section !== undefined).join('\n\n') ||
-      'Continue the interrupted work.'
+      [inputSection, sharedContext, feedback]
+        .filter((section) => section !== undefined)
+        .join('\n\n') || 'Continue the interrupted work.'
     );
   }
   const basePrompt = promptWithWorkItem(aggregate, declaredPrompt);
-  return [basePrompt, sharedContext, feedback]
+  return [basePrompt, inputSection, sharedContext, feedback]
     .filter((section) => section !== undefined)
     .join('\n\n');
 }
@@ -343,6 +353,18 @@ function artifactChecksums(aggregate: RunAggregate): readonly string[] {
   ].toSorted();
 }
 
+function recordsAttemptSpans(aggregate: RunAggregate): boolean {
+  return Number(aggregate.artifact.bundle.semanticVersions.ir) >= 5;
+}
+
+function timestampAtOrAfter(clock: Clock, lowerBound: string | undefined): string {
+  const now = clock.now();
+  if (lowerBound === undefined) return now;
+  const nowMs = Date.parse(now);
+  const lowerMs = Date.parse(lowerBound);
+  return !Number.isNaN(nowMs) && !Number.isNaN(lowerMs) && nowMs < lowerMs ? lowerBound : now;
+}
+
 function appendAgentFailure(
   store: RunStore,
   aggregate: RunAggregate,
@@ -352,20 +374,19 @@ function appendAgentFailure(
   hasFallback: boolean,
   finishedAt: string,
 ): Result<RunAggregate, ExecutorError> {
-  const appended = fromStore(
-    store.appendEvent({
-      runId: aggregate.runId,
-      expectedSequence: aggregate.nextEventSequence,
-      idempotencyKey: `agent:failed:${invocationSequence}:${attemptNumber}`,
-      event: {
-        type: 'attempt.failed',
-        invocationSequence,
-        attemptNumber,
-        failure: serializedAgentFailure(error),
-        retry: hasFallback ? 'fallback' : 'none',
-        ...(hasFallback ? {} : { finishedAt }),
-      },
-    }),
+  const appended = appendLatestEvent(
+    store,
+    aggregate.runId,
+    `agent:failed:${invocationSequence}:${attemptNumber}`,
+    {
+      type: 'attempt.failed',
+      invocationSequence,
+      attemptNumber,
+      failure: serializedAgentFailure(error),
+      retry: hasFallback ? 'fallback' : 'none',
+      ...(hasFallback ? {} : { finishedAt }),
+      ...(recordsAttemptSpans(aggregate) ? { attemptFinishedAt: finishedAt } : {}),
+    },
   );
   return appended.isErr()
     ? appended
@@ -379,18 +400,16 @@ function recordResumeToken(
   attemptNumber: number,
   token: string,
 ): Result<RunAggregate, ExecutorError> {
-  return fromStore(
-    store.appendEvent({
-      runId: aggregate.runId,
-      expectedSequence: aggregate.nextEventSequence,
-      idempotencyKey: `agent:resume-token:${invocationSequence}:${attemptNumber}`,
-      event: {
-        type: 'attempt.resume_token_recorded',
-        invocationSequence,
-        attemptNumber,
-        resumeToken: token,
-      },
-    }),
+  return appendLatestEvent(
+    store,
+    aggregate.runId,
+    `agent:resume-token:${invocationSequence}:${attemptNumber}`,
+    {
+      type: 'attempt.resume_token_recorded',
+      invocationSequence,
+      attemptNumber,
+      resumeToken: token,
+    },
   );
 }
 
@@ -472,19 +491,12 @@ function publishAgentArtifacts(
   let current: Result<RunAggregate, ExecutorError> = ok(aggregate);
   for (const artifact of artifacts) {
     const before = current.unwrap();
-    current = fromStore(
-      store.appendEvent({
-        runId: before.runId,
-        expectedSequence: before.nextEventSequence,
-        idempotencyKey: `agent:artifact:${artifact.id}`,
-        event: {
-          type: 'attempt.artifact_published',
-          invocationSequence,
-          attemptNumber,
-          artifact,
-        },
-      }),
-    );
+    current = appendLatestEvent(store, before.runId, `agent:artifact:${artifact.id}`, {
+      type: 'attempt.artifact_published',
+      invocationSequence,
+      attemptNumber,
+      artifact,
+    });
     if (current.isErr()) return current;
   }
   return current;
@@ -504,19 +516,18 @@ function completeAgentInvocation(
   if (!invocation) {
     throw new Error(`Active invocation disappeared: ${invocationSequence}`);
   }
-  return fromStore(
-    store.appendEvent({
-      runId: aggregate.runId,
-      expectedSequence: aggregate.nextEventSequence,
-      idempotencyKey: `agent:completed:${invocation.sequence}:${attemptNumber}`,
-      event: {
-        type: 'invocation.completed',
-        invocationSequence,
-        outcome: 'success',
-        output,
-        finishedAt,
-      },
-    }),
+  return appendLatestEvent(
+    store,
+    aggregate.runId,
+    `agent:completed:${invocation.sequence}:${attemptNumber}`,
+    {
+      type: 'invocation.completed',
+      invocationSequence,
+      outcome: 'success',
+      output,
+      finishedAt,
+      ...(recordsAttemptSpans(aggregate) ? { attemptFinishedAt: finishedAt } : {}),
+    },
   );
 }
 
@@ -528,18 +539,16 @@ function recordAttemptUsage(
   usage: TokenUsage,
 ): Result<RunAggregate, ExecutorError> {
   if (!validTokenUsage(usage)) return ok(aggregate);
-  return fromStore(
-    store.appendEvent({
-      runId: aggregate.runId,
-      expectedSequence: aggregate.nextEventSequence,
-      idempotencyKey: `agent:usage:${invocationSequence}:${attemptNumber}`,
-      event: {
-        type: 'attempt.usage_recorded',
-        invocationSequence,
-        attemptNumber,
-        usage,
-      },
-    }),
+  return appendLatestEvent(
+    store,
+    aggregate.runId,
+    `agent:usage:${invocationSequence}:${attemptNumber}`,
+    {
+      type: 'attempt.usage_recorded',
+      invocationSequence,
+      attemptNumber,
+      usage,
+    },
   );
 }
 
@@ -551,18 +560,16 @@ function recordSubagentExecutions(
   subagents: readonly SubagentExecutionSummary[],
 ): Result<RunAggregate, ExecutorError> {
   if (subagents.length === 0) return ok(aggregate);
-  return fromStore(
-    store.appendEvent({
-      runId: aggregate.runId,
-      expectedSequence: aggregate.nextEventSequence,
-      idempotencyKey: `agent:subagents:${invocationSequence}:${attemptNumber}`,
-      event: {
-        type: 'attempt.subagents_recorded',
-        invocationSequence,
-        attemptNumber,
-        subagents,
-      },
-    }),
+  return appendLatestEvent(
+    store,
+    aggregate.runId,
+    `agent:subagents:${invocationSequence}:${attemptNumber}`,
+    {
+      type: 'attempt.subagents_recorded',
+      invocationSequence,
+      attemptNumber,
+      subagents,
+    },
   );
 }
 
@@ -594,6 +601,19 @@ function intentKey(intent: OrchestrationIntent): string {
       return `intent:reconciliation.request:${intent.invocationSequence}`;
     case 'recovery.halt':
       return `intent:recovery.halt:${intent.invocationSequence}`;
+    case 'parallel.fork':
+    case 'collection.expand':
+      return `intent:${intent.type}:${intent.groupId}`;
+    case 'parallel.branch.complete':
+      return `intent:parallel.branch.complete:${intent.groupId}:${intent.branchId}`;
+    case 'parallel.join':
+      return `intent:parallel.join:${intent.groupId}`;
+    case 'timer.schedule':
+    case 'timer.elapse':
+    case 'event.wait':
+    case 'event.timeout':
+    case 'invocation.complete':
+      return `intent:${intent.type}:${intent.invocationSequence}`;
   }
   return unexpectedIntent(intent);
 }
@@ -616,6 +636,11 @@ function intentEvent(
           ? {}
           : { sourceInvocationSequence: intent.sourceInvocationSequence }),
         ...(intent.transitionId === undefined ? {} : { transitionId: intent.transitionId }),
+        ...(intent.parallelGroupId === undefined
+          ? {}
+          : { parallelGroupId: intent.parallelGroupId }),
+        ...(intent.branchId === undefined ? {} : { branchId: intent.branchId }),
+        ...(intent.input === undefined ? {} : { input: intent.input }),
       };
     case 'approval.request':
       return {
@@ -632,6 +657,11 @@ function intentEvent(
   return unexpectedIntent(intent);
 }
 
+interface PreparedAttemptExecution {
+  readonly aggregate: RunAggregate;
+  execute(): Promise<Result<RunAggregate, ExecutorError>>;
+}
+
 export class RunCoordinator {
   constructor(
     private readonly store: RunStore,
@@ -639,6 +669,8 @@ export class RunCoordinator {
     private readonly agentExecutor?: AgentExecutor,
     private readonly workingDirectory = process.cwd(),
     private readonly clock: Clock = systemClock,
+    private readonly parallelWorkspaces?: ParallelWorkspaceManager,
+    private readonly traceExporter?: TraceExporter,
   ) {}
 
   createRun(input: CreateRunInput): Result<RunAggregate, ExecutorError> {
@@ -666,11 +698,84 @@ export class RunCoordinator {
   }
 
   async advance(runId: string): Promise<Result<RunAggregate, ExecutorError>> {
+    const prepared = await this.prepareAdvance(runId);
+    if (prepared.isErr()) return prepared;
+    const aggregate = prepared.unwrap();
+    const scheduled = scheduleRun(aggregate.artifact, aggregate.state);
+    if (scheduled.isErr()) {
+      return toExecutorError(ExecutorErrorKind.Runtime, { error: scheduled.error });
+    }
+    const intent = scheduled.unwrap()[0];
+    return intent ? this.executeIntent(aggregate, intent) : prepared;
+  }
+
+  /**
+   * Executes every deterministic intent currently available to one parallel
+   * group. Starts are committed canonically before isolated effects run, while
+   * completion events are serialized in the order the effects actually end.
+   */
+  async advanceAvailable(runId: string): Promise<Result<RunAggregate, ExecutorError>> {
+    const prepared = await this.prepareAdvance(runId);
+    if (prepared.isErr()) return prepared;
+    const aggregate = prepared.unwrap();
+    const scheduled = scheduleRun(aggregate.artifact, aggregate.state);
+    if (scheduled.isErr()) {
+      return toExecutorError(ExecutorErrorKind.Runtime, { error: scheduled.error });
+    }
+    const intents = scheduled.unwrap();
+    if (intents.length === 0) return prepared;
+    if (intents.every(({ type }) => type === 'invocation.activate')) {
+      let current = aggregate;
+      for (const intent of intents) {
+        if (intent.type !== 'invocation.activate') continue;
+        const advanced = await this.executeIntent(current, intent);
+        if (advanced.isErr()) return advanced;
+        current = advanced.unwrap();
+      }
+      return ok(current);
+    }
+    if (intents.every(({ type }) => type === 'attempt.schedule')) {
+      return this.executeAttemptsConcurrently(
+        aggregate,
+        intents.filter(
+          (intent): intent is Extract<OrchestrationIntent, { type: 'attempt.schedule' }> =>
+            intent.type === 'attempt.schedule',
+        ),
+      );
+    }
+    const intent = intents[0];
+    return intent ? this.executeIntent(aggregate, intent) : prepared;
+  }
+
+  private async prepareAdvance(runId: string): Promise<Result<RunAggregate, ExecutorError>> {
     let loaded = fromStore(this.store.loadRun(runId));
     if (loaded.isErr()) return loaded;
     let aggregate = loaded.unwrap();
 
-    if (aggregate.artifact.bundle.runLimits?.maxDurationMs !== undefined) {
+    const activeGroup = aggregate.state.parallelGroups?.find(({ state }) => state === 'active');
+    if (activeGroup && this.parallelWorkspaces) {
+      const recovered = await this.parallelWorkspaces.recover(
+        runId,
+        activeGroup.id,
+        activeGroup.baseHead,
+        activeGroup.baseTree,
+        activeGroup.checkpoint,
+        activeGroup.branches.flatMap((branch) =>
+          branch.workspaceId ? [{ branchId: branch.id, workspaceId: branch.workspaceId }] : [],
+        ),
+      );
+      if (recovered.isErr()) {
+        return toExecutorError(ExecutorErrorKind.Command, {
+          invocationSequence: activeGroup.ownerInvocationSequence,
+          error: recovered.error,
+        });
+      }
+    }
+
+    if (
+      aggregate.artifact.bundle.runLimits?.maxDurationMs !== undefined ||
+      aggregate.state.status === 'waiting'
+    ) {
       const observedAt = this.clock.now();
       if (aggregate.state.observedAt !== observedAt) {
         loaded = fromStore(
@@ -685,30 +790,74 @@ export class RunCoordinator {
         aggregate = loaded.unwrap();
       }
     }
+    return ok(aggregate);
+  }
 
-    const scheduled = scheduleRun(aggregate.artifact, aggregate.state);
-    if (scheduled.isErr()) {
-      return toExecutorError(ExecutorErrorKind.Runtime, {
-        error: scheduled.error,
-      });
-    }
-    const intent = scheduled.unwrap()[0];
-    if (!intent) return loaded;
-
+  private async executeIntent(
+    aggregate: RunAggregate,
+    intent: OrchestrationIntent,
+  ): Promise<Result<RunAggregate, ExecutorError>> {
     switch (intent.type) {
       case 'attempt.schedule':
         return this.executeAttempt(aggregate, intent);
       case 'invocation.activate':
       case 'approval.request':
       case 'run.complete':
-        return fromStore(
-          this.store.appendEvent({
-            runId,
-            expectedSequence: aggregate.nextEventSequence,
-            idempotencyKey: intentKey(intent),
-            event: intentEvent(intent, this.clock.now()),
-          }),
+        return this.appendAndExport(
+          aggregate,
+          intentKey(intent),
+          intentEvent(intent, this.clock.now()),
         );
+      case 'timer.schedule': {
+        const scheduledAt = this.clock.now();
+        return this.appendAndExport(aggregate, intentKey(intent), {
+          type: 'timer.scheduled',
+          invocationSequence: intent.invocationSequence,
+          scheduledAt,
+          dueAt: new Date(Date.parse(scheduledAt) + intent.durationMs).toISOString(),
+        });
+      }
+      case 'timer.elapse':
+        return this.appendAndExport(aggregate, intentKey(intent), {
+          type: 'timer.elapsed',
+          invocationSequence: intent.invocationSequence,
+          observedAt: aggregate.state.observedAt ?? this.clock.now(),
+        });
+      case 'event.wait': {
+        const scheduledAt = this.clock.now();
+        return this.appendAndExport(aggregate, intentKey(intent), {
+          type: 'event.waiting',
+          invocationSequence: intent.invocationSequence,
+          event: intent.event,
+          scheduledAt,
+          ...(intent.timeoutMs === undefined
+            ? {}
+            : {
+                timeoutAt: new Date(Date.parse(scheduledAt) + intent.timeoutMs).toISOString(),
+              }),
+        });
+      }
+      case 'event.timeout':
+        return this.appendAndExport(aggregate, intentKey(intent), {
+          type: 'event.timed_out',
+          invocationSequence: intent.invocationSequence,
+          observedAt: aggregate.state.observedAt ?? this.clock.now(),
+        });
+      case 'invocation.complete':
+        return this.appendAndExport(aggregate, intentKey(intent), {
+          type: 'invocation.completed',
+          invocationSequence: intent.invocationSequence,
+          outcome: intent.outcome,
+          ...(intent.output === undefined ? {} : { output: intent.output }),
+          finishedAt: this.clock.now(),
+        });
+      case 'parallel.fork':
+      case 'collection.expand':
+        return this.prepareParallel(aggregate, intent);
+      case 'parallel.branch.complete':
+        return this.completeParallelBranch(aggregate, intent);
+      case 'parallel.join':
+        return this.joinParallel(aggregate, intent);
       case 'session.resume':
         return this.resumeAgent(aggregate, intent);
       case 'effect.verify':
@@ -724,6 +873,263 @@ export class RunCoordinator {
       }
     }
     return unexpectedIntent(intent);
+  }
+
+  receiveEvent(
+    runId: string,
+    invocationSequence: number,
+    event: string,
+    payload: JsonValue,
+    actor: string,
+    idempotencyKey: string,
+    expectedSequence?: number,
+  ): Result<RunAggregate, ExecutorError> {
+    const loaded = fromStore(this.store.loadRun(runId));
+    if (loaded.isErr()) return loaded;
+    const aggregate = loaded.unwrap();
+    const existing = aggregate.events.find(
+      (candidate) =>
+        candidate.type === 'external_event.received' && candidate.idempotencyKey === idempotencyKey,
+    );
+    if (existing?.type === 'external_event.received') {
+      return existing.invocationSequence === invocationSequence &&
+        existing.event === event &&
+        existing.actor === actor &&
+        JSON.stringify(existing.payload) === JSON.stringify(payload)
+        ? ok(aggregate)
+        : toExecutorError(ExecutorErrorKind.RunStore, {
+            error: { kind: RunStoreErrorKind.IdempotencyConflict, runId, idempotencyKey },
+          });
+    }
+    if (expectedSequence !== undefined && expectedSequence !== aggregate.nextEventSequence) {
+      return toExecutorError(ExecutorErrorKind.RunStore, {
+        error: {
+          kind: RunStoreErrorKind.EventSequenceConflict,
+          runId,
+          expected: aggregate.nextEventSequence,
+          received: expectedSequence,
+        },
+      });
+    }
+    return fromStore(
+      this.store.appendEvent({
+        runId,
+        expectedSequence: expectedSequence ?? aggregate.nextEventSequence,
+        idempotencyKey,
+        event: {
+          type: 'external_event.received',
+          invocationSequence,
+          event,
+          payload,
+          actor,
+          receivedAt: this.clock.now(),
+          idempotencyKey,
+        },
+      }),
+    );
+  }
+
+  private async appendAndExport(
+    aggregate: RunAggregate,
+    idempotencyKey: string,
+    event: RunEventInput,
+  ): Promise<Result<RunAggregate, ExecutorError>> {
+    const appended = fromStore(
+      this.store.appendEvent({
+        runId: aggregate.runId,
+        expectedSequence: aggregate.nextEventSequence,
+        idempotencyKey,
+        event,
+      }),
+    );
+    if (appended.isOk() && this.traceExporter) {
+      try {
+        // Trace delivery is deliberately outside the scheduling transaction.
+        // A collector outage must remain observable at the exporter boundary
+        // without changing the durable run result or blocking the next intent.
+        const exported = await this.traceExporter.export(
+          deriveRunTrace(appended.value.runId, appended.value.artifact, appended.value.state),
+        );
+        if (exported.isErr()) this.traceExporter.observeFailure(exported.error);
+      } catch (cause) {
+        this.traceExporter.observeFailure({
+          kind: CommandRunnerErrorKind.ProcessFailure,
+          message: cause instanceof Error ? cause.message : 'Trace exporter threw',
+        });
+      }
+    }
+    return appended;
+  }
+
+  private async prepareParallel(
+    aggregate: RunAggregate,
+    intent: Extract<OrchestrationIntent, { type: 'parallel.fork' | 'collection.expand' }>,
+  ): Promise<Result<RunAggregate, ExecutorError>> {
+    if (!this.parallelWorkspaces) {
+      return toExecutorError(ExecutorErrorKind.UnsupportedNode, {
+        nodeId: `invocation:${intent.invocationSequence}`,
+        nodeType: intent.type,
+      });
+    }
+    const branches =
+      intent.type === 'parallel.fork'
+        ? intent.branches
+        : intent.items.map((_, index) => ({ id: String(index), entryNodeId: intent.entryNodeId }));
+    const prepared = await this.parallelWorkspaces.prepare(
+      aggregate.runId,
+      intent.groupId,
+      aggregate.state.repositoryHead,
+      branches.map(({ id }) => id),
+    );
+    if (prepared.isErr()) {
+      return toExecutorError(ExecutorErrorKind.Command, {
+        invocationSequence: intent.invocationSequence,
+        error: prepared.error,
+      });
+    }
+    const preparation = prepared.unwrap();
+    const effectiveMax = Math.min(
+      intent.maxConcurrent,
+      aggregate.artifact.bundle.runLimits?.maxConcurrentInvocations ?? Number.MAX_SAFE_INTEGER,
+    );
+    const workspace = (branchId: string): string | undefined =>
+      preparation.workspaces.find((candidate) => candidate.branchId === branchId)?.workspaceId;
+    const missingWorkspace = branches.find((branch) => workspace(branch.id) === undefined);
+    if (missingWorkspace) {
+      return toExecutorError(ExecutorErrorKind.Command, {
+        invocationSequence: intent.invocationSequence,
+        error: {
+          kind: CommandRunnerErrorKind.ProcessFailure,
+          message: `workspace preparation omitted branch ${missingWorkspace.id}`,
+        },
+      });
+    }
+    return this.appendAndExport(
+      aggregate,
+      intentKey(intent),
+      intent.type === 'parallel.fork'
+        ? {
+            type: 'parallel.forked',
+            groupId: intent.groupId,
+            invocationSequence: intent.invocationSequence,
+            kind: 'parallel',
+            branches: branches.map((branch) => ({
+              ...branch,
+              workspaceId: workspace(branch.id) ?? '',
+            })),
+            maxConcurrent: effectiveMax,
+            baseHead: aggregate.state.repositoryHead,
+            baseTree: preparation.baseTree,
+            checkpoint: preparation.checkpoint,
+          }
+        : {
+            type: 'collection.expanded',
+            invocationSequence: intent.invocationSequence,
+            groupId: intent.groupId,
+            items: intent.items,
+            workspaces: branches.flatMap((branch) => {
+              const workspaceId = workspace(branch.id);
+              return workspaceId ? [{ branchId: branch.id, workspaceId }] : [];
+            }),
+            maxConcurrent: effectiveMax,
+            baseHead: aggregate.state.repositoryHead,
+            baseTree: preparation.baseTree,
+            checkpoint: preparation.checkpoint,
+          },
+    );
+  }
+
+  private async completeParallelBranch(
+    aggregate: RunAggregate,
+    intent: Extract<OrchestrationIntent, { type: 'parallel.branch.complete' }>,
+  ): Promise<Result<RunAggregate, ExecutorError>> {
+    const inspected =
+      intent.outcome === 'succeeded' && this.parallelWorkspaces
+        ? await this.parallelWorkspaces.inspectBranch(
+            aggregate.runId,
+            intent.groupId,
+            intent.branchId,
+          )
+        : undefined;
+    if (inspected?.isErr()) {
+      return toExecutorError(ExecutorErrorKind.Command, {
+        invocationSequence: intent.invocationSequence,
+        error: inspected.error,
+      });
+    }
+    const invocation = aggregate.state.invocations.find(
+      ({ sequence }) => sequence === intent.invocationSequence,
+    );
+    const branchOutput =
+      invocation?.output ??
+      aggregate.state.invocations
+        .filter(
+          (candidate) =>
+            candidate.parallelGroupId === intent.groupId &&
+            candidate.branchId === intent.branchId &&
+            candidate.output !== undefined,
+        )
+        .toSorted((left, right) => right.sequence - left.sequence)[0]?.output;
+    return this.appendAndExport(aggregate, intentKey(intent), {
+      type: 'parallel.branch_completed',
+      groupId: intent.groupId,
+      branchId: intent.branchId,
+      invocationSequence: intent.invocationSequence,
+      outcome: intent.outcome,
+      ...(branchOutput === undefined ? {} : { output: branchOutput }),
+      ...(inspected?.isOk() ? { changedPaths: inspected.value.changedPaths } : {}),
+      finishedAt: this.clock.now(),
+    });
+  }
+
+  private async joinParallel(
+    aggregate: RunAggregate,
+    intent: Extract<OrchestrationIntent, { type: 'parallel.join' }>,
+  ): Promise<Result<RunAggregate, ExecutorError>> {
+    const group = aggregate.state.parallelGroups?.find(({ id }) => id === intent.groupId);
+    if (!group) {
+      return toExecutorError(ExecutorErrorKind.UnknownNode, { nodeId: intent.groupId });
+    }
+    if (intent.outcome !== 'succeeded') {
+      return this.appendAndExport(aggregate, intentKey(intent), {
+        type: 'parallel.joined',
+        groupId: intent.groupId,
+        outcome: intent.outcome,
+        finishedAt: this.clock.now(),
+      });
+    }
+    if (!this.parallelWorkspaces) {
+      return toExecutorError(ExecutorErrorKind.UnsupportedNode, {
+        nodeId: group.ownerNodeId,
+        nodeType: intent.type,
+      });
+    }
+    const joined = await this.parallelWorkspaces.join(
+      aggregate.runId,
+      group.id,
+      group.branches.map(({ id }) => id),
+      group.baseHead,
+    );
+    if (joined.isErr()) {
+      return toExecutorError(ExecutorErrorKind.Command, {
+        invocationSequence: group.ownerInvocationSequence,
+        error: joined.error,
+      });
+    }
+    const result = joined.unwrap();
+    const appended = await this.appendAndExport(aggregate, intentKey(intent), {
+      type: 'parallel.joined',
+      groupId: group.id,
+      outcome: result.outcome,
+      ...(result.outcome === 'succeeded' && result.head && result.tree
+        ? { joinedHead: result.head, joinedTree: result.tree }
+        : {}),
+      finishedAt: this.clock.now(),
+    });
+    if (appended.isOk() && result.outcome === 'succeeded') {
+      await this.parallelWorkspaces.cleanupSuccessful(aggregate.runId, group.id);
+    }
+    return appended;
   }
 
   decideApproval(
@@ -1022,6 +1428,7 @@ export class RunCoordinator {
             type: 'attempt.interrupted',
             invocationSequence: invocation.sequence,
             attemptNumber: attempt.number,
+            ...(recordsAttemptSpans(aggregate) ? { finishedAt: this.clock.now() } : {}),
           },
         }),
       );
@@ -1053,15 +1460,25 @@ export class RunCoordinator {
     aggregate: RunAggregate,
     intent: Extract<OrchestrationIntent, { type: 'attempt.schedule' }>,
   ): Promise<Result<RunAggregate, ExecutorError>> {
+    const prepared = this.prepareCommandAttempt(aggregate, intent);
+    return prepared.isErr() ? prepared : prepared.unwrap().execute();
+  }
+
+  private prepareCommandAttempt(
+    aggregate: RunAggregate,
+    intent: Extract<OrchestrationIntent, { type: 'attempt.schedule' }>,
+  ): Result<PreparedAttemptExecution, ExecutorError> {
     const target = definitionFor(aggregate, intent.invocationSequence);
     if (target.isErr()) return target;
-    const { definition } = target.unwrap();
+    const { definition, invocation } = target.unwrap();
     if (definition.type !== 'command' || !definition.command) {
       return toExecutorError(ExecutorErrorKind.UnsupportedNode, {
         nodeId: definition.id,
         nodeType: definition.type,
       });
     }
+    const workingDirectory = this.workingDirectoryFor(aggregate, invocation);
+    if (workingDirectory.isErr()) return workingDirectory;
 
     const started = fromStore(
       this.store.appendEvent({
@@ -1072,48 +1489,62 @@ export class RunCoordinator {
           type: 'attempt.started',
           invocationSequence: intent.invocationSequence,
           attemptNumber: intent.attemptNumber,
+          ...(recordsAttemptSpans(aggregate)
+            ? {
+                startedAt: timestampAtOrAfter(this.clock, target.unwrap().invocation.activatedAt),
+              }
+            : {}),
         },
       }),
     );
     if (started.isErr()) return started;
     const startedAggregate = started.unwrap();
-
-    const executed = await this.commandRunner.execute(definition.command);
-    if (executed.isErr()) {
-      const interrupted = fromStore(
-        this.store.appendEvent({
-          runId: aggregate.runId,
-          expectedSequence: startedAggregate.nextEventSequence,
-          idempotencyKey: `command:interrupted:${intent.invocationSequence}:${intent.attemptNumber}`,
-          event: {
-            type: 'attempt.interrupted',
+    return ok({
+      aggregate: startedAggregate,
+      execute: async () => {
+        const executed = await this.commandRunner.execute(
+          definition.command ?? '',
+          workingDirectory.unwrap(),
+        );
+        if (executed.isErr()) {
+          const interrupted = appendLatestEvent(
+            this.store,
+            aggregate.runId,
+            `command:interrupted:${intent.invocationSequence}:${intent.attemptNumber}`,
+            {
+              type: 'attempt.interrupted',
+              invocationSequence: intent.invocationSequence,
+              attemptNumber: intent.attemptNumber,
+              ...(recordsAttemptSpans(aggregate)
+                ? {
+                    finishedAt: timestampAtOrAfter(this.clock, invocation.activatedAt),
+                  }
+                : {}),
+            },
+          );
+          if (interrupted.isErr()) return interrupted;
+          return toExecutorError(ExecutorErrorKind.Command, {
             invocationSequence: intent.invocationSequence,
-            attemptNumber: intent.attemptNumber,
+            error: executed.error,
+          });
+        }
+        const commandExecution = executed.unwrap();
+        const finishedAt = this.clock.now();
+        return appendLatestEvent(
+          this.store,
+          aggregate.runId,
+          `command:completed:${intent.invocationSequence}:${intent.attemptNumber}`,
+          {
+            type: 'invocation.completed',
+            invocationSequence: intent.invocationSequence,
+            outcome: commandExecution.outcome,
+            output: commandExecution.output,
+            finishedAt,
+            ...(recordsAttemptSpans(aggregate) ? { attemptFinishedAt: finishedAt } : {}),
           },
-        }),
-      );
-      if (interrupted.isErr()) return interrupted;
-      return toExecutorError(ExecutorErrorKind.Command, {
-        invocationSequence: intent.invocationSequence,
-        error: executed.error,
-      });
-    }
-    const commandExecution = executed.unwrap();
-
-    return fromStore(
-      this.store.appendEvent({
-        runId: aggregate.runId,
-        expectedSequence: startedAggregate.nextEventSequence,
-        idempotencyKey: `command:completed:${intent.invocationSequence}:${intent.attemptNumber}`,
-        event: {
-          type: 'invocation.completed',
-          invocationSequence: intent.invocationSequence,
-          outcome: commandExecution.outcome,
-          output: commandExecution.output,
-          finishedAt: this.clock.now(),
-        },
-      }),
-    );
+        );
+      },
+    });
   }
 
   private async executeAttempt(
@@ -1127,13 +1558,97 @@ export class RunCoordinator {
       : this.executeCommand(aggregate, intent);
   }
 
+  private prepareAttempt(
+    aggregate: RunAggregate,
+    intent: Extract<OrchestrationIntent, { type: 'attempt.schedule' }>,
+  ): Result<PreparedAttemptExecution, ExecutorError> {
+    const target = definitionFor(aggregate, intent.invocationSequence);
+    if (target.isErr()) return target;
+    return target.unwrap().definition.type === 'agent'
+      ? this.prepareAgentAttempt(aggregate, intent)
+      : this.prepareCommandAttempt(aggregate, intent);
+  }
+
+  private async executeAttemptsConcurrently(
+    aggregate: RunAggregate,
+    intents: readonly Extract<OrchestrationIntent, { type: 'attempt.schedule' }>[],
+  ): Promise<Result<RunAggregate, ExecutorError>> {
+    let current = aggregate;
+    const prepared: PreparedAttemptExecution[] = [];
+    for (const intent of intents) {
+      const attempt = this.prepareAttempt(current, intent);
+      if (attempt.isErr()) {
+        await this.executePreparedAttempts(aggregate, intents.slice(0, prepared.length), prepared);
+        return attempt;
+      }
+      prepared.push(attempt.unwrap());
+      current = attempt.unwrap().aggregate;
+    }
+
+    const results = await this.executePreparedAttempts(aggregate, intents, prepared);
+    const latest = fromStore(this.store.loadRun(aggregate.runId));
+    if (latest.isErr()) return latest;
+    const finalAggregate = latest.unwrap();
+    const unresolvedError = results.find((result, index) => {
+      if (result.isOk()) return false;
+      const intent = intents[index];
+      return (
+        finalAggregate.state.invocations.find(
+          ({ sequence }) => sequence === intent?.invocationSequence,
+        )?.state === 'active'
+      );
+    });
+    return unresolvedError?.isErr() ? unresolvedError : ok(finalAggregate);
+  }
+
+  private async executePreparedAttempts(
+    aggregate: RunAggregate,
+    intents: readonly Extract<OrchestrationIntent, { type: 'attempt.schedule' }>[],
+    prepared: readonly PreparedAttemptExecution[],
+  ): Promise<readonly Result<RunAggregate, ExecutorError>[]> {
+    const settled = await Promise.allSettled(prepared.map((attempt) => attempt.execute()));
+    return settled.map((result, index) => {
+      if (result.status === 'fulfilled') return result.value;
+      const intent = intents[index];
+      if (!intent) throw result.reason;
+      const interrupted = appendLatestEvent(
+        this.store,
+        aggregate.runId,
+        `attempt:threw:${intent.invocationSequence}:${intent.attemptNumber}`,
+        {
+          type: 'attempt.interrupted',
+          invocationSequence: intent.invocationSequence,
+          attemptNumber: intent.attemptNumber,
+          ...(recordsAttemptSpans(aggregate) ? { finishedAt: this.clock.now() } : {}),
+        },
+      );
+      return interrupted.isErr()
+        ? interrupted
+        : toExecutorError(ExecutorErrorKind.Command, {
+            invocationSequence: intent.invocationSequence,
+            error: {
+              kind: CommandRunnerErrorKind.ProcessFailure,
+              message: result.reason instanceof Error ? result.reason.message : 'Effect threw',
+            },
+          });
+    });
+  }
+
   private async executeAgent(
     aggregate: RunAggregate,
     intent: Extract<OrchestrationIntent, { type: 'attempt.schedule' }>,
   ): Promise<Result<RunAggregate, ExecutorError>> {
+    const prepared = this.prepareAgentAttempt(aggregate, intent);
+    return prepared.isErr() ? prepared : prepared.unwrap().execute();
+  }
+
+  private prepareAgentAttempt(
+    aggregate: RunAggregate,
+    intent: Extract<OrchestrationIntent, { type: 'attempt.schedule' }>,
+  ): Result<PreparedAttemptExecution, ExecutorError> {
     const target = definitionFor(aggregate, intent.invocationSequence);
     if (target.isErr()) return target;
-    const { definition } = target.unwrap();
+    const { definition, invocation } = target.unwrap();
     if (definition.type !== 'agent' || !definition.role || !definition.prompt) {
       return toExecutorError(ExecutorErrorKind.UnsupportedNode, {
         nodeId: definition.id,
@@ -1146,6 +1661,8 @@ export class RunCoordinator {
         nodeType: definition.type,
       });
     }
+    const workingDirectory = this.workingDirectoryFor(aggregate, invocation);
+    if (workingDirectory.isErr()) return workingDirectory;
 
     const configured = agentHarnesses(aggregate, definition);
     if (configured.isErr()) return configured;
@@ -1172,21 +1689,31 @@ export class RunCoordinator {
           harnessId,
           ...(model ? { model } : {}),
           ...(resumeToken ? { resumeToken } : {}),
+          ...(recordsAttemptSpans(aggregate)
+            ? {
+                startedAt: timestampAtOrAfter(this.clock, target.unwrap().invocation.activatedAt),
+              }
+            : {}),
         },
       }),
     );
     if (started.isErr()) return started;
-
-    return this.completeAgentAttempt(
-      started.unwrap(),
-      definition,
-      intent.invocationSequence,
-      intent.attemptNumber,
-      harnessId,
-      model,
-      harnesses.length > intent.attemptNumber,
-      resumeToken,
-    );
+    const startedAggregate = started.unwrap();
+    return ok({
+      aggregate: startedAggregate,
+      execute: () =>
+        this.completeAgentAttempt(
+          startedAggregate,
+          definition,
+          intent.invocationSequence,
+          intent.attemptNumber,
+          harnessId,
+          model,
+          harnesses.length > intent.attemptNumber,
+          workingDirectory.unwrap(),
+          resumeToken,
+        ),
+    });
   }
 
   private async resumeAgent(
@@ -1209,6 +1736,8 @@ export class RunCoordinator {
         nodeType: 'session.resume',
       });
     }
+    const workingDirectory = this.workingDirectoryFor(aggregate, invocation);
+    if (workingDirectory.isErr()) return workingDirectory;
 
     const resumed = fromStore(
       this.store.appendEvent({
@@ -1233,6 +1762,7 @@ export class RunCoordinator {
       attempt.harnessId,
       attempt.model,
       false,
+      workingDirectory.unwrap(),
       intent.token,
     );
   }
@@ -1245,6 +1775,7 @@ export class RunCoordinator {
     harnessId: string,
     model: string | undefined,
     hasFallback: boolean,
+    workingDirectory: string,
     resumeToken?: string,
   ): Promise<Result<RunAggregate, ExecutorError>> {
     if (!this.agentExecutor || !definition.role || !definition.prompt) {
@@ -1291,7 +1822,7 @@ export class RunCoordinator {
       invocationSequence,
       attemptNumber,
       harnessId,
-      workingDirectory: this.workingDirectory,
+      workingDirectory,
       role: definition.role,
       prompt,
       capabilities: definition.capabilities ?? [],
@@ -1407,5 +1938,26 @@ export class RunCoordinator {
       result.output,
       this.clock.now(),
     );
+  }
+
+  private workingDirectoryFor(
+    aggregate: RunAggregate,
+    invocation: NodeInvocation | undefined,
+  ): Result<string, ExecutorError> {
+    if (!invocation?.parallelGroupId || !invocation.branchId) return ok(this.workingDirectory);
+    const isolated = this.parallelWorkspaces?.workingDirectory(
+      aggregate.runId,
+      invocation.parallelGroupId,
+      invocation.branchId,
+    );
+    return isolated
+      ? ok(isolated)
+      : toExecutorError(ExecutorErrorKind.Command, {
+          invocationSequence: invocation.sequence,
+          error: {
+            kind: CommandRunnerErrorKind.ProcessFailure,
+            message: `isolated workspace is unavailable for ${invocation.parallelGroupId}/${invocation.branchId}`,
+          },
+        });
   }
 }

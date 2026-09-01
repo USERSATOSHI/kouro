@@ -7,7 +7,24 @@ import type {
   JsonValue,
   RunEvent,
   RunState,
+  RunTrace,
 } from '@kouro/domain';
+
+export type RunTraceView = RunTrace;
+
+export interface ExternalEventRequest {
+  readonly payload: JsonValue;
+  readonly actor: string;
+  readonly idempotencyKey: string;
+  readonly expectedEventSequence?: number;
+}
+
+export interface ExternalEventResponse {
+  readonly runId: string;
+  readonly invocationSequence: number;
+  readonly event: string;
+  readonly status: RunState['status'];
+}
 import type {
   Ticket,
   TicketBoardCard,
