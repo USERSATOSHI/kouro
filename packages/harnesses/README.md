@@ -120,6 +120,14 @@ path; legacy Pi session IDs are resolved through the current project's session
 index before resume. Kouro calls `session.steer()` and `session.abort()` for
 live controls and disposes the session subscription afterward.
 
+Kouro also registers Pi's built-in extensions when it creates the SDK runtime,
+including the built-in `llama.cpp` provider. The built-in provider follows Pi's
+normal configuration: set `LLAMA_BASE_URL` or run Pi's `/login llama.cpp`, and
+load the model through Pi's llama.cpp model UI before selecting
+`llama.cpp/<model-id>` in a workflow.
+The `llamaServerUrl` setting and `llama-server=<url>` provider belong to the
+separate `pi-llama-cpp` extension and do not configure this built-in provider.
+
 Pi's tool allowlist is derived from declared capabilities: read tools are
 always present, edit/write require a write capability, and Bash requires an
 execute capability. Provider configuration and extensions remain available,

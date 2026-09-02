@@ -1,6 +1,6 @@
 import {
-  createAgentSession,
-  DefaultResourceLoader,
+  createAgentSessionFromServices,
+  createAgentSessionServices,
   getAgentDir,
   ModelRuntime,
   SessionManager,
@@ -16,6 +16,7 @@ import type {
   HarnessExecutionRequest,
 } from '@kouro/executors';
 import { invalidResponse, processFailure } from './errors.ts';
+import { loadPiBuiltInExtensions } from './pi-builtins.ts';
 import { createPiSandboxTools } from './pi-sandbox-tools.ts';
 import { parseHarnessOutput } from './structured-output.ts';
 
@@ -94,20 +95,22 @@ const defaultSdk: PiAgentSdk = {
     const pathGuard = new WorktreePathGuard();
     const commandSandbox = new SandboxRuntimeAgentCommandSandbox();
     const agentDir = getAgentDir();
-    const modelRuntime = await ModelRuntime.create();
-    const model = await modelFor(modelRuntime, request.model);
-    if (request.model && !model) throw new Error(`Pi model is unavailable: ${request.model}`);
-    const resourceLoader = new DefaultResourceLoader({
+    const services = await createAgentSessionServices({
       cwd: request.workingDirectory,
       agentDir,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
+      modelRuntime: await ModelRuntime.create(),
+      resourceLoaderOptions: {
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        extensionFactories: await loadPiBuiltInExtensions(),
+      },
     });
-    await resourceLoader.reload();
-    const { session } = await createAgentSession({
-      cwd: request.workingDirectory,
-      modelRuntime,
+    const model = await modelFor(services.modelRuntime, request.model);
+    if (request.model && !model) throw new Error(`Pi model is unavailable: ${request.model}`);
+    const { session } = await createAgentSessionFromServices({
+      services,
+      sessionManager: await sessionManagerFor(request.workingDirectory, resumeToken),
       ...(model ? { model } : {}),
       ...(request.reasoningEffort ? { thinkingLevel: request.reasoningEffort } : {}),
       tools: toolsFor(request.capabilities),
@@ -118,8 +121,6 @@ const defaultSdk: PiAgentSdk = {
         commandSandbox,
         request.subagents,
       ),
-      sessionManager: await sessionManagerFor(request.workingDirectory, resumeToken),
-      resourceLoader,
     });
     return session;
   },

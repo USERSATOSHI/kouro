@@ -18,6 +18,7 @@ import {
   PiHarness,
 } from '@kouro/harnesses';
 import { invokePiSubagent } from '../../packages/harnesses/src/pi-sandbox-tools.ts';
+import { loadPiBuiltInExtensions } from '../../packages/harnesses/src/pi-builtins.ts';
 
 interface Deferred {
   readonly promise: Promise<void>;
@@ -213,6 +214,12 @@ class ControlledPiSdk implements PiAgentSdk {
 }
 
 describe('ADR-0029: provider SDK harness control', () => {
+  test('loads Pi built-in providers for SDK-created runtimes', async () => {
+    const extensions = await loadPiBuiltInExtensions();
+
+    expect(extensions).toContainEqual(expect.objectContaining({ name: 'llama.cpp', hidden: true }));
+  });
+
   test('steers every SDK-backed provider through the normalized control channel', async () => {
     const claudeSdk = new ControlledClaudeSdk('steer');
     const openCodeSdk = new ControlledOpenCodeSdk('steer');
