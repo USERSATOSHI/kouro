@@ -1,6 +1,6 @@
 {
   "name": "@kouro/delivery-provider-github",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -16,7 +16,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@kouro/delivery": "0.1.20",
+    "@kouro/delivery": "0.1.21",
     "@usersatoshi/results": "^1.0.0"
   }
 }
