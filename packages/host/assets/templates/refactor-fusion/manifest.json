@@ -1,0 +1,7 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "1",
+  "description": "Multi-model refactor planning and fusion workflow.",
+  "entrypoint": "./kouro.ts"
+}

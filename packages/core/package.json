@@ -1,0 +1,13 @@
+{
+  "name": "@kouro/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./contracts": "./src/contracts.ts"
+  },
+  "dependencies": {
+    "ajv": "8.17.1"
+  }
+}
