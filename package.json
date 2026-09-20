@@ -1,5 +1,6 @@
 {
   "name": "kouro-workspace",
+  "version": "2.0.0",
   "private": true,
   "workspaces": [
     "packages/*"
@@ -9,6 +10,7 @@
     "dev": "bun run --cwd packages/web build && bun run packages/host/src/cli.ts serve",
     "kouro": "bun run packages/host/src/cli.ts",
     "build": "bun run --cwd packages/web build",
+    "release:forgejo": "bun run typecheck && bun test packages/core packages/host && bun run build && bun run scripts/publish-forgejo.ts",
     "test": "bun test packages scripts",
     "test:browser": "playwright test",
     "typecheck": "tsc --noEmit",

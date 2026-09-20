@@ -1,0 +1,5 @@
+[publish]
+token = "$NPM_CONFIG_TOKEN"
+
+[install.scopes]
+kouro = "https://git.usersatoshi.com/api/packages/kouro/npm/"
