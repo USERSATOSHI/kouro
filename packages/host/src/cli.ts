@@ -45,6 +45,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-data");
   const staticRoot = firstExistingPath([
     resolve("packages/web/dist"),
+    resolve(import.meta.dir, "web"),
     resolve(import.meta.dir, "../../web/dist"),
     resolve(import.meta.dir, "../web"),
   ]);

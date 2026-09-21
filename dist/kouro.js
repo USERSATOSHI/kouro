@@ -36873,6 +36873,7 @@ ${usage}`);
   const dataDir = resolve4(process.env.KOURO_DATA_DIR ?? ".kouro-data");
   const staticRoot = firstExistingPath([
     resolve4("packages/web/dist"),
+    resolve4(import.meta.dir, "web"),
     resolve4(import.meta.dir, "../../web/dist"),
     resolve4(import.meta.dir, "../web")
   ]);
