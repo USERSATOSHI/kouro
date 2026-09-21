@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
+import { isHarnessId } from "@kouro/core";
+import type { HarnessId } from "@kouro/core";
 
 export type SwarmParticipant = {
   id: string;
   name: string;
   role: string;
-  harness?: string;
+  harness?: HarnessId;
   model?: string;
   state: string;
   activity?: string;
@@ -103,7 +105,7 @@ export function normalizeCollaboration(raw: unknown, runId: string): Collaborati
         id: text(x.id),
         name: text(x.name, text(x.id, "participant")),
         role: text(x.role, "participant"),
-        harness: text(x.harness) || undefined,
+        harness: isHarnessId(text(x.harness)) ? (text(x.harness) as HarnessId) : undefined,
         model: text(x.model) || undefined,
         state: text(x.state, "unknown"),
         activity: text(x.activity) || undefined,

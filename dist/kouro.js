@@ -48,8 +48,12 @@ var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
 var __require = import.meta.require;
 
 // packages/core/src/contracts.ts
-var PROJECTION_VERSION = 1, BUNDLE_FORMAT_VERSION = 1, DEFAULT_LIMITS, CompileError;
+function isHarnessId(value) {
+  return typeof value === "string" && HARNESS_IDS.includes(value);
+}
+var PROJECTION_VERSION = 1, BUNDLE_FORMAT_VERSION = 1, HARNESS_IDS, DEFAULT_LIMITS, CompileError;
 var init_contracts = __esm(() => {
+  HARNESS_IDS = ["scripted", "codex", "pi", "claude", "opencode"];
   DEFAULT_LIMITS = Object.freeze({
     maxScopes: 16,
     maxInvocations: 128,
@@ -230,7 +234,7 @@ class WorkflowBuilder {
       kind: "agent",
       role: options.role ?? id,
       prompt: options.prompt,
-      ...options.harnessId === undefined ? {} : { harnessId: options.harnessId },
+      ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), true)),
       outputPorts: output === undefined ? [] : [output],
@@ -550,7 +554,7 @@ function stripInternal(node) {
       ...base,
       role: node.role,
       prompt: node.prompt,
-      ...node.harnessId === undefined ? {} : { harnessId: node.harnessId },
+      ...node.harness === undefined ? {} : { harness: node.harness },
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
       timeoutMs: node.timeoutMs,
       ...node.scripted === undefined ? {} : { scripted: node.scripted }
@@ -739,6 +743,8 @@ async function compileWorkflowDetailed(source) {
     ].includes(node.kind)) {
       diagnostics.push(error("UNSUPPORTED_NODE_KIND", `Node kind ${node.kind} is unsupported by this compiler`, node.id));
     }
+    if (node.kind === "agent" && node.harness !== undefined && !isHarnessId(node.harness))
+      diagnostics.push(error("INVALID_HARNESS", `Unsupported harness ${node.harness}`, node.id));
     validatePorts(node.inputPorts, schemaDigests, diagnostics, node.id);
     validatePorts(node.outputPorts, schemaDigests, diagnostics, node.id);
     if (node.kind === "call" && !source.definitions?.[node.definitionId])
@@ -9743,6 +9749,7 @@ __export(exports_src, {
   promptVersion: () => promptVersion,
   prepareForkProjection: () => prepareForkProjection,
   makeEvidence: () => makeEvidence,
+  isHarnessId: () => isHarnessId,
   invalidateCheckpoint: () => invalidateCheckpoint,
   experimentCellKey: () => experimentCellKey,
   evidenceDigest: () => evidenceDigest,
@@ -9781,6 +9788,7 @@ __export(exports_src, {
   WorkflowBuilder: () => WorkflowBuilder,
   PROJECTION_VERSION: () => PROJECTION_VERSION,
   NodeHandle: () => NodeHandle,
+  HARNESS_IDS: () => HARNESS_IDS,
   EdgeBuilder: () => EdgeBuilder,
   DEFAULT_LIMITS: () => DEFAULT_LIMITS,
   CompileError: () => CompileError,
@@ -15441,7 +15449,7 @@ class CodexHarnessAdapter {
         ...input.outputSchema ? { outputSchema: input.outputSchema } : {}
       },
       selection: {
-        harnessId: this.id,
+        harness: this.id,
         model: { id: input.modelId ?? "default" },
         ...input.nativeConfig ? { nativeConfig: input.nativeConfig } : {}
       },
@@ -15491,7 +15499,11 @@ async function capture2(args) {
     ]);
     return { exitCode, stdout, stderr };
   } catch (cause) {
-    return { exitCode: -1, stdout: "", stderr: cause instanceof Error ? cause.message : String(cause) };
+    return {
+      exitCode: -1,
+      stdout: "",
+      stderr: cause instanceof Error ? cause.message : String(cause)
+    };
   }
 }
 async function inspectExternalCli(kind) {
@@ -15511,16 +15523,26 @@ async function inspectExternalCli(kind) {
       cancel: supported,
       resume: { state: "unsupported" },
       reattach: { state: "unsupported" },
-      tools: { state: "conditional", constraints: ["native CLI permissions must be configured by the operator"] },
+      tools: {
+        state: "conditional",
+        constraints: ["native CLI permissions must be configured by the operator"]
+      },
       usage: { state: "unsupported" },
       "cost-cap": { state: "unsupported" }
     },
-    nativeConfigSchema: { type: "object", additionalProperties: true, properties: { model: { type: "string" } } }
+    nativeConfigSchema: {
+      type: "object",
+      additionalProperties: true,
+      properties: { model: { type: "string" } }
+    }
   };
 }
 function parseOutput(kind, stdout) {
-  const candidates = [stdout.trim(), ...stdout.split(`
-`).reverse().map((line) => line.trim())].filter(Boolean);
+  const candidates = [
+    stdout.trim(),
+    ...stdout.split(`
+`).reverse().map((line) => line.trim())
+  ].filter(Boolean);
   for (const candidate of candidates) {
     try {
       const value = JSON.parse(candidate);
@@ -15562,7 +15584,12 @@ class ExternalCliHarnessAdapter {
   async run(input) {
     const unavailable = () => JSON.parse(JSON.stringify(unavailableUsage()));
     if (this.descriptor.availability !== "available")
-      return { status: "unavailable", error: this.descriptor.detail, usage: unavailable(), events: [] };
+      return {
+        status: "unavailable",
+        error: this.descriptor.detail,
+        usage: unavailable(),
+        events: []
+      };
     const config = input.nativeConfig ?? {};
     const command = binary(this.kind);
     const args = this.kind === "claude" ? [command, "-p", "--output-format", "json", "--permission-mode", "plan"] : [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
@@ -15577,9 +15604,19 @@ ${input.prompt}` : input.prompt;
     args.push(prompt);
     let proc;
     try {
-      proc = Bun.spawn(args, { cwd: input.cwd ?? ".", stdout: "pipe", stderr: "pipe", signal: input.signal });
+      proc = Bun.spawn(args, {
+        cwd: input.cwd ?? ".",
+        stdout: "pipe",
+        stderr: "pipe",
+        signal: input.signal
+      });
     } catch (cause) {
-      return { status: "failed", error: `${this.kind} spawn failed: ${cause instanceof Error ? cause.message : String(cause)}`, usage: unavailable(), events: [] };
+      return {
+        status: "failed",
+        error: `${this.kind} spawn failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        usage: unavailable(),
+        events: []
+      };
     }
     const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
     const stderrPromise = new Response(proc.stderr).text().catch(() => "");
@@ -15596,20 +15633,43 @@ ${input.prompt}` : input.prompt;
     if (timer)
       clearTimeout(timer);
     if (result === "timeout")
-      return { status: "failed", error: `${this.kind} timed out after ${timeoutMs}ms`, usage: unavailable(), events: [] };
+      return {
+        status: "failed",
+        error: `${this.kind} timed out after ${timeoutMs}ms`,
+        usage: unavailable(),
+        events: []
+      };
     if (input.signal?.aborted)
       return { status: "cancelled", error: "cancelled", usage: unavailable(), events: [] };
     const output = parseOutput(this.kind, result.stdout);
     const events = result.stdout.split(`
 `).filter(Boolean).map((line) => ({ type: "log", at: new Date().toISOString(), data: line }));
     if (result.code !== 0)
-      return { status: "failed", rawOutput: result.stdout, error: result.stderr || `${this.kind} exited ${result.code}`, usage: unavailable(), events };
+      return {
+        status: "failed",
+        rawOutput: result.stdout,
+        error: result.stderr || `${this.kind} exited ${result.code}`,
+        usage: unavailable(),
+        events
+      };
     if (input.outputSchema) {
       const check = validateJsonSchema(output, input.outputSchema);
       if (!check.valid)
-        return { status: "failed", rawOutput: result.stdout, error: `invalid-output: ${check.error}`, usage: unavailable(), events };
+        return {
+          status: "failed",
+          rawOutput: result.stdout,
+          error: `invalid-output: ${check.error}`,
+          usage: unavailable(),
+          events
+        };
     }
-    return { status: "succeeded", output, rawOutput: result.stdout, usage: unavailable(), events };
+    return {
+      status: "succeeded",
+      output,
+      rawOutput: result.stdout,
+      usage: unavailable(),
+      events
+    };
   }
 }
 
@@ -16013,7 +16073,7 @@ class PiHarnessAdapter {
       attemptId: input.invocationId,
       role: { id: input.role, prompt: input.prompt, outputSchema: input.outputSchema },
       selection: {
-        harnessId: this.id,
+        harness: this.id,
         model: { id: input.modelId ?? "" },
         nativeConfig: input.nativeConfig
       },
@@ -18138,6 +18198,10 @@ async function prepareAgentHandoff(input) {
 }
 
 // packages/host/src/coordinator/coordinator.ts
+function toHarnessId(value) {
+  return isHarnessId(value) ? value : "scripted";
+}
+
 class Coordinator {
   journal;
   agent;
@@ -19103,7 +19167,7 @@ class Coordinator {
             diagnostics: ["collaboration idle/no-progress: participant completed"],
             resolvedExecution: {
               role: node.role,
-              harnessId: this.harness.id,
+              harness: toHarnessId(this.harness.id),
               adapterVersion: this.harness.adapterVersion
             }
           });
@@ -19202,7 +19266,7 @@ class Coordinator {
               digest: contextManifest.digest
             },
             provenance: {
-              sourceHarnessId: this.harness.id,
+              sourceHarness: toHarnessId(this.harness.id),
               createdBy: "host",
               createdAt: now()
             }
@@ -19237,12 +19301,12 @@ class Coordinator {
       }
       const outputSchema = node.outputPorts[0] ? bundle.schemas[node.outputPorts[0].schemaDigest] : undefined;
       let selected = this.harness;
-      let resolvedHarnessId = this.harness.id;
+      let resolvedHarnessId = toHarnessId(this.harness.id);
       let resolvedVersion = this.harness.adapterVersion;
       let resolvedModelId;
       let nativeConfig;
-      const requestedHarnessId = (node.harnessId === "codex-cli" ? "codex" : node.harnessId === "pi-cli-rpc" ? "pi" : node.harnessId) ?? (profile === "codex-readonly" ? "codex" : profile === "pi-readonly" ? "pi" : this.harness.id);
-      if (requestedHarnessId === this.harness.id) {} else if (requestedHarnessId === "codex") {
+      const requestedHarnessId = node.harness ?? (profile === "codex-readonly" ? "codex" : profile === "pi-readonly" ? "pi" : toHarnessId(this.harness.id));
+      if (requestedHarnessId === "scripted" && node.harness !== "codex" && node.harness !== "pi" && profile !== "codex-readonly" && profile !== "pi-readonly") {} else if (requestedHarnessId === "codex") {
         this.codexDescriptor ??= await inspectCodex();
         if (this.codexDescriptor.availability !== "available") {
           this.journal.completeEffect({
@@ -19256,7 +19320,7 @@ class Coordinator {
             diagnostics: ["execution rejected before workspace side effects"],
             resolvedExecution: {
               role: node.role,
-              harnessId: this.codexDescriptor.id,
+              harness: this.codexDescriptor.id,
               adapterVersion: this.codexDescriptor.adapterVersion
             },
             contextManifest: JSON.parse(JSON.stringify(contextManifest))
@@ -19265,7 +19329,7 @@ class Coordinator {
         }
         const codex = this.codex ??= new CodexHarnessAdapter(new CodexCliHarness(this.codexDescriptor));
         selected = codex;
-        resolvedHarnessId = codex.id;
+        resolvedHarnessId = toHarnessId(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = { sandbox: "read-only" };
       } else if (requestedHarnessId === "pi") {
@@ -19282,7 +19346,7 @@ class Coordinator {
             diagnostics: ["execution rejected before workspace side effects"],
             resolvedExecution: {
               role: node.role,
-              harnessId: this.piDescriptor.id,
+              harness: this.piDescriptor.id,
               adapterVersion: this.piDescriptor.adapterVersion
             },
             contextManifest: JSON.parse(JSON.stringify(contextManifest))
@@ -19291,9 +19355,9 @@ class Coordinator {
         }
         const pi = this.pi ??= new PiHarnessAdapter(new PiCliHarness(this.piDescriptor));
         selected = pi;
-        resolvedHarnessId = pi.id;
+        resolvedHarnessId = toHarnessId(pi.id);
         resolvedVersion = pi.adapterVersion;
-        const piSelection = resolvePiSelection({ harnessId: pi.id, model: { id: node.modelId ?? "" } }, { timeoutMs: node.timeoutMs, ...node.modelId ? { model: node.modelId } : {} });
+        const piSelection = resolvePiSelection({ harness: "pi", model: { id: node.modelId ?? "" } }, { timeoutMs: node.timeoutMs, ...node.modelId ? { model: node.modelId } : {} });
         resolvedModelId = piSelection.model;
         nativeConfig = {
           timeoutMs: node.timeoutMs,
@@ -19313,7 +19377,11 @@ class Coordinator {
               status: "failed",
               error: `harness-unavailable: ${this.claudeDescriptor.detail ?? "claude unavailable"}`,
               diagnostics: ["execution rejected before workspace side effects"],
-              resolvedExecution: { role: node.role, harnessId: "claude", adapterVersion: this.claudeDescriptor.adapterVersion },
+              resolvedExecution: {
+                role: node.role,
+                harness: "claude",
+                adapterVersion: this.claudeDescriptor.adapterVersion
+              },
               contextManifest: JSON.parse(JSON.stringify(contextManifest))
             });
             return;
@@ -19333,7 +19401,11 @@ class Coordinator {
               status: "failed",
               error: `harness-unavailable: ${this.opencodeDescriptor.detail ?? "opencode unavailable"}`,
               diagnostics: ["execution rejected before workspace side effects"],
-              resolvedExecution: { role: node.role, harnessId: "opencode", adapterVersion: this.opencodeDescriptor.adapterVersion },
+              resolvedExecution: {
+                role: node.role,
+                harness: "opencode",
+                adapterVersion: this.opencodeDescriptor.adapterVersion
+              },
               contextManifest: JSON.parse(JSON.stringify(contextManifest))
             });
             return;
@@ -19342,7 +19414,7 @@ class Coordinator {
           this.opencode = opencode;
           selected = opencode;
         }
-        resolvedHarnessId = selected.id;
+        resolvedHarnessId = toHarnessId(selected.id);
         resolvedVersion = selected.adapterVersion;
         nativeConfig = { ...node.modelId ? { model: node.modelId } : {} };
       } else {
@@ -19357,7 +19429,7 @@ class Coordinator {
           diagnostics: ["execution rejected before workspace side effects"],
           resolvedExecution: {
             role: node.role,
-            harnessId: requestedHarnessId,
+            harness: requestedHarnessId,
             adapterVersion: "unknown"
           },
           contextManifest: JSON.parse(JSON.stringify(contextManifest))
@@ -19478,7 +19550,7 @@ class Coordinator {
         diagnostics: [harnessResult.error].filter((item) => Boolean(item)),
         resolvedExecution: {
           role: node.role,
-          harnessId: resolvedHarnessId,
+          harness: resolvedHarnessId,
           adapterVersion: resolvedVersion,
           ...resolvedModelId ? { modelId: resolvedModelId } : {},
           ...nativeConfigDigest ? { nativeConfigDigest } : {}
@@ -21091,7 +21163,7 @@ class ApplicationService {
             kind: node.kind,
             label: node.id,
             role: node.kind === "agent" ? node.role : undefined,
-            harnessId: node.kind === "agent" ? node.harnessId : undefined,
+            harness: node.kind === "agent" ? node.harness : undefined,
             modelId: node.kind === "agent" ? node.modelId : undefined,
             definitionId: childDefinition.id,
             scopeId: childDefinition.id === bundle.rootDefinitionId ? undefined : childDefinition.id,

@@ -3,6 +3,7 @@ import {
   WorkflowBuilder,
   artifactType,
   compileWorkflow,
+  compileWorkflowDetailed,
   createInitialState,
   decide,
   reduceEvent,
@@ -60,12 +61,12 @@ describe("@kouro/core M1 kernel", () => {
   test("preserves per-agent harness overrides alongside model IDs", async () => {
     const workflow = new WorkflowBuilder({ id: "mixed-harness", version: "1" });
     const codex = workflow.agent("codex", {
-      harnessId: "codex",
+      harness: "codex",
       modelId: "gpt-5",
       prompt: "plan",
     });
     const pi = workflow.agent("pi", {
-      harnessId: "pi",
+      harness: "pi",
       modelId: "llama.cpp/local",
       prompt: "implement",
     });
@@ -76,13 +77,24 @@ describe("@kouro/core M1 kernel", () => {
     const nodes = (await compileWorkflow(workflow.build())).definitions["mixed-harness"].nodes;
     expect(nodes).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "codex", harnessId: "codex", modelId: "gpt-5" }),
+        expect.objectContaining({ id: "codex", harness: "codex", modelId: "gpt-5" }),
         expect.objectContaining({
           id: "pi",
-          harnessId: "pi",
+          harness: "pi",
           modelId: "llama.cpp/local",
         }),
       ]),
+    );
+  });
+
+  test("rejects harness overrides outside the defined harness list", async () => {
+    const workflow = new WorkflowBuilder({ id: "invalid-harness", version: "1" });
+    workflow.agent("agent", { prompt: "test" });
+    const source = workflow.build();
+    (source.nodes[0] as { harness?: string }).harness = "unknown";
+    const result = await compileWorkflowDetailed(source);
+    expect(result.diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "INVALID_HARNESS" })]),
     );
   });
 

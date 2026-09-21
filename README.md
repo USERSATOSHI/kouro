@@ -82,17 +82,19 @@ Agent structured output is optional. Commands supply their standard result witho
 an author-provided schema. Runtime evidence, typed output, persisted artifacts and
 workspace resources remain separate concepts.
 
-Harnesses can be mixed per agent. `harnessId` overrides the run's execution profile;
+Harnesses can be mixed per agent. `harness` overrides the run's execution profile;
 when omitted, the run profile selects the harness:
+
+Supported harness values are `scripted`, `codex`, `pi`, `claude`, and `opencode`.
 
 ```ts
 workflow.agent("planner", {
-  harnessId: "codex",
+  harness: "codex",
   modelId: "gpt-5",
   prompt: "Plan the change.",
 });
 workflow.agent("implementer", {
-  harnessId: "pi",
+  harness: "pi",
   modelId: "llama.cpp/my-model",
   prompt: "Implement the plan.",
 });

@@ -467,7 +467,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
       attemptId: input.invocationId,
       role: { id: input.role, prompt: input.prompt, outputSchema: input.outputSchema },
       selection: {
-        harnessId: this.id,
+        harness: this.id,
         model: { id: input.modelId ?? "" },
         nativeConfig: input.nativeConfig,
       },

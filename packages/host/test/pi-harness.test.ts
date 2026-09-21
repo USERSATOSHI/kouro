@@ -25,7 +25,7 @@ const descriptor = await inspectPi((args) => fakeProcess(args, ""));
 describe("Pi native RPC adapter", () => {
   test("selects optional Kouro profile env values without splitting provider URLs", () => {
     const resolved = resolvePiSelection(
-      { harnessId: "pi", model: { id: "" } },
+      { harness: "pi", model: { id: "" } },
       {},
       { KOURO_PI_PROVIDER: "llama-server=http://models:8080", KOURO_PI_MODEL: "qwen-0.8b" },
     );
@@ -33,10 +33,10 @@ describe("Pi native RPC adapter", () => {
       provider: "llama-server=http://models:8080",
       model: "qwen-0.8b",
     });
-    expect(resolvePiSelection({ harnessId: "pi", model: { id: "" } }, {}, {})).toEqual({});
+    expect(resolvePiSelection({ harness: "pi", model: { id: "" } }, {}, {})).toEqual({});
     expect(
       resolvePiSelection(
-        { harnessId: "pi", model: { id: "" } },
+        { harness: "pi", model: { id: "" } },
         {},
         { KOURO_PI_MODEL: "qwen36-35b-a3b-256k-vision-mtp" },
       ),
@@ -64,7 +64,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "a",
       role: { id: "r", prompt: "read" },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
     });
     expect(result.status).toBe("succeeded");
@@ -85,7 +85,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "fenced",
       role: { id: "r", prompt: "read", outputSchema: { type: "object", required: ["ok"] } },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
     });
     expect(result.status).toBe("succeeded");
@@ -134,7 +134,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "persistent",
       role: { id: "r", prompt: "Return JSON", outputSchema: { type: "object", required: ["ok"] } },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
     });
     expect(stopped).toBe(true);
@@ -163,7 +163,7 @@ describe("Pi native RPC adapter", () => {
       attemptId: "stats-timeout",
       role: { id: "r", prompt: "Return JSON" },
       selection: {
-        harnessId: "pi",
+        harness: "pi",
         model: { id: "local" },
         nativeConfig: { timeoutMs: 5 },
       },
@@ -186,7 +186,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "zero-stats",
       role: { id: "r", prompt: "Return JSON" },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
     });
     expect(result.status).toBe("succeeded");
@@ -211,7 +211,7 @@ describe("Pi native RPC adapter", () => {
     await new PiCliHarness({ ...descriptor, availability: "available" }, spawn).run({
       attemptId: "ctx",
       role: { id: "r", prompt: "handoff" },
-      selection: { harnessId: "pi", model: { id: "llama.cpp/qwen" } },
+      selection: { harness: "pi", model: { id: "llama.cpp/qwen" } },
       cwd: ".",
       context: {
         version: 1,
@@ -244,7 +244,7 @@ describe("Pi native RPC adapter", () => {
       await new PiCliHarness({ ...descriptor, availability: "available" }, spawn).run({
         attemptId: "env",
         role: { id: "r", prompt: "read" },
-      selection: { harnessId: "pi", model: { id: "" } },
+        selection: { harness: "pi", model: { id: "" } },
         cwd: ".",
       });
       expect(argv[argv.indexOf("--provider") + 1]).toBe("llama-server=http://models:8080");
@@ -264,7 +264,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "a",
       role: { id: "r", prompt: "read", outputSchema: { type: "object", required: ["ok"] } },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
     });
     expect(bad.status).toBe("failed");
@@ -275,7 +275,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "a",
       role: { id: "r", prompt: "read" },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
     });
     expect(dead.status).toBe("failed");
@@ -290,7 +290,7 @@ describe("Pi native RPC adapter", () => {
     ).run({
       attemptId: "a",
       role: { id: "r", prompt: "read" },
-      selection: { harnessId: "pi", model: { id: "local" } },
+      selection: { harness: "pi", model: { id: "local" } },
       cwd: ".",
       signal: controller.signal,
     });

@@ -8,6 +8,7 @@ import type {
   ProjectionFrame,
   RunStatus,
   RunView,
+  HarnessId,
 } from "@kouro/core/contracts";
 
 export type {
@@ -39,7 +40,7 @@ export interface ExecutionProfileSummary {
   name: string;
   description: string;
   available: boolean;
-  harness: string;
+  harness: HarnessId;
   model?: string;
   capabilities: Record<string, "supported" | "unsupported" | "conditional">;
   unavailableReason?: string;
@@ -103,6 +104,7 @@ export interface ScriptedAgent {
 }
 
 export interface HarnessAdapter {
+  /** Internal adapter identity; workflow-facing harness values are validated separately. */
   readonly id: string;
   readonly adapterVersion: string;
   capabilities(): Record<string, "supported" | "unsupported" | "conditional">;

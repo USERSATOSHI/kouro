@@ -152,7 +152,7 @@ TurnHandle {
   cancel(reason), resume?(), reattach?(), steer?(), close()
 }
 SessionReference {
-  harnessId, adapterVersion, opaqueSecretRef, modelIdentity?,
+  harness, adapterVersion, opaqueSecretRef, modelIdentity?,
   workspaceIdentity?, continuationKey, permissionDigest, contextLineageRef
 }
 ```

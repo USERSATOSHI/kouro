@@ -2,6 +2,7 @@ import {
   BUNDLE_FORMAT_VERSION,
   CompileError,
   DEFAULT_LIMITS,
+  isHarnessId,
   type Binding,
   type Bundle,
   type BoundSummary,
@@ -112,6 +113,8 @@ export async function compileWorkflowDetailed(
         ),
       );
     }
+    if (node.kind === "agent" && node.harness !== undefined && !isHarnessId(node.harness))
+      diagnostics.push(error("INVALID_HARNESS", `Unsupported harness ${node.harness}`, node.id));
     validatePorts(node.inputPorts, schemaDigests, diagnostics, node.id);
     validatePorts(node.outputPorts, schemaDigests, diagnostics, node.id);
     if (node.kind === "call" && !source.definitions?.[node.definitionId])

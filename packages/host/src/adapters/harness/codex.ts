@@ -343,7 +343,7 @@ export class CodexHarnessAdapter implements HarnessAdapter {
         ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
       },
       selection: {
-        harnessId: this.id,
+        harness: this.id,
         model: { id: input.modelId ?? "default" },
         ...(input.nativeConfig ? { nativeConfig: input.nativeConfig } : {}),
       },

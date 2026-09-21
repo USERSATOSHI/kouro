@@ -1,4 +1,4 @@
-import type { JsonObject, JsonValue } from "./contracts";
+import type { HarnessId, JsonObject, JsonValue } from "./contracts";
 import { canonicalize, sha256Hex } from "./canonical";
 import Ajv2020 from "ajv/dist/2020.js";
 
@@ -17,7 +17,7 @@ export interface CapabilityState {
 }
 
 export interface HarnessDescriptor {
-  readonly id: string;
+  readonly id: HarnessId;
   readonly adapterVersion: string;
   readonly version: string;
   readonly capabilities: Readonly<Record<Capability, CapabilityState>>;
@@ -37,7 +37,7 @@ export interface ModelSpec {
   readonly config?: JsonObject;
 }
 export interface HarnessSelection {
-  readonly harnessId: string;
+  readonly harness: HarnessId;
   readonly model: ModelSpec;
   readonly nativeConfig?: JsonObject;
 }

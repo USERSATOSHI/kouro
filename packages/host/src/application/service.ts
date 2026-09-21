@@ -330,7 +330,7 @@ export class ApplicationService {
               kind: node.kind,
               label: node.id,
               role: node.kind === "agent" ? node.role : undefined,
-              harnessId: node.kind === "agent" ? node.harnessId : undefined,
+              harness: node.kind === "agent" ? node.harness : undefined,
               modelId: node.kind === "agent" ? node.modelId : undefined,
               definitionId: childDefinition.id,
               scopeId:

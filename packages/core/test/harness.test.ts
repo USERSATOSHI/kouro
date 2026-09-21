@@ -33,7 +33,7 @@ describe("M2 harness contracts", () => {
     expect(manifest.digest).toMatch(/^sha256:/);
   });
   test("fallback is bounded and redaction does not leak secrets", async () => {
-    const primary: HarnessSelection = { harnessId: "fake", model: { id: "m" } };
+    const primary: HarnessSelection = { harness: "scripted", model: { id: "m" } };
     let calls = 0;
     const result = await runWithBoundedFallback(
       async () => {
@@ -41,7 +41,7 @@ describe("M2 harness contracts", () => {
         return { status: calls === 1 ? "unavailable" : "succeeded" };
       },
       primary,
-      { maxAttempts: 2, retryOn: ["unavailable"], fallback: { ...primary, harnessId: "fallback" } },
+      { maxAttempts: 2, retryOn: ["unavailable"], fallback: { ...primary, harness: "scripted" } },
     );
     expect(result.attempts).toBe(2);
     expect(

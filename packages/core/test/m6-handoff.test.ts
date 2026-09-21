@@ -24,7 +24,7 @@ const base = {
   ],
   contextManifest: context,
   provenance: {
-    sourceHarnessId: "scripted",
+    sourceHarness: "scripted" as const,
     sourceModelId: "fixture",
     createdBy: "host" as const,
     createdAt: "2026-09-19T00:00:00.000Z",

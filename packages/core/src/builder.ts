@@ -22,6 +22,7 @@ import type {
   ForEachNode,
   JoinMode,
   JoinFailure,
+  HarnessId,
 } from "./contracts";
 
 export type SchemaInput<T = unknown> = ArtifactType<T> | JsonValue;
@@ -52,7 +53,7 @@ export interface AgentOptions<T = unknown> {
   readonly role?: string;
   readonly prompt: string;
   /** Optional per-agent harness override. Defaults to the run execution profile. */
-  readonly harnessId?: string;
+  readonly harness?: HarnessId;
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
   readonly input?: Readonly<Record<string, ValueBinding>>;
@@ -349,7 +350,7 @@ export class WorkflowBuilder {
       kind: "agent",
       role: options.role ?? id,
       prompt: options.prompt,
-      ...(options.harnessId === undefined ? {} : { harnessId: options.harnessId }),
+      ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), true),
@@ -730,7 +731,7 @@ function stripInternal(node: InternalNode): Node {
       ...base,
       role: node.role,
       prompt: node.prompt,
-      ...(node.harnessId === undefined ? {} : { harnessId: node.harnessId }),
+      ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
       timeoutMs: node.timeoutMs,
       ...(node.scripted === undefined ? {} : { scripted: node.scripted }),
