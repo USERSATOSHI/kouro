@@ -7,11 +7,12 @@
 
 export const PROJECTION_VERSION = 1 as const;
 export const BUNDLE_FORMAT_VERSION = 1 as const;
-export const HARNESS_IDS = ["scripted", "codex", "pi", "claude", "opencode"] as const;
-export type HarnessId = (typeof HARNESS_IDS)[number];
+export const HARNESS = ["codex", "pi", "claude", "opencode"] as const;
+export type Harness = (typeof HARNESS)[number];
+export type RuntimeHarness = Harness | "scripted";
 
-export function isHarnessId(value: unknown): value is HarnessId {
-  return typeof value === "string" && (HARNESS_IDS as readonly string[]).includes(value);
+export function isHarness(value: unknown): value is Harness {
+  return typeof value === "string" && (HARNESS as readonly string[]).includes(value);
 }
 
 export type JsonPrimitive = null | boolean | number | string;
@@ -92,7 +93,7 @@ export interface AgentNode {
   readonly role: string;
   readonly prompt: string;
   /** Optional per-agent harness override. Defaults to the run execution profile. */
-  readonly harness?: HarnessId;
+  readonly harness?: Harness;
   readonly modelId?: string;
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];
@@ -355,7 +356,7 @@ export interface AttemptState {
 
 export interface ResolvedExecution {
   readonly role: string;
-  readonly harness: HarnessId;
+  readonly harness: RuntimeHarness;
   readonly adapterVersion: string;
   readonly modelId?: string;
   readonly nativeConfigDigest?: string;

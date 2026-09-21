@@ -4,7 +4,7 @@ import {
   canonicalize,
   createContextManifest,
   decide,
-  isHarnessId,
+  isHarness,
   redactSecrets,
   sha256Hex,
   unavailableUsage,
@@ -20,7 +20,7 @@ import type {
   JoinNode,
   JsonValue,
 } from "@kouro/core";
-import type { HarnessId } from "@kouro/core";
+import type { RuntimeHarness } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harness/scripted.ts";
 import { CodexCliHarness, CodexHarnessAdapter, inspectCodex } from "../adapters/harness/codex.ts";
@@ -60,8 +60,8 @@ export interface CoordinatorOptions {
   workspaceAdapter?: GitWorkspaceAdapter;
 }
 
-function toHarnessId(value: string): HarnessId {
-  return isHarnessId(value) ? value : "scripted";
+function toHarness(value: string): RuntimeHarness {
+  return isHarness(value) ? value : "scripted";
 }
 
 /** Host orchestration around the pure core reducer/decision function. */
@@ -1351,7 +1351,7 @@ export class Coordinator {
             diagnostics: ["collaboration idle/no-progress: participant completed"],
             resolvedExecution: {
               role: node.role,
-              harness: toHarnessId(this.harness.id),
+              harness: toHarness(this.harness.id),
               adapterVersion: this.harness.adapterVersion,
             },
           });
@@ -1456,7 +1456,7 @@ export class Coordinator {
               digest: contextManifest.digest,
             },
             provenance: {
-              sourceHarness: toHarnessId(this.harness.id),
+              sourceHarness: toHarness(this.harness.id),
               createdBy: "host",
               createdAt: now(),
             },
@@ -1493,26 +1493,26 @@ export class Coordinator {
         ? bundle.schemas[node.outputPorts[0].schemaDigest]
         : undefined;
       let selected: HarnessAdapter = this.harness;
-      let resolvedHarnessId: HarnessId = toHarnessId(this.harness.id);
+      let resolvedHarness: RuntimeHarness = toHarness(this.harness.id);
       let resolvedVersion = this.harness.adapterVersion;
       let resolvedModelId: string | undefined;
       let nativeConfig: import("@kouro/core").JsonObject | undefined;
-      const requestedHarnessId =
+      const requestedHarness =
         node.harness ??
         (profile === "codex-readonly"
           ? "codex"
           : profile === "pi-readonly"
             ? "pi"
-            : toHarnessId(this.harness.id));
+            : toHarness(this.harness.id));
       if (
-        requestedHarnessId === "scripted" &&
+        requestedHarness === "scripted" &&
         node.harness !== "codex" &&
         node.harness !== "pi" &&
         profile !== "codex-readonly" &&
         profile !== "pi-readonly"
       ) {
         // The injected/default harness is the run's scripted (or test) adapter.
-      } else if (requestedHarnessId === "codex") {
+      } else if (requestedHarness === "codex") {
         this.codexDescriptor ??= await inspectCodex();
         if (this.codexDescriptor.availability !== "available") {
           this.journal.completeEffect({
@@ -1537,10 +1537,10 @@ export class Coordinator {
           new CodexCliHarness(this.codexDescriptor),
         ));
         selected = codex;
-        resolvedHarnessId = toHarnessId(codex.id);
+        resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = { sandbox: "read-only" };
-      } else if (requestedHarnessId === "pi") {
+      } else if (requestedHarness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available") {
           this.journal.completeEffect({
@@ -1563,7 +1563,7 @@ export class Coordinator {
         }
         const pi = (this.pi ??= new PiHarnessAdapter(new PiCliHarness(this.piDescriptor)));
         selected = pi;
-        resolvedHarnessId = toHarnessId(pi.id);
+        resolvedHarness = toHarness(pi.id);
         resolvedVersion = pi.adapterVersion;
         const piSelection = resolvePiSelection(
           { harness: "pi", model: { id: node.modelId ?? "" } },
@@ -1575,8 +1575,8 @@ export class Coordinator {
           ...(piSelection.provider ? { provider: piSelection.provider } : {}),
           ...(piSelection.model ? { model: piSelection.model } : {}),
         };
-      } else if (requestedHarnessId === "claude" || requestedHarnessId === "opencode") {
-        if (requestedHarnessId === "claude") {
+      } else if (requestedHarness === "claude" || requestedHarness === "opencode") {
+        if (requestedHarness === "claude") {
           this.claudeDescriptor ??= await inspectExternalCli("claude");
           if (this.claudeDescriptor.availability !== "available") {
             this.journal.completeEffect({
@@ -1627,7 +1627,7 @@ export class Coordinator {
           this.opencode = opencode;
           selected = opencode;
         }
-        resolvedHarnessId = toHarnessId(selected.id);
+        resolvedHarness = toHarness(selected.id);
         resolvedVersion = selected.adapterVersion;
         nativeConfig = { ...(node.modelId ? { model: node.modelId } : {}) };
       } else {
@@ -1638,11 +1638,11 @@ export class Coordinator {
           evidence: [],
           output: [],
           status: "failed",
-          error: `harness-unavailable: unknown harness ${requestedHarnessId}`,
+          error: `harness-unavailable: unknown harness ${requestedHarness}`,
           diagnostics: ["execution rejected before workspace side effects"],
           resolvedExecution: {
             role: node.role,
-            harness: requestedHarnessId,
+            harness: requestedHarness,
             adapterVersion: "unknown",
           },
           contextManifest: JSON.parse(JSON.stringify(contextManifest)),
@@ -1806,7 +1806,7 @@ export class Coordinator {
         diagnostics: [harnessResult.error].filter((item): item is string => Boolean(item)),
         resolvedExecution: {
           role: node.role,
-          harness: resolvedHarnessId,
+          harness: resolvedHarness,
           adapterVersion: resolvedVersion,
           ...(resolvedModelId ? { modelId: resolvedModelId } : {}),
           ...(nativeConfigDigest ? { nativeConfigDigest } : {}),

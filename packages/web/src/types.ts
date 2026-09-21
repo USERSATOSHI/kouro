@@ -7,7 +7,8 @@ import type {
   ProjectionFrame as CoreProjectionFrame,
   RunView as CoreRunView,
   ScopeState,
-  HarnessId,
+  Harness,
+  RuntimeHarness,
 } from "@kouro/core/contracts";
 
 export type { CoreProjectionFrame, CoreRunView };
@@ -23,7 +24,7 @@ export interface WorkflowNode {
   scopeId?: string;
   definitionId?: string;
   parentNodeId?: string;
-  harness?: HarnessId;
+  harness?: Harness;
   groupId?: string;
   parallelGroupId?: string;
   joinId?: string;
@@ -65,7 +66,7 @@ export interface ExecutionProfile {
   name: string;
   description: string;
   available: boolean;
-  harness: HarnessId;
+  harness: RuntimeHarness;
   model?: string;
   capabilities: Record<string, "supported" | "unsupported" | "conditional">;
   unavailableReason?: string;

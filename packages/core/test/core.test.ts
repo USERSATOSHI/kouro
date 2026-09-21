@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   WorkflowBuilder,
+  HARNESS,
   artifactType,
   compileWorkflow,
   compileWorkflowDetailed,
@@ -8,6 +9,7 @@ import {
   decide,
   reduceEvent,
   type LifecycleEvent,
+  isHarness,
 } from "../src/index";
 
 const task = artifactType<string>("Task", { type: "string" });
@@ -45,6 +47,12 @@ function event<T extends LifecycleEvent["type"]>(
 }
 
 describe("@kouro/core M1 kernel", () => {
+  test("exposes only provider harnesses for per-agent selection", () => {
+    expect(HARNESS).toEqual(["codex", "pi", "claude", "opencode"]);
+    expect(isHarness("scripted")).toBe(false);
+    expect(isHarness("codex")).toBe(true);
+  });
+
   test("compiles a browser-safe scripted agent -> command -> complete bundle", async () => {
     const bundle = await compileWorkflow(tinyWorkflow().build());
     expect(bundle.formatVersion).toBe(1);

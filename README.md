@@ -85,7 +85,7 @@ workspace resources remain separate concepts.
 Harnesses can be mixed per agent. `harness` overrides the run's execution profile;
 when omitted, the run profile selects the harness:
 
-Supported harness values are `scripted`, `codex`, `pi`, `claude`, and `opencode`.
+Supported harness values are `codex`, `pi`, `claude`, and `opencode`.
 
 ```ts
 workflow.agent("planner", {

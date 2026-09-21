@@ -8,7 +8,8 @@ import type {
   ProjectionFrame,
   RunStatus,
   RunView,
-  HarnessId,
+  Harness,
+  RuntimeHarness,
 } from "@kouro/core/contracts";
 
 export type {
@@ -40,7 +41,7 @@ export interface ExecutionProfileSummary {
   name: string;
   description: string;
   available: boolean;
-  harness: HarnessId;
+  harness: RuntimeHarness;
   model?: string;
   capabilities: Record<string, "supported" | "unsupported" | "conditional">;
   unavailableReason?: string;

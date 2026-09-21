@@ -22,7 +22,7 @@ import type {
   ForEachNode,
   JoinMode,
   JoinFailure,
-  HarnessId,
+  Harness,
 } from "./contracts";
 
 export type SchemaInput<T = unknown> = ArtifactType<T> | JsonValue;
@@ -53,7 +53,7 @@ export interface AgentOptions<T = unknown> {
   readonly role?: string;
   readonly prompt: string;
   /** Optional per-agent harness override. Defaults to the run execution profile. */
-  readonly harness?: HarnessId;
+  readonly harness?: Harness;
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
   readonly input?: Readonly<Record<string, ValueBinding>>;

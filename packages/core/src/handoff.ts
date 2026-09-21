@@ -33,7 +33,7 @@ export interface AgentHandoff {
   readonly nextSteps: readonly HandoffClaim[];
   readonly contextManifest: Pick<ContextManifest, "version" | "attemptId" | "digest">;
   readonly provenance: {
-    readonly sourceHarness: import("./contracts").HarnessId;
+    readonly sourceHarness: import("./contracts").RuntimeHarness;
     readonly sourceModelId?: string;
     readonly createdBy: HandoffClaimSource;
     readonly createdAt: string;
