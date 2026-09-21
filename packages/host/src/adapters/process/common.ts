@@ -103,7 +103,9 @@ export async function probeEnforcedProcess(
       : {
           available: false,
           detail:
-            result.evidence.spawnError ?? `probe exited ${result.evidence.exitCode}: ${stderr}`,
+            result.evidence.spawnError ??
+            `probe exited ${result.evidence.exitCode ?? "unknown"}` +
+              `${result.evidence.signal ? ` (${result.evidence.signal})` : ""}: ${stderr || "no stderr"}`,
         };
   } catch (cause) {
     return { available: false, detail: cause instanceof Error ? cause.message : String(cause) };

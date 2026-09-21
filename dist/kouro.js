@@ -16297,7 +16297,7 @@ async function probeEnforcedProcess(spawn, name) {
     return result.evidence.exitCode === 0 && stdout === `kouro-bwrap-probe
 ` ? { available: true, detail: `${name} enforced probe passed` } : {
       available: false,
-      detail: result.evidence.spawnError ?? `probe exited ${result.evidence.exitCode}: ${stderr}`
+      detail: result.evidence.spawnError ?? `probe exited ${result.evidence.exitCode ?? "unknown"}` + `${result.evidence.signal ? ` (${result.evidence.signal})` : ""}: ${stderr || "no stderr"}`
     };
   } catch (cause) {
     return { available: false, detail: cause instanceof Error ? cause.message : String(cause) };
@@ -16344,10 +16344,17 @@ class DarwinSandboxProcessAdapter {
       "(deny default)",
       '(allow process-exec (literal "/usr/bin/printf"))',
       "(allow process-fork)",
-      "(allow signal (target self))",
+      "(allow signal (target same-sandbox))",
+      "(allow file-read-metadata)",
       '(allow file-read* (subpath "/System"))',
       '(allow file-read* (subpath "/usr"))',
       '(allow file-read* (subpath "/bin"))',
+      '(allow file-read* (subpath "/private/etc"))',
+      '(allow file-read* (subpath "/private/var/db/timezone"))',
+      '(allow file-read* file-write* (subpath "/private/tmp"))',
+      '(allow file-write* (literal "/dev/null"))',
+      '(allow file-read* (literal "/dev/random"))',
+      '(allow file-read* (literal "/dev/urandom"))',
       `(allow file-read* (subpath "${path}"))`,
       `(allow file-write* (subpath "${path}"))`
     ].join(`
