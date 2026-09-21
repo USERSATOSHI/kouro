@@ -27,8 +27,10 @@ paths that must exist in this v2 checkout.
 
 ## Authoring and compiler contract
 
-Keep `WorkflowBuilder.subagent(id, childDefinition, options)` and make it
-return an owner-checked subagent handle. Declared subagents are available to
+Expose `WorkflowBuilder.subagent(id, options, limits)` and make it return an
+owner-checked subagent handle. The options contain the role, prompt, input
+schemas, and one typed output schema; the builder creates the restricted child
+definition internally. Declared subagents are available to
 every agent. An optional `uses: ScoutHandle[]` list narrows one agent's access;
 persist that allowlist on the compiled node and reject duplicate or foreign
 handles. Names such as `repositoryScout` and `testScout` are illustrative
@@ -60,7 +62,7 @@ than the number of required authorized scouts.
 
 ## Example workflow
 
-This is target authoring syntax, not a claim that the additions compile today.
+This is the public authoring syntax.
 `Task` and `Question` are project-owned string artifact types; `ScoutReport` and
 `Plan` are object artifact types exported from `schemas/schema.ts`. For the
 walkthrough below, ScoutReport has `summary: string` and
@@ -70,37 +72,26 @@ walkthrough below, ScoutReport has `summary: string` and
 import { WorkflowBuilder } from "@kouro/core";
 import { Task, Question, ScoutReport, Plan } from "./schemas/schema.ts";
 
-function scoutDefinition(id: string, role: string, prompt: string) {
-  const child = new WorkflowBuilder({ id, version: "1" });
-  const task = child.input("task", Task);
-  const question = child.input("question", Question);
-  const inspect = child.agent("inspect", {
-    role,
-    prompt,
-    input: { task, question },
-    produces: ScoutReport,
-    timeoutMs: 60_000,
-    // Normal per-agent harness/modelId overrides remain available here.
-  });
-  const done = child.complete("done", { output: inspect.output });
-  child.startAt(inspect);
-  inspect.on("success").to(done);
-  child.output(inspect.output);
-  return child;
-}
-
 const workflow = new WorkflowBuilder({ id: "feature", version: "1" });
 const task = workflow.input("task", Task);
 const repositoryScout = workflow.subagent(
   "repositoryScout",
-  scoutDefinition("repositoryScout", "repository-scout",
-    "Read repository boundaries relevant to the task and question. Return evidence."),
+  {
+    role: "repository-scout",
+    prompt: "Read repository boundaries relevant to the task and question. Return evidence.",
+    input: { task: Task, question: Question },
+    produces: ScoutReport,
+  },
   { maxInvocations: 2, maxConcurrent: 1, optional: false },
 );
 const testScout = workflow.subagent(
   "testScout",
-  scoutDefinition("testScout", "test-scout",
-    "Read relevant tests. Report coverage and gaps; do not execute tests."),
+  {
+    role: "test-scout",
+    prompt: "Read relevant tests. Report coverage and gaps; do not execute tests.",
+    input: { task: Task, question: Question },
+    produces: ScoutReport,
+  },
   { maxInvocations: 2, maxConcurrent: 1, optional: true },
 );
 const plan = workflow.agent("plan", {

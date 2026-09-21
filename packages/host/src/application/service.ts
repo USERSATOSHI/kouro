@@ -972,51 +972,27 @@ async function compileTiny(): Promise<Bundle> {
 }
 
 async function compileFeature(): Promise<Bundle> {
-  const repositoryScout = new WorkflowBuilder({ id: "repositoryScout", version: "1" });
-  const repositoryQuestion = repositoryScout.input("question", ScoutQuestion);
-  const repositoryTask = repositoryScout.input(
-    "task",
-    artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
-  );
-  const repositoryInspect = repositoryScout.agent("inspect", {
+  const taskSchema = artifactType<string>("kouro.workflow-task.v1", {
+    type: "string",
+    minLength: 1,
+  });
+  const builder = new WorkflowBuilder({ id: "feature", version: "2" });
+  const task = builder.input("task", taskSchema, { required: false });
+  const workItem = builder.input("workItem", WorkItem, { required: false });
+  builder.subagent("repositoryScout", {
     role: "repository-scout",
     prompt: "Inspect the read-only repository view and return a structured repository report.",
-    input: { task: repositoryTask, question: repositoryQuestion },
+    input: { task: taskSchema, question: ScoutQuestion },
     produces: ScoutReport,
     scripted: { output: { summary: "Repository scout fixture", findings: [] } },
   });
-  const repositoryDone = repositoryScout.complete("done", { output: repositoryInspect.output });
-  repositoryScout.startAt(repositoryInspect);
-  repositoryInspect.on("success").to(repositoryDone);
-  repositoryScout.output(repositoryInspect.output);
-
-  const testScout = new WorkflowBuilder({ id: "testScout", version: "1" });
-  const testQuestion = testScout.input("question", ScoutQuestion);
-  const testTask = testScout.input(
-    "task",
-    artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
-  );
-  const testInspect = testScout.agent("inspect", {
+  builder.subagent("testScout", {
     role: "test-scout",
     prompt: "Inspect the read-only repository view and return a structured test/build report.",
-    input: { task: testTask, question: testQuestion },
+    input: { task: taskSchema, question: ScoutQuestion },
     produces: ScoutReport,
     scripted: { output: { summary: "Test scout fixture", findings: [] } },
   });
-  const testDone = testScout.complete("done", { output: testInspect.output });
-  testScout.startAt(testInspect);
-  testInspect.on("success").to(testDone);
-  testScout.output(testInspect.output);
-
-  const builder = new WorkflowBuilder({ id: "feature", version: "2" });
-  const task = builder.input(
-    "task",
-    artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
-    { required: false },
-  );
-  const workItem = builder.input("workItem", WorkItem, { required: false });
-  builder.subagent("repositoryScout", repositoryScout);
-  builder.subagent("testScout", testScout);
   const plan = builder.agent("plan", {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",

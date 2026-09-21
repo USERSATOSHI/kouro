@@ -13,28 +13,11 @@ test("bounded scout gateway keeps request identity, typed results, delivery, and
     required: ["summary"],
     properties: { summary: { type: "string", minLength: 1 } },
   });
-  const child = new WorkflowBuilder({ id: "repositoryScout", version: "1" });
-  const task = child.input("task", artifactType<string>("task", { type: "string", minLength: 1 }));
-  const question = child.input(
-    "question",
-    artifactType<string>("question", { type: "string", minLength: 1 }),
-  );
-  const inspect = child.agent("inspect", {
-    role: "scout",
-    prompt: "inspect",
-    input: { task, question },
-    produces: report,
-  });
-  const childDone = child.complete("done", { output: inspect.output });
-  child.startAt(inspect);
-  inspect.on("success").to(childDone);
-  child.output(inspect.output);
+  const taskSchema = artifactType<string>("task", { type: "string", minLength: 1 });
+  const questionSchema = artifactType<string>("question", { type: "string", minLength: 1 });
 
   const root = new WorkflowBuilder({ id: "workflow", version: "1" });
-  const rootTask = root.input(
-    "task",
-    artifactType<string>("task", { type: "string", minLength: 1 }),
-  );
+  const rootTask = root.input("task", taskSchema);
   const implementer = root.agent("implementer", {
     role: "implementer",
     prompt: "implement",
@@ -43,7 +26,12 @@ test("bounded scout gateway keeps request identity, typed results, delivery, and
   const done = root.complete("done");
   root.startAt(implementer);
   implementer.on("success").to(done);
-  root.subagent("repository", child);
+  root.subagent("repository", {
+    role: "scout",
+    prompt: "inspect",
+    input: { task: taskSchema, question: questionSchema },
+    produces: report,
+  });
   const bundle = await compileWorkflow(root.build());
   const dataDir = mkdtempSync(join(tmpdir(), "kouro-scout-"));
   const journal = new Journal({ dataDir });

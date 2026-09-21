@@ -17,20 +17,12 @@ const Plan = artifactType<{ summary: string }>("plan", {
 });
 
 function scout(id = "repositoryScout") {
-  const child = new WorkflowBuilder({ id, version: "1" });
-  const task = child.input("task", Task);
-  const question = child.input("question", Question);
-  const inspect = child.agent("inspect", {
-    role: "repository-scout",
+  return {
+    role: `${id}-role`,
     prompt: "inspect",
-    input: { task, question },
+    input: { task: Task, question: Question },
     produces: Report,
-  });
-  const done = child.complete("done", { output: inspect.output });
-  child.startAt(inspect);
-  inspect.on("success").to(done);
-  child.output(inspect.output);
-  return child;
+  };
 }
 
 test("planner scout authoring preserves authorization and typed report bindings", async () => {
@@ -98,17 +90,23 @@ test("planner scout authoring rejects impossible required budgets and foreign ha
   ).toThrow("expected feature");
 });
 
-test("compiler rejects a scout child that is not the restricted agent shape", async () => {
-  const child = new WorkflowBuilder({ id: "bad-scout", version: "1" });
-  const command = child.command("command", { executable: "/usr/bin/printf", args: ["x"] });
-  const done = child.complete("done");
-  child.startAt(command);
-  command.on("success").to(done);
+test("direct subagent declarations compile to restricted child definitions", async () => {
   const workflow = new WorkflowBuilder({ id: "feature", version: "1" });
-  const handle = workflow.subagent("bad", child);
+  const handle = workflow.subagent("customReviewer", {
+    role: "reviewer",
+    prompt: "review",
+    input: { task: Task },
+    produces: Report,
+  });
   const plan = workflow.agent("plan", { role: "planner", prompt: "plan", uses: [handle] });
   const finish = workflow.complete("finish");
   workflow.startAt(plan);
   plan.on("success").to(finish);
-  await expect(compileWorkflow(workflow.build())).rejects.toThrow("INVALID_SCOUT_SHAPE");
+  const bundle = await compileWorkflow(workflow.build());
+  const child = bundle.definitions.customReviewer;
+  expect(child.nodes.map((node) => node.kind).sort()).toEqual(["agent", "complete"]);
+  expect(child.nodes.find((node) => node.kind === "agent")).toMatchObject({
+    role: "reviewer",
+    prompt: "review",
+  });
 });

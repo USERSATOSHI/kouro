@@ -89,6 +89,28 @@ export interface AgentOptions<T = unknown> {
   readonly resources?: Readonly<Record<string, number>>;
 }
 
+export interface SubagentOptions<T = unknown> {
+  readonly role?: string;
+  readonly prompt: string;
+  /** Optional per-subagent harness override. Defaults to the run execution profile. */
+  readonly harness?: Harness;
+  /** Optional provider/model reference for model-backed execution profiles. */
+  readonly modelId?: string;
+  /** Input schemas exposed to the subagent. */
+  readonly input?: Readonly<Record<string, SchemaInput>>;
+  /** The single typed report returned by the subagent. */
+  readonly produces: ArtifactType<T>;
+  readonly timeoutMs?: number;
+  readonly scripted?: ScriptedAgentProfile;
+  readonly resources?: Readonly<Record<string, number>>;
+}
+
+export interface SubagentLimits {
+  readonly maxInvocations?: number;
+  readonly maxConcurrent?: number;
+  readonly optional?: boolean;
+}
+
 export interface CommandOptions {
   readonly executable: string;
   readonly args?: readonly string[];
@@ -263,6 +285,79 @@ function defaultOutput<T>(
   const schema =
     produces ?? ({ id: `${nodeId}.output`, schema: fallbackSchema } as ArtifactType<T>);
   return port("output", schema);
+}
+
+function directSubagentSource<T>(
+  id: string,
+  options: SubagentOptions<T>,
+): WorkflowDefinitionSource {
+  if (!id) throw new Error("Subagent id must be non-empty");
+  const inputPorts = Object.entries(options.input ?? {}).map(([name, schema]) =>
+    port(name, schema),
+  );
+  const output = defaultOutput("subagent", options.produces);
+  const agentId = "subagent";
+  const completeId = "complete";
+  const agent: AgentNode = {
+    id: agentId,
+    kind: "agent",
+    role: options.role ?? id,
+    prompt: options.prompt,
+    ...(options.harness === undefined ? {} : { harness: options.harness }),
+    ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+    inputPorts: inputPorts.map(stripPort),
+    outputPorts: [stripPort(output)],
+    bindings: inputPorts.map((input) => ({
+      targetPort: input.name,
+      source: { kind: "input" as const, sourceId: input.name, port: input.name },
+      missing: "error" as const,
+    })),
+    timeoutMs: finitePositive(options.timeoutMs, 5_000),
+    ...(options.scripted === undefined ? {} : { scripted: options.scripted }),
+    ...(options.resources === undefined ? {} : { resources: options.resources }),
+  };
+  const complete: CompleteNode = {
+    id: completeId,
+    kind: "complete",
+    inputPorts: [stripPort(output)],
+    outputPorts: [],
+    bindings: [
+      {
+        targetPort: "output",
+        source: { kind: "producer", sourceId: agentId, port: "output" },
+        missing: "error",
+      },
+    ],
+    result: "succeeded",
+  };
+  const schemaCatalog: Record<string, JsonValue> = {};
+  for (const input of inputPorts) schemaCatalog[input.schemaLabel] = input.schema;
+  schemaCatalog[output.schemaLabel] = output.schema;
+  return {
+    id,
+    version: "1",
+    nodes: [agent, complete],
+    controlEdges: [
+      {
+        id: `${agentId}:success:${completeId}:0`,
+        sourceNodeId: agentId,
+        outcome: "success",
+        targetNodeId: completeId,
+        kind: "sequential",
+      },
+    ],
+    inputPorts: inputPorts.map(stripPort),
+    outputPorts: [stripPort(output)],
+    entry: agentId,
+    schemaCatalog,
+    counters: [],
+    definitions: {},
+    sourceMap: {
+      [agentId]: { sourceId: agentId },
+      [completeId]: { sourceId: completeId },
+    },
+    scouts: [],
+  };
 }
 
 function bindingSource(value: ValueBinding, owner: WorkflowBuilder): BindingSource {
@@ -602,20 +697,44 @@ export class WorkflowBuilder {
     });
   }
 
-  declareSubagent<T = unknown>(
-    id: string,
-    child: WorkflowBuilder,
-    options: { maxInvocations?: number; maxConcurrent?: number; optional?: boolean } = {},
-  ): ScoutHandle<T> {
-    return this.declareScout(id, child, options);
-  }
-
   subagent<T = unknown>(
     id: string,
-    child: WorkflowBuilder,
-    options: { maxInvocations?: number; maxConcurrent?: number; optional?: boolean } = {},
+    options: SubagentOptions<T>,
+    limits: SubagentLimits = {},
   ): ScoutHandle<T> {
-    return this.declareScout(id, child, options);
+    if (this.scoutList.some((scout) => scout.id === id)) throw new Error(`Duplicate scout ${id}`);
+    const child = directSubagentSource(id, options);
+    this.childDefinitions.set(id, child);
+    const maxInvocations = limits.maxInvocations ?? 2;
+    const maxConcurrent = limits.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations <= 0)
+      throw new Error("scout maxInvocations must be a positive safe integer");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+      throw new Error("scout maxConcurrent must be a positive safe integer");
+    this.scoutList.push({
+      id,
+      definitionId: id,
+      maxInvocations,
+      maxConcurrent,
+      ...(limits.optional ? { optional: true } : {}),
+    });
+    return Object.freeze({
+      kind: "scout" as const,
+      workflowId: this.id,
+      id,
+      definitionId: id,
+      schema: options.produces,
+      ownerToken: this.ownerToken,
+    });
+  }
+
+  /** @deprecated Use subagent(id, options, limits). */
+  declareSubagent<T = unknown>(
+    id: string,
+    options: SubagentOptions<T>,
+    limits: SubagentLimits = {},
+  ): ScoutHandle<T> {
+    return this.subagent(id, options, limits);
   }
 
   scoutResults<T = unknown>(
