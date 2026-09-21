@@ -16738,6 +16738,18 @@ import { openSync as openSync2, closeSync as closeSync2, constants as fsConstant
 import { dlopen } from "bun:ffi";
 var LOCK_EX = 2;
 var LOCK_NB = 4;
+function nativeLockLibrary(platform = process.platform) {
+  switch (platform) {
+    case "darwin":
+      return "/usr/lib/libSystem.B.dylib";
+    case "freebsd":
+      return "libc.so.7";
+    case "linux":
+      return "libc.so.6";
+    default:
+      throw new Error(`Kouro owner locking is not supported on ${platform}; supported platforms are Linux, macOS, and FreeBSD`);
+  }
+}
 
 class OwnerLock {
   path;
@@ -16745,7 +16757,7 @@ class OwnerLock {
   flock;
   constructor(path) {
     this.path = path;
-    const libc = dlopen("libc.so.6", {
+    const libc = dlopen(nativeLockLibrary(), {
       flock: { args: ["int", "int"], returns: "int" }
     });
     this.flock = libc.symbols.flock;
