@@ -3,6 +3,8 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { GitWorkspaceAdapter } from "../src/adapters/workspace/git.ts";
+import { Coordinator } from "../src/coordinator/coordinator.ts";
+import { WorkflowBuilder, compileWorkflow } from "@kouro/core";
 
 describe("GitWorkspaceAdapter", () => {
   test("creates isolated registered worktrees and captures exact changes", async () => {
@@ -85,6 +87,69 @@ describe("GitWorkspaceAdapter", () => {
       }),
     ).rejects.toThrow("tree changed");
     await adapter.cleanup(workspace);
+  });
+
+  test("binds delivery approval to the prepared tree and operation identity", async () => {
+    const repository = await fixtureRepo();
+    const root = mkdtempSync(join(tmpdir(), "kouro-delivery-data-"));
+    const adapter = new GitWorkspaceAdapter({ worktreeRoot: join(root, "worktrees") });
+    const workflow = new WorkflowBuilder({ id: "delivery", version: "1" });
+    const done = workflow.complete("done");
+    workflow.startAt(done);
+    const bundle = await compileWorkflow(workflow.build());
+    const coordinator = new Coordinator({ dataDir: join(root, "data"), workspaceAdapter: adapter });
+    const run = await coordinator.createRun({
+      workflowId: "delivery",
+      bundle,
+      idempotencyKey: "delivery-run",
+      workspace: { repositoryPath: repository },
+    });
+    const runId = run.run.runId;
+    const workspacePath = coordinator.workspacePath(runId)!;
+    writeFileSync(join(workspacePath, "approved.txt"), "approved\n");
+    const action = await coordinator.prepareDelivery({
+      runId,
+      requestKey: "delivery-request",
+      message: "Deliver approved change",
+    });
+    expect(action.status).toBe("pending");
+    await expect(
+      coordinator.workspaceCommit({
+        runId,
+        expectedTree: action.resultTree,
+        operationKey: "client-key",
+        message: action.message,
+        deliveryActionId: action.id,
+      }),
+    ).rejects.toThrow("pending");
+    coordinator.decideDelivery({ actionId: action.id, decision: "approved", actor: "operator" });
+    writeFileSync(join(workspacePath, "stale.txt"), "stale\n");
+    await expect(
+      coordinator.workspaceCommit({
+        runId,
+        expectedTree: action.resultTree,
+        operationKey: "client-key",
+        message: action.message,
+        deliveryActionId: action.id,
+      }),
+    ).rejects.toThrow("tree changed");
+
+    const fresh = await coordinator.prepareDelivery({
+      runId,
+      requestKey: "delivery-request-2",
+      message: "Deliver fresh change",
+    });
+    coordinator.decideDelivery({ actionId: fresh.id, decision: "approved", actor: "operator" });
+    const committed = await coordinator.workspaceCommit({
+      runId,
+      expectedTree: fresh.resultTree,
+      operationKey: "client-key-2",
+      message: fresh.message,
+      deliveryActionId: fresh.id,
+    });
+    expect(committed.commit).toMatch(/^[a-f0-9]{40}$/);
+    expect(coordinator.deliveryAction(fresh.id)?.status).toBe("committed");
+    await coordinator.close();
   });
 });
 

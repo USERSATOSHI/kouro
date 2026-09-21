@@ -11,6 +11,8 @@ import { assertMessageTarget, collaborationBodyBytes } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import type { Journal } from "../storage/journal.ts";
 import type { CollaborationTools } from "../types.ts";
+import type { ScoutResult } from "../types.ts";
+import type { ScoutGateway } from "../scouting/gateway.ts";
 
 export type WaitRequest = {
   readonly grantId: string;
@@ -27,7 +29,16 @@ export class CollaborationGateway {
   constructor(private readonly journal: Journal) {}
 
   /** Create the deliberately small tool surface handed to one host turn. */
-  tools(grant: CollaborationGrant): CollaborationTools {
+  tools(
+    grant: CollaborationGrant,
+    subagents?: ScoutGateway,
+    subagent?: (input: {
+      requestId: string;
+      subagentId: string;
+      input: Record<string, unknown>;
+      signal?: AbortSignal;
+    }) => Promise<ScoutResult>,
+  ): CollaborationTools {
     return {
       participantId: grant.participantId,
       send_message: (input) =>
@@ -56,7 +67,19 @@ export class CollaborationGateway {
           maxMessages: Math.max(1, Math.min(64, input.maxMessages ?? 8)),
           idleDeadline: input.idleDeadline ?? new Date().toISOString(),
         }),
+      ...(subagents && subagent
+        ? {
+            subagent: (input) => subagent(input),
+          }
+        : {}),
     };
+  }
+
+  private attemptInvocation(runId: string, attemptId: string): string {
+    const view = this.journal.getView(runId);
+    const attempt = view?.state.attempts[attemptId];
+    if (!attempt) throw new Error("attempt is not registered");
+    return attempt.invocationId;
   }
 
   private ensureBlackboardChannel(runId: string, channel: string): void {

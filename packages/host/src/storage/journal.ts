@@ -31,7 +31,7 @@ import type {
   RunComparisonRecord,
 } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
-import type { CommandReceipt, RunSummary } from "../types.ts";
+import type { CommandReceipt, DeliveryAction, RunSummary } from "../types.ts";
 import { migrate } from "./schema.ts";
 import { BlobStore, type StoredBlobRef } from "./blob-store.ts";
 import { OwnerLock } from "./lock.ts";
@@ -59,6 +59,56 @@ interface RunRow {
   input_json: string;
   createdAt: string;
   updatedAt: string;
+}
+
+interface DeliveryActionRow {
+  id: string;
+  request_key: string;
+  run_id: string;
+  workspace_id: string;
+  invocation_id: string | null;
+  base_tree: string;
+  result_tree: string;
+  patch_digest: string;
+  changed_paths_json: string;
+  message: string;
+  validation_evidence_json: string;
+  review_evidence_json: string;
+  action_digest: string;
+  operation_key: string;
+  status: DeliveryAction["status"];
+  actor: string | null;
+  commit_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function toDeliveryAction(row: DeliveryActionRow): DeliveryAction {
+  return {
+    id: row.id,
+    requestKey: row.request_key,
+    runId: row.run_id,
+    workspaceId: row.workspace_id,
+    ...(row.invocation_id === null ? {} : { invocationId: row.invocation_id }),
+    baseTree: row.base_tree,
+    resultTree: row.result_tree,
+    patchDigest: row.patch_digest,
+    changedPaths: parseJson<unknown[]>(row.changed_paths_json),
+    message: row.message,
+    ...(parseJson<string[]>(row.validation_evidence_json).length
+      ? { validationEvidence: parseJson<string[]>(row.validation_evidence_json) }
+      : {}),
+    ...(parseJson<string[]>(row.review_evidence_json).length
+      ? { reviewEvidence: parseJson<string[]>(row.review_evidence_json) }
+      : {}),
+    actionDigest: row.action_digest,
+    operationKey: row.operation_key,
+    status: row.status,
+    ...(row.actor === null ? {} : { actor: row.actor }),
+    ...(row.commit_json === null ? {} : { commit: parseJson(row.commit_json) }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 /** Durable M1 journal. It stores core lifecycle facts and never implements a second reducer. */
@@ -674,6 +724,8 @@ export class Journal {
     input?: Record<string, unknown>;
     idempotencyKey: string;
     actor?: string;
+    executionProfile?: string;
+    workspace?: { repositoryPath: string; workspaceId?: string };
   }): { run: RunSummary; receipt: CommandReceipt; created: boolean } {
     const requestDigest = createHash("sha256")
       .update(
@@ -681,6 +733,8 @@ export class Journal {
           workflowId: input.workflowId,
           bundleDigest: input.bundle.digest,
           input: input.input ?? {},
+          executionProfile: input.executionProfile ?? null,
+          workspace: input.workspace ?? null,
         }),
       )
       .digest("hex");
@@ -736,6 +790,130 @@ export class Journal {
     this.db
       .query("UPDATE runs SET input_json = ?, updated_at = ? WHERE id = ?")
       .run(json(input), now(), runId);
+  }
+
+  createDeliveryAction(input: {
+    requestKey: string;
+    runId: string;
+    workspaceId: string;
+    invocationId?: string;
+    baseTree: string;
+    resultTree: string;
+    patchDigest: string;
+    changedPaths: readonly unknown[];
+    message: string;
+    validationEvidence?: readonly string[];
+    reviewEvidence?: readonly string[];
+  }): DeliveryAction {
+    if (!input.requestKey.trim()) throw new Error("delivery request key is required");
+    const base = {
+      runId: input.runId,
+      workspaceId: input.workspaceId,
+      baseTree: input.baseTree,
+      resultTree: input.resultTree,
+      patchDigest: input.patchDigest,
+      changedPaths: input.changedPaths,
+      message: input.message,
+      invocationId: input.invocationId ?? null,
+      validationEvidence: input.validationEvidence ?? [],
+      reviewEvidence: input.reviewEvidence ?? [],
+    };
+    const actionDigest = `sha256:${createHash("sha256").update(canonicalize(base)).digest("hex")}`;
+    return this.tx(() => {
+      const prior = this.db
+        .query("SELECT * FROM delivery_actions WHERE request_key=?1")
+        .get(input.requestKey) as DeliveryActionRow | null;
+      if (prior) {
+        if (prior.action_digest !== actionDigest)
+          throw new Error("delivery request key payload conflict");
+        return toDeliveryAction(prior);
+      }
+      const timestamp = now();
+      const action: DeliveryAction = {
+        id: id("delivery"),
+        requestKey: input.requestKey,
+        runId: input.runId,
+        workspaceId: input.workspaceId,
+        ...(input.invocationId ? { invocationId: input.invocationId } : {}),
+        baseTree: input.baseTree,
+        resultTree: input.resultTree,
+        patchDigest: input.patchDigest,
+        changedPaths: input.changedPaths,
+        message: input.message,
+        ...(input.validationEvidence?.length
+          ? { validationEvidence: input.validationEvidence }
+          : {}),
+        ...(input.reviewEvidence?.length ? { reviewEvidence: input.reviewEvidence } : {}),
+        actionDigest,
+        operationKey: `delivery/${input.runId}/${input.requestKey}`,
+        status: "pending",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.db
+        .query(
+          "INSERT INTO delivery_actions(id,request_key,run_id,workspace_id,invocation_id,base_tree,result_tree,patch_digest,changed_paths_json,message,validation_evidence_json,review_evidence_json,action_digest,operation_key,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'pending',?15,?15)",
+        )
+        .run(
+          action.id,
+          action.requestKey,
+          action.runId,
+          action.workspaceId,
+          action.invocationId ?? null,
+          action.baseTree,
+          action.resultTree,
+          action.patchDigest,
+          json(action.changedPaths),
+          action.message,
+          json(action.validationEvidence ?? []),
+          json(action.reviewEvidence ?? []),
+          action.actionDigest,
+          action.operationKey,
+          timestamp,
+        );
+      return action;
+    });
+  }
+
+  getDeliveryAction(actionId: string): DeliveryAction | undefined {
+    const row = this.db
+      .query("SELECT * FROM delivery_actions WHERE id=?1")
+      .get(actionId) as DeliveryActionRow | null;
+    return row ? toDeliveryAction(row) : undefined;
+  }
+
+  decideDeliveryAction(input: {
+    actionId: string;
+    decision: "approved" | "rejected";
+    actor: string;
+  }): DeliveryAction {
+    if (!input.actor.trim()) throw new Error("delivery approval actor is required");
+    return this.tx(() => {
+      const action = this.getDeliveryAction(input.actionId);
+      if (!action) throw new Error("delivery action not found");
+      if (action.status === "committed") throw new Error("delivery action is already committed");
+      if (action.status !== "pending" && action.status !== input.decision)
+        throw new Error(`delivery action is ${action.status}`);
+      this.db
+        .query("UPDATE delivery_actions SET status=?1, actor=?2, updated_at=?3 WHERE id=?4")
+        .run(input.decision, input.actor, now(), input.actionId);
+      return this.getDeliveryAction(input.actionId)!;
+    });
+  }
+
+  completeDeliveryAction(actionId: string, commit: unknown): DeliveryAction {
+    return this.tx(() => {
+      const action = this.getDeliveryAction(actionId);
+      if (!action) throw new Error("delivery action not found");
+      if (action.status === "committed") return action;
+      if (action.status !== "approved") throw new Error("delivery action is not approved");
+      this.db
+        .query(
+          "UPDATE delivery_actions SET status='committed', commit_json=?1, updated_at=?2 WHERE id=?3",
+        )
+        .run(json(commit), now(), actionId);
+      return this.getDeliveryAction(actionId)!;
+    });
   }
 
   /** Materialize inherited results as new child facts; parent envelopes are never copied. */
@@ -1146,11 +1324,17 @@ export class Journal {
   private runSummary(row: RunSummary & { input_json: string }): RunSummary {
     const input = parseJson<Record<string, unknown>>(row.input_json);
     const profile = input.__kouroExecutionProfile;
+    const task = typeof input.task === "string" ? input.task : undefined;
+    const workItem = input.workItem;
     const { input_json: _input, ...summary } = row;
     return {
       ...summary,
-      ...(profile === "scripted" || profile === "codex-readonly"
+      ...(profile === "scripted" || profile === "codex-readonly" || profile === "pi-readonly"
         ? { executionProfile: profile }
+        : {}),
+      ...(task ? { task } : {}),
+      ...(workItem && typeof workItem === "object"
+        ? { workItem: workItem as RunSummary["workItem"] }
         : {}),
     };
   }

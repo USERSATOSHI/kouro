@@ -67,6 +67,34 @@ export async function compileWorkflowDetailed(
 
   const nodes = Array.isArray(source.nodes) ? source.nodes : [];
   const counters = Array.isArray(source.counters) ? source.counters : [];
+  const scoutIds = new Set<string>();
+  for (const scout of source.scouts ?? []) {
+    if (scoutIds.has(scout.id))
+      diagnostics.push(error("DUPLICATE_SCOUT", `Duplicate scout ${scout.id}`, scout.id));
+    scoutIds.add(scout.id);
+    if (!scout.id || !source.definitions?.[scout.definitionId])
+      diagnostics.push(
+        error(
+          "MISSING_SCOUT_DEFINITION",
+          `Scout ${scout.id} references missing child definition ${scout.definitionId}`,
+          scout.id,
+        ),
+      );
+    if (!Number.isSafeInteger(scout.maxInvocations) || scout.maxInvocations <= 0)
+      diagnostics.push(
+        error("INVALID_SCOUT_BOUND", `Scout ${scout.id} has an invalid invocation bound`, scout.id),
+      );
+    if (!Number.isSafeInteger(scout.maxConcurrent) || scout.maxConcurrent <= 0)
+      diagnostics.push(
+        error(
+          "INVALID_SCOUT_CONCURRENCY",
+          `Scout ${scout.id} has an invalid concurrency bound`,
+          scout.id,
+        ),
+      );
+    const child = source.definitions?.[scout.definitionId];
+    if (child) validateScoutChild(child, scout.id, diagnostics);
+  }
   const counterIds = new Set<string>();
   for (const counter of counters) {
     if (counterIds.has(counter.id))
@@ -148,6 +176,49 @@ export async function compileWorkflowDetailed(
           node.id,
         ),
       );
+    if (node.kind === "agent") {
+      const uses = node.uses ?? [];
+      const seenUses = new Set<string>();
+      for (const scoutId of uses) {
+        if (seenUses.has(scoutId))
+          diagnostics.push(
+            error("DUPLICATE_SCOUT_USE", `Scout ${scoutId} is used more than once`, node.id),
+          );
+        seenUses.add(scoutId);
+        if (!(source.scouts ?? []).some((scout) => scout.id === scoutId))
+          diagnostics.push(
+            error("UNKNOWN_SCOUT_USE", `Agent uses unknown subagent ${scoutId}`, node.id),
+          );
+      }
+      if (node.scoutPolicy !== undefined) {
+        if (
+          !Number.isSafeInteger(node.scoutPolicy.maxRequests) ||
+          node.scoutPolicy.maxRequests <= 0
+        )
+          diagnostics.push(
+            error("INVALID_SCOUT_POLICY", "scoutPolicy.maxRequests must be positive", node.id),
+          );
+        if (
+          !Number.isSafeInteger(node.scoutPolicy.maxConcurrent) ||
+          node.scoutPolicy.maxConcurrent <= 0
+        )
+          diagnostics.push(
+            error("INVALID_SCOUT_POLICY", "scoutPolicy.maxConcurrent must be positive", node.id),
+          );
+      }
+      const required = uses.filter((scoutId: string) =>
+        (source.scouts ?? []).some((scout) => scout.id === scoutId && !scout.optional),
+      ).length;
+      const policy = node.scoutPolicy ?? { maxRequests: 4, maxConcurrent: 2 };
+      if (uses.length > 0 && policy.maxRequests < required)
+        diagnostics.push(
+          error(
+            "SCOUT_POLICY_TOO_SMALL",
+            `Planner request budget ${policy.maxRequests} is smaller than required scout count ${required}`,
+            node.id,
+          ),
+        );
+    }
   }
   for (const node of nodes) {
     validateBindings(
@@ -159,6 +230,7 @@ export async function compileWorkflowDetailed(
       node.id,
     );
     validateBindingSchemas(node, nodeMap, source.inputPorts ?? [], diagnostics);
+    validateScoutResultBindings(node, nodeMap, source.scouts ?? [], diagnostics);
     if (node.kind === "call") {
       const child = source.definitions?.[node.definitionId];
       if (child) validateCallInterface(node, child, diagnostics);
@@ -319,6 +391,7 @@ export async function compileWorkflowDetailed(
       entry: entry ?? "",
       exits: normalizedNodes.filter((node) => node.kind === "complete").map((node) => node.id),
       counters: [...counters].sort((a, b) => a.id.localeCompare(b.id)),
+      scouts: [...(source.scouts ?? [])].sort((a, b) => a.id.localeCompare(b.id)),
     };
   }
   for (const child of Object.values(source.definitions ?? {})) {
@@ -331,6 +404,14 @@ export async function compileWorkflowDetailed(
       if (definitions[id])
         diagnostics.push(error("DUPLICATE_DEFINITION", `Duplicate definition ${id}`, id));
       else definitions[id] = definition;
+    }
+    for (const [digest, schema] of Object.entries(child.schemas)) {
+      const existing = schemas[digest];
+      if (existing !== undefined && canonicalize(existing) !== canonicalize(schema))
+        diagnostics.push(
+          error("SCHEMA_DIGEST_COLLISION", `Schema digest collision ${digest}`, digest),
+        );
+      else schemas[digest] = schema;
     }
   }
 
@@ -484,7 +565,8 @@ function validateBindingSchemas(
   const targetPorts = new Map((node.inputPorts ?? []).map((port) => [port.name, port]));
   for (const binding of node.bindings ?? []) {
     const target = targetPorts.get(binding.targetPort);
-    if (!target || binding.source.kind === "literal") continue;
+    if (!target || binding.source.kind === "literal" || binding.source.kind === "scout-results")
+      continue;
     const sourceBinding = binding.source;
     let source: Port | undefined;
     if (sourceBinding.kind === "producer") {
@@ -513,6 +595,126 @@ function validateBindingSchemas(
         ),
       );
     }
+  }
+}
+
+function validateScoutResultBindings(
+  node: Node,
+  nodeMap: ReadonlyMap<string, Node>,
+  scouts: readonly import("./contracts").ScoutDefinition[],
+  diagnostics: Diagnostic[],
+): void {
+  for (const binding of node.bindings ?? []) {
+    if (binding.source.kind !== "scout-results") continue;
+    const source = binding.source;
+    const parent = nodeMap.get(source.sourceId);
+    if (parent?.kind !== "agent") {
+      diagnostics.push(
+        error("SCOUT_RESULTS_SOURCE", "Subagent results must reference an agent", node.id),
+      );
+      continue;
+    }
+    const authorized = parent.uses ?? scouts.map((scout) => scout.id);
+    if (!authorized.includes(source.scoutId))
+      diagnostics.push(
+        error(
+          "SCOUT_RESULTS_UNAUTHORIZED",
+          `Subagent ${source.scoutId} is not authorized on agent ${parent.id}`,
+          node.id,
+        ),
+      );
+    if (!scouts.some((scout) => scout.id === source.scoutId))
+      diagnostics.push(error("UNKNOWN_SCOUT", `Unknown scout ${source.scoutId}`, node.id));
+  }
+}
+
+function validateScoutChild(
+  child: WorkflowDefinitionSource,
+  scoutId: string,
+  diagnostics: Diagnostic[],
+): void {
+  const nodes = child.nodes ?? [];
+  const agents = nodes.filter((node) => node.kind === "agent");
+  const completes = nodes.filter((node) => node.kind === "complete");
+  if (
+    nodes.length !== 2 ||
+    agents.length !== 1 ||
+    completes.length !== 1 ||
+    Object.keys(child.definitions ?? {}).length > 0
+  ) {
+    diagnostics.push(
+      error(
+        "INVALID_SCOUT_SHAPE",
+        `Scout ${scoutId} must contain exactly one agent and one successful completion node`,
+        scoutId,
+      ),
+    );
+    return;
+  }
+  const agent = agents[0] as Extract<Node, { kind: "agent" }>;
+  const complete = completes[0] as Extract<Node, { kind: "complete" }>;
+  if (child.entry !== agent.id || complete.result !== "succeeded")
+    diagnostics.push(
+      error("INVALID_SCOUT_ENTRY", `Scout ${scoutId} must start at its agent and succeed`, scoutId),
+    );
+  const edges = child.controlEdges ?? [];
+  if (
+    edges.length !== 1 ||
+    edges[0].sourceNodeId !== agent.id ||
+    edges[0].targetNodeId !== complete.id ||
+    edges[0].outcome !== "success" ||
+    edges[0].guard !== undefined ||
+    edges[0].default !== undefined
+  )
+    diagnostics.push(
+      error(
+        "INVALID_SCOUT_EDGES",
+        `Scout ${scoutId} must have one unconditional success edge`,
+        scoutId,
+      ),
+    );
+  if ((child.outputPorts ?? []).length !== 1 || agent.outputPorts.length !== 1)
+    diagnostics.push(
+      error(
+        "INVALID_SCOUT_OUTPUT",
+        `Scout ${scoutId} must export its agent's one typed output`,
+        scoutId,
+      ),
+    );
+  else if (child.outputPorts![0].schemaDigest !== agent.outputPorts[0].schemaDigest)
+    diagnostics.push(
+      error("INVALID_SCOUT_OUTPUT", `Scout ${scoutId} output must be the agent output`, scoutId),
+    );
+  const completionBinding = complete.bindings?.[0];
+  if (
+    complete.bindings?.length !== 1 ||
+    completionBinding?.source.kind !== "producer" ||
+    completionBinding.source.sourceId !== agent.id
+  )
+    diagnostics.push(
+      error(
+        "INVALID_SCOUT_COMPLETION",
+        `Scout ${scoutId} completion must export the agent output binding`,
+        scoutId,
+      ),
+    );
+  if ((child.scouts ?? []).length > 0 || agent.uses?.length || agent.scoutPolicy)
+    diagnostics.push(
+      error("NESTED_SCOUT", `Scout ${scoutId} cannot declare or use nested scouts`, scoutId),
+    );
+  const inputNames = new Set((child.inputPorts ?? []).map((port) => port.name));
+  for (const binding of agent.bindings ?? []) {
+    if (
+      binding.source.kind !== "literal" &&
+      (binding.source.kind !== "input" || !inputNames.has(binding.source.sourceId))
+    )
+      diagnostics.push(
+        error(
+          "INVALID_SCOUT_INPUT",
+          `Scout ${scoutId} agent inputs may use only declared child inputs or literals`,
+          scoutId,
+        ),
+      );
   }
 }
 

@@ -525,6 +525,9 @@ export class ApplicationService {
   collaboration(runId: string): Record<string, unknown> {
     return new CollaborationGateway(this.coordinator.journal).snapshot(runId);
   }
+  scouts(runId: string) {
+    return this.coordinator.scouts.requests(runId);
+  }
   getView(runId: string) {
     return this.coordinator.journal.getView(runId);
   }
@@ -576,8 +579,25 @@ export class ApplicationService {
     expectedTree: string;
     operationKey: string;
     message: string;
+    deliveryActionId?: string;
   }) {
     return this.coordinator.workspaceCommit(input);
+  }
+  prepareDelivery(input: {
+    runId: string;
+    requestKey: string;
+    message: string;
+    invocationId?: string;
+    validationEvidence?: readonly string[];
+    reviewEvidence?: readonly string[];
+  }) {
+    return this.coordinator.prepareDelivery(input);
+  }
+  decideDelivery(input: { actionId: string; decision: "approved" | "rejected"; actor: string }) {
+    return this.coordinator.decideDelivery(input);
+  }
+  deliveryAction(actionId: string) {
+    return this.coordinator.deliveryAction(actionId);
   }
   async cleanupWorkspace(runId: string): Promise<void> {
     // Checkpoint roots are immutable retention claims. Cleanup must consult the
@@ -894,6 +914,39 @@ const AgentSummary = artifactType<{ summary: string }>("kouro.agent-summary.v1",
   required: ["summary"],
   properties: { summary: { type: "string", minLength: 1 } },
 });
+const WorkItem = artifactType<{
+  version: 1;
+  task: string;
+  title?: string;
+  description?: string;
+  source?: string;
+  ticket?: { reference: string; snapshot: Record<string, unknown> };
+}>("kouro.work-item.v1", {
+  type: "object",
+  additionalProperties: false,
+  required: ["version", "task"],
+  properties: {
+    version: { const: 1 },
+    task: { type: "string", minLength: 1 },
+    title: { type: "string" },
+    description: { type: "string" },
+    source: { type: "string" },
+    ticket: { type: "object" },
+  },
+});
+const ScoutQuestion = artifactType<string>("kouro.scout-question.v1", {
+  type: "string",
+  minLength: 1,
+});
+const ScoutReport = artifactType<{ summary: string; findings: string[] }>("kouro.scout-report.v1", {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary", "findings"],
+  properties: {
+    summary: { type: "string", minLength: 1 },
+    findings: { type: "array", items: { type: "string" } },
+  },
+});
 
 async function compileTiny(): Promise<Bundle> {
   const builder = new WorkflowBuilder({ id: "tiny", version: "1" });
@@ -919,26 +972,65 @@ async function compileTiny(): Promise<Bundle> {
 }
 
 async function compileFeature(): Promise<Bundle> {
+  const repositoryScout = new WorkflowBuilder({ id: "repositoryScout", version: "1" });
+  const repositoryQuestion = repositoryScout.input("question", ScoutQuestion);
+  const repositoryTask = repositoryScout.input(
+    "task",
+    artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
+  );
+  const repositoryInspect = repositoryScout.agent("inspect", {
+    role: "repository-scout",
+    prompt: "Inspect the read-only repository view and return a structured repository report.",
+    input: { task: repositoryTask, question: repositoryQuestion },
+    produces: ScoutReport,
+    scripted: { output: { summary: "Repository scout fixture", findings: [] } },
+  });
+  const repositoryDone = repositoryScout.complete("done", { output: repositoryInspect.output });
+  repositoryScout.startAt(repositoryInspect);
+  repositoryInspect.on("success").to(repositoryDone);
+  repositoryScout.output(repositoryInspect.output);
+
+  const testScout = new WorkflowBuilder({ id: "testScout", version: "1" });
+  const testQuestion = testScout.input("question", ScoutQuestion);
+  const testTask = testScout.input(
+    "task",
+    artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
+  );
+  const testInspect = testScout.agent("inspect", {
+    role: "test-scout",
+    prompt: "Inspect the read-only repository view and return a structured test/build report.",
+    input: { task: testTask, question: testQuestion },
+    produces: ScoutReport,
+    scripted: { output: { summary: "Test scout fixture", findings: [] } },
+  });
+  const testDone = testScout.complete("done", { output: testInspect.output });
+  testScout.startAt(testInspect);
+  testInspect.on("success").to(testDone);
+  testScout.output(testInspect.output);
+
   const builder = new WorkflowBuilder({ id: "feature", version: "2" });
   const task = builder.input(
     "task",
     artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
     { required: false },
   );
+  const workItem = builder.input("workItem", WorkItem, { required: false });
+  builder.declareSubagent("repositoryScout", repositoryScout);
+  builder.declareSubagent("testScout", testScout);
   const plan = builder.agent("plan", {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",
-    input: { task },
+    input: { task, workItem },
     produces: AgentSummary,
   });
   const approval = builder.approval("approve-plan", {
     action: "accept-plan",
-    input: { task, plan: plan.output },
+    input: { task, workItem, plan: plan.output },
   });
   const implement = builder.agent("implement", {
     role: "implementer",
     prompt: "Inspect the supplied plan and perform the authorized implementation.",
-    input: { plan: plan.output },
+    input: { task, workItem, plan: plan.output },
   });
   const validate = builder.command("validate", {
     executable: "/usr/bin/printf",

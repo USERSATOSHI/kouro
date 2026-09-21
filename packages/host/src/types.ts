@@ -8,7 +8,6 @@ import type {
   ProjectionFrame,
   RunStatus,
   RunView,
-  Harness,
   RuntimeHarness,
 } from "@kouro/core/contracts";
 
@@ -32,6 +31,27 @@ export interface RunSummary {
   createdAt: string;
   updatedAt: string;
   executionProfile?: ExecutionProfileId;
+  task?: string;
+  workItem?: WorkItemInput;
+}
+
+export interface ResolvedTicketSnapshot {
+  readonly version: 1;
+  readonly provider: string;
+  readonly externalId: string;
+  readonly title: string;
+  readonly body: string;
+  readonly revision?: string;
+  readonly capturedAt?: string;
+}
+
+export interface WorkItemInput {
+  readonly version: 1;
+  readonly task: string;
+  readonly ticket?: { readonly reference: string; readonly snapshot: ResolvedTicketSnapshot };
+  readonly title?: string;
+  readonly description?: string;
+  readonly source?: string;
 }
 
 export type ExecutionProfileId = "scripted" | "codex-readonly" | "pi-readonly";
@@ -54,6 +74,7 @@ export interface CreateRunInput {
   idempotencyKey: string;
   actor?: string;
   executionProfile?: ExecutionProfileId;
+  workspace?: { repositoryPath: string; workspaceId?: string };
 }
 
 export interface CommandReceipt {
@@ -153,6 +174,98 @@ export interface CollaborationTools {
     readonly maxMessages?: number;
     readonly idleDeadline?: string;
   }): import("@kouro/core").CollaborationManifest | null;
+  subagent?: (input: {
+    readonly requestId: string;
+    readonly subagentId: string;
+    readonly input: Record<string, unknown>;
+  }) => Promise<ScoutResult>;
+}
+
+export type ScoutRequestState =
+  | "accepted"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "unknown";
+
+export interface ScoutRequest {
+  readonly runId: string;
+  readonly requestId: string;
+  readonly parentInvocationId: string;
+  readonly parentAttemptId: string;
+  readonly scoutId: string;
+  readonly question: string;
+  readonly input: Record<string, unknown>;
+  readonly ordinal: number;
+  readonly optional: boolean;
+  readonly state: ScoutRequestState;
+  readonly result?: unknown;
+  readonly resultArtifactId?: string;
+  readonly resultDigest?: string;
+  readonly childDefinitionId?: string;
+  readonly childAgentId?: string;
+  readonly effectiveHarness?: string;
+  readonly modelId?: string;
+  readonly workspaceId?: string;
+  readonly deadlineAt?: string;
+  readonly dispatchId?: string;
+  readonly usage?: unknown;
+  readonly error?: string;
+}
+
+export type ScoutResult =
+  | {
+      readonly requestId: string;
+      readonly scoutId: string;
+      readonly state: "succeeded";
+      readonly result: unknown;
+      readonly resultArtifactId: string;
+      readonly resultDigest: string;
+    }
+  | {
+      readonly requestId: string;
+      readonly scoutId: string;
+      readonly state: "failed" | "unknown" | "cancelled";
+      readonly error: { readonly code: string; readonly message: string };
+    };
+
+export interface ScoutDelivery {
+  readonly requestId: string;
+  readonly plannerAttemptId: string;
+  readonly manifest: {
+    readonly requestId: string;
+    readonly scoutId: string;
+    readonly artifactId?: string;
+    readonly resultDigest?: string;
+    readonly bytes: number;
+    readonly source: "scout-result";
+  };
+  readonly result?: unknown;
+}
+
+export type DeliveryActionStatus = "pending" | "approved" | "rejected" | "committed";
+
+export interface DeliveryAction {
+  readonly id: string;
+  readonly requestKey: string;
+  readonly runId: string;
+  readonly workspaceId: string;
+  readonly invocationId?: string;
+  readonly baseTree: string;
+  readonly resultTree: string;
+  readonly patchDigest: string;
+  readonly changedPaths: readonly unknown[];
+  readonly message: string;
+  readonly validationEvidence?: readonly string[];
+  readonly reviewEvidence?: readonly string[];
+  readonly actionDigest: string;
+  readonly operationKey: string;
+  readonly status: DeliveryActionStatus;
+  readonly actor?: string;
+  readonly commit?: unknown;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 export interface HostProjection {

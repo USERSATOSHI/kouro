@@ -12,5 +12,6 @@ export * from "./adapters/workspace/index.ts";
 export * from "./scheduler/index.ts";
 export * from "./collaboration/gateway.ts";
 export * from "./handoff/index.ts";
+export * from "./scouting/index.ts";
 export * from "./checkpoints/index.ts";
 export * from "./evaluations.ts";

@@ -366,6 +366,14 @@ export function createHostServer(
       };
     }
   });
+  app.get("/api/runs/:id/scouts", ({ request, set, params }) => {
+    if (!checked(request, set)) return denied(set);
+    if (!service.getView(params.id)) {
+      set.status = 404;
+      return { error: "run-not-found" };
+    }
+    return service.scouts(params.id);
+  });
   app.post("/api/runs", async ({ request, set, body }) => {
     if (!checked(request, set, true)) return denied(set);
     const input = bodyObject(body);
@@ -471,15 +479,24 @@ export function createHostServer(
           actor: "local-operator",
           idempotencyKey: input.idempotencyKey,
         });
-      if (input.action === "deliver" && typeof input.expectedTree === "string")
+      if (
+        input.action === "deliver" &&
+        (typeof input.expectedTree === "string" || typeof input.deliveryActionId === "string")
+      )
         return service.workspaceCommit({
           runId: params.id,
-          expectedTree: input.expectedTree,
+          expectedTree:
+            typeof input.expectedTree === "string"
+              ? input.expectedTree
+              : (service.deliveryAction(String(input.deliveryActionId))?.resultTree ?? ""),
           operationKey: input.idempotencyKey,
           message:
             typeof input.message === "string" && input.message.trim()
               ? input.message
               : `Deliver ${params.id}`,
+          ...(typeof input.deliveryActionId === "string"
+            ? { deliveryActionId: input.deliveryActionId }
+            : {}),
         });
       if (
         (input.action !== "approve" && input.action !== "reject") ||
@@ -554,6 +571,73 @@ export function createHostServer(
       revision: Number.isSafeInteger(revision) ? revision : undefined,
       evaluatorId: typeof query.evaluatorId === "string" ? query.evaluatorId : undefined,
     });
+  });
+  app.get("/api/runs/:id/delivery/:actionId", ({ request, set, params }) => {
+    if (!checked(request, set)) return denied(set);
+    const action = service.deliveryAction(params.actionId);
+    if (!action || action.runId !== params.id) {
+      set.status = 404;
+      return { error: "delivery-action-not-found" };
+    }
+    return action;
+  });
+  app.post("/api/runs/:id/delivery", async ({ request, set, params, body }) => {
+    if (!checked(request, set, true)) return denied(set);
+    try {
+      const input = bodyObject(body);
+      if (typeof input.requestKey !== "string" || !input.requestKey.trim())
+        throw new Error("delivery requestKey is required");
+      return await service.prepareDelivery({
+        runId: params.id,
+        requestKey: input.requestKey,
+        ...(typeof input.invocationId === "string" ? { invocationId: input.invocationId } : {}),
+        message:
+          typeof input.message === "string" && input.message.trim()
+            ? input.message
+            : `Deliver ${params.id}`,
+        ...(Array.isArray(input.validationEvidence)
+          ? {
+              validationEvidence: input.validationEvidence.filter(
+                (item): item is string => typeof item === "string",
+              ),
+            }
+          : {}),
+        ...(Array.isArray(input.reviewEvidence)
+          ? {
+              reviewEvidence: input.reviewEvidence.filter(
+                (item): item is string => typeof item === "string",
+              ),
+            }
+          : {}),
+      });
+    } catch (cause) {
+      set.status = 409;
+      return {
+        error: "delivery-preparation-rejected",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  });
+  app.post("/api/runs/:id/delivery/:actionId", ({ request, set, params, body }) => {
+    if (!checked(request, set, true)) return denied(set);
+    try {
+      const input = bodyObject(body);
+      if (input.decision !== "approved" && input.decision !== "rejected")
+        throw new Error("delivery decision must be approved or rejected");
+      const action = service.deliveryAction(params.actionId);
+      if (!action || action.runId !== params.id) throw new Error("delivery action not found");
+      return service.decideDelivery({
+        actionId: params.actionId,
+        decision: input.decision,
+        actor: typeof input.actor === "string" ? input.actor : "local-operator",
+      });
+    } catch (cause) {
+      set.status = 409;
+      return {
+        error: "delivery-decision-rejected",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
   });
   app.get("/api/experiments/:id/cells/:cellKey/evidence", ({ request, set, params }) => {
     if (!checked(request, set)) return denied(set);
@@ -843,6 +927,8 @@ function toWebRun(run: {
   createdAt: string;
   updatedAt: string;
   executionProfile?: string;
+  task?: string;
+  workItem?: unknown;
 }) {
   return {
     id: run.runId,
@@ -853,5 +939,7 @@ function toWebRun(run: {
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     executionProfile: run.executionProfile,
+    ...(run.task ? { task: run.task } : {}),
+    ...(run.workItem ? { workItem: run.workItem } : {}),
   };
 }

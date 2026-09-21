@@ -248,6 +248,71 @@ export function migrate(db: Database): void {
       message_id TEXT PRIMARY KEY NOT NULL REFERENCES collaboration_messages(id),
       batch_id TEXT NOT NULL REFERENCES collaboration_batches(id)
     );
+
+    CREATE TABLE IF NOT EXISTS scout_requests (
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      request_id TEXT NOT NULL,
+      parent_invocation_id TEXT NOT NULL,
+      parent_attempt_id TEXT NOT NULL,
+      scout_id TEXT NOT NULL,
+      question TEXT NOT NULL,
+      input_json TEXT NOT NULL,
+      request_digest TEXT NOT NULL,
+      input_digest TEXT NOT NULL DEFAULT '',
+      child_definition_id TEXT NOT NULL DEFAULT '',
+      child_agent_id TEXT NOT NULL DEFAULT '',
+      effective_harness TEXT,
+      model_id TEXT,
+      workspace_id TEXT,
+      deadline_at TEXT,
+      dispatch_id TEXT,
+      usage_json TEXT NOT NULL DEFAULT '{}',
+      ordinal INTEGER NOT NULL,
+      optional INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL,
+      result_json TEXT,
+      result_artifact_id TEXT,
+      result_digest TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, parent_attempt_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS scout_requests_parent_idx
+      ON scout_requests(run_id, parent_attempt_id, state);
+    CREATE TABLE IF NOT EXISTS scout_deliveries (
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      parent_attempt_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      planner_attempt_id TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, parent_attempt_id, request_id, planner_attempt_id),
+      FOREIGN KEY(run_id, parent_attempt_id, request_id)
+        REFERENCES scout_requests(run_id, parent_attempt_id, request_id)
+    );
+    CREATE TABLE IF NOT EXISTS delivery_actions (
+      id TEXT PRIMARY KEY NOT NULL,
+      request_key TEXT NOT NULL UNIQUE,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      workspace_id TEXT NOT NULL,
+      invocation_id TEXT,
+      base_tree TEXT NOT NULL,
+      result_tree TEXT NOT NULL,
+      patch_digest TEXT NOT NULL,
+      changed_paths_json TEXT NOT NULL,
+      message TEXT NOT NULL,
+      validation_evidence_json TEXT NOT NULL DEFAULT '[]',
+      review_evidence_json TEXT NOT NULL DEFAULT '[]',
+      action_digest TEXT NOT NULL,
+      operation_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      actor TEXT,
+      commit_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS delivery_actions_run_idx ON delivery_actions(run_id, created_at);
     CREATE TABLE IF NOT EXISTS checkpoints (
       id TEXT PRIMARY KEY NOT NULL,
       source_run_id TEXT NOT NULL REFERENCES runs(id),
@@ -290,11 +355,90 @@ export function migrate(db: Database): void {
     "ALTER TABLE evaluation_evidence ADD COLUMN experiment_id TEXT",
     "ALTER TABLE evaluation_evidence ADD COLUMN cell_key TEXT",
     "ALTER TABLE experiments ADD COLUMN repository_path TEXT",
+    "ALTER TABLE delivery_actions ADD COLUMN invocation_id TEXT",
+    "ALTER TABLE delivery_actions ADD COLUMN validation_evidence_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE delivery_actions ADD COLUMN review_evidence_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE scout_requests ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE scout_requests ADD COLUMN child_definition_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE scout_requests ADD COLUMN child_agent_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE scout_requests ADD COLUMN effective_harness TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN model_id TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN workspace_id TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN deadline_at TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN dispatch_id TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE scout_requests ADD COLUMN result_digest TEXT",
   ]) {
     try {
       db.exec(statement);
     } catch {
       /* already migrated */
     }
+  }
+  const scoutColumns = db.query("PRAGMA table_info(scout_requests)").all() as Array<{
+    name: string;
+    pk: number;
+  }>;
+  const deliveryColumns = db.query("PRAGMA table_info(scout_deliveries)").all() as Array<{
+    name: string;
+    pk: number;
+  }>;
+  const scoutPrimaryKey = scoutColumns
+    .filter((column) => column.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((column) => column.name);
+  if (
+    scoutColumns.length > 0 &&
+    (!scoutColumns.some((column) => column.name === "parent_attempt_id") ||
+      JSON.stringify(scoutPrimaryKey) !==
+        JSON.stringify(["run_id", "parent_attempt_id", "request_id"]))
+  ) {
+    db.exec(`
+      ALTER TABLE scout_deliveries RENAME TO scout_deliveries_legacy;
+      ALTER TABLE scout_requests RENAME TO scout_requests_legacy;
+      CREATE TABLE scout_requests (
+        run_id TEXT NOT NULL REFERENCES runs(id), request_id TEXT NOT NULL,
+        parent_invocation_id TEXT NOT NULL, parent_attempt_id TEXT NOT NULL,
+        scout_id TEXT NOT NULL, question TEXT NOT NULL, input_json TEXT NOT NULL,
+        request_digest TEXT NOT NULL, input_digest TEXT NOT NULL DEFAULT '',
+        child_definition_id TEXT NOT NULL DEFAULT '', child_agent_id TEXT NOT NULL DEFAULT '',
+        effective_harness TEXT, model_id TEXT, workspace_id TEXT, deadline_at TEXT,
+        dispatch_id TEXT, usage_json TEXT NOT NULL DEFAULT '{}', ordinal INTEGER NOT NULL,
+        optional INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, result_json TEXT,
+        result_artifact_id TEXT, result_digest TEXT, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, parent_attempt_id, request_id)
+      );
+      INSERT INTO scout_requests(
+        run_id, request_id, parent_invocation_id, parent_attempt_id, scout_id, question,
+        input_json, request_digest, ordinal, optional, state, result_json, result_artifact_id,
+        error, created_at, updated_at
+      )
+        SELECT run_id, request_id, parent_invocation_id, parent_attempt_id, scout_id, question,
+          input_json, request_digest, ordinal, optional, state, result_json, result_artifact_id,
+          error, created_at, updated_at
+        FROM scout_requests_legacy;
+      CREATE INDEX scout_requests_parent_idx ON scout_requests(run_id, parent_attempt_id, state);
+      CREATE TABLE scout_deliveries (
+        run_id TEXT NOT NULL REFERENCES runs(id), parent_attempt_id TEXT NOT NULL,
+        request_id TEXT NOT NULL, planner_attempt_id TEXT NOT NULL, manifest_json TEXT NOT NULL,
+        delivered_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, parent_attempt_id, request_id, planner_attempt_id),
+        FOREIGN KEY(run_id, parent_attempt_id, request_id)
+          REFERENCES scout_requests(run_id, parent_attempt_id, request_id)
+      );
+      INSERT INTO scout_deliveries(run_id,parent_attempt_id,request_id,planner_attempt_id,manifest_json,delivered_at)
+        SELECT d.run_id, r.parent_attempt_id, d.request_id, d.planner_attempt_id,
+          d.manifest_json, d.delivered_at
+        FROM scout_deliveries_legacy d
+        JOIN scout_requests r ON r.run_id=d.run_id AND r.request_id=d.request_id;
+      DROP TABLE scout_deliveries_legacy;
+      DROP TABLE scout_requests_legacy;
+    `);
+  } else if (
+    deliveryColumns.length > 0 &&
+    !deliveryColumns.some((column) => column.name === "parent_attempt_id")
+  ) {
+    throw new Error("scout delivery schema is inconsistent with scout request schema");
   }
 }

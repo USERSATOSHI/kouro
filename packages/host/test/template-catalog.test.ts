@@ -36,6 +36,16 @@ describe("workflow template catalog", () => {
     const catalog = await service.workflows();
     const ids = catalog.map((entry) => entry.id);
     expect(ids).toEqual(["tiny", "feature", "parallel", "catalog-feature", "catalog-fusion"]);
+    const feature = catalog.find((entry) => entry.id === "catalog-feature")!;
+    const featureRoot = feature.bundle.definitions[feature.bundle.rootDefinitionId];
+    expect(featureRoot.scouts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "repositoryScout", maxInvocations: 2 }),
+        expect.objectContaining({ id: "testScout", maxInvocations: 2 }),
+      ]),
+    );
+    expect(feature.bundle.definitions.repositoryScout).toBeDefined();
+    expect(feature.bundle.definitions.testScout).toBeDefined();
     const fusion = catalog.find((entry) => entry.id === "catalog-fusion")!;
     expect(fusion.bundle.definitions[fusion.bundle.rootDefinitionId].nodes).toEqual(
       expect.arrayContaining([

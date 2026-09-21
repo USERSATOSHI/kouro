@@ -11,7 +11,7 @@ const usage = `Kouro v2 M1
 Usage:
   kouro serve     Start the loopback-only local workbench
   kouro create template NAME --template ID  Create a project template under .kouro
-  kouro run [--profile ID]  Execute the tiny workflow headlessly
+  kouro run [WORKFLOW] [--task TEXT] [--profile ID]  Execute a workflow headlessly
   kouro inspect ID  Print one durable run view as JSON
   kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
   kouro retry ID INVOCATION REV  Retry one failed invocation
@@ -52,11 +52,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const service = new ApplicationService({ dataDir });
   await service.start();
   if (command === "run") {
+    const workflowId = argv.slice(1).find((arg) => !arg.startsWith("--")) ?? "tiny";
     const profileArg = argv.find((arg) => arg.startsWith("--profile="));
     const profileIndex = argv.indexOf("--profile");
     const profile =
       profileArg?.slice("--profile=".length) ??
       (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
+    const task = optionValue(argv, "--task");
+    const workspace = optionValue(argv, "--workspace");
+    const ticket = optionValue(argv, "--ticket");
     if (
       profile !== undefined &&
       profile !== "scripted" &&
@@ -68,10 +72,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 2;
     }
     const run = await service.createRun({
-      workflowId: "tiny",
+      workflowId,
       idempotencyKey: crypto.randomUUID(),
       actor: "cli",
       executionProfile: profile as "scripted" | "codex-readonly" | "pi-readonly" | undefined,
+      input: {
+        ...(task === undefined ? {} : { task }),
+        ...(ticket === undefined ? {} : { ticket }),
+      },
+      ...(workspace === undefined ? {} : { workspace: { repositoryPath: workspace } }),
     });
     let view = service.getView(run.runId);
     while (view && (view.state.status === "pending" || view.state.status === "running")) {
@@ -205,6 +214,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     void close();
   });
   return 0;
+}
+
+function optionValue(argv: readonly string[], name: string): string | undefined {
+  const inline = argv.find((arg) => arg.startsWith(`${name}=`));
+  if (inline) return inline.slice(name.length + 1);
+  const index = argv.indexOf(name);
+  return index >= 0 ? argv[index + 1] : undefined;
 }
 
 const templateIds = [

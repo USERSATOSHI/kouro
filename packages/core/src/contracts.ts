@@ -66,6 +66,7 @@ export interface Port {
 export type BindingSource =
   | { readonly kind: "input"; readonly sourceId: string; readonly port?: string }
   | { readonly kind: "producer"; readonly sourceId: string; readonly port: string }
+  | { readonly kind: "scout-results"; readonly sourceId: string; readonly scoutId: string }
   | { readonly kind: "literal"; readonly value: JsonValue };
 
 export interface Binding {
@@ -99,6 +100,9 @@ export interface AgentNode {
   readonly outputPorts: readonly Port[];
   readonly bindings: readonly Binding[];
   readonly timeoutMs: number;
+  /** Optional per-agent allowlist of declared subagents. */
+  readonly uses?: readonly string[];
+  readonly scoutPolicy?: ScoutPolicy;
   readonly scripted?: ScriptedAgentProfile;
   readonly resources?: Readonly<Record<string, number>>;
 }
@@ -229,6 +233,21 @@ export interface Definition {
   readonly exits: readonly string[];
   readonly counters: readonly CounterDefinition[];
   readonly sourceId?: string;
+  /** Child definitions that agents may invoke through the bounded subagent gateway. */
+  readonly scouts?: readonly ScoutDefinition[];
+}
+
+export interface ScoutDefinition {
+  readonly id: string;
+  readonly definitionId: string;
+  readonly maxInvocations: number;
+  readonly maxConcurrent: number;
+  readonly optional?: boolean;
+}
+
+export interface ScoutPolicy {
+  readonly maxRequests: number;
+  readonly maxConcurrent: number;
 }
 
 export interface ExecutionLimits {
@@ -756,4 +775,5 @@ export interface WorkflowDefinitionSource {
   /** Child definitions are retained as definitions; they are never flattened into the root. */
   readonly definitions?: Readonly<Record<string, WorkflowDefinitionSource>>;
   readonly sourceMap?: Readonly<Record<string, SourceLocation>>;
+  readonly scouts?: readonly ScoutDefinition[];
 }

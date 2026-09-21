@@ -60,9 +60,11 @@ export interface RunSummary {
   revision?: number;
   activeCount?: number;
   executionProfile?: string;
+  task?: string;
+  workItem?: unknown;
 }
 export interface ExecutionProfile {
-  id: "scripted" | "codex-readonly";
+  id: "scripted" | "codex-readonly" | "pi-readonly";
   name: string;
   description: string;
   available: boolean;

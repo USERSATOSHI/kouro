@@ -44,10 +44,13 @@ import type {
   ProcessResult,
   RunSummary,
   ScriptedAgent,
+  DeliveryAction,
 } from "../types.ts";
 import { ReadySetScheduler } from "../scheduler/scheduler.ts";
 import { CollaborationGateway } from "../collaboration/gateway.ts";
 import { prepareAgentHandoff } from "../handoff/index.ts";
+import { normalizeAdmissionInput } from "../admission.ts";
+import { ScoutGateway } from "../scouting/gateway.ts";
 
 export interface CoordinatorOptions {
   dataDir: string;
@@ -71,6 +74,7 @@ export class Coordinator {
   readonly harness: HarnessAdapter;
   readonly process: ProcessAdapter;
   readonly ownerEpoch: number;
+  readonly scouts: ScoutGateway;
   private readonly dataDir: string;
   private readonly scriptedDelayMs: number;
   private readonly commandTimeoutMs: number;
@@ -95,6 +99,7 @@ export class Coordinator {
   constructor(options: CoordinatorOptions) {
     this.dataDir = options.dataDir;
     this.journal = new Journal({ dataDir: options.dataDir });
+    this.scouts = new ScoutGateway(this.journal);
     this.agent = options.agent ?? new DelayedScriptedAgent();
     this.harness = options.harness ?? new ScriptedHarnessAdapter();
     this.process = options.process ?? createDefaultProcessAdapter();
@@ -113,6 +118,7 @@ export class Coordinator {
 
   async start(): Promise<void> {
     for (const run of this.journal.listRuns()) {
+      this.scouts.reconcile(run.runId);
       const row = this.journal.getRunRow(run.runId);
       const configured = row
         ? parseJson<Record<string, unknown>>(row.input_json).__kouroWorkspace
@@ -187,14 +193,17 @@ export class Coordinator {
     executionProfile?: "scripted" | "codex-readonly" | "pi-readonly";
     workspace?: { repositoryPath: string; workspaceId?: string };
   }): Promise<{ run: RunSummary; created: boolean }> {
+    const normalizedInput = normalizeAdmissionInput(input.bundle, input.input);
     if (input.workspace && !this.workspaceAdapter)
       throw new Error("workspace adapter is not configured");
     const result = this.journal.createRun({
       ...input,
       input: {
-        ...input.input,
+        ...normalizedInput,
         __kouroExecutionProfile: input.executionProfile ?? this.defaultProfile,
       },
+      executionProfile: input.executionProfile ?? this.defaultProfile,
+      workspace: input.workspace,
     });
     if (result.created && input.workspace) {
       try {
@@ -295,15 +304,66 @@ export class Coordinator {
     expectedTree: string;
     operationKey: string;
     message: string;
+    deliveryActionId?: string;
   }): Promise<import("../adapters/workspace/git.ts").PreparedCommit> {
     const ref = this.workspaces.get(input.runId);
     if (!ref || !this.workspaceAdapter) throw new Error("run has no repository workspace");
-    return this.workspaceAdapter.prepareCommit({
+    const action = input.deliveryActionId
+      ? this.journal.getDeliveryAction(input.deliveryActionId)
+      : undefined;
+    if (input.deliveryActionId && (!action || action.runId !== input.runId))
+      throw new Error("delivery action not found for run");
+    if (action && action.status !== "approved" && action.status !== "committed")
+      throw new Error(`delivery action is ${action.status}`);
+    if (action && (input.expectedTree !== action.resultTree || input.message !== action.message))
+      throw new Error("delivery action binding changed");
+    const prepared = await this.workspaceAdapter.prepareCommit({
       ref,
-      expectedTree: input.expectedTree,
-      operationKey: input.operationKey,
-      message: input.message,
+      expectedTree: action?.resultTree ?? input.expectedTree,
+      operationKey: action?.operationKey ?? input.operationKey,
+      message: action?.message ?? input.message,
     });
+    if (action && action.status !== "committed")
+      this.journal.completeDeliveryAction(action.id, prepared);
+    return prepared;
+  }
+
+  async prepareDelivery(input: {
+    runId: string;
+    requestKey: string;
+    message: string;
+    invocationId?: string;
+    validationEvidence?: readonly string[];
+    reviewEvidence?: readonly string[];
+  }): Promise<DeliveryAction> {
+    const ref = this.workspaces.get(input.runId);
+    if (!ref || !this.workspaceAdapter) throw new Error("run has no repository workspace");
+    const snapshot = await this.workspaceAdapter.snapshot(ref);
+    return this.journal.createDeliveryAction({
+      requestKey: input.requestKey,
+      runId: input.runId,
+      workspaceId: ref.workspaceId,
+      ...(input.invocationId ? { invocationId: input.invocationId } : {}),
+      baseTree: snapshot.baseTree,
+      resultTree: snapshot.resultTree,
+      patchDigest: snapshot.patchDigest,
+      changedPaths: snapshot.changedPaths,
+      message: input.message,
+      ...(input.validationEvidence ? { validationEvidence: input.validationEvidence } : {}),
+      ...(input.reviewEvidence ? { reviewEvidence: input.reviewEvidence } : {}),
+    });
+  }
+
+  decideDelivery(input: {
+    actionId: string;
+    decision: "approved" | "rejected";
+    actor: string;
+  }): DeliveryAction {
+    return this.journal.decideDeliveryAction(input);
+  }
+
+  deliveryAction(actionId: string): DeliveryAction | undefined {
+    return this.journal.getDeliveryAction(actionId);
   }
 
   workspaceDiff(runId: string): WorkspaceSnapshot | null {
@@ -1303,7 +1363,11 @@ export class Coordinator {
     const invocationWorkspaceDir = invocationWorkspace?.path ?? workspaceDir;
     if (node.kind === "agent") {
       const config = collaborationConfig;
-      const collaborationGateway = config ? new CollaborationGateway(this.journal) : undefined;
+      const definition = bundle.definitions[scope?.definitionId ?? bundle.rootDefinitionId];
+      const subagentIds = node.uses ?? (definition?.scouts ?? []).map((scout) => scout.id);
+      const hasSubagents = subagentIds.length > 0;
+      const collaborationGateway =
+        config || hasSubagents ? new CollaborationGateway(this.journal) : undefined;
       let collaborationGrant: import("@kouro/core").CollaborationGrant | undefined;
       let collaborationBatch: import("@kouro/core").CollaborationManifest | null = null;
       if (collaborationGateway) {
@@ -1402,6 +1466,21 @@ export class Coordinator {
             tokenQuality: "unavailable",
           },
           ...inputSegments,
+          ...this.scouts.deliveries(runId, attemptId).flatMap((delivery) => {
+            const content = JSON.stringify(delivery.result);
+            return [
+              {
+                id: `${attemptId}:scout:${delivery.requestId}`,
+                source: "scout-result",
+                content,
+                supplied: true,
+                reason: `durably delivered scout result ${delivery.requestId}`,
+                bytes: new TextEncoder().encode(content).byteLength,
+                tokenCount: null,
+                tokenQuality: "unavailable" as const,
+              },
+            ];
+          }),
           ...(collaborationBatch?.visible.map((message) => ({
             id: `${attemptId}:message:${message.id}`,
             source: "collaboration-message",
@@ -1427,6 +1506,21 @@ export class Coordinator {
                 inputSchema: { type: "object" },
                 enabled: true,
               },
+              ...(subagentIds.length
+                ? [
+                    {
+                      name: "subagent",
+                      description:
+                        "Run one awaited bounded subagent. The input object must match the selected subagent's declared child inputs.",
+                      inputSchema: subagentToolSchema(
+                        bundle,
+                        scope?.definitionId ?? bundle.rootDefinitionId,
+                        subagentIds,
+                      ),
+                      enabled: true,
+                    },
+                  ]
+                : []),
             ]
           : [],
         hiddenNativeContext: "unavailable",
@@ -1629,7 +1723,7 @@ export class Coordinator {
         }
         resolvedHarness = toHarness(selected.id);
         resolvedVersion = selected.adapterVersion;
-        nativeConfig = { ...(node.modelId ? { model: node.modelId } : {}) };
+        nativeConfig = node.modelId ? { model: node.modelId } : {};
       } else {
         this.journal.completeEffect({
           effectId: detail.id,
@@ -1648,6 +1742,32 @@ export class Coordinator {
           contextManifest: JSON.parse(JSON.stringify(contextManifest)),
         });
         return;
+      }
+      if (subagentIds.length) {
+        const capabilities = selected.capabilities();
+        if (
+          capabilities["awaited-subagent-tool"] !== "supported" ||
+          capabilities["child-read-only-envelope"] !== "supported"
+        ) {
+          this.journal.completeEffect({
+            effectId: detail.id,
+            storedArtifacts: [],
+            artifacts: [],
+            evidence: [],
+            output: [],
+            status: "failed",
+            error:
+              "harness-unavailable: awaited subagent tool or child read-only envelope is unsupported",
+            diagnostics: ["subagent admission rejected before provider execution"],
+            resolvedExecution: {
+              role: node.role,
+              harness: resolvedHarness,
+              adapterVersion: resolvedVersion,
+            },
+            contextManifest: JSON.parse(JSON.stringify(contextManifest)),
+          });
+          return;
+        }
       }
       mkdirSync(invocationWorkspaceDir, { recursive: true, mode: 0o700 });
       let harnessResult: Awaited<ReturnType<HarnessAdapter["run"]>>;
@@ -1671,7 +1791,22 @@ export class Coordinator {
           ...(collaborationGateway && collaborationGrant
             ? {
                 collaboration: {
-                  ...collaborationGateway.tools(collaborationGrant),
+                  ...collaborationGateway.tools(
+                    collaborationGrant,
+                    subagentIds.length ? this.scouts : undefined,
+                    subagentIds.length
+                      ? (subagentInput) =>
+                          this.invokeScout({
+                            runId,
+                            parentInvocationId: invocationId,
+                            parentAttemptId: attemptId,
+                            requestId: subagentInput.requestId,
+                            scoutId: subagentInput.subagentId,
+                            input: subagentInput.input,
+                            signal: aborter.signal,
+                          })
+                      : undefined,
+                  ),
                   // The host freezes the selected delivery batch into context;
                   // expose that same batch to the scripted/provider tool view.
                   wait: () => collaborationBatch,
@@ -1727,6 +1862,13 @@ export class Coordinator {
         if (!validation.valid) {
           status = "failed";
           error = `invalid-output: ${validation.error}`;
+        }
+      }
+      if (status === "succeeded" && node.uses?.length) {
+        const scoutError = this.scouts.acceptanceError(runId, attemptId, node.uses);
+        if (scoutError) {
+          status = "failed";
+          error = `scout-acceptance: ${scoutError}`;
         }
       }
       const secretValues = Object.entries(process.env)
@@ -1978,7 +2120,7 @@ export class Coordinator {
 
     for (const port of node.inputPorts) {
       const binding = invocation.inputBindings[port.name];
-      let value = binding ? this.resolveBoundInput(binding, state) : undefined;
+      let value = binding ? this.resolveBoundInput(binding, state, invocationId) : undefined;
       if (value !== undefined && binding?.path?.length) value = selectJsonPath(value, binding.path);
       if (value === undefined) {
         const missing = binding?.missing ?? (port.defaultValue === undefined ? "error" : "default");
@@ -2000,8 +2142,134 @@ export class Coordinator {
     return resolved;
   }
 
-  private resolveBoundInput(binding: BoundInput, state: ExecutionState): JsonValue | undefined {
+  private async invokeScout(input: {
+    runId: string;
+    parentInvocationId: string;
+    parentAttemptId: string;
+    requestId: string;
+    scoutId: string;
+    input: Record<string, unknown>;
+    signal?: AbortSignal;
+  }): Promise<import("../types.ts").ScoutResult> {
+    const view = this.journal.getView(input.runId);
+    if (!view) throw new Error(`Run not found: ${input.runId}`);
+    const parent = view.state.invocations[input.parentInvocationId];
+    const scope = parent ? view.state.scopes[parent.scopeId] : undefined;
+    const definition = scope
+      ? view.bundle.definitions[scope.definitionId]
+      : view.bundle.definitions[view.bundle.rootDefinitionId];
+    const scout = definition?.scouts?.find((candidate) => candidate.id === input.scoutId);
+    const child = scout ? view.bundle.definitions[scout.definitionId] : undefined;
+    const childAgent = child?.nodes.find((node) => node.kind === "agent");
+    if (!child || !scout || childAgent?.kind !== "agent")
+      throw new Error(`subagent ${input.scoutId} is unavailable`);
+    if (childAgent.harness && childAgent.harness !== this.harness.id)
+      throw new Error(`subagent harness ${childAgent.harness} is unavailable in this host`);
+    const outputSchema = childAgent.outputPorts[0]
+      ? view.bundle.schemas[childAgent.outputPorts[0].schemaDigest]
+      : undefined;
+    const childInvocationId = `${input.parentAttemptId}:scout:${input.requestId}`;
+    return this.scouts.invoke({
+      ...input,
+      runner: async (request, signal) => {
+        const segments = Object.entries(request.input).map(([name, value]) => {
+          const content = JSON.stringify(value);
+          return {
+            id: `${childInvocationId}:input:${name}`,
+            source: "artifact-input",
+            content,
+            supplied: true,
+            reason: `resolved scout input ${name}`,
+            bytes: new TextEncoder().encode(content).byteLength,
+            tokenCount: null,
+            tokenQuality: "unavailable" as const,
+          };
+        });
+        const context = await createContextManifest({
+          attemptId: childInvocationId,
+          segments: [
+            {
+              id: `${childInvocationId}:role-prompt`,
+              source: "role-prompt",
+              content: childAgent.prompt,
+              supplied: true,
+              reason: `declared by scout role ${childAgent.role}`,
+              bytes: new TextEncoder().encode(childAgent.prompt).byteLength,
+              tokenCount: null,
+              tokenQuality: "unavailable",
+            },
+            ...segments,
+          ],
+          tools: [],
+          hiddenNativeContext: "unavailable",
+        });
+        const childAborter = new AbortController();
+        const abort = () => childAborter.abort();
+        signal?.addEventListener("abort", abort, { once: true });
+        const timeout = setTimeout(
+          () => childAborter.abort(),
+          Math.min(childAgent.timeoutMs, 60_000),
+        );
+        try {
+          const result = await this.harness.run({
+            runId: input.runId,
+            invocationId: childInvocationId,
+            role: childAgent.role,
+            prompt: childAgent.prompt,
+            ...(outputSchema ? { outputSchema } : {}),
+            delayMs: this.scriptedDelayMs,
+            timeoutMs: Math.min(childAgent.timeoutMs, 60_000),
+            cwd: this.workspaces.get(input.runId)?.path,
+            context,
+            signal: childAborter.signal,
+          });
+          if (result.status !== "succeeded" || result.output === undefined)
+            throw new Error(result.error ?? `scout harness ${result.status}`);
+          return result.output;
+        } finally {
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", abort);
+        }
+      },
+    });
+  }
+
+  private resolveBoundInput(
+    binding: BoundInput,
+    state: ExecutionState,
+    consumerInvocationId?: string,
+  ): JsonValue | undefined {
     if (binding.value !== undefined) return binding.value;
+    if (binding.source.kind === "scout-results") {
+      const source = binding.source;
+      if (!consumerInvocationId) return undefined;
+      const consumer = state.invocations[consumerInvocationId];
+      const planner = Object.values(state.invocations)
+        .filter(
+          (candidate) =>
+            candidate.scopeId === consumer?.scopeId &&
+            candidate.nodeId === source.sourceId &&
+            candidate.status === "succeeded",
+        )
+        .sort((a, b) => b.activationOrdinal - a.activationOrdinal)[0];
+      if (!planner) return [];
+      const attempt = Object.values(state.attempts)
+        .filter(
+          (candidate) => candidate.invocationId === planner.id && candidate.status === "succeeded",
+        )
+        .sort((a, b) => b.ordinal - a.ordinal)[0];
+      if (!attempt) return [];
+      return this.scouts
+        .deliveries(state.runId, attempt.id)
+        .filter((delivery) => delivery.manifest.scoutId === source.scoutId)
+        .map((delivery) => ({
+          requestId: delivery.requestId,
+          scoutId: delivery.manifest.scoutId,
+          resultArtifactId: delivery.manifest.artifactId ?? null,
+          resultDigest: delivery.manifest.resultDigest ?? null,
+          result: delivery.result,
+        })) as unknown as JsonValue;
+    }
     if (!binding.artifactId) return undefined;
     const ref = allArtifactRefs(state).find((candidate) => candidate.id === binding.artifactId);
     if (!ref) throw new Error(`Bound artifact ${binding.artifactId} is unavailable`);
@@ -2046,6 +2314,53 @@ export class Coordinator {
       else this.schedule(effect.runId);
     }
   }
+}
+
+function subagentToolSchema(
+  bundle: Bundle,
+  definitionId: string,
+  subagentIds: readonly string[] | undefined,
+): JsonValue {
+  const definition = bundle.definitions[definitionId];
+  const choices = (subagentIds ?? []).flatMap((subagentId) => {
+    const scout = definition?.scouts?.find((candidate) => candidate.id === subagentId);
+    const child = scout ? bundle.definitions[scout.definitionId] : undefined;
+    if (!child) return [];
+    const properties: Record<string, JsonValue> = {};
+    const required: string[] = [];
+    for (const port of child.inputPorts) {
+      const schema = bundle.schemas[port.schemaDigest] ?? {};
+      properties[port.name] = schema;
+      if (port.required && port.defaultValue === undefined) required.push(port.name);
+    }
+    return [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["subagentId", "requestId", "input"],
+        properties: {
+          subagentId: { const: subagentId },
+          requestId: { type: "string", maxLength: 128 },
+          input: {
+            type: "object",
+            additionalProperties: false,
+            ...(required.length ? { required } : {}),
+            properties,
+          },
+        },
+      } as JsonValue,
+    ];
+  });
+  return {
+    type: "object",
+    oneOf: choices,
+    properties: {
+      subagentId: { type: "string", enum: Array.from(subagentIds ?? []) },
+      requestId: { type: "string", maxLength: 128 },
+      input: { type: "object" },
+    },
+    required: ["subagentId", "requestId", "input"],
+  };
 }
 
 function selectJsonPath(value: JsonValue, path: readonly string[]): JsonValue | undefined {

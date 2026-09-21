@@ -23,6 +23,8 @@ import type {
   JoinMode,
   JoinFailure,
   Harness,
+  ScoutDefinition,
+  ScoutPolicy,
 } from "./contracts";
 
 export type SchemaInput<T = unknown> = ArtifactType<T> | JsonValue;
@@ -47,7 +49,29 @@ export interface OutputHandle<T = unknown> {
   readonly ownerToken: symbol;
 }
 
-export type ValueBinding<T = unknown> = InputHandle<T> | OutputHandle<T> | JsonValue;
+export interface ScoutHandle<T = unknown> {
+  readonly kind: "scout";
+  readonly workflowId: string;
+  readonly id: string;
+  readonly definitionId: string;
+  readonly schema: SchemaInput<T>;
+  readonly ownerToken: symbol;
+}
+
+export interface ScoutResultsHandle<T = unknown> {
+  readonly kind: "scout-results";
+  readonly workflowId: string;
+  readonly sourceId: string;
+  readonly scoutId: string;
+  readonly schema: SchemaInput<T[]>;
+  readonly ownerToken: symbol;
+}
+
+export type ValueBinding<T = unknown> =
+  | InputHandle<T>
+  | OutputHandle<T>
+  | ScoutResultsHandle<T>
+  | JsonValue;
 
 export interface AgentOptions<T = unknown> {
   readonly role?: string;
@@ -59,6 +83,8 @@ export interface AgentOptions<T = unknown> {
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly produces?: ArtifactType<T>;
   readonly timeoutMs?: number;
+  readonly uses?: readonly ScoutHandle[];
+  readonly scoutPolicy?: Partial<ScoutPolicy>;
   readonly scripted?: ScriptedAgentProfile;
   readonly resources?: Readonly<Record<string, number>>;
 }
@@ -248,6 +274,10 @@ function bindingSource(value: ValueBinding, owner: WorkflowBuilder): BindingSour
     assertHandleOwner(value, owner);
     return { kind: "producer", sourceId: value.sourceId, port: value.port };
   }
+  if (isScoutResultsHandle(value)) {
+    assertHandleOwner(value, owner);
+    return { kind: "scout-results", sourceId: value.sourceId, scoutId: value.scoutId };
+  }
   return { kind: "literal", value };
 }
 
@@ -288,6 +318,14 @@ function isOutputHandle(value: unknown): value is OutputHandle {
   );
 }
 
+function isScoutResultsHandle(value: unknown): value is ScoutResultsHandle {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { kind?: unknown }).kind === "scout-results"
+  );
+}
+
 export function artifactType<T = unknown>(id: string, schema: JsonValue): ArtifactType<T> {
   if (!id || typeof id !== "string") throw new Error("artifactType id must be a non-empty string");
   return Object.freeze({ id, schema });
@@ -305,6 +343,7 @@ export class WorkflowBuilder {
   private readonly childDefinitions = new Map<string, WorkflowDefinitionSource>();
   private readonly sourceMap = new Map<string, { sourceId: string }>();
   private readonly outputMap = new Map<string, InternalPort>();
+  private readonly scoutList: ScoutDefinition[] = [];
   private entryId: string | undefined;
   readonly ownerToken = Symbol("workflow-owner");
 
@@ -358,6 +397,19 @@ export class WorkflowBuilder {
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),
       timeoutMs: finitePositive(options.timeoutMs, 5_000),
+      ...(options.uses === undefined
+        ? {}
+        : {
+            uses: options.uses.map((scout) => {
+              assertScoutOwner(scout, this);
+              if (!this.scoutList.some((declared) => declared.id === scout.id))
+                throw new Error(`Scout ${scout.id} has not been declared on this workflow`);
+              return scout.id;
+            }),
+          }),
+      ...(options.uses === undefined || options.uses.length === 0
+        ? {}
+        : { scoutPolicy: normalizeScoutPolicy(options.scoutPolicy ?? {}) }),
       scripted: options.scripted,
       ...(options.resources ? { resources: options.resources } : {}),
     } as InternalNode;
@@ -482,6 +534,111 @@ export class WorkflowBuilder {
     this.addNode(node as InternalNode);
     this.sourceMap.set(id, { sourceId: id });
     return this.handle<T>(id, output);
+  }
+
+  /** Declare a child definition that agents may invoke through the subagent tool. */
+  scout<T = unknown>(
+    id: string,
+    child: WorkflowBuilder,
+    options: {
+      input?: Readonly<Record<string, ValueBinding>>;
+      maxInvocations?: number;
+      maxConcurrent?: number;
+      optional?: boolean;
+    } = {},
+  ): NodeHandle<T, true> {
+    const handle = this.call<T>(id, child, options);
+    const maxInvocations = options.maxInvocations ?? 2;
+    const maxConcurrent = options.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations <= 0)
+      throw new Error("scout maxInvocations must be a positive safe integer");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+      throw new Error("scout maxConcurrent must be a positive safe integer");
+    this.scoutList.push({
+      id,
+      definitionId: child.id,
+      maxInvocations,
+      maxConcurrent,
+      ...(options.optional ? { optional: true } : {}),
+    });
+    return handle;
+  }
+
+  subagent<T = unknown>(
+    id: string,
+    child: WorkflowBuilder,
+    options: Parameters<WorkflowBuilder["scout"]>[2] = {},
+  ): NodeHandle<T, true> {
+    return this.scout<T>(id, child, options);
+  }
+
+  /** Register a child that agents may invoke without adding a static graph activation. */
+  declareScout<T = unknown>(
+    id: string,
+    child: WorkflowBuilder,
+    options: { maxInvocations?: number; maxConcurrent?: number; optional?: boolean } = {},
+  ): ScoutHandle<T> {
+    if (this.scoutList.some((scout) => scout.id === id)) throw new Error(`Duplicate scout ${id}`);
+    this.childDefinitions.set(child.id, child.build());
+    const maxInvocations = options.maxInvocations ?? 2;
+    const maxConcurrent = options.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations <= 0)
+      throw new Error("scout maxInvocations must be a positive safe integer");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+      throw new Error("scout maxConcurrent must be a positive safe integer");
+    this.scoutList.push({
+      id,
+      definitionId: child.id,
+      maxInvocations,
+      maxConcurrent,
+      ...(options.optional ? { optional: true } : {}),
+    });
+    const childOutput = child.build().outputPorts?.[0];
+    const schema = childOutput
+      ? {
+          id: childOutput.schemaDigest,
+          schema: child.build().schemaCatalog?.[childOutput.schemaDigest] ?? {},
+        }
+      : ({ id: `${id}.output`, schema: {} } as ArtifactType);
+    return Object.freeze({
+      kind: "scout" as const,
+      workflowId: this.id,
+      id,
+      definitionId: child.id,
+      schema: schema as SchemaInput<T>,
+      ownerToken: this.ownerToken,
+    });
+  }
+
+  declareSubagent<T = unknown>(
+    id: string,
+    child: WorkflowBuilder,
+    options: { maxInvocations?: number; maxConcurrent?: number; optional?: boolean } = {},
+  ): ScoutHandle<T> {
+    return this.declareScout(id, child, options);
+  }
+
+  scoutResults<T = unknown>(
+    plan: NodeHandle<any, true>,
+    scout: ScoutHandle<T>,
+  ): ScoutResultsHandle<T> {
+    assertHandleOwner(plan, this);
+    assertScoutOwner(scout, this);
+    const parent = this.nodeMap.get(plan.id);
+    if (parent?.kind !== "agent") throw new Error("scoutResults requires an agent");
+    if (parent.uses !== undefined && !parent.uses.includes(scout.id))
+      throw new Error(`Subagent ${scout.id} is not authorized on agent ${plan.id}`);
+    return Object.freeze({
+      kind: "scout-results" as const,
+      workflowId: this.id,
+      sourceId: plan.id,
+      scoutId: scout.id,
+      schema: {
+        id: `${plan.id}.${scout.id}.results`,
+        schema: { type: "array", items: schemaValue(scout.schema) },
+      },
+      ownerToken: this.ownerToken,
+    });
   }
   parallel(id: string, options: ParallelOptions): NodeHandle<never, false> {
     if (!options.branches.length) throw new Error("parallel requires at least one branch");
@@ -614,6 +771,7 @@ export class WorkflowBuilder {
       counters: [...this.counterMap.values()],
       definitions: Object.fromEntries(this.childDefinitions.entries()),
       sourceMap: Object.fromEntries(this.sourceMap.entries()),
+      scouts: [...this.scoutList],
     } as WorkflowDefinitionSource;
   }
 
@@ -693,7 +851,8 @@ export class WorkflowBuilder {
   }
 
   private schemaOf(value: ValueBinding): SchemaInput {
-    if (isInputHandle(value) || isOutputHandle(value)) return value.schema;
+    if (isInputHandle(value) || isOutputHandle(value) || isScoutResultsHandle(value))
+      return value.schema;
     return {};
   }
 
@@ -708,6 +867,22 @@ export class WorkflowBuilder {
     }
     return result;
   }
+}
+
+function assertScoutOwner(handle: ScoutHandle, owner: WorkflowBuilder): void {
+  assertWorkflow(handle.workflowId, owner.id);
+  if (handle.ownerToken !== owner.ownerToken)
+    throw new Error("Scout handle belongs to another WorkflowBuilder instance");
+}
+
+function normalizeScoutPolicy(policy: Partial<ScoutPolicy>): ScoutPolicy {
+  const maxRequests = policy.maxRequests ?? 4;
+  const maxConcurrent = policy.maxConcurrent ?? 2;
+  if (!Number.isSafeInteger(maxRequests) || maxRequests <= 0)
+    throw new Error("scoutPolicy.maxRequests must be a positive safe integer");
+  if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+    throw new Error("scoutPolicy.maxConcurrent must be a positive safe integer");
+  return { maxRequests, maxConcurrent };
 }
 
 function stripInternal(node: InternalNode): Node {
@@ -734,6 +909,8 @@ function stripInternal(node: InternalNode): Node {
       ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
       timeoutMs: node.timeoutMs,
+      ...(node.uses === undefined ? {} : { uses: node.uses }),
+      ...(node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy }),
       ...(node.scripted === undefined ? {} : { scripted: node.scripted }),
     } as AgentNode;
   }

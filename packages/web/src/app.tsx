@@ -266,6 +266,7 @@ export function App() {
   const [loadingOlderRuns, setLoadingOlderRuns] = useState(false);
   const [workflowId, setWorkflowId] = useState("tiny");
   const [task, setTask] = useState("");
+  const [workspacePath, setWorkspacePath] = useState("");
   const [profiles, setProfiles] = useState<ExecutionProfile[]>([]);
   const [profileId, setProfileId] = useState<ExecutionProfile["id"]>("scripted");
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(
@@ -684,6 +685,7 @@ export function App() {
           executionProfile: profileId,
           idempotencyKey: crypto.randomUUID(),
           ...(task.trim() ? { input: { task: task.trim() } } : {}),
+          ...(workspacePath.trim() ? { workspace: { repositoryPath: workspacePath.trim() } } : {}),
         }),
       });
       setRuns((old) => [created, ...old.filter((run) => run.id !== created.id)]);
@@ -895,6 +897,8 @@ export function App() {
             workflow={workflow}
             task={task}
             setTask={setTask}
+            workspacePath={workspacePath}
+            setWorkspacePath={setWorkspacePath}
             onLaunch={launch}
             launching={launching}
           />
@@ -1123,6 +1127,7 @@ function Sidebar({
             <span>
               <strong>{run.workflowId || "run"}</strong>
               <em>
+                {run.task ? `${run.task.slice(0, 48)} · ` : ""}
                 {run.id.slice(0, 12)} ·{" "}
                 {run.createdAt
                   ? new Date(run.createdAt).toLocaleTimeString([], {
@@ -1356,12 +1361,16 @@ function Preview({
   workflow,
   task,
   setTask,
+  workspacePath,
+  setWorkspacePath,
   onLaunch,
   launching,
 }: {
   workflow?: WorkflowSummary;
   task: string;
   setTask: (task: string) => void;
+  workspacePath: string;
+  setWorkspacePath: (path: string) => void;
   onLaunch: () => void;
   launching: boolean;
 }) {
@@ -1391,6 +1400,17 @@ function Preview({
           rows={4}
         />
         <small>The task is delivered as the workflow's typed root input.</small>
+      </label>
+      <label className="task-input">
+        <span>
+          REPOSITORY / WORKSPACE <small>OPTIONAL</small>
+        </span>
+        <input
+          value={workspacePath}
+          onChange={(event) => setWorkspacePath(event.target.value)}
+          placeholder="/path/to/a git repository"
+        />
+        <small>Workspace effects run in an isolated managed worktree.</small>
       </label>
       <div className="preview-map">
         {workflow?.graph?.nodes?.map((node, index) => (
@@ -2084,7 +2104,7 @@ function Inspector({
               />
             )}
             {tab === "diagnostics" && <DiagnosticPanel items={diagnostics} />}
-            {tab === "diff" && <DiffPanel runId={view.runId} />}
+            {tab === "diff" && <DiffPanel runId={view.runId} revision={view.revision} />}
           </div>
         </>
       ) : (
@@ -2303,7 +2323,7 @@ function ApprovalPanel({
   );
 }
 
-function DiffPanel({ runId }: { runId: string }) {
+function DiffPanel({ runId, revision }: { runId: string; revision: number }) {
   const [state, setState] = useState<
     | { kind: "loading" }
     | { kind: "none"; message: string }
@@ -2315,6 +2335,12 @@ function DiffPanel({ runId }: { runId: string }) {
       }
     | { kind: "error"; message: string }
   >({ kind: "loading" });
+  const [delivery, setDelivery] = useState<
+    | { kind: "idle" }
+    | { kind: "working" }
+    | { kind: "error"; message: string }
+    | { kind: "action"; id: string; status: string; resultTree: string }
+  >({ kind: "idle" });
   useEffect(() => {
     let cancelled = false;
     void api<unknown>(`/api/runs/${encodeURIComponent(runId)}/diff`)
@@ -2368,6 +2394,78 @@ function DiffPanel({ runId }: { runId: string }) {
       cancelled = true;
     };
   }, [runId]);
+  const prepare = async () => {
+    if (state.kind !== "snapshot") return;
+    setDelivery({ kind: "working" });
+    try {
+      const action = await api<{
+        id: string;
+        status: string;
+        resultTree: string;
+      }>(`/api/runs/${encodeURIComponent(runId)}/delivery`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          requestKey: `web:${runId}:${state.patchDigest}`,
+          message: `Deliver ${runId}`,
+        }),
+      });
+      setDelivery({ kind: "action", ...action });
+    } catch (cause) {
+      setDelivery({
+        kind: "error",
+        message: cause instanceof Error ? cause.message : "Unable to prepare delivery.",
+      });
+    }
+  };
+  const decide = async (decision: "approved" | "rejected") => {
+    if (delivery.kind !== "action") return;
+    setDelivery({ kind: "working" });
+    try {
+      const action = await api<{
+        id: string;
+        status: string;
+        resultTree: string;
+      }>(`/api/runs/${encodeURIComponent(runId)}/delivery/${encodeURIComponent(delivery.id)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision, actor: "local-operator" }),
+      });
+      setDelivery({ kind: "action", ...action });
+    } catch (cause) {
+      setDelivery({
+        kind: "error",
+        message: cause instanceof Error ? cause.message : "Unable to record delivery decision.",
+      });
+    }
+  };
+  const commit = async () => {
+    if (delivery.kind !== "action" || delivery.status !== "approved") return;
+    setDelivery({ kind: "working" });
+    try {
+      const result = await api<{ status?: string }>(
+        `/api/runs/${encodeURIComponent(runId)}/actions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            action: "deliver",
+            expectedRevision: revision,
+            idempotencyKey: `web:commit:${delivery.id}`,
+            deliveryActionId: delivery.id,
+            expectedTree: delivery.resultTree,
+            message: `Deliver ${runId}`,
+          }),
+        },
+      );
+      setDelivery({ ...delivery, status: result.status ?? "committed" });
+    } catch (cause) {
+      setDelivery({
+        kind: "error",
+        message: cause instanceof Error ? cause.message : "Unable to commit delivery.",
+      });
+    }
+  };
   return (
     <div className="diff-panel" data-testid="diff-panel">
       <div className="section-label">
@@ -2423,6 +2521,43 @@ function DiffPanel({ runId }: { runId: string }) {
           <pre className="diff-content" data-testid="diff-content">
             {state.patch || "(empty diff)"}
           </pre>
+          <div className="delivery-actions" data-testid="delivery-actions">
+            <div className="section-label">
+              DELIVERY <span>{delivery.kind === "action" ? delivery.status : "pending"}</span>
+            </div>
+            <p className="pending-copy">
+              Prepare this exact tree for a durable approval before the local commit effect.
+            </p>
+            {delivery.kind === "idle" && (
+              <button className="control-button approve" onClick={() => void prepare()}>
+                Prepare delivery
+              </button>
+            )}
+            {delivery.kind === "working" && (
+              <div className="diff-placeholder">Updating delivery action…</div>
+            )}
+            {delivery.kind === "error" && (
+              <div className="diff-placeholder diff-error">{delivery.message}</div>
+            )}
+            {delivery.kind === "action" && delivery.status === "pending" && (
+              <div className="approval-actions">
+                <button className="control-button approve" onClick={() => void decide("approved")}>
+                  Approve delivery
+                </button>
+                <button className="control-button danger" onClick={() => void decide("rejected")}>
+                  Reject delivery
+                </button>
+              </div>
+            )}
+            {delivery.kind === "action" && delivery.status === "approved" && (
+              <button className="control-button approve" onClick={() => void commit()}>
+                Commit approved tree
+              </button>
+            )}
+            {delivery.kind === "action" && delivery.status === "committed" && (
+              <div className="diff-placeholder">Delivery committed.</div>
+            )}
+          </div>
         </>
       )}
     </div>
