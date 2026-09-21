@@ -27,11 +27,12 @@ paths that must exist in this v2 checkout.
 
 ## Authoring and compiler contract
 
-Keep `WorkflowBuilder.declareSubagent(id, childDefinition, options)` and make it
+Keep `WorkflowBuilder.subagent(id, childDefinition, options)` and make it
 return an owner-checked subagent handle. Declared subagents are available to
 every agent. An optional `uses: ScoutHandle[]` list narrows one agent's access;
 persist that allowlist on the compiled node and reject duplicate or foreign
-handles.
+handles. Names such as `repositoryScout` and `testScout` are illustrative
+user-created subagents; the runtime gives them no special behavior.
 
 For this version, a scout definition must contain exactly one agent and one
 successful completion node, start at that agent, and connect them with one
@@ -43,8 +44,8 @@ without interpreting a child graph.
 
 Every subagent has positive integer `maxInvocations` and `maxConcurrent` bounds and
 a compiled `optional` flag, defaulting to false. Required means at least one
-successful call is mandatory before accepting the planner output. Additionally,
-any failed, unknown, or cancelled accepted call to a required scout blocks
+successful call is mandatory before accepting the parent agent output. Additionally,
+any failed, unknown, or cancelled accepted call to a required subagent blocks
 acceptance for that attempt, even if another call succeeds. Optional scouts need
 not run, and their failures do not block acceptance.
 
@@ -90,13 +91,13 @@ function scoutDefinition(id: string, role: string, prompt: string) {
 
 const workflow = new WorkflowBuilder({ id: "feature", version: "1" });
 const task = workflow.input("task", Task);
-const repositoryScout = workflow.declareScout(
+const repositoryScout = workflow.subagent(
   "repositoryScout",
   scoutDefinition("repositoryScout", "repository-scout",
     "Read repository boundaries relevant to the task and question. Return evidence."),
   { maxInvocations: 2, maxConcurrent: 1, optional: false },
 );
-const testScout = workflow.declareScout(
+const testScout = workflow.subagent(
   "testScout",
   scoutDefinition("testScout", "test-scout",
     "Read relevant tests. Report coverage and gaps; do not execute tests."),
@@ -122,8 +123,8 @@ const implement = workflow.agent("implement", {
   input: {
     task,
     plan: plan.output,
-    repositoryReports: workflow.scoutResults(plan, repositoryScout),
-    testReports: workflow.scoutResults(plan, testScout),
+    repositoryReports: workflow.subagentResults(plan, repositoryScout),
+    testReports: workflow.subagentResults(plan, testScout),
   },
 });
 const done = workflow.complete("done");
@@ -143,18 +144,30 @@ approval or implementation as a successful planner outcome.
 
 ```ts
 type ScoutResult =
-  | { requestId: string; scoutId: string; state: "succeeded";
-      result: JsonValue; resultArtifactId: string; resultDigest: string }
-  | { requestId: string; scoutId: string;
+  | {
+      requestId: string;
+      scoutId: string;
+      state: "succeeded";
+      result: JsonValue;
+      resultArtifactId: string;
+      resultDigest: string;
+    }
+  | {
+      requestId: string;
+      scoutId: string;
       state: "failed" | "unknown" | "cancelled";
-      error: { code: string; message: string } };
+      error: { code: string; message: string };
+    };
 
 interface ScoutTool {
-  invoke(input: {
-    scoutId: string;
-    requestId: string;
-    input: Record<string, JsonValue>;
-  }, signal?: AbortSignal): Promise<ScoutResult>;
+  invoke(
+    input: {
+      scoutId: string;
+      requestId: string;
+      input: Record<string, JsonValue>;
+    },
+    signal?: AbortSignal,
+  ): Promise<ScoutResult>;
 }
 ```
 
@@ -170,7 +183,7 @@ before it consumes that result.
 
 ```text
 Agent calls subagent:
-  { "scoutId": "repositoryScout", "requestId": "repo-1",
+  { "subagentId": "repositoryScout", "requestId": "repo-1",
     "input": { "task": "Add a retry option",
                "question": "Where are retry settings validated?" } }
 
@@ -179,7 +192,7 @@ and persists acceptance. Host runs the repository subagent with read-only tools.
 Host validates ScoutReport, persists its artifact and terminal state, then
 records the response envelope and returns it to the outstanding `subagent` call:
 
-  { "scoutId": "repositoryScout", "requestId": "repo-1",
+  { "subagentId": "repositoryScout", "requestId": "repo-1",
     "state": "succeeded", "resultArtifactId": "artifact-123",
     "resultDigest": "<digest>",
     "result": { "summary": "Validation is in the compiler.",
@@ -213,14 +226,14 @@ identity, effective harness/model, workspace identity, input digest, ordinal,
 deadline, dispatch identity, timestamps, usage, terminal error, and result
 artifact ID/digest. This lineage does not manufacture a graph invocation.
 
-| State | Meaning and allowed next states |
-| --- | --- |
-| accepted | Validated and budget reserved; may become running, failed, or cancelled. |
-| running | Dispatch intent committed before calling the harness; may become succeeded, failed, unknown, or cancelled. |
-| succeeded | Output validated and durable artifact reference committed; terminal. |
-| failed | Known failure, including timeout or invalid output; terminal. |
-| unknown | Dispatch may have occurred but outcome cannot be established; terminal. |
-| cancelled | Parent or caller cancellation; terminal. |
+| State     | Meaning and allowed next states                                                                            |
+| --------- | ---------------------------------------------------------------------------------------------------------- |
+| accepted  | Validated and budget reserved; may become running, failed, or cancelled.                                   |
+| running   | Dispatch intent committed before calling the harness; may become succeeded, failed, unknown, or cancelled. |
+| succeeded | Output validated and durable artifact reference committed; terminal.                                       |
+| failed    | Known failure, including timeout or invalid output; terminal.                                              |
+| unknown   | Dispatch may have occurred but outcome cannot be established; terminal.                                    |
+| cancelled | Parent or caller cancellation; terminal.                                                                   |
 
 Acceptance, invocation-budget consumption, and concurrency reservation are
 atomic. Dispatch requires a compare-and-set claim by the owning controller.

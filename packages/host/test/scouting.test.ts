@@ -43,7 +43,7 @@ test("bounded scout gateway keeps request identity, typed results, delivery, and
   const done = root.complete("done");
   root.startAt(implementer);
   implementer.on("success").to(done);
-  root.declareSubagent("repository", child);
+  root.subagent("repository", child);
   const bundle = await compileWorkflow(root.build());
   const dataDir = mkdtempSync(join(tmpdir(), "kouro-scout-"));
   const journal = new Journal({ dataDir });

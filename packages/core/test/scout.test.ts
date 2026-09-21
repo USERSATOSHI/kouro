@@ -36,7 +36,7 @@ function scout(id = "repositoryScout") {
 test("planner scout authoring preserves authorization and typed report bindings", async () => {
   const workflow = new WorkflowBuilder({ id: "feature", version: "1" });
   const task = workflow.input("task", Task);
-  const repository = workflow.declareScout("repositoryScout", scout());
+  const repository = workflow.subagent("repositoryScout", scout());
   const plan = workflow.agent("plan", {
     role: "planner",
     prompt: "plan",
@@ -47,7 +47,7 @@ test("planner scout authoring preserves authorization and typed report bindings"
   const implement = workflow.agent("implement", {
     role: "implementer",
     prompt: "implement",
-    input: { reports: workflow.scoutResults(plan, repository) },
+    input: { reports: workflow.subagentResults(plan, repository) },
   });
   const done = workflow.complete("done");
   workflow.startAt(plan);
@@ -72,8 +72,8 @@ test("planner scout authoring preserves authorization and typed report bindings"
 test("planner scout authoring rejects impossible required budgets and foreign handles", async () => {
   const workflow = new WorkflowBuilder({ id: "feature", version: "1" });
   const task = workflow.input("task", Task);
-  const first = workflow.declareScout("first", scout("first"));
-  const second = workflow.declareScout("second", scout("second"));
+  const first = workflow.subagent("first", scout("first"));
+  const second = workflow.subagent("second", scout("second"));
   const plan = workflow.agent("plan", {
     role: "planner",
     prompt: "plan",
@@ -88,7 +88,7 @@ test("planner scout authoring rejects impossible required budgets and foreign ha
   await expect(compileWorkflow(workflow.build())).rejects.toThrow("SCOUT_POLICY_TOO_SMALL");
 
   const other = new WorkflowBuilder({ id: "other", version: "1" });
-  const foreign = other.declareScout("foreign", scout("foreign"));
+  const foreign = other.subagent("foreign", scout("foreign"));
   expect(() =>
     workflow.agent("foreign-use", {
       role: "planner",
@@ -105,7 +105,7 @@ test("compiler rejects a scout child that is not the restricted agent shape", as
   child.startAt(command);
   command.on("success").to(done);
   const workflow = new WorkflowBuilder({ id: "feature", version: "1" });
-  const handle = workflow.declareScout("bad", child);
+  const handle = workflow.subagent("bad", child);
   const plan = workflow.agent("plan", { role: "planner", prompt: "plan", uses: [handle] });
   const finish = workflow.complete("finish");
   workflow.startAt(plan);

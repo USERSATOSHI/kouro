@@ -1015,8 +1015,8 @@ async function compileFeature(): Promise<Bundle> {
     { required: false },
   );
   const workItem = builder.input("workItem", WorkItem, { required: false });
-  builder.declareSubagent("repositoryScout", repositoryScout);
-  builder.declareSubagent("testScout", testScout);
+  builder.subagent("repositoryScout", repositoryScout);
+  builder.subagent("testScout", testScout);
   const plan = builder.agent("plan", {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",

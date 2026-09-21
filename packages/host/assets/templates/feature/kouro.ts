@@ -39,11 +39,11 @@ testScout.output(testInspect.output);
 const workflow = new WorkflowBuilder({ id: "{{id}}", version: "1" });
 const task = workflow.input("task", Task, { required: false });
 const workItem = workflow.input("workItem", WorkItem, { required: false });
-const repositoryScoutHandle = workflow.declareSubagent("repositoryScout", repositoryScout, {
+const repositoryScoutHandle = workflow.subagent("repositoryScout", repositoryScout, {
   maxInvocations: 2,
   maxConcurrent: 1,
 });
-const testScoutHandle = workflow.declareSubagent("testScout", testScout, {
+const testScoutHandle = workflow.subagent("testScout", testScout, {
   maxInvocations: 2,
   maxConcurrent: 1,
   optional: true,
@@ -62,8 +62,8 @@ const approval = workflow.approval("approve-plan", {
     task,
     workItem,
     plan: plan.output,
-    repositoryReports: workflow.scoutResults(plan, repositoryScoutHandle),
-    testReports: workflow.scoutResults(plan, testScoutHandle),
+    repositoryReports: workflow.subagentResults(plan, repositoryScoutHandle),
+    testReports: workflow.subagentResults(plan, testScoutHandle),
   },
 });
 const implement = workflow.agent("implement", {

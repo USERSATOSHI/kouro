@@ -564,14 +564,6 @@ export class WorkflowBuilder {
     return handle;
   }
 
-  subagent<T = unknown>(
-    id: string,
-    child: WorkflowBuilder,
-    options: Parameters<WorkflowBuilder["scout"]>[2] = {},
-  ): NodeHandle<T, true> {
-    return this.scout<T>(id, child, options);
-  }
-
   /** Register a child that agents may invoke without adding a static graph activation. */
   declareScout<T = unknown>(
     id: string,
@@ -618,6 +610,14 @@ export class WorkflowBuilder {
     return this.declareScout(id, child, options);
   }
 
+  subagent<T = unknown>(
+    id: string,
+    child: WorkflowBuilder,
+    options: { maxInvocations?: number; maxConcurrent?: number; optional?: boolean } = {},
+  ): ScoutHandle<T> {
+    return this.declareScout(id, child, options);
+  }
+
   scoutResults<T = unknown>(
     plan: NodeHandle<any, true>,
     scout: ScoutHandle<T>,
@@ -639,6 +639,13 @@ export class WorkflowBuilder {
       },
       ownerToken: this.ownerToken,
     });
+  }
+
+  subagentResults<T = unknown>(
+    agent: NodeHandle<any, true>,
+    subagent: ScoutHandle<T>,
+  ): ScoutResultsHandle<T> {
+    return this.scoutResults(agent, subagent);
   }
   parallel(id: string, options: ParallelOptions): NodeHandle<never, false> {
     if (!options.branches.length) throw new Error("parallel requires at least one branch");

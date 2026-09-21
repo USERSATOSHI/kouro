@@ -93,7 +93,7 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
         const configuredSubagentIds = input.context?.tools.find(
           (tool) => tool.name === "subagent",
         )?.inputSchema;
-        const enumValues =
+        const subagentIds =
           configuredSubagentIds &&
           typeof configuredSubagentIds === "object" &&
           !Array.isArray(configuredSubagentIds) &&
@@ -107,19 +107,13 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
             ? configuredSubagentIds.properties.subagentId.enum.filter(
                 (value): value is string => typeof value === "string",
               )
-            : ["repositoryScout", "testScout"];
+            : [];
         const requests = await Promise.all(
-          enumValues.map((subagentId) =>
+          subagentIds.map((subagentId) =>
             input.collaboration!.subagent!({
               requestId: `${input.invocationId}:${subagentId}`,
               subagentId,
-              input: {
-                task,
-                question:
-                  subagentId === "repositoryScout"
-                    ? "Inspect repository structure"
-                    : "Inspect test coverage",
-              },
+              input: subagentInputFromToolSchema(configuredSubagentIds, subagentId, task),
             }),
           ),
         );
@@ -129,20 +123,12 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
     }
     const scoutReports =
       collaboration && Array.isArray(collaboration.scouts) ? collaboration.scouts : undefined;
-    const output = {
-      summary: "Scripted Kouro harness completed.",
-      ...(allowsOutputProperty(input.outputSchema, "findings") ? { findings: [] } : {}),
-      ...(allowsOutputProperty(input.outputSchema, "evidence") ? { evidence: [] } : {}),
-      ...(scoutReports && allowsOutputProperty(input.outputSchema, "scoutReports")
-        ? { scoutReports }
-        : {}),
-      ...(collaboration &&
-      (input.role !== "planner" ||
-        (collaboration.scouts === undefined &&
-          allowsOutputProperty(input.outputSchema, "collaboration")))
-        ? { collaboration }
-        : {}),
-    };
+    const output = input.outputSchema
+      ? scriptedOutput(input.outputSchema, collaboration, scoutReports)
+      : {
+          summary: "Scripted Kouro harness completed.",
+          ...(collaboration ? { collaboration } : {}),
+        };
     return {
       status: "succeeded" as const,
       output: output as import("@kouro/core").JsonValue,
@@ -152,14 +138,105 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
   }
 }
 
-function allowsOutputProperty(
+function subagentInputFromToolSchema(
   schema: import("@kouro/core").JsonValue | undefined,
+  subagentId: string,
+  task: string,
+): Record<string, import("@kouro/core").JsonValue> {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return {};
+  const branches = Array.isArray(schema.oneOf) ? schema.oneOf : [];
+  const branch = branches.find(
+    (candidate) =>
+      isRecord(candidate) &&
+      isRecord(candidate.properties) &&
+      isRecord(candidate.properties.subagentId) &&
+      candidate.properties.subagentId.const === subagentId,
+  );
+  if (!isRecord(branch) || !isRecord(branch.properties) || !isRecord(branch.properties.input))
+    return {};
+  const inputSchema = branch.properties.input;
+  if (!isRecord(inputSchema) || !isRecord(inputSchema.properties)) return {};
+  const required = new Set(
+    Array.isArray(inputSchema.required)
+      ? inputSchema.required.filter((value): value is string => typeof value === "string")
+      : [],
+  );
+  return Object.fromEntries(
+    Object.entries(inputSchema.properties)
+      .filter(([name]) => required.has(name))
+      .map(([name, propertySchema]) => [name, scriptedValue(propertySchema, name, task)]),
+  );
+}
+
+function scriptedOutput(
+  schema: import("@kouro/core").JsonValue,
+  collaboration: Record<string, unknown> | undefined,
+  scoutReports: unknown[] | undefined,
+): import("@kouro/core").JsonValue {
+  const output = scriptedValue(schema, "output", "scripted task");
+  if (!isRecord(output)) return output;
+  const properties = isRecord(schema) && isRecord(schema.properties) ? schema.properties : {};
+  if (scoutReports && Object.prototype.hasOwnProperty.call(properties, "scoutReports"))
+    output.scoutReports = scoutReports as import("@kouro/core").JsonValue;
+  if (collaboration && Object.prototype.hasOwnProperty.call(properties, "collaboration"))
+    output.collaboration = collaboration as import("@kouro/core").JsonValue;
+  return output;
+}
+
+function scriptedValue(
+  schema: unknown,
   name: string,
-): boolean {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
-  const properties = schema.properties;
-  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false;
-  return Object.prototype.hasOwnProperty.call(properties, name);
+  task: string,
+): import("@kouro/core").JsonValue {
+  if (!isRecord(schema)) return "Scripted Kouro harness completed.";
+  if (schema.const !== undefined && isJsonValue(schema.const)) return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0 && isJsonValue(schema.enum[0]))
+    return schema.enum[0];
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0)
+    return scriptedValue(schema.oneOf[0], name, task);
+  const type = schema.type;
+  if (type === "object" || schema.properties !== undefined) {
+    const properties = isRecord(schema.properties) ? schema.properties : {};
+    const required = new Set(
+      Array.isArray(schema.required)
+        ? schema.required.filter((value): value is string => typeof value === "string")
+        : Object.keys(properties),
+    );
+    return Object.fromEntries(
+      Object.entries(properties)
+        .filter(([property]) => required.has(property))
+        .map(([property, propertySchema]) => [
+          property,
+          scriptedValue(propertySchema, property, task),
+        ]),
+    );
+  }
+  if (type === "array") return [];
+  if (type === "boolean") return false;
+  if (type === "integer" || type === "number")
+    return typeof schema.minimum === "number" ? schema.minimum : 0;
+  if (type === "string") {
+    if (name === "task") return task;
+    const minimum = typeof schema.minLength === "number" ? schema.minLength : 0;
+    return "Scripted subagent input".padEnd(minimum, "x");
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isJsonValue(value: unknown): value is import("@kouro/core").JsonValue {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return true;
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isRecord(value) && Object.values(value).every(isJsonValue);
 }
 
 function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
