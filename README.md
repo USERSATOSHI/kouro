@@ -20,6 +20,35 @@ bun install
 bun run dev
 ```
 
+## Install the CLI
+
+Install directly from GitHub, without cloning the repository:
+
+```sh
+npm install --global github:usersatoshi/kouro
+```
+
+Or with Bun:
+
+```sh
+bun add --global github:usersatoshi/kouro
+```
+
+Confirm the command:
+
+```sh
+kouro --help
+```
+
+The root GitHub package installs the CLI entrypoint and its local `@kouro/core`
+and `@kouro/host` dependency graph. The CLI requires Bun at runtime.
+
+For a one-off invocation without a global install:
+
+```sh
+bunx --package github:usersatoshi/kouro kouro --help
+```
+
 The host serves the built web application and API through ElysiaJS. Use the local
 URL printed by the host. Keep the pairing token private. The server binds to
 loopback; this is a local workbench, not a hosted service.

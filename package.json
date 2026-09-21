@@ -1,7 +1,23 @@
 {
-  "name": "kouro-workspace",
+  "name": "kouro",
+  "description": "A local workbench for declarative agent workflows",
   "version": "2.0.0",
-  "private": true,
+  "homepage": "https://github.com/usersatoshi/kouro#readme",
+  "bugs": {
+    "url": "https://github.com/usersatoshi/kouro/issues"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usersatoshi/kouro.git"
+  },
+  "bin": {
+    "kouro": "packages/host/src/cli.ts"
+  },
+  "files": [
+    "packages/core",
+    "packages/host"
+  ],
   "workspaces": [
     "packages/*"
   ],
@@ -17,6 +33,12 @@
     "lint": "oxlint --deny-warnings packages scripts && bun run scripts/check-boundaries.ts",
     "format": "oxfmt --write packages scripts package.json tsconfig.json playwright.config.ts",
     "format:check": "oxfmt --check packages scripts package.json tsconfig.json playwright.config.ts"
+  },
+  "dependencies": {
+    "@kouro/core": "file:packages/core",
+    "@kouro/host": "file:packages/host",
+    "ajv": "8.17.1",
+    "elysia": "^1.4.29"
   },
   "devDependencies": {
     "@playwright/test": "1.58.2",
