@@ -130,13 +130,14 @@ textarea:focus-visible {
 .app-shell {
   height: 100vh;
   display: grid;
-  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 232px) minmax(0, 1fr);
   overflow: hidden;
   background: #0b111a;
 }
 @media (max-width: 900px) {
   .app-shell {
-    grid-template-columns: 196px minmax(0, 1fr);
+    --sidebar-width: 196px;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   }
   .top-actions {
     gap: 6px;
@@ -196,11 +197,40 @@ textarea:focus-visible {
   }
 }
 .sidebar {
+  position: relative;
   background: #0c121b;
   border-right: 1px solid #1b2738;
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+.resize-handle {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  bottom: 0;
+  z-index: 20;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+.resize-handle:hover::after,
+.resizing-panels .resize-handle::after {
+  background: #66cfaa;
+}
+body.resizing-panels {
+  cursor: col-resize;
+  user-select: none;
 }
 .brand {
   height: 66px;
@@ -548,7 +578,7 @@ textarea:focus-visible {
   gap: 14px;
   position: absolute;
   left: 0;
-  right: 310px;
+  right: var(--inspector-width, 310px);
   top: 0;
   z-index: 5;
   border-bottom: 1px solid #1b2738;
@@ -587,7 +617,7 @@ textarea:focus-visible {
 .work-area {
   flex: 1;
   padding-top: 39px;
-  padding-right: 310px;
+  padding-right: var(--inspector-width, 310px);
   display: flex;
   flex-direction: column;
   width: 100%;
@@ -858,10 +888,14 @@ textarea:focus-visible {
   right: 0;
   top: 0;
   bottom: 0;
-  width: 310px;
+  width: var(--inspector-width, 310px);
   background: #0d151f;
   border-left: 1px solid #1c2b3d;
   overflow: auto;
+}
+.inspector > .resize-handle {
+  left: -4px;
+  right: auto;
 }
 .inspector-header {
   height: 39px;
@@ -1391,8 +1425,11 @@ textarea:focus-visible {
   }
 }
 @media (max-width: 1150px) {
+  .app-shell {
+    --inspector-width: 275px;
+  }
   .inspector {
-    width: 275px;
+    width: var(--inspector-width);
   }
   .work-area,
   .view-toolbar {
@@ -1407,9 +1444,13 @@ textarea:focus-visible {
 }
 @media (max-width: 800px) {
   .app-shell {
+    --inspector-width: 260px;
     grid-template-columns: minmax(0, 1fr);
   }
   .sidebar {
+    display: none;
+  }
+  .inspector > .resize-handle {
     display: none;
   }
   .inspector {

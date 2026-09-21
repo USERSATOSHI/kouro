@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   Background,
   Controls,
@@ -222,6 +231,33 @@ function LogoMark() {
   );
 }
 
+function readPanelWidth(key: string, fallback: number, min: number, max: number): number {
+  try {
+    const stored = Number(window.localStorage.getItem(key));
+    return Number.isFinite(stored) ? Math.min(max, Math.max(min, stored)) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function ResizeHandle({
+  label,
+  onStart,
+}: {
+  label: string;
+  onStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+}) {
+  return (
+    <div
+      className="resize-handle"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      onPointerDown={onStart}
+    />
+  );
+}
+
 export function App() {
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -250,7 +286,48 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [error, setError] = useState<string>();
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readPanelWidth("kouro.sidebar.width", 232, 180, 420),
+  );
+  const [inspectorWidth, setInspectorWidth] = useState(() =>
+    readPanelWidth("kouro.inspector.width", 310, 260, 560),
+  );
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+
+  useEffect(() => {
+    window.localStorage.setItem("kouro.sidebar.width", String(sidebarWidth));
+  }, [sidebarWidth]);
+  useEffect(() => {
+    window.localStorage.setItem("kouro.inspector.width", String(inspectorWidth));
+  }, [inspectorWidth]);
+
+  const startPanelResize = useCallback(
+    (panel: "sidebar" | "inspector", event: ReactPointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      const initialX = event.clientX;
+      const initialWidth = panel === "sidebar" ? sidebarWidth : inspectorWidth;
+      const min = panel === "sidebar" ? 180 : 260;
+      const max = panel === "sidebar" ? 420 : 560;
+      const update = (move: PointerEvent) => {
+        const delta = move.clientX - initialX;
+        const next = Math.min(
+          max,
+          Math.max(min, initialWidth + (panel === "sidebar" ? delta : -delta)),
+        );
+        if (panel === "sidebar") setSidebarWidth(next);
+        else setInspectorWidth(next);
+      };
+      const stop = () => {
+        window.removeEventListener("pointermove", update);
+        window.removeEventListener("pointerup", stop);
+        document.body.classList.remove("resizing-panels");
+      };
+      document.body.classList.add("resizing-panels");
+      window.addEventListener("pointermove", update);
+      window.addEventListener("pointerup", stop, { once: true });
+    },
+    [inspectorWidth, sidebarWidth],
+  );
 
   const loadCatalog = useCallback(async () => {
     try {
@@ -699,7 +776,15 @@ export function App() {
       : run,
   );
   return (
-    <div className="app-shell">
+    <div
+      className="app-shell"
+      style={
+        {
+          "--sidebar-width": `${sidebarWidth}px`,
+          "--inspector-width": `${inspectorWidth}px`,
+        } as CSSProperties
+      }
+    >
       <Sidebar
         workflows={workflows}
         runs={visibleRuns}
@@ -713,6 +798,7 @@ export function App() {
         setSelectedRunId={setSelectedRunId}
         surface={surface}
         setSurface={setSurface}
+        onResizeStart={(event) => startPanelResize("sidebar", event)}
       />
       <main className="main-column">
         <Topbar
@@ -800,6 +886,7 @@ export function App() {
             setSelectedInvocationId={setSelectedInvocationId}
             onControl={controlRun}
             pendingAction={pendingAction}
+            onInspectorResizeStart={(event) => startPanelResize("inspector", event)}
           />
         ) : (
           <Preview workflow={workflow} onLaunch={launch} launching={launching} />
@@ -929,6 +1016,7 @@ function Sidebar({
   setSelectedRunId,
   surface,
   setSurface,
+  onResizeStart,
 }: {
   workflows: WorkflowSummary[];
   runs: RunSummary[];
@@ -942,6 +1030,7 @@ function Sidebar({
   setSelectedRunId: (id: string) => void;
   surface: "runs" | "evals" | "swarm" | "development" | "checkpoints";
   setSurface: (surface: "runs" | "evals" | "swarm" | "development" | "checkpoints") => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
   return (
     <aside className="sidebar">
@@ -1053,6 +1142,7 @@ function Sidebar({
         <span className="connection-dot" /> local host{" "}
         <span className="footer-version">v2 / local</span>
       </div>
+      <ResizeHandle label="Resize navigation sidebar" onStart={onResizeStart} />
     </aside>
   );
 }
@@ -1306,6 +1396,7 @@ function Workbench({
   setSelectedInvocationId,
   onControl,
   pendingAction,
+  onInspectorResizeStart,
 }: {
   workflow?: WorkflowSummary;
   view: UiRunView;
@@ -1313,6 +1404,7 @@ function Workbench({
   setSelectedInvocationId: (id: string) => void;
   onControl: (action: string, invocationId?: string) => void;
   pendingAction?: string;
+  onInspectorResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
   const [mode, setMode] = useState<"graph" | "split" | "timeline">("split");
   return (
@@ -1366,6 +1458,7 @@ function Workbench({
         selectedId={selectedInvocationId}
         onControl={onControl}
         pendingAction={pendingAction}
+        onResizeStart={onInspectorResizeStart}
       />
     </section>
   );
@@ -1846,12 +1939,14 @@ function Inspector({
   selectedId,
   onControl,
   pendingAction,
+  onResizeStart,
 }: {
   view: UiRunView;
   graph?: WorkflowGraph;
   selectedId?: string;
   onControl: (action: string, invocationId?: string) => void;
   pendingAction?: string;
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
   const [tab, setTab] = useState<
     | "output"
@@ -1902,6 +1997,7 @@ function Inspector({
       data-testid="node-inspector"
       data-invocation-id={invocation?.invocationId}
     >
+      <ResizeHandle label="Resize inspector drawer" onStart={onResizeStart} />
       <div className="inspector-header">
         <span>INSPECTOR</span>
         <span className="inspector-rev">r{view.revision}</span>

@@ -15058,7 +15058,7 @@ init_src();
 
 // packages/host/src/coordinator/coordinator.ts
 init_src();
-import { mkdirSync as mkdirSync4 } from "fs";
+import { mkdirSync as mkdirSync5 } from "fs";
 import { join as join4 } from "path";
 
 // packages/host/src/id.ts
@@ -16202,9 +16202,161 @@ function simpleHash(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-// packages/host/src/adapters/process/bwrap.ts
-import { mkdirSync, rmSync as rmSync2 } from "fs";
+// packages/host/src/adapters/process/darwin.ts
+import { mkdirSync } from "fs";
 
+// packages/host/src/adapters/process/common.ts
+import { rmSync as rmSync2 } from "fs";
+async function runEnforcedProcess(input) {
+  const operationKey = input.operationKey ?? "probe";
+  let process2;
+  try {
+    process2 = Bun.spawn(input.command, { stdout: "pipe", stderr: "pipe" });
+  } catch (cause) {
+    return {
+      operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        spawnError: cause instanceof Error ? cause.message : String(cause),
+        stdout: new Uint8Array,
+        stderr: new Uint8Array,
+        enforcementMode: "enforced"
+      }
+    };
+  }
+  const readPipe = async (pipe) => {
+    if (pipe === undefined || typeof pipe === "number")
+      return new Uint8Array;
+    return new Uint8Array(await new Response(pipe).arrayBuffer());
+  };
+  const stdoutPromise = readPipe(process2.stdout);
+  const stderrPromise = readPipe(process2.stderr);
+  let timedOut = false;
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      process2.kill();
+      resolve("timeout");
+    }, input.timeoutMs);
+  });
+  try {
+    const outcome = await Promise.race([process2.exited, timeout]);
+    const exitCode = outcome === "timeout" ? await process2.exited.catch(() => null) : outcome;
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    return {
+      operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: exitCode === null ? null : Number(exitCode),
+        signal: null,
+        timedOut,
+        spawnError: null,
+        stdout,
+        stderr,
+        enforcementMode: "enforced"
+      }
+    };
+  } catch (cause) {
+    const [stdout, stderr] = await Promise.all([
+      stdoutPromise.catch(() => new Uint8Array),
+      stderrPromise.catch(() => new Uint8Array)
+    ]);
+    return {
+      operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: null,
+        signal: null,
+        timedOut,
+        spawnError: cause instanceof Error ? cause.message : String(cause),
+        stdout,
+        stderr,
+        enforcementMode: "enforced"
+      }
+    };
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+async function probeEnforcedProcess(spawn, name) {
+  const workspace = await Bun.$`mktemp -d /tmp/kouro-${name}-probe.XXXXXX`.text().catch(() => "").then((value) => value.trim());
+  if (!workspace)
+    return { available: false, detail: "cannot allocate probe workspace" };
+  try {
+    const result = await spawn(workspace, ["/usr/bin/printf", "kouro-bwrap-probe\\n"], 5000);
+    const stdout = new TextDecoder().decode(result.evidence.stdout);
+    const stderr = new TextDecoder().decode(result.evidence.stderr);
+    return result.evidence.exitCode === 0 && stdout === `kouro-bwrap-probe
+` ? { available: true, detail: `${name} enforced probe passed` } : {
+      available: false,
+      detail: result.evidence.spawnError ?? `probe exited ${result.evidence.exitCode}: ${stderr}`
+    };
+  } catch (cause) {
+    return { available: false, detail: cause instanceof Error ? cause.message : String(cause) };
+  } finally {
+    rmSync2(workspace, { recursive: true, force: true });
+  }
+}
+
+// packages/host/src/adapters/process/darwin.ts
+class DarwinSandboxProcessAdapter {
+  enforcementMode = "enforced";
+  probeResult;
+  sandboxExecPath;
+  constructor(options = {}) {
+    this.sandboxExecPath = options.sandboxExecPath ?? "/usr/bin/sandbox-exec";
+  }
+  async probe() {
+    if (this.probeResult)
+      return this.probeResult;
+    this.probeResult = await probeEnforcedProcess((workspace, argv, timeoutMs) => this.spawn(workspace, argv, timeoutMs), "darwin-sandbox");
+    return this.probeResult;
+  }
+  async executeFixedFixture(input) {
+    const probe = await this.probe();
+    if (!probe.available)
+      throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
+    mkdirSync(input.workspaceDir, { recursive: true, mode: 448 });
+    return this.spawn(input.workspaceDir, ["/usr/bin/printf", `Kouro M1 command
+`], input.timeoutMs, input.operationKey);
+  }
+  async spawn(workspaceDir, argv, timeoutMs, operationKey = "probe") {
+    return runEnforcedProcess({
+      command: [this.sandboxExecPath, "-p", this.profile(workspaceDir), ...argv],
+      argv,
+      cwd: workspaceDir,
+      timeoutMs,
+      operationKey
+    });
+  }
+  profile(workspaceDir) {
+    const path = workspaceDir.replaceAll("\\", "\\\\").replaceAll('"', "\\\"");
+    return [
+      "(version 1)",
+      "(deny default)",
+      '(allow process-exec (literal "/usr/bin/printf"))',
+      "(allow process-fork)",
+      "(allow signal (target self))",
+      '(allow file-read* (subpath "/System"))',
+      '(allow file-read* (subpath "/usr"))',
+      '(allow file-read* (subpath "/bin"))',
+      `(allow file-read* (subpath "${path}"))`,
+      `(allow file-write* (subpath "${path}"))`
+    ].join(`
+`);
+  }
+}
+
+// packages/host/src/adapters/process/bwrap.ts
+import { mkdirSync as mkdirSync2 } from "fs";
 class BubblewrapProcessAdapter {
   enforcementMode = "enforced";
   probeResult;
@@ -16215,113 +16367,24 @@ class BubblewrapProcessAdapter {
   async probe() {
     if (this.probeResult)
       return this.probeResult;
-    const workspace = await Bun.$`mktemp -d /tmp/kouro-bwrap-probe.XXXXXX`.text().catch(() => "").then((value) => value.trim());
-    if (!workspace)
-      return this.probeResult = { available: false, detail: "cannot allocate probe workspace" };
-    try {
-      const result = await this.spawn(workspace, ["/usr/bin/printf", "kouro-bwrap-probe\\n"], 5000);
-      const stdout = new TextDecoder().decode(result.evidence.stdout);
-      const stderr = new TextDecoder().decode(result.evidence.stderr);
-      this.probeResult = result.evidence.exitCode === 0 && stdout === `kouro-bwrap-probe
-` ? { available: true, detail: "bubblewrap enforced probe passed" } : {
-        available: false,
-        detail: result.evidence.spawnError ?? `probe exited ${result.evidence.exitCode}: ${stderr}`
-      };
-    } catch (cause) {
-      this.probeResult = {
-        available: false,
-        detail: cause instanceof Error ? cause.message : String(cause)
-      };
-    } finally {
-      rmSync2(workspace, { recursive: true, force: true });
-    }
+    this.probeResult = await probeEnforcedProcess((workspace, argv, timeoutMs) => this.spawn(workspace, argv, timeoutMs), "bwrap");
     return this.probeResult;
   }
   async executeFixedFixture(input) {
     const probe = await this.probe();
     if (!probe.available)
       throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
-    mkdirSync(input.workspaceDir, { recursive: true, mode: 448 });
+    mkdirSync2(input.workspaceDir, { recursive: true, mode: 448 });
     return this.spawn(input.workspaceDir, ["/usr/bin/printf", "Kouro M1 command\\n"], input.timeoutMs, input.operationKey);
   }
   async spawn(workspaceDir, argv, timeoutMs, operationKey = "probe") {
-    const command = this.bwrapCommand(workspaceDir, argv);
-    let process2;
-    try {
-      process2 = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
-    } catch (cause) {
-      return {
-        operationKey,
-        evidence: {
-          argv,
-          cwd: workspaceDir,
-          exitCode: null,
-          signal: null,
-          timedOut: false,
-          spawnError: cause instanceof Error ? cause.message : String(cause),
-          stdout: new Uint8Array,
-          stderr: new Uint8Array,
-          enforcementMode: "enforced"
-        }
-      };
-    }
-    const readPipe = async (pipe) => {
-      if (pipe === undefined || typeof pipe === "number")
-        return new Uint8Array;
-      return new Uint8Array(await new Response(pipe).arrayBuffer());
-    };
-    const stdoutPromise = readPipe(process2.stdout);
-    const stderrPromise = readPipe(process2.stderr);
-    let timedOut = false;
-    let timer;
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        process2.kill();
-        resolve("timeout");
-      }, timeoutMs);
+    return runEnforcedProcess({
+      command: this.bwrapCommand(workspaceDir, argv),
+      argv,
+      cwd: workspaceDir,
+      timeoutMs,
+      operationKey
     });
-    try {
-      const outcome = await Promise.race([process2.exited, timeout]);
-      const exitCode = outcome === "timeout" ? await process2.exited.catch(() => null) : outcome;
-      const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-      return {
-        operationKey,
-        evidence: {
-          argv,
-          cwd: workspaceDir,
-          exitCode: exitCode === null ? null : Number(exitCode),
-          signal: null,
-          timedOut,
-          spawnError: null,
-          stdout,
-          stderr,
-          enforcementMode: "enforced"
-        }
-      };
-    } catch (cause) {
-      const [stdout, stderr] = await Promise.all([
-        stdoutPromise.catch(() => new Uint8Array),
-        stderrPromise.catch(() => new Uint8Array)
-      ]);
-      return {
-        operationKey,
-        evidence: {
-          argv,
-          cwd: workspaceDir,
-          exitCode: null,
-          signal: null,
-          timedOut,
-          spawnError: cause instanceof Error ? cause.message : String(cause),
-          stdout,
-          stderr,
-          enforcementMode: "enforced"
-        }
-      };
-    } finally {
-      if (timer)
-        clearTimeout(timer);
-    }
   }
   bwrapCommand(workspaceDir, argv) {
     return [
@@ -16370,12 +16433,21 @@ class BubblewrapProcessAdapter {
   }
 }
 
+// packages/host/src/adapters/process/index.ts
+function createDefaultProcessAdapter(platform = process.platform) {
+  if (platform === "darwin")
+    return new DarwinSandboxProcessAdapter;
+  if (platform === "linux")
+    return new BubblewrapProcessAdapter;
+  throw new Error(`Enforced process execution is not supported on ${platform}; supported platforms are Linux and macOS`);
+}
+
 // packages/host/src/storage/journal.ts
 init_src();
 init_src();
 import { Database } from "bun:sqlite";
 import { createHash as createHash3 } from "crypto";
-import { mkdirSync as mkdirSync3 } from "fs";
+import { mkdirSync as mkdirSync4 } from "fs";
 import { join as join3 } from "path";
 
 // packages/host/src/storage/schema.ts
@@ -16672,7 +16744,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
-  mkdirSync as mkdirSync2,
+  mkdirSync as mkdirSync3,
   openSync,
   readFileSync,
   renameSync,
@@ -16683,13 +16755,13 @@ class BlobStore {
   root;
   constructor(root) {
     this.root = root;
-    mkdirSync2(join2(root, "blobs"), { recursive: true, mode: 448 });
-    mkdirSync2(join2(root, "tmp"), { recursive: true, mode: 448 });
+    mkdirSync3(join2(root, "blobs"), { recursive: true, mode: 448 });
+    mkdirSync3(join2(root, "tmp"), { recursive: true, mode: 448 });
   }
   put(runId, bytes, mediaType = "application/octet-stream") {
     const digest = createHash2("sha256").update(bytes).digest("hex");
     const destination = join2(this.root, "blobs", digest.slice(0, 2), digest);
-    mkdirSync2(dirname(destination), { recursive: true, mode: 448 });
+    mkdirSync3(dirname(destination), { recursive: true, mode: 448 });
     if (!existsSync(destination)) {
       const temporary = join2(this.root, "tmp", `${id("blob")}.partial`);
       writeFileSync(temporary, bytes, { mode: 384 });
@@ -16793,7 +16865,7 @@ class Journal {
   frameBatch = null;
   constructor(options) {
     this.dataDir = options.dataDir;
-    mkdirSync3(options.dataDir, { recursive: true, mode: 448 });
+    mkdirSync4(options.dataDir, { recursive: true, mode: 448 });
     this.owner = new OwnerLock(join3(options.dataDir, "owner.lock"));
     if (options.requireOwner !== false)
       this.owner.acquire();
@@ -18245,7 +18317,7 @@ class Coordinator {
     this.journal = new Journal({ dataDir: options.dataDir });
     this.agent = options.agent ?? new DelayedScriptedAgent;
     this.harness = options.harness ?? new ScriptedHarnessAdapter;
-    this.process = options.process ?? new BubblewrapProcessAdapter;
+    this.process = options.process ?? createDefaultProcessAdapter();
     this.scriptedDelayMs = Math.max(0, options.scriptedDelayMs ?? 5000);
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30000;
     this.defaultProfile = options.executionProfile ?? "scripted";
@@ -19448,7 +19520,7 @@ class Coordinator {
         });
         return;
       }
-      mkdirSync4(invocationWorkspaceDir, { recursive: true, mode: 448 });
+      mkdirSync5(invocationWorkspaceDir, { recursive: true, mode: 448 });
       let harnessResult;
       const aborter = new AbortController;
       const runAborters = this.aborters.get(runId) ?? new Map;
@@ -19796,7 +19868,7 @@ function validateM1Command(node) {
 
 // packages/host/src/adapters/workspace/git.ts
 import {
-  mkdirSync as mkdirSync5,
+  mkdirSync as mkdirSync6,
   readFileSync as readFileSync2,
   rmSync as rmSync3,
   writeFileSync as writeFileSync2,
@@ -19814,9 +19886,9 @@ class GitWorkspaceAdapter {
   constructor(options) {
     this.root = resolve(options.worktreeRoot);
     this.executable = options.gitExecutable ?? "git";
-    mkdirSync5(this.root, { recursive: true, mode: 448 });
-    mkdirSync5(join5(this.root, "claims"), { recursive: true, mode: 448 });
-    mkdirSync5(join5(this.root, "indexes"), { recursive: true, mode: 448 });
+    mkdirSync6(this.root, { recursive: true, mode: 448 });
+    mkdirSync6(join5(this.root, "claims"), { recursive: true, mode: 448 });
+    mkdirSync6(join5(this.root, "indexes"), { recursive: true, mode: 448 });
   }
   async create(input) {
     const repositoryPath = await this.repositoryRoot(input.repositoryPath);
@@ -19828,7 +19900,7 @@ class GitWorkspaceAdapter {
     const path = join5(this.root, safePart(input.runId), safePart(input.workspaceId));
     if (existsSync2(path))
       throw new Error(`workspace path already exists: ${path}`);
-    mkdirSync5(join5(this.root, safePart(input.runId)), { recursive: true, mode: 448 });
+    mkdirSync6(join5(this.root, safePart(input.runId)), { recursive: true, mode: 448 });
     await this.git(repositoryPath, ["worktree", "add", "--detach", path, baseCommit]);
     const claim2 = {
       repositoryPath,
@@ -19952,7 +20024,7 @@ class GitWorkspaceAdapter {
     if (conflicts.length)
       return { target, sources, conflicts };
     const backup = join5(this.root, "integration-backups", randomUUID3());
-    mkdirSync5(backup, { recursive: true, mode: 448 });
+    mkdirSync6(backup, { recursive: true, mode: 448 });
     try {
       for (const entry of readdirSync(input.target.path)) {
         if (entry === ".git")
@@ -19973,7 +20045,7 @@ class GitWorkspaceAdapter {
           if (change.status.startsWith("D"))
             rmSync3(targetPath, { recursive: true, force: true });
           else if (existsSync2(sourcePath)) {
-            mkdirSync5(join5(targetPath, ".."), { recursive: true });
+            mkdirSync6(join5(targetPath, ".."), { recursive: true });
             rmSync3(targetPath, { recursive: true, force: true });
             cpSync(sourcePath, targetPath, { recursive: true, force: true });
             if (change.mode && !change.mode.endsWith("000"))
@@ -20179,7 +20251,7 @@ init_src();
 // packages/host/src/evaluation/verifier.ts
 init_src();
 import { createHash as createHash4 } from "crypto";
-import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync6, mkdtempSync as mkdtempSync2, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
+import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync7, mkdtempSync as mkdtempSync2, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
 import { join as join6, resolve as resolve2 } from "path";
 
 class BunVerifierProcess {
@@ -20249,7 +20321,7 @@ async function runDeterministicCommandEvaluator(input) {
   const observedTreeDigest = await input.resolveCandidateTreeDigest();
   if (observedTreeDigest !== input.candidateTreeDigest)
     throw new Error(`candidate tree digest mismatch: expected ${input.candidateTreeDigest}, observed ${observedTreeDigest}`);
-  mkdirSync6(verifier, { recursive: true, mode: 448 });
+  mkdirSync7(verifier, { recursive: true, mode: 448 });
   const runVerifier = mkdtempSync2(join6(verifier, "run-"));
   const acceptance = join6(runVerifier, "acceptance-source");
   const isolatedCandidate = join6(runVerifier, "candidate");
@@ -20886,14 +20958,14 @@ function structuralIdentity(bundle) {
   });
 }
 // packages/host/src/checkpoints/retention.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync7, readFileSync as readFileSync3, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
+import { existsSync as existsSync3, mkdirSync as mkdirSync8, readFileSync as readFileSync3, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
 import { join as join7 } from "path";
 
 class CheckpointRetention {
   path;
   marks;
   constructor(dataDir) {
-    mkdirSync7(dataDir, { recursive: true, mode: 448 });
+    mkdirSync8(dataDir, { recursive: true, mode: 448 });
     this.path = join7(dataDir, "checkpoint-retention.json");
     this.marks = existsSync3(this.path) ? JSON.parse(readFileSync3(this.path, "utf8")) : {};
   }

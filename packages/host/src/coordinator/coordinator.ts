@@ -31,7 +31,7 @@ import {
   inspectPi,
   resolvePiSelection,
 } from "../adapters/harness/pi.ts";
-import { BubblewrapProcessAdapter } from "../adapters/process/bwrap.ts";
+import { createDefaultProcessAdapter } from "../adapters/process/index.ts";
 import { Journal, type StoredArtifact } from "../storage/journal.ts";
 import {
   GitWorkspaceAdapter,
@@ -97,7 +97,7 @@ export class Coordinator {
     this.journal = new Journal({ dataDir: options.dataDir });
     this.agent = options.agent ?? new DelayedScriptedAgent();
     this.harness = options.harness ?? new ScriptedHarnessAdapter();
-    this.process = options.process ?? new BubblewrapProcessAdapter();
+    this.process = options.process ?? createDefaultProcessAdapter();
     this.scriptedDelayMs = Math.max(0, options.scriptedDelayMs ?? 5_000);
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
     this.defaultProfile = options.executionProfile ?? "scripted";

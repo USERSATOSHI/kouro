@@ -1,5 +1,6 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import type { ProcessAdapter, ProcessResult } from "../../types.ts";
+import { probeEnforcedProcess, runEnforcedProcess } from "./common.ts";
 
 export interface BubblewrapOptions {
   bwrapPath?: string;
@@ -23,36 +24,10 @@ export class BubblewrapProcessAdapter implements ProcessAdapter {
 
   async probe(): Promise<{ available: boolean; detail: string }> {
     if (this.probeResult) return this.probeResult;
-    const workspace = await Bun.$`mktemp -d /tmp/kouro-bwrap-probe.XXXXXX`
-      .text()
-      .catch(() => "")
-      .then((value) => value.trim());
-    if (!workspace)
-      return (this.probeResult = { available: false, detail: "cannot allocate probe workspace" });
-    try {
-      const result = await this.spawn(
-        workspace,
-        ["/usr/bin/printf", "kouro-bwrap-probe\\n"],
-        5_000,
-      );
-      const stdout = new TextDecoder().decode(result.evidence.stdout);
-      const stderr = new TextDecoder().decode(result.evidence.stderr);
-      this.probeResult =
-        result.evidence.exitCode === 0 && stdout === "kouro-bwrap-probe\n"
-          ? { available: true, detail: "bubblewrap enforced probe passed" }
-          : {
-              available: false,
-              detail:
-                result.evidence.spawnError ?? `probe exited ${result.evidence.exitCode}: ${stderr}`,
-            };
-    } catch (cause) {
-      this.probeResult = {
-        available: false,
-        detail: cause instanceof Error ? cause.message : String(cause),
-      };
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-    }
+    this.probeResult = await probeEnforcedProcess(
+      (workspace, argv, timeoutMs) => this.spawn(workspace, argv, timeoutMs),
+      "bwrap",
+    );
     return this.probeResult;
   }
 
@@ -80,81 +55,13 @@ export class BubblewrapProcessAdapter implements ProcessAdapter {
     timeoutMs: number,
     operationKey = "probe",
   ): Promise<ProcessResult> {
-    const command = this.bwrapCommand(workspaceDir, argv);
-    let process: ReturnType<typeof Bun.spawn>;
-    try {
-      process = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
-    } catch (cause) {
-      return {
-        operationKey,
-        evidence: {
-          argv,
-          cwd: workspaceDir,
-          exitCode: null,
-          signal: null,
-          timedOut: false,
-          spawnError: cause instanceof Error ? cause.message : String(cause),
-          stdout: new Uint8Array(),
-          stderr: new Uint8Array(),
-          enforcementMode: "enforced",
-        },
-      };
-    }
-    const readPipe = async (pipe: typeof process.stdout): Promise<Uint8Array> => {
-      if (pipe === undefined || typeof pipe === "number") return new Uint8Array();
-      return new Uint8Array(await new Response(pipe).arrayBuffer());
-    };
-    const stdoutPromise = readPipe(process.stdout);
-    const stderrPromise = readPipe(process.stderr);
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        process.kill();
-        resolve("timeout");
-      }, timeoutMs);
+    return runEnforcedProcess({
+      command: this.bwrapCommand(workspaceDir, argv),
+      argv,
+      cwd: workspaceDir,
+      timeoutMs,
+      operationKey,
     });
-    try {
-      const outcome = await Promise.race([process.exited, timeout]);
-      const exitCode = outcome === "timeout" ? await process.exited.catch(() => null) : outcome;
-      const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-      return {
-        operationKey,
-        evidence: {
-          argv,
-          cwd: workspaceDir,
-          exitCode: exitCode === null ? null : Number(exitCode),
-          signal: null,
-          timedOut,
-          spawnError: null,
-          stdout,
-          stderr,
-          enforcementMode: "enforced",
-        },
-      };
-    } catch (cause) {
-      const [stdout, stderr] = await Promise.all([
-        stdoutPromise.catch(() => new Uint8Array()),
-        stderrPromise.catch(() => new Uint8Array()),
-      ]);
-      return {
-        operationKey,
-        evidence: {
-          argv,
-          cwd: workspaceDir,
-          exitCode: null,
-          signal: null,
-          timedOut,
-          spawnError: cause instanceof Error ? cause.message : String(cause),
-          stdout,
-          stderr,
-          enforcementMode: "enforced",
-        },
-      };
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
   }
 
   private bwrapCommand(workspaceDir: string, argv: string[]): string[] {

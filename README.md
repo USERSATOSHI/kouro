@@ -10,10 +10,11 @@ harness lets you explore and test it without model credentials.
 
 ## Run locally
 
-Requirements: Bun 1.3.14 or newer, Linux, and Bubblewrap (`bwrap`) with usable user
-and network namespaces. Real command execution fails closed if containment is
-unavailable. Git is required for workspace-backed runs and forks, but not for
-pure workflow runs. No model credentials are needed for the scripted harness.
+Requirements: Bun 1.3.14 or newer, plus either Linux with Bubblewrap (`bwrap`) and
+usable user/network namespaces, or macOS with native `sandbox-exec` profile support.
+Real command execution fails closed if containment is unavailable. Git is required
+for workspace-backed runs and forks, but not for pure workflow runs. No model
+credentials are needed for the scripted harness.
 
 ```sh
 bun install
