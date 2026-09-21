@@ -9,8 +9,6 @@ describe("native owner lock library", () => {
   });
 
   test("fails clearly for unsupported platforms", () => {
-    expect(() => nativeLockLibrary("win32")).toThrow(
-      "owner locking is not supported on win32",
-    );
+    expect(() => nativeLockLibrary("win32")).toThrow("owner locking is not supported on win32");
   });
 });

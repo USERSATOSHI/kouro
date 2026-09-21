@@ -1,6 +1,6 @@
 {
   "name": "kouro",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "A local workbench for declarative agent workflows",
   "homepage": "https://github.com/usersatoshi/kouro#readme",
   "bugs": {

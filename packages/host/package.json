@@ -1,6 +1,6 @@
 {
   "name": "@kouro/host",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Kouro v2 local execution host, journal, coordinator, HTTP API and CLI",
   "license": "Apache-2.0",
   "bin": {
@@ -26,7 +26,7 @@
     "typecheck": "bunx tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@kouro/core": "2.0.1",
+    "@kouro/core": "2.0.2",
     "elysia": "^1.4.29"
   }
 }
