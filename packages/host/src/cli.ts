@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { ApplicationService } from "./application/service.ts";
@@ -42,7 +43,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (command === "create") return createCommand(argv.slice(1));
 
   const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-data");
-  const staticRoot = resolve("packages/web/dist");
+  const staticRoot = firstExistingPath([
+    resolve("packages/web/dist"),
+    resolve(import.meta.dir, "../../web/dist"),
+    resolve(import.meta.dir, "../web"),
+  ]);
   const service = new ApplicationService({ dataDir });
   await service.start();
   if (command === "run") {
@@ -239,7 +244,15 @@ async function createCommand(args: string[]): Promise<number> {
     process.stderr.write(`target already exists: ${target}\n`);
     return 1;
   }
-  const source = resolve(import.meta.dir, "..", "assets", "templates", template);
+  const templateRoot = firstExistingPath([
+    resolve(import.meta.dir, "..", "assets", "templates"),
+    resolve(import.meta.dir, "assets", "templates"),
+  ]);
+  if (!templateRoot) {
+    process.stderr.write("Kouro CLI template assets are not installed\n");
+    return 1;
+  }
+  const source = resolve(templateRoot, template);
   const temporary = `${target}.tmp-${randomUUID()}`;
   try {
     await renderDirectory(source, temporary, name);
@@ -252,6 +265,10 @@ async function createCommand(args: string[]): Promise<number> {
     process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
     return 1;
   }
+}
+
+function firstExistingPath(paths: readonly string[]): string | undefined {
+  return paths.find((path) => existsSync(path));
 }
 
 async function exists(path: string): Promise<boolean> {

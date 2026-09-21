@@ -40,8 +40,9 @@ Confirm the command:
 kouro --help
 ```
 
-The root GitHub package installs the CLI entrypoint and its local `@kouro/core`
-and `@kouro/host` dependency graph. The CLI requires Bun at runtime.
+The root GitHub package contains a bundled CLI distribution, including the
+runtime code, starter templates, and web UI. It has no workspace or `file:`
+dependency requirement. The CLI requires Bun at runtime.
 
 For a one-off invocation without a global install:
 

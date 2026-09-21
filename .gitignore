@@ -1,5 +1,7 @@
 node_modules/
 packages/*/dist/
+!/dist/
+!/dist/**
 .kouro-data/
 test-results/
 playwright-report/

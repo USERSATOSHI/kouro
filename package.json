@@ -12,11 +12,10 @@
     "url": "git+https://github.com/usersatoshi/kouro.git"
   },
   "bin": {
-    "kouro": "packages/host/src/cli.ts"
+    "kouro": "dist/kouro.js"
   },
   "files": [
-    "packages/core",
-    "packages/host"
+    "dist"
   ],
   "workspaces": [
     "packages/*"
@@ -26,6 +25,7 @@
     "dev": "bun run --cwd packages/web build && bun run packages/host/src/cli.ts serve",
     "kouro": "bun run packages/host/src/cli.ts",
     "build": "bun run --cwd packages/web build",
+    "build:cli": "bun run build && bun run scripts/build-cli.ts",
     "release:forgejo": "bun run typecheck && bun test packages/core packages/host && bun run build && bun run scripts/publish-forgejo.ts",
     "test": "bun test packages scripts",
     "test:browser": "playwright test",
@@ -33,12 +33,6 @@
     "lint": "oxlint --deny-warnings packages scripts && bun run scripts/check-boundaries.ts",
     "format": "oxfmt --write packages scripts package.json tsconfig.json playwright.config.ts",
     "format:check": "oxfmt --check packages scripts package.json tsconfig.json playwright.config.ts"
-  },
-  "dependencies": {
-    "@kouro/core": "file:packages/core",
-    "@kouro/host": "file:packages/host",
-    "ajv": "8.17.1",
-    "elysia": "^1.4.29"
   },
   "devDependencies": {
     "@playwright/test": "1.58.2",
