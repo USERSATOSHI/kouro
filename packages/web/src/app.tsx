@@ -265,6 +265,7 @@ export function App() {
   const [hasMoreRuns, setHasMoreRuns] = useState(true);
   const [loadingOlderRuns, setLoadingOlderRuns] = useState(false);
   const [workflowId, setWorkflowId] = useState("tiny");
+  const [task, setTask] = useState("");
   const [profiles, setProfiles] = useState<ExecutionProfile[]>([]);
   const [profileId, setProfileId] = useState<ExecutionProfile["id"]>("scripted");
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(
@@ -682,6 +683,7 @@ export function App() {
           workflowId,
           executionProfile: profileId,
           idempotencyKey: crypto.randomUUID(),
+          ...(task.trim() ? { input: { task: task.trim() } } : {}),
         }),
       });
       setRuns((old) => [created, ...old.filter((run) => run.id !== created.id)]);
@@ -889,7 +891,13 @@ export function App() {
             onInspectorResizeStart={(event) => startPanelResize("inspector", event)}
           />
         ) : (
-          <Preview workflow={workflow} onLaunch={launch} launching={launching} />
+          <Preview
+            workflow={workflow}
+            task={task}
+            setTask={setTask}
+            onLaunch={launch}
+            launching={launching}
+          />
         )}
       </main>
     </div>
@@ -1346,13 +1354,20 @@ function RunControlBar({
 
 function Preview({
   workflow,
+  task,
+  setTask,
   onLaunch,
   launching,
 }: {
   workflow?: WorkflowSummary;
+  task: string;
+  setTask: (task: string) => void;
   onLaunch: () => void;
   launching: boolean;
 }) {
+  const root = workflow?.bundle?.definitions[workflow.bundle.rootDefinitionId];
+  const taskInput = root?.inputPorts?.find((port) => port.name === "task");
+  const taskRequired = taskInput?.required === true;
   return (
     <section className="preview">
       <div className="preview-kicker">
@@ -1367,6 +1382,16 @@ function Preview({
           Bundle validation failed: {workflow.validation.errors?.join(", ")}
         </div>
       )}
+      <label className="task-input">
+        <span>WORK ITEM / TASK{taskRequired ? " · REQUIRED" : ""}</span>
+        <textarea
+          value={task}
+          onChange={(event) => setTask(event.target.value)}
+          placeholder="Describe what this workflow should accomplish…"
+          rows={4}
+        />
+        <small>The task is delivered as the workflow's typed root input.</small>
+      </label>
       <div className="preview-map">
         {workflow?.graph?.nodes?.map((node, index) => (
           <div className="preview-node" key={node.id}>
@@ -1381,8 +1406,12 @@ function Preview({
           </div>
         )) ?? <div className="empty-inline">The host did not return a compiled graph.</div>}
       </div>
-      <button className="primary-cta" disabled={!workflow || launching} onClick={onLaunch}>
-        {launching ? "Starting run…" : "Start tiny run"}
+      <button
+        className="primary-cta"
+        disabled={!workflow || launching || (taskRequired && !task.trim())}
+        onClick={onLaunch}
+      >
+        {launching ? "Starting run…" : taskRequired ? "Run workflow" : "Start demo run"}
         <span>→</span>
       </button>
     </section>

@@ -1334,6 +1334,38 @@ body.resizing-panels {
   font-size: 12px;
   margin: 0 0 25px;
 }
+.task-input {
+  display: grid;
+  gap: 7px;
+  margin: 22px 0 18px;
+  max-width: 720px;
+  color: #8494aa;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+.task-input textarea {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  padding: 12px;
+  border: 1px solid #293b54;
+  border-radius: 6px;
+  background: #0e1724;
+  color: #dbe5f5;
+  font: 13px/1.5 inherit;
+  letter-spacing: 0;
+}
+.task-input textarea:focus {
+  outline: 1px solid #66cfaa;
+  border-color: #66cfaa;
+}
+.task-input small {
+  color: #5f728d;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
 .preview-map {
   display: flex;
   gap: 0;

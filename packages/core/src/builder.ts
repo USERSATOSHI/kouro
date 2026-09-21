@@ -258,7 +258,7 @@ function bindings(
   return Object.entries(values ?? {}).map(([targetPort, value]) => ({
     targetPort,
     source: bindingSource(value, owner),
-    missing: "error" as const,
+    missing: isInputHandle(value) && !value.required ? ("omit" as const) : ("error" as const),
   }));
 }
 
@@ -353,7 +353,7 @@ export class WorkflowBuilder {
       ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
-        port(name, this.schemaOf(value), true),
+        port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true),
       ),
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),

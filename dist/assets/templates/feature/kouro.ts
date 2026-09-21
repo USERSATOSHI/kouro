@@ -1,13 +1,19 @@
 import { WorkflowBuilder } from "@kouro/core";
-import { Summary } from "./schemas/schema.ts";
+import { Summary, Task } from "./schemas/schema.ts";
 
 const planPrompt = await Bun.file(new URL("./prompts/plan.md", import.meta.url)).text();
 const implementPrompt = await Bun.file(new URL("./prompts/implement.md", import.meta.url)).text();
 const workflow = new WorkflowBuilder({ id: "{{id}}", version: "1" });
-const plan = workflow.agent("plan", { role: "planner", prompt: planPrompt, produces: Summary });
+const task = workflow.input("task", Task);
+const plan = workflow.agent("plan", {
+  role: "planner",
+  prompt: planPrompt,
+  input: { task },
+  produces: Summary,
+});
 const approval = workflow.approval("approve-plan", {
   action: "accept-plan",
-  input: { plan: plan.output },
+  input: { task, plan: plan.output },
 });
 const implement = workflow.agent("implement", {
   role: "implementer",

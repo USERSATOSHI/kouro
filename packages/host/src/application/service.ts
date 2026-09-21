@@ -920,14 +920,20 @@ async function compileTiny(): Promise<Bundle> {
 
 async function compileFeature(): Promise<Bundle> {
   const builder = new WorkflowBuilder({ id: "feature", version: "2" });
+  const task = builder.input(
+    "task",
+    artifactType<string>("kouro.workflow-task.v1", { type: "string", minLength: 1 }),
+    { required: false },
+  );
   const plan = builder.agent("plan", {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",
+    input: { task },
     produces: AgentSummary,
   });
   const approval = builder.approval("approve-plan", {
     action: "accept-plan",
-    input: { plan: plan.output },
+    input: { task, plan: plan.output },
   });
   const implement = builder.agent("implement", {
     role: "implementer",

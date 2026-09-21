@@ -166,7 +166,7 @@ function bindings(values, owner) {
   return Object.entries(values ?? {}).map(([targetPort, value]) => ({
     targetPort,
     source: bindingSource(value, owner),
-    missing: "error"
+    missing: isInputHandle(value) && !value.required ? "omit" : "error"
   }));
 }
 function assertWorkflow(actual, expected) {
@@ -236,7 +236,7 @@ class WorkflowBuilder {
       prompt: options.prompt,
       ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
-      inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), true)),
+      inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true)),
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),
       timeoutMs: finitePositive(options.timeoutMs, 5000),
@@ -21690,14 +21690,16 @@ async function compileTiny() {
 }
 async function compileFeature() {
   const builder2 = new WorkflowBuilder({ id: "feature", version: "2" });
+  const task = builder2.input("task", artifactType("kouro.workflow-task.v1", { type: "string", minLength: 1 }), { required: false });
   const plan = builder2.agent("plan", {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",
+    input: { task },
     produces: AgentSummary
   });
   const approval = builder2.approval("approve-plan", {
     action: "accept-plan",
-    input: { plan: plan.output }
+    input: { task, plan: plan.output }
   });
   const implement = builder2.agent("implement", {
     role: "implementer",
