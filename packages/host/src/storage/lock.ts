@@ -1,10 +1,25 @@
 import { openSync, closeSync, constants as fsConstants } from "node:fs";
 import { dlopen } from "bun:ffi";
 
-// Linux flock(2) constants. The v2 host currently supports Linux/Bun only;
-// keeping these explicit also avoids accidentally implementing a stale PID lock.
+// flock(2) uses the same operation values on the supported Unix platforms.
+// Keeping these explicit avoids accidentally implementing a stale PID lock.
 const LOCK_EX = 2;
 const LOCK_NB = 4;
+
+export function nativeLockLibrary(platform: NodeJS.Platform = process.platform): string {
+  switch (platform) {
+    case "darwin":
+      return "/usr/lib/libSystem.B.dylib";
+    case "freebsd":
+      return "libc.so.7";
+    case "linux":
+      return "libc.so.6";
+    default:
+      throw new Error(
+        `Kouro owner locking is not supported on ${platform}; supported platforms are Linux, macOS, and FreeBSD`,
+      );
+  }
+}
 
 /**
  * A lifetime lock backed by the kernel's advisory flock. A marker file is not
@@ -15,7 +30,7 @@ export class OwnerLock {
   private readonly flock: (fd: number, operation: number) => number;
 
   constructor(private readonly path: string) {
-    const libc = dlopen("libc.so.6", {
+    const libc = dlopen(nativeLockLibrary(), {
       flock: { args: ["int", "int"], returns: "int" },
     });
     this.flock = libc.symbols.flock as (fd: number, operation: number) => number;
