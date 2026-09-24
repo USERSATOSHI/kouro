@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import type { ProcessAdapter, ProcessResult } from "../../types.ts";
-import { probeEnforcedProcess, runEnforcedProcess } from "./common.ts";
+import { probeEnforcedProcess, runEnforcedProcess, runTrustedCommand } from "./common.ts";
 
 export interface BubblewrapOptions {
   bwrapPath?: string;
@@ -49,6 +49,23 @@ export class BubblewrapProcessAdapter implements ProcessAdapter {
     );
   }
 
+  async executeCommand(
+    input: Parameters<ProcessAdapter["executeCommand"]>[0],
+  ): Promise<ProcessResult> {
+    const argv = [Bun.which(input.executable) ?? input.executable, ...input.args];
+    if (input.executionMode === "trusted-unrestricted")
+      return runTrustedCommand({
+        argv,
+        cwd: input.workspaceDir,
+        timeoutMs: input.timeoutMs,
+        operationKey: input.operationKey,
+      });
+    const probe = await this.probe();
+    if (!probe.available)
+      throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
+    return this.spawn(input.workspaceDir, argv, input.timeoutMs, input.operationKey);
+  }
+
   private async spawn(
     workspaceDir: string,
     argv: string[],
@@ -78,6 +95,15 @@ export class BubblewrapProcessAdapter implements ProcessAdapter {
       "--ro-bind",
       "/bin",
       "/bin",
+      "--ro-bind-try",
+      "/opt/homebrew",
+      "/opt/homebrew",
+      "--ro-bind-try",
+      "/usr/local",
+      "/usr/local",
+      ...(process.env.HOME && process.env.HOME.startsWith("/Users/")
+        ? ["--ro-bind-try", `${process.env.HOME}/.bun`, `${process.env.HOME}/.bun`]
+        : []),
       "--ro-bind",
       "/lib",
       "/lib",
@@ -143,6 +169,27 @@ export class FakeProcessAdapter implements ProcessAdapter {
         stdout: new TextEncoder().encode(this.output),
         stderr: new Uint8Array(),
         enforcementMode: "enforced",
+      },
+    };
+  }
+  async executeCommand(
+    input: Parameters<ProcessAdapter["executeCommand"]>[0],
+  ): Promise<ProcessResult> {
+    this.operations.push(input.operationKey);
+    const output = this.output;
+    if (this.delayMs) await Bun.sleep(this.delayMs);
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: [input.executable, ...input.args],
+        cwd: input.workspaceDir,
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        spawnError: null,
+        stdout: new TextEncoder().encode(output),
+        stderr: new Uint8Array(),
+        enforcementMode: input.executionMode ?? "enforced",
       },
     };
   }

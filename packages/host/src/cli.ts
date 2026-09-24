@@ -11,7 +11,7 @@ const usage = `Kouro v2 M1
 Usage:
   kouro serve     Start the loopback-only local workbench
   kouro create template NAME --template ID  Create a project template under .kouro
-  kouro run [WORKFLOW] [--task TEXT] [--profile ID]  Execute a workflow headlessly
+  kouro run [WORKFLOW] [--task TEXT] [--profile ID] [--allow-unrestricted-commands]  Execute a workflow headlessly
   kouro inspect ID  Print one durable run view as JSON
   kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
   kouro retry ID INVOCATION REV  Retry one failed invocation
@@ -52,7 +52,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const service = new ApplicationService({ dataDir });
   await service.start();
   if (command === "run") {
-    const workflowId = argv.slice(1).find((arg) => !arg.startsWith("--")) ?? "tiny";
+    const valueOptions = new Set(["--profile", "--task", "--workspace", "--ticket"]);
+    let workflowId = "tiny";
+    for (let index = 1; index < argv.length; index += 1) {
+      const arg = argv[index]!;
+      if (valueOptions.has(arg)) {
+        index += 1;
+        continue;
+      }
+      if (arg.startsWith("--")) continue;
+      workflowId = arg;
+      break;
+    }
     const profileArg = argv.find((arg) => arg.startsWith("--profile="));
     const profileIndex = argv.indexOf("--profile");
     const profile =
@@ -65,6 +76,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       profile !== undefined &&
       profile !== "scripted" &&
       profile !== "codex-readonly" &&
+      profile !== "codex-workspace-write" &&
+      profile !== "claude-readonly" &&
+      profile !== "claude-workspace-write" &&
       profile !== "pi-readonly"
     ) {
       process.stderr.write(`Unknown execution profile: ${profile}\n`);
@@ -75,7 +89,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       workflowId,
       idempotencyKey: crypto.randomUUID(),
       actor: "cli",
-      executionProfile: profile as "scripted" | "codex-readonly" | "pi-readonly" | undefined,
+      executionProfile: profile as
+        | "scripted"
+        | "codex-readonly"
+        | "codex-workspace-write"
+        | "claude-readonly"
+        | "claude-workspace-write"
+        | "pi-readonly"
+        | undefined,
+      allowUnrestrictedCommands: argv.includes("--allow-unrestricted-commands"),
       input: {
         ...(task === undefined ? {} : { task }),
         ...(ticket === undefined ? {} : { ticket }),
@@ -83,12 +105,21 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       ...(workspace === undefined ? {} : { workspace: { repositoryPath: workspace } }),
     });
     let view = service.getView(run.runId);
-    while (view && (view.state.status === "pending" || view.state.status === "running")) {
+    while (
+      view &&
+      (view.state.status === "pending" || view.state.status === "running") &&
+      !Object.values(view.state.approvals).some((approval) => approval.status === "pending")
+    ) {
       await Bun.sleep(50);
       view = service.getView(run.runId);
     }
     process.stdout.write(
-      `${JSON.stringify({ runId: run.runId, status: view?.state.status ?? "unknown", revision: view?.revision ?? 0 })}\n`,
+      `${JSON.stringify({
+        runId: run.runId,
+        status: view?.state.status ?? "unknown",
+        revision: view?.revision ?? 0,
+        unrestrictedCommandOptIn: argv.includes("--allow-unrestricted-commands"),
+      })}\n`,
     );
     await service.close();
     return view?.state.status === "succeeded" ? 0 : 1;

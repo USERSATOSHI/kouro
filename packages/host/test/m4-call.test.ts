@@ -132,7 +132,7 @@ describe("M4 child call execution", () => {
     await coordinator.close();
   });
 
-  test("rejects an unsupported command before reserving an effect", async () => {
+  test("rejects unrestricted commands without explicit launch opt-in", async () => {
     const coordinator = new Coordinator({
       dataDir: (dirs.push(mkdtempSync(join(tmpdir(), "kouro-command-admission-"))), dirs.at(-1)!),
       process: new FakeProcessAdapter(),
@@ -142,6 +142,7 @@ describe("M4 child call execution", () => {
     const command = workflow.command("validate", {
       executable: "/usr/bin/printf",
       args: ["unsupported\\n"],
+      executionMode: "trusted-unrestricted",
     });
     const done = workflow.complete("done");
     workflow.startAt(command);

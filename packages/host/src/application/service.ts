@@ -404,6 +404,48 @@ export class ApplicationService {
         unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host",
       },
       {
+        id: "codex-workspace-write",
+        name: "Codex · workspace write",
+        description: "Codex can write inside the workspace for explicitly writable roles.",
+        available: codexAvailable,
+        harness: "codex",
+        capabilities: codexCapabilities,
+        unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host",
+      },
+      {
+        id: "claude-readonly",
+        name: "Claude Agent SDK · read-only",
+        description:
+          "Use the Claude Agent SDK with built-in file tools restricted to the workspace.",
+        available: true,
+        harness: "claude",
+        capabilities: {
+          "structured-output": "supported",
+          cancel: "supported",
+          resume: "unsupported",
+          reattach: "unsupported",
+          tools: "conditional",
+          usage: "supported",
+          "cost-cap": "unsupported",
+        },
+      },
+      {
+        id: "claude-workspace-write",
+        name: "Claude Agent SDK · workspace write",
+        description: "Claude may edit workspace files for roles declaring workspace-write access.",
+        available: true,
+        harness: "claude",
+        capabilities: {
+          "structured-output": "supported",
+          cancel: "supported",
+          resume: "unsupported",
+          reattach: "unsupported",
+          tools: "conditional",
+          usage: "supported",
+          "cost-cap": "unsupported",
+        },
+      },
+      {
         id: "pi-readonly",
         name: "Pi · read-only RPC",
         description:
@@ -441,6 +483,7 @@ export class ApplicationService {
     input?: Record<string, unknown>;
     executionProfile?: ExecutionProfileId;
     workspace?: { repositoryPath: string; workspaceId?: string };
+    allowUnrestrictedCommands?: boolean;
   }): Promise<RunSummary> {
     const bundle = this.bundles.get(input.workflowId);
     if (!bundle) throw new Error(`Unknown workflow ${input.workflowId}`);

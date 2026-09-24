@@ -7,6 +7,7 @@ import { FakeProcessAdapter } from "../src/adapters/process/bwrap.ts";
 import { createHostServer } from "../src/http/server.ts";
 import type { ProcessAdapter } from "../src/types.ts";
 import type { HarnessAdapter } from "../src/types.ts";
+import { WorkflowBuilder, compileWorkflow } from "@kouro/core";
 
 const directories: string[] = [];
 const temporaryDirectory = () => {
@@ -55,6 +56,51 @@ async function git(cwd: string, args: string[]): Promise<void> {
 }
 
 describe("Kouro M1 host", () => {
+  test("runs declared git argv only after unrestricted launch opt-in and records stderr on failure", async () => {
+    const dataDir = temporaryDirectory();
+    const repository = await fixtureRepository();
+    const builder = new WorkflowBuilder({ id: "git-command-e2e", version: "1" });
+    const command = builder.command("git-status", {
+      executable: "git",
+      args: ["status", "--short"],
+      executionMode: "trusted-unrestricted",
+    });
+    const done = builder.complete("done");
+    builder.startAt(command);
+    builder.sequence(command, done);
+    const bundle = await compileWorkflow(builder.build());
+    const service = new ApplicationService({ dataDir, scriptedDelayMs: 1 });
+    await service.start();
+    const denied = await service.coordinator.createRun({
+      workflowId: "git-command-e2e",
+      bundle,
+      idempotencyKey: "git-command-denied",
+      workspace: { repositoryPath: repository },
+    });
+    const deniedView = await waitForTerminal(service, denied.run.runId);
+    expect(deniedView.state.status).toBe("failed");
+    expect(
+      Object.values(deniedView.state.attempts).some((attempt) => attempt.commandEvidence),
+    ).toBe(false);
+
+    const accepted = await service.coordinator.createRun({
+      workflowId: "git-command-e2e",
+      bundle,
+      idempotencyKey: "git-command-accepted",
+      allowUnrestrictedCommands: true,
+      workspace: { repositoryPath: repository },
+    });
+    const acceptedView = await waitForTerminal(service, accepted.run.runId);
+    expect(acceptedView.state.status).toBe("succeeded");
+    const evidence = Object.values(acceptedView.state.attempts).find(
+      (attempt) => attempt.commandEvidence,
+    )?.commandEvidence;
+    expect(evidence?.args).toEqual(["status", "--short"]);
+    expect(evidence?.executable).toBe("git");
+    expect(evidence?.executionMode).toBe("trusted-unrestricted");
+    await service.close();
+  });
+
   test("repository runs use isolated worktrees, exact API diff, and guarded delivery", async () => {
     const dataDir = temporaryDirectory();
     const repository = await fixtureRepository();
@@ -401,6 +447,22 @@ describe("Kouro M1 host", () => {
           },
         };
       },
+      async executeCommand(input) {
+        return {
+          operationKey: input.operationKey,
+          evidence: {
+            argv: [input.executable, ...input.args],
+            cwd: input.workspaceDir,
+            exitCode: 2,
+            signal: null,
+            timedOut: false,
+            spawnError: null,
+            stdout: new Uint8Array(),
+            stderr: new TextEncoder().encode("failed"),
+            enforcementMode: "enforced",
+          },
+        };
+      },
     };
     const service = new ApplicationService({
       dataDir: temporaryDirectory(),
@@ -413,6 +475,7 @@ describe("Kouro M1 host", () => {
     expect(view.state.status).toBe("failed");
     const command = Object.values(view.state.attempts).find((attempt) => attempt.commandEvidence);
     expect(command?.commandEvidence?.exitCode).toBe(2);
+    expect(command?.commandEvidence?.stderrArtifactId).toBeDefined();
     await service.close();
   });
 

@@ -16,6 +16,8 @@ const child = Bun.spawn(
     resolve(dist, "kouro.js"),
     "--target",
     "bun",
+    "--external",
+    "@anthropic-ai/claude-agent-sdk",
   ],
   { cwd: root, stdin: "inherit", stdout: "inherit", stderr: "inherit" },
 );

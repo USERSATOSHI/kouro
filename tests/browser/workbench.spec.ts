@@ -131,6 +131,37 @@ test("feature workflow durably waits for approval and reaches terminal state", a
   await page.screenshot({ path: "test-results/m3-feature-approval-desktop.png", fullPage: true });
 });
 
+test("a workflow can return to its input form and start a second run", async ({ page }) => {
+  await page.goto("/#token=kouro-browser-test-token");
+  await page.getByRole("button", { name: /Feature development loop/ }).click();
+  const taskInput = page.getByPlaceholder("Describe what this workflow should accomplish…");
+  await expect(taskInput).toBeVisible();
+  await taskInput.fill("First feature task");
+  await page.locator(".preview .primary-cta").click();
+  await expect(page.getByTestId("workflow-graph")).toBeVisible();
+  const firstRunId = await page.locator(".topbar .run-id").textContent();
+  expect(firstRunId).toBeTruthy();
+
+  await page.getByRole("button", { name: /Feature development loop/ }).click();
+  await expect(taskInput).toBeVisible();
+  await expect(taskInput).toHaveValue("");
+  await taskInput.fill("Second feature task");
+  await page.locator(".preview .primary-cta").click();
+  await expect(page.getByTestId("workflow-graph")).toBeVisible();
+  const secondRunId = await page.locator(".topbar .run-id").textContent();
+  expect(secondRunId).toBeTruthy();
+  expect(secondRunId).not.toBe(firstRunId);
+  await expect(page.locator(".run-list")).toContainText("First feature task");
+  await expect(page.locator(".run-list")).toContainText("Second feature task");
+
+  await page.getByRole("button", { name: "New run with different input" }).click();
+  await expect(taskInput).toBeVisible();
+  await expect(taskInput).toHaveValue("");
+  await page.locator(".run-list .run-row").filter({ hasText: "First feature task" }).click();
+  await expect(page.getByTestId("workflow-graph")).toBeVisible();
+  await expect(page.locator(".topbar .run-id")).toHaveText(firstRunId!);
+});
+
 test("repository workspace diff is rendered from the host snapshot", async ({ page }) => {
   await page.goto("/#token=kouro-browser-test-token");
   await expect(page.getByTestId("start-run").first()).toBeEnabled();

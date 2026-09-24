@@ -2,7 +2,12 @@ import { canonicalize, validateJsonSchema } from "@kouro/core";
 import type { Bundle, JsonObject, Port } from "@kouro/core";
 import type { WorkItemInput } from "./types.ts";
 
-const HOST_OWNED_INPUTS = new Set(["__kouroExecutionProfile", "__kouroWorkspace", "__kouroFork"]);
+const HOST_OWNED_INPUTS = new Set([
+  "__kouroExecutionProfile",
+  "__kouroWorkspace",
+  "__kouroFork",
+  "__kouroAllowUnrestrictedCommands",
+]);
 
 export function normalizeWorkItemInput(input: Record<string, unknown>): WorkItemInput | undefined {
   const rawWorkItem = input.workItem;

@@ -7,7 +7,7 @@ import {
 } from "@kouro/core";
 import type { HarnessAdapter } from "../../types.ts";
 
-export type ExternalCliKind = "claude" | "opencode";
+export type ExternalCliKind = "opencode";
 
 interface CliProcess {
   stdout: ReadableStream<Uint8Array>;
@@ -16,8 +16,8 @@ interface CliProcess {
   kill(signal?: string): void;
 }
 
-function binary(kind: ExternalCliKind): string {
-  return process.env[kind === "claude" ? "KOURO_CLAUDE_BIN" : "KOURO_OPENCODE_BIN"]?.trim() || kind;
+function binary(): string {
+  return process.env.KOURO_OPENCODE_BIN?.trim() || "opencode";
 }
 
 async function capture(
@@ -41,9 +41,9 @@ async function capture(
 }
 
 export async function inspectExternalCli(kind: ExternalCliKind): Promise<HarnessDescriptor> {
-  const command = binary(kind);
+  const command = binary();
   const version = await capture([command, "--version"]);
-  const help = await capture(kind === "claude" ? [command, "--help"] : [command, "run", "--help"]);
+  const help = await capture([command, "run", "--help"]);
   const available = version.exitCode === 0 && help.exitCode === 0;
   const supported = { state: available ? ("supported" as const) : ("unsupported" as const) };
   return {
@@ -74,7 +74,7 @@ export async function inspectExternalCli(kind: ExternalCliKind): Promise<Harness
   };
 }
 
-function parseOutput(kind: ExternalCliKind, stdout: string): JsonValue | undefined {
+function parseOutput(stdout: string): JsonValue | undefined {
   const candidates = [
     stdout.trim(),
     ...stdout
@@ -87,9 +87,7 @@ function parseOutput(kind: ExternalCliKind, stdout: string): JsonValue | undefin
       const value = JSON.parse(candidate) as Record<string, unknown> | JsonValue;
       if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
       const record = value as Record<string, unknown>;
-      for (const key of kind === "claude"
-        ? ["structured_output", "result", "text", "content"]
-        : ["output", "result", "text", "content"]) {
+      for (const key of ["output", "result", "text", "content"]) {
         if (record[key] !== undefined) {
           const selected = record[key];
           if (typeof selected === "string") {
@@ -136,14 +134,9 @@ export class ExternalCliHarnessAdapter implements HarnessAdapter {
         events: [],
       };
     const config = input.nativeConfig ?? {};
-    const command = binary(this.kind);
-    const args =
-      this.kind === "claude"
-        ? [command, "-p", "--output-format", "json", "--permission-mode", "plan"]
-        : [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
+    const command = binary();
+    const args = [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
     if (typeof config.model === "string" && config.model) args.push("--model", config.model);
-    if (input.outputSchema && this.kind === "claude")
-      args.push("--json-schema", JSON.stringify(input.outputSchema));
     const prompt = input.context
       ? `[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]\n${input.prompt}`
       : input.prompt;
@@ -188,7 +181,7 @@ export class ExternalCliHarnessAdapter implements HarnessAdapter {
       };
     if (input.signal?.aborted)
       return { status: "cancelled" as const, error: "cancelled", usage: unavailable(), events: [] };
-    const output = parseOutput(this.kind, result.stdout);
+    const output = parseOutput(result.stdout);
     const events: HarnessEvent[] = result.stdout
       .split("\n")
       .filter(Boolean)

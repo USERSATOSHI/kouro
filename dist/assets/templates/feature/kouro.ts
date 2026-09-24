@@ -1,34 +1,47 @@
 import { WorkflowBuilder } from "@kouro/core";
-import { Summary, Task } from "./schemas/schema.ts";
+import { Summary, Task, WorkItem } from "./schemas/schema.ts";
 
 const planPrompt = await Bun.file(new URL("./prompts/plan.md", import.meta.url)).text();
 const implementPrompt = await Bun.file(new URL("./prompts/implement.md", import.meta.url)).text();
+
 const workflow = new WorkflowBuilder({ id: "{{id}}", version: "1" });
-const task = workflow.input("task", Task);
+const task = workflow.input("task", Task, { required: false });
+const workItem = workflow.input("workItem", WorkItem, { required: false });
 const plan = workflow.agent("plan", {
   role: "planner",
   prompt: planPrompt,
-  input: { task },
+  input: { task, workItem },
   produces: Summary,
 });
 const approval = workflow.approval("approve-plan", {
   action: "accept-plan",
-  input: { task, plan: plan.output },
+  input: {
+    task,
+    workItem,
+    plan: plan.output,
+  },
 });
 const implement = workflow.agent("implement", {
   role: "implementer",
   prompt: implementPrompt,
-  input: { plan: plan.output },
+  input: { task, workItem, plan: plan.output },
+  workspaceAccess: "workspace-write",
 });
 const validate = workflow.command("validate", {
-  executable: "/usr/bin/printf",
-  args: ["Kouro M1 command\\n"],
+  executable: "bun",
+  args: ["test"],
+  executionMode: "trusted-unrestricted",
 });
 const done = workflow.complete("done");
 const failed = workflow.complete("failed", { result: "failed" });
+const typecheck = workflow.command("typecheck", {
+  executable: "bun",
+  args: ["run", "typecheck"],
+  executionMode: "trusted-unrestricted",
+});
 workflow.startAt(plan);
 plan.on("success").to(approval);
 approval.on("approved").to(implement);
 approval.on("rejected").to(failed);
-workflow.sequence(implement, validate, done);
+workflow.sequence(implement, typecheck, validate, done);
 export default workflow.build();

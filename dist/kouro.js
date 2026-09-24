@@ -151,6 +151,75 @@ function defaultOutput(nodeId, produces, fallbackSchema = {}) {
   const schema = produces ?? { id: `${nodeId}.output`, schema: fallbackSchema };
   return port("output", schema);
 }
+function directSubagentSource(id, options) {
+  if (!id)
+    throw new Error("Subagent id must be non-empty");
+  const inputPorts = Object.entries(options.input ?? {}).map(([name, schema]) => port(name, schema));
+  const output = defaultOutput("subagent", options.produces);
+  const agentId = "subagent";
+  const completeId = "complete";
+  const agent = {
+    id: agentId,
+    kind: "agent",
+    role: options.role ?? id,
+    prompt: options.prompt,
+    ...options.harness === undefined ? {} : { harness: options.harness },
+    ...options.modelId === undefined ? {} : { modelId: options.modelId },
+    inputPorts: inputPorts.map(stripPort),
+    outputPorts: [stripPort(output)],
+    bindings: inputPorts.map((input) => ({
+      targetPort: input.name,
+      source: { kind: "input", sourceId: input.name, port: input.name },
+      missing: "error"
+    })),
+    timeoutMs: finitePositive(options.timeoutMs, 5000),
+    ...options.scripted === undefined ? {} : { scripted: options.scripted },
+    ...options.resources === undefined ? {} : { resources: options.resources }
+  };
+  const complete = {
+    id: completeId,
+    kind: "complete",
+    inputPorts: [stripPort(output)],
+    outputPorts: [],
+    bindings: [
+      {
+        targetPort: "output",
+        source: { kind: "producer", sourceId: agentId, port: "output" },
+        missing: "error"
+      }
+    ],
+    result: "succeeded"
+  };
+  const schemaCatalog = {};
+  for (const input of inputPorts)
+    schemaCatalog[input.schemaLabel] = input.schema;
+  schemaCatalog[output.schemaLabel] = output.schema;
+  return {
+    id,
+    version: "1",
+    nodes: [agent, complete],
+    controlEdges: [
+      {
+        id: `${agentId}:success:${completeId}:0`,
+        sourceNodeId: agentId,
+        outcome: "success",
+        targetNodeId: completeId,
+        kind: "sequential"
+      }
+    ],
+    inputPorts: inputPorts.map(stripPort),
+    outputPorts: [stripPort(output)],
+    entry: agentId,
+    schemaCatalog,
+    counters: [],
+    definitions: {},
+    sourceMap: {
+      [agentId]: { sourceId: agentId },
+      [completeId]: { sourceId: completeId }
+    },
+    scouts: []
+  };
+}
 function bindingSource(value, owner) {
   if (isInputHandle(value)) {
     assertHandleOwner(value, owner);
@@ -159,6 +228,10 @@ function bindingSource(value, owner) {
   if (isOutputHandle(value)) {
     assertHandleOwner(value, owner);
     return { kind: "producer", sourceId: value.sourceId, port: value.port };
+  }
+  if (isScoutResultsHandle(value)) {
+    assertHandleOwner(value, owner);
+    return { kind: "scout-results", sourceId: value.sourceId, scoutId: value.scoutId };
   }
   return { kind: "literal", value };
 }
@@ -184,6 +257,9 @@ function isInputHandle(value) {
 function isOutputHandle(value) {
   return typeof value === "object" && value !== null && value.kind === "output";
 }
+function isScoutResultsHandle(value) {
+  return typeof value === "object" && value !== null && value.kind === "scout-results";
+}
 function artifactType(id, schema) {
   if (!id || typeof id !== "string")
     throw new Error("artifactType id must be a non-empty string");
@@ -201,6 +277,7 @@ class WorkflowBuilder {
   childDefinitions = new Map;
   sourceMap = new Map;
   outputMap = new Map;
+  scoutList = [];
   entryId;
   ownerToken = Symbol("workflow-owner");
   constructor(options) {
@@ -236,10 +313,20 @@ class WorkflowBuilder {
       prompt: options.prompt,
       ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
+      ...options.workspaceAccess === undefined ? {} : { workspaceAccess: options.workspaceAccess },
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true)),
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),
       timeoutMs: finitePositive(options.timeoutMs, 5000),
+      ...options.uses === undefined ? {} : {
+        uses: options.uses.map((scout) => {
+          assertScoutOwner(scout, this);
+          if (!this.scoutList.some((declared) => declared.id === scout.id))
+            throw new Error(`Scout ${scout.id} has not been declared on this workflow`);
+          return scout.id;
+        })
+      },
+      ...options.uses === undefined || options.uses.length === 0 ? {} : { scoutPolicy: normalizeScoutPolicy(options.scoutPolicy ?? {}) },
       scripted: options.scripted,
       ...options.resources ? { resources: options.resources } : {}
     };
@@ -254,6 +341,7 @@ class WorkflowBuilder {
       id,
       kind: "command",
       executable: options.executable,
+      ...options.executionMode ? { executionMode: options.executionMode } : {},
       args: [...options.args ?? []],
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), true)),
       outputPorts: [output],
@@ -331,6 +419,107 @@ class WorkflowBuilder {
     this.addNode(node);
     this.sourceMap.set(id, { sourceId: id });
     return this.handle(id, output);
+  }
+  scout(id, child, options = {}) {
+    const handle = this.call(id, child, options);
+    const maxInvocations = options.maxInvocations ?? 2;
+    const maxConcurrent = options.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations <= 0)
+      throw new Error("scout maxInvocations must be a positive safe integer");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+      throw new Error("scout maxConcurrent must be a positive safe integer");
+    this.scoutList.push({
+      id,
+      definitionId: child.id,
+      maxInvocations,
+      maxConcurrent,
+      ...options.optional ? { optional: true } : {}
+    });
+    return handle;
+  }
+  declareScout(id, child, options = {}) {
+    if (this.scoutList.some((scout) => scout.id === id))
+      throw new Error(`Duplicate scout ${id}`);
+    this.childDefinitions.set(child.id, child.build());
+    const maxInvocations = options.maxInvocations ?? 2;
+    const maxConcurrent = options.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations <= 0)
+      throw new Error("scout maxInvocations must be a positive safe integer");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+      throw new Error("scout maxConcurrent must be a positive safe integer");
+    this.scoutList.push({
+      id,
+      definitionId: child.id,
+      maxInvocations,
+      maxConcurrent,
+      ...options.optional ? { optional: true } : {}
+    });
+    const childOutput = child.build().outputPorts?.[0];
+    const schema = childOutput ? {
+      id: childOutput.schemaDigest,
+      schema: child.build().schemaCatalog?.[childOutput.schemaDigest] ?? {}
+    } : { id: `${id}.output`, schema: {} };
+    return Object.freeze({
+      kind: "scout",
+      workflowId: this.id,
+      id,
+      definitionId: child.id,
+      schema,
+      ownerToken: this.ownerToken
+    });
+  }
+  subagent(id, options, limits = {}) {
+    if (this.scoutList.some((scout) => scout.id === id))
+      throw new Error(`Duplicate scout ${id}`);
+    const child = directSubagentSource(id, options);
+    this.childDefinitions.set(id, child);
+    const maxInvocations = limits.maxInvocations ?? 2;
+    const maxConcurrent = limits.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations <= 0)
+      throw new Error("scout maxInvocations must be a positive safe integer");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+      throw new Error("scout maxConcurrent must be a positive safe integer");
+    this.scoutList.push({
+      id,
+      definitionId: id,
+      maxInvocations,
+      maxConcurrent,
+      ...limits.optional ? { optional: true } : {}
+    });
+    return Object.freeze({
+      kind: "scout",
+      workflowId: this.id,
+      id,
+      definitionId: id,
+      schema: options.produces,
+      ownerToken: this.ownerToken
+    });
+  }
+  declareSubagent(id, options, limits = {}) {
+    return this.subagent(id, options, limits);
+  }
+  scoutResults(plan, scout) {
+    assertHandleOwner(plan, this);
+    assertScoutOwner(scout, this);
+    const parent = this.nodeMap.get(plan.id);
+    if (parent?.kind !== "agent")
+      throw new Error("scoutResults requires an agent");
+    if (parent.uses !== undefined && !parent.uses.includes(scout.id))
+      throw new Error(`Subagent ${scout.id} is not authorized on agent ${plan.id}`);
+    return Object.freeze({
+      kind: "scout-results",
+      workflowId: this.id,
+      sourceId: plan.id,
+      scoutId: scout.id,
+      schema: {
+        id: `${plan.id}.${scout.id}.results`,
+        schema: { type: "array", items: schemaValue(scout.schema) }
+      },
+      ownerToken: this.ownerToken
+    });
+  }
+  subagentResults(agent, subagent) {
+    return this.scoutResults(agent, subagent);
   }
   parallel(id, options) {
     if (!options.branches.length)
@@ -454,7 +643,8 @@ class WorkflowBuilder {
       schemaCatalog: this.collectSchemas(),
       counters: [...this.counterMap.values()],
       definitions: Object.fromEntries(this.childDefinitions.entries()),
-      sourceMap: Object.fromEntries(this.sourceMap.entries())
+      sourceMap: Object.fromEntries(this.sourceMap.entries()),
+      scouts: [...this.scoutList]
     };
   }
   _nodes() {
@@ -520,7 +710,7 @@ class WorkflowBuilder {
     return new NodeHandle(this, id, descriptor);
   }
   schemaOf(value) {
-    if (isInputHandle(value) || isOutputHandle(value))
+    if (isInputHandle(value) || isOutputHandle(value) || isScoutResultsHandle(value))
       return value.schema;
     return {};
   }
@@ -539,6 +729,20 @@ class WorkflowBuilder {
     return result;
   }
 }
+function assertScoutOwner(handle, owner) {
+  assertWorkflow(handle.workflowId, owner.id);
+  if (handle.ownerToken !== owner.ownerToken)
+    throw new Error("Scout handle belongs to another WorkflowBuilder instance");
+}
+function normalizeScoutPolicy(policy) {
+  const maxRequests = policy.maxRequests ?? 4;
+  const maxConcurrent = policy.maxConcurrent ?? 2;
+  if (!Number.isSafeInteger(maxRequests) || maxRequests <= 0)
+    throw new Error("scoutPolicy.maxRequests must be a positive safe integer");
+  if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0)
+    throw new Error("scoutPolicy.maxConcurrent must be a positive safe integer");
+  return { maxRequests, maxConcurrent };
+}
 function stripInternal(node) {
   const base = {
     id: node.id,
@@ -556,7 +760,10 @@ function stripInternal(node) {
       prompt: node.prompt,
       ...node.harness === undefined ? {} : { harness: node.harness },
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
+      ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
       timeoutMs: node.timeoutMs,
+      ...node.uses === undefined ? {} : { uses: node.uses },
+      ...node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy },
       ...node.scripted === undefined ? {} : { scripted: node.scripted }
     };
   }
@@ -564,6 +771,7 @@ function stripInternal(node) {
     return {
       ...base,
       executable: node.executable,
+      ...node.executionMode === undefined ? {} : { executionMode: node.executionMode },
       args: node.args,
       timeoutMs: node.timeoutMs,
       acceptedExitCodes: node.acceptedExitCodes
@@ -600,6 +808,7 @@ var init_builder = __esm(() => {
       executable: { type: "string" },
       args: { type: "array", items: { type: "string" } },
       exitCode: { type: ["integer", "null"] },
+      executionMode: { enum: ["enforced", "trusted-unrestricted"] },
       signal: { type: ["string", "null"] },
       timeout: { type: ["boolean", "null"] },
       spawnError: { type: ["string", "null"] }
@@ -611,6 +820,7 @@ var init_builder = __esm(() => {
     type: "object",
     properties: {
       exitCode: { type: ["integer", "null"] },
+      executionMode: { enum: ["enforced", "trusted-unrestricted"] },
       signal: { type: ["string", "null"] },
       timeout: { type: ["boolean", "null"] },
       spawnError: { type: ["string", "null"] },
@@ -711,6 +921,21 @@ async function compileWorkflowDetailed(source) {
   }
   const nodes = Array.isArray(source.nodes) ? source.nodes : [];
   const counters = Array.isArray(source.counters) ? source.counters : [];
+  const scoutIds = new Set;
+  for (const scout of source.scouts ?? []) {
+    if (scoutIds.has(scout.id))
+      diagnostics.push(error("DUPLICATE_SCOUT", `Duplicate scout ${scout.id}`, scout.id));
+    scoutIds.add(scout.id);
+    if (!scout.id || !source.definitions?.[scout.definitionId])
+      diagnostics.push(error("MISSING_SCOUT_DEFINITION", `Scout ${scout.id} references missing child definition ${scout.definitionId}`, scout.id));
+    if (!Number.isSafeInteger(scout.maxInvocations) || scout.maxInvocations <= 0)
+      diagnostics.push(error("INVALID_SCOUT_BOUND", `Scout ${scout.id} has an invalid invocation bound`, scout.id));
+    if (!Number.isSafeInteger(scout.maxConcurrent) || scout.maxConcurrent <= 0)
+      diagnostics.push(error("INVALID_SCOUT_CONCURRENCY", `Scout ${scout.id} has an invalid concurrency bound`, scout.id));
+    const child = source.definitions?.[scout.definitionId];
+    if (child)
+      validateScoutChild(child, scout.id, diagnostics);
+  }
   const counterIds = new Set;
   for (const counter of counters) {
     if (counterIds.has(counter.id))
@@ -755,10 +980,32 @@ async function compileWorkflowDetailed(source) {
       diagnostics.push(error("UNBOUNDED_LOOP", "Loop maxIterations must be a positive safe integer", node.id));
     if (node.kind === "forEach" && (!Number.isSafeInteger(node.maxItems) || node.maxItems <= 0 || !Number.isSafeInteger(node.maxConcurrent) || node.maxConcurrent <= 0))
       diagnostics.push(error("INVALID_MAP_BOUND", "forEach maxItems and maxConcurrent must be positive safe integers", node.id));
+    if (node.kind === "agent") {
+      const uses = node.uses ?? [];
+      const seenUses = new Set;
+      for (const scoutId of uses) {
+        if (seenUses.has(scoutId))
+          diagnostics.push(error("DUPLICATE_SCOUT_USE", `Scout ${scoutId} is used more than once`, node.id));
+        seenUses.add(scoutId);
+        if (!(source.scouts ?? []).some((scout) => scout.id === scoutId))
+          diagnostics.push(error("UNKNOWN_SCOUT_USE", `Agent uses unknown subagent ${scoutId}`, node.id));
+      }
+      if (node.scoutPolicy !== undefined) {
+        if (!Number.isSafeInteger(node.scoutPolicy.maxRequests) || node.scoutPolicy.maxRequests <= 0)
+          diagnostics.push(error("INVALID_SCOUT_POLICY", "scoutPolicy.maxRequests must be positive", node.id));
+        if (!Number.isSafeInteger(node.scoutPolicy.maxConcurrent) || node.scoutPolicy.maxConcurrent <= 0)
+          diagnostics.push(error("INVALID_SCOUT_POLICY", "scoutPolicy.maxConcurrent must be positive", node.id));
+      }
+      const required = uses.filter((scoutId) => (source.scouts ?? []).some((scout) => scout.id === scoutId && !scout.optional)).length;
+      const policy = node.scoutPolicy ?? { maxRequests: 4, maxConcurrent: 2 };
+      if (uses.length > 0 && policy.maxRequests < required)
+        diagnostics.push(error("SCOUT_POLICY_TOO_SMALL", `Planner request budget ${policy.maxRequests} is smaller than required scout count ${required}`, node.id));
+    }
   }
   for (const node of nodes) {
     validateBindings(node.bindings, node.inputPorts, nodeMap, source.inputPorts ?? [], diagnostics, node.id);
     validateBindingSchemas(node, nodeMap, source.inputPorts ?? [], diagnostics);
+    validateScoutResultBindings(node, nodeMap, source.scouts ?? [], diagnostics);
     if (node.kind === "call") {
       const child = source.definitions?.[node.definitionId];
       if (child)
@@ -865,7 +1112,8 @@ async function compileWorkflowDetailed(source) {
       dataBindings: normalizedNodes.flatMap((node) => node.bindings),
       entry: entry ?? "",
       exits: normalizedNodes.filter((node) => node.kind === "complete").map((node) => node.id),
-      counters: [...counters].sort((a, b) => a.id.localeCompare(b.id))
+      counters: [...counters].sort((a, b) => a.id.localeCompare(b.id)),
+      scouts: [...source.scouts ?? []].sort((a, b) => a.id.localeCompare(b.id))
     };
   }
   for (const child of Object.values(source.definitions ?? {})) {
@@ -880,6 +1128,13 @@ async function compileWorkflowDetailed(source) {
         diagnostics.push(error("DUPLICATE_DEFINITION", `Duplicate definition ${id}`, id));
       else
         definitions[id] = definition;
+    }
+    for (const [digest2, schema] of Object.entries(child.schemas)) {
+      const existing = schemas[digest2];
+      if (existing !== undefined && canonicalize(existing) !== canonicalize(schema))
+        diagnostics.push(error("SCHEMA_DIGEST_COLLISION", `Schema digest collision ${digest2}`, digest2));
+      else
+        schemas[digest2] = schema;
     }
   }
   const boundSummary = summarizeDefinition(definitions[source.id ?? ""], definitions, new Set);
@@ -968,7 +1223,7 @@ function validateBindingSchemas(node, nodeMap, inputPorts, diagnostics) {
   const targetPorts = new Map((node.inputPorts ?? []).map((port2) => [port2.name, port2]));
   for (const binding of node.bindings ?? []) {
     const target = targetPorts.get(binding.targetPort);
-    if (!target || binding.source.kind === "literal")
+    if (!target || binding.source.kind === "literal" || binding.source.kind === "scout-results")
       continue;
     const sourceBinding = binding.source;
     let source;
@@ -984,6 +1239,53 @@ function validateBindingSchemas(node, nodeMap, inputPorts, diagnostics) {
     if (source && source.schemaDigest !== target.schemaDigest) {
       diagnostics.push(error("BINDING_SCHEMA_MISMATCH", `Binding ${binding.targetPort} expects ${target.schemaDigest} but receives ${source.schemaDigest}`, `${node.id}.${binding.targetPort}`));
     }
+  }
+}
+function validateScoutResultBindings(node, nodeMap, scouts, diagnostics) {
+  for (const binding of node.bindings ?? []) {
+    if (binding.source.kind !== "scout-results")
+      continue;
+    const source = binding.source;
+    const parent = nodeMap.get(source.sourceId);
+    if (parent?.kind !== "agent") {
+      diagnostics.push(error("SCOUT_RESULTS_SOURCE", "Subagent results must reference an agent", node.id));
+      continue;
+    }
+    const authorized = parent.uses ?? scouts.map((scout) => scout.id);
+    if (!authorized.includes(source.scoutId))
+      diagnostics.push(error("SCOUT_RESULTS_UNAUTHORIZED", `Subagent ${source.scoutId} is not authorized on agent ${parent.id}`, node.id));
+    if (!scouts.some((scout) => scout.id === source.scoutId))
+      diagnostics.push(error("UNKNOWN_SCOUT", `Unknown scout ${source.scoutId}`, node.id));
+  }
+}
+function validateScoutChild(child, scoutId, diagnostics) {
+  const nodes = child.nodes ?? [];
+  const agents = nodes.filter((node) => node.kind === "agent");
+  const completes = nodes.filter((node) => node.kind === "complete");
+  if (nodes.length !== 2 || agents.length !== 1 || completes.length !== 1 || Object.keys(child.definitions ?? {}).length > 0) {
+    diagnostics.push(error("INVALID_SCOUT_SHAPE", `Scout ${scoutId} must contain exactly one agent and one successful completion node`, scoutId));
+    return;
+  }
+  const agent = agents[0];
+  const complete = completes[0];
+  if (child.entry !== agent.id || complete.result !== "succeeded")
+    diagnostics.push(error("INVALID_SCOUT_ENTRY", `Scout ${scoutId} must start at its agent and succeed`, scoutId));
+  const edges = child.controlEdges ?? [];
+  if (edges.length !== 1 || edges[0].sourceNodeId !== agent.id || edges[0].targetNodeId !== complete.id || edges[0].outcome !== "success" || edges[0].guard !== undefined || edges[0].default !== undefined)
+    diagnostics.push(error("INVALID_SCOUT_EDGES", `Scout ${scoutId} must have one unconditional success edge`, scoutId));
+  if ((child.outputPorts ?? []).length !== 1 || agent.outputPorts.length !== 1)
+    diagnostics.push(error("INVALID_SCOUT_OUTPUT", `Scout ${scoutId} must export its agent's one typed output`, scoutId));
+  else if (child.outputPorts[0].schemaDigest !== agent.outputPorts[0].schemaDigest)
+    diagnostics.push(error("INVALID_SCOUT_OUTPUT", `Scout ${scoutId} output must be the agent output`, scoutId));
+  const completionBinding = complete.bindings?.[0];
+  if (complete.bindings?.length !== 1 || completionBinding?.source.kind !== "producer" || completionBinding.source.sourceId !== agent.id)
+    diagnostics.push(error("INVALID_SCOUT_COMPLETION", `Scout ${scoutId} completion must export the agent output binding`, scoutId));
+  if ((child.scouts ?? []).length > 0 || agent.uses?.length || agent.scoutPolicy)
+    diagnostics.push(error("NESTED_SCOUT", `Scout ${scoutId} cannot declare or use nested scouts`, scoutId));
+  const inputNames = new Set((child.inputPorts ?? []).map((port2) => port2.name));
+  for (const binding of agent.bindings ?? []) {
+    if (binding.source.kind !== "literal" && (binding.source.kind !== "input" || !inputNames.has(binding.source.sourceId)))
+      diagnostics.push(error("INVALID_SCOUT_INPUT", `Scout ${scoutId} agent inputs may use only declared child inputs or literals`, scoutId));
   }
 }
 function validateCallInterface(node, child, diagnostics) {
@@ -15059,7 +15361,7 @@ init_src();
 // packages/host/src/coordinator/coordinator.ts
 init_src();
 import { mkdirSync as mkdirSync5 } from "fs";
-import { join as join4 } from "path";
+import { join as join5 } from "path";
 
 // packages/host/src/id.ts
 import { randomUUID } from "crypto";
@@ -15100,6 +15402,8 @@ class ScriptedHarnessAdapter {
     return {
       "structured-output": "supported",
       cancel: "supported",
+      "awaited-subagent-tool": "supported",
+      "child-read-only-envelope": "supported",
       usage: "unsupported",
       "cost-cap": "unsupported"
     };
@@ -15115,34 +15419,59 @@ class ScriptedHarnessAdapter {
     await wait(input.delayMs, input.signal);
     let collaboration2;
     if (input.collaboration) {
-      const peer = input.role.toLowerCase().includes("receiver") ? "sender" : "receiver";
-      const batch = input.collaboration.wait({ maxMessages: 8 });
-      if (batch?.visible.length) {
-        const first = batch.visible[0];
-        input.collaboration.send_message({
-          to: first.senderParticipantId,
-          body: { kind: "reply", received: first.body },
-          replyTo: first.id,
-          idempotencyKey: `${input.invocationId}:reply:${first.id}`
-        });
-        collaboration2 = { received: batch.visible.map((message) => message.id) };
-      } else if (peer !== input.collaboration.participantId) {
-        try {
-          const sent = input.collaboration.send_message({
-            to: peer,
-            body: { kind: "request", from: input.collaboration.participantId },
-            idempotencyKey: `${input.invocationId}:request`
+      if (!input.collaboration.subagent) {
+        const peer = input.role.toLowerCase().includes("receiver") ? "sender" : "receiver";
+        const batch = input.collaboration.wait({ maxMessages: 8 });
+        if (batch?.visible.length) {
+          const first = batch.visible[0];
+          input.collaboration.send_message({
+            to: first.senderParticipantId,
+            body: { kind: "reply", received: first.body },
+            replyTo: first.id,
+            idempotencyKey: `${input.invocationId}:reply:${first.id}`
           });
-          collaboration2 = { sent: sent.id };
-        } catch {}
+          collaboration2 = { received: batch.visible.map((message) => message.id) };
+        } else if (peer !== input.collaboration.participantId) {
+          try {
+            const sent = input.collaboration.send_message({
+              to: peer,
+              body: { kind: "request", from: input.collaboration.participantId },
+              idempotencyKey: `${input.invocationId}:request`
+            });
+            collaboration2 = { sent: sent.id };
+          } catch {}
+        }
+        input.collaboration.publish_blackboard({
+          type: "finding",
+          body: { participant: input.collaboration.participantId, status: "completed" },
+          idempotencyKey: `${input.invocationId}:finding`
+        });
       }
-      input.collaboration.publish_blackboard({
-        type: "finding",
-        body: { participant: input.collaboration.participantId, status: "completed" },
-        idempotencyKey: `${input.invocationId}:finding`
-      });
+      if (input.collaboration.subagent) {
+        const taskSegment = input.context?.segments.find((segment) => segment.source === "artifact-input" && segment.id.endsWith(":task"));
+        let task = "scripted planner task";
+        if (taskSegment) {
+          try {
+            const parsed = JSON.parse(taskSegment.content);
+            if (typeof parsed === "string")
+              task = parsed;
+          } catch {
+            task = taskSegment.content.trim();
+          }
+        }
+        const configuredSubagentIds = input.context?.tools.find((tool) => tool.name === "subagent")?.inputSchema;
+        const subagentIds = configuredSubagentIds && typeof configuredSubagentIds === "object" && !Array.isArray(configuredSubagentIds) && configuredSubagentIds.properties && typeof configuredSubagentIds.properties === "object" && !Array.isArray(configuredSubagentIds.properties) && configuredSubagentIds.properties.subagentId && typeof configuredSubagentIds.properties.subagentId === "object" && !Array.isArray(configuredSubagentIds.properties.subagentId) && Array.isArray(configuredSubagentIds.properties.subagentId.enum) ? configuredSubagentIds.properties.subagentId.enum.filter((value) => typeof value === "string") : [];
+        const requests = await Promise.all(subagentIds.map((subagentId) => input.collaboration.subagent({
+          requestId: `${input.invocationId}:${subagentId}`,
+          subagentId,
+          input: subagentInputFromToolSchema(configuredSubagentIds, subagentId, task)
+        })));
+        collaboration2 ??= {};
+        collaboration2.scouts = requests;
+      }
     }
-    const output = {
+    const scoutReports = collaboration2 && Array.isArray(collaboration2.scouts) ? collaboration2.scouts : undefined;
+    const output = input.outputSchema ? scriptedOutput(input.outputSchema, collaboration2, scoutReports) : {
       summary: "Scripted Kouro harness completed.",
       ...collaboration2 ? { collaboration: collaboration2 } : {}
     };
@@ -15153,6 +15482,72 @@ class ScriptedHarnessAdapter {
       usage: { quality: "unavailable" }
     };
   }
+}
+function subagentInputFromToolSchema(schema, subagentId, task) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema))
+    return {};
+  const branches = Array.isArray(schema.oneOf) ? schema.oneOf : [];
+  const branch = branches.find((candidate) => isRecord(candidate) && isRecord(candidate.properties) && isRecord(candidate.properties.subagentId) && candidate.properties.subagentId.const === subagentId);
+  if (!isRecord(branch) || !isRecord(branch.properties) || !isRecord(branch.properties.input))
+    return {};
+  const inputSchema = branch.properties.input;
+  if (!isRecord(inputSchema) || !isRecord(inputSchema.properties))
+    return {};
+  const required = new Set(Array.isArray(inputSchema.required) ? inputSchema.required.filter((value) => typeof value === "string") : []);
+  return Object.fromEntries(Object.entries(inputSchema.properties).filter(([name]) => required.has(name)).map(([name, propertySchema]) => [name, scriptedValue(propertySchema, name, task)]));
+}
+function scriptedOutput(schema, collaboration2, scoutReports) {
+  const output = scriptedValue(schema, "output", "scripted task");
+  if (!isRecord(output))
+    return output;
+  const properties = isRecord(schema) && isRecord(schema.properties) ? schema.properties : {};
+  if (scoutReports && Object.prototype.hasOwnProperty.call(properties, "scoutReports"))
+    output.scoutReports = scoutReports;
+  if (collaboration2 && Object.prototype.hasOwnProperty.call(properties, "collaboration"))
+    output.collaboration = collaboration2;
+  return output;
+}
+function scriptedValue(schema, name, task) {
+  if (!isRecord(schema))
+    return "Scripted Kouro harness completed.";
+  if (schema.const !== undefined && isJsonValue(schema.const))
+    return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0 && isJsonValue(schema.enum[0]))
+    return schema.enum[0];
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0)
+    return scriptedValue(schema.oneOf[0], name, task);
+  const type = schema.type;
+  if (type === "object" || schema.properties !== undefined) {
+    const properties = isRecord(schema.properties) ? schema.properties : {};
+    const required = new Set(Array.isArray(schema.required) ? schema.required.filter((value) => typeof value === "string") : Object.keys(properties));
+    return Object.fromEntries(Object.entries(properties).filter(([property]) => required.has(property)).map(([property, propertySchema]) => [
+      property,
+      scriptedValue(propertySchema, property, task)
+    ]));
+  }
+  if (type === "array")
+    return [];
+  if (type === "boolean")
+    return false;
+  if (type === "integer" || type === "number")
+    return typeof schema.minimum === "number" ? schema.minimum : 0;
+  if (type === "string") {
+    if (name === "task")
+      return task;
+    const minimum = typeof schema.minLength === "number" ? schema.minLength : 0;
+    return "Scripted subagent input".padEnd(minimum, "x");
+  }
+  return null;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isJsonValue(value) {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+    return true;
+  if (Array.isArray(value))
+    return value.every(isJsonValue);
+  return isRecord(value) && Object.values(value).every(isJsonValue);
 }
 function wait(delayMs, signal) {
   return new Promise((resolve, reject) => {
@@ -15271,15 +15666,7 @@ class CodexCliHarness {
     if (process.env.CODEX_HOME)
       env.CODEX_HOME = process.env.CODEX_HOME;
     let proc;
-    try {
-      proc = Bun.spawn(args, {
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
-        signal: input.signal,
-        env
-      });
-      const handoff2 = input.context ? `
+    const handoff2 = input.context ? `
 
 [KOURO_CONTEXT_BEGIN]
 ${JSON.stringify(input.context)}
@@ -15287,8 +15674,14 @@ ${JSON.stringify(input.context)}
 [KOURO_HANDOFF_BEGIN]
 ${input.role.prompt}
 [KOURO_HANDOFF_END]` : input.role.prompt;
-      proc.stdin.write(handoff2);
-      proc.stdin.end();
+    try {
+      proc = Bun.spawn(args, {
+        stdin: new Blob([handoff2]),
+        stdout: "pipe",
+        stderr: "pipe",
+        signal: input.signal,
+        env
+      });
     } catch (cause) {
       cleanupCodexTemp(schemaPath, tempDir);
       return {
@@ -15348,6 +15741,7 @@ ${input.role.prompt}
         status: "failed",
         error: `codex timed out after ${timeoutMs}ms`,
         rawOutput: stdout,
+        stderr,
         usage: unavailableUsage(),
         events: [{ type: "log", at: new Date().toISOString(), data: "timed out" }]
       };
@@ -15357,6 +15751,7 @@ ${input.role.prompt}
         error: "cancelled",
         usage: unavailableUsage(),
         rawOutput: stdout,
+        stderr,
         events: [{ type: "log", at: new Date().toISOString(), data: "cancelled" }]
       };
     if (code === undefined)
@@ -15408,6 +15803,7 @@ ${input.role.prompt}
       return {
         status: "failed",
         rawOutput: stdout,
+        stderr,
         error: stderr || `codex exited ${code}`,
         usage,
         events
@@ -15418,12 +15814,13 @@ ${input.role.prompt}
         return {
           status: "failed",
           rawOutput: stdout,
+          stderr,
           error: `invalid-output: ${check.error}`,
           usage,
           events
         };
     }
-    return { status: "succeeded", output: parsed, rawOutput: stdout, usage, events };
+    return { status: "succeeded", output: parsed, rawOutput: stdout, stderr, usage, events };
   }
 }
 
@@ -15486,8 +15883,8 @@ async function capture(args) {
 
 // packages/host/src/adapters/harness/external-cli.ts
 init_src();
-function binary(kind) {
-  return process.env[kind === "claude" ? "KOURO_CLAUDE_BIN" : "KOURO_OPENCODE_BIN"]?.trim() || kind;
+function binary() {
+  return process.env.KOURO_OPENCODE_BIN?.trim() || "opencode";
 }
 async function capture2(args) {
   try {
@@ -15507,9 +15904,9 @@ async function capture2(args) {
   }
 }
 async function inspectExternalCli(kind) {
-  const command = binary(kind);
+  const command = binary();
   const version = await capture2([command, "--version"]);
-  const help = await capture2(kind === "claude" ? [command, "--help"] : [command, "run", "--help"]);
+  const help = await capture2([command, "run", "--help"]);
   const available = version.exitCode === 0 && help.exitCode === 0;
   const supported = { state: available ? "supported" : "unsupported" };
   return {
@@ -15537,7 +15934,7 @@ async function inspectExternalCli(kind) {
     }
   };
 }
-function parseOutput(kind, stdout) {
+function parseOutput(stdout) {
   const candidates = [
     stdout.trim(),
     ...stdout.split(`
@@ -15549,7 +15946,7 @@ function parseOutput(kind, stdout) {
       if (typeof value !== "object" || value === null || Array.isArray(value))
         return value;
       const record = value;
-      for (const key of kind === "claude" ? ["structured_output", "result", "text", "content"] : ["output", "result", "text", "content"]) {
+      for (const key of ["output", "result", "text", "content"]) {
         if (record[key] !== undefined) {
           const selected = record[key];
           if (typeof selected === "string") {
@@ -15591,12 +15988,10 @@ class ExternalCliHarnessAdapter {
         events: []
       };
     const config = input.nativeConfig ?? {};
-    const command = binary(this.kind);
-    const args = this.kind === "claude" ? [command, "-p", "--output-format", "json", "--permission-mode", "plan"] : [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
+    const command = binary();
+    const args = [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
     if (typeof config.model === "string" && config.model)
       args.push("--model", config.model);
-    if (input.outputSchema && this.kind === "claude")
-      args.push("--json-schema", JSON.stringify(input.outputSchema));
     const prompt = input.context ? `[KOURO_CONTEXT_BEGIN]
 ${JSON.stringify(input.context)}
 [KOURO_CONTEXT_END]
@@ -15641,7 +16036,7 @@ ${input.prompt}` : input.prompt;
       };
     if (input.signal?.aborted)
       return { status: "cancelled", error: "cancelled", usage: unavailable(), events: [] };
-    const output = parseOutput(this.kind, result.stdout);
+    const output = parseOutput(result.stdout);
     const events = result.stdout.split(`
 `).filter(Boolean).map((line) => ({ type: "log", at: new Date().toISOString(), data: line }));
     if (result.code !== 0)
@@ -15671,6 +16066,184 @@ ${input.prompt}` : input.prompt;
       events
     };
   }
+}
+
+// packages/host/src/adapters/harness/claude-agent-sdk.ts
+init_src();
+import {
+  query
+} from "@anthropic-ai/claude-agent-sdk";
+var claudeSdkDescriptor = {
+  id: "claude",
+  adapterVersion: "agent-sdk",
+  version: "Claude Agent SDK",
+  availability: "available",
+  capabilities: {
+    "structured-output": { state: "supported" },
+    cancel: { state: "supported" },
+    resume: { state: "unsupported" },
+    reattach: { state: "unsupported" },
+    tools: { state: "conditional", constraints: ["built-in tools are explicitly allowlisted"] },
+    usage: { state: "supported" },
+    "cost-cap": { state: "unsupported" }
+  },
+  nativeConfigSchema: {
+    type: "object",
+    additionalProperties: true,
+    properties: { model: { type: "string" }, permissionMode: { type: "string" } }
+  }
+};
+
+class ClaudeAgentSdkHarnessAdapter {
+  id = "claude";
+  adapterVersion = claudeSdkDescriptor.adapterVersion;
+  capabilities() {
+    return Object.fromEntries(Object.entries(claudeSdkDescriptor.capabilities).map(([name, value]) => [name, value.state]));
+  }
+  async run(input) {
+    const abortController = new AbortController;
+    const abort = () => abortController.abort(input.signal?.reason);
+    if (input.signal?.aborted)
+      abort();
+    else
+      input.signal?.addEventListener("abort", abort, { once: true });
+    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : 120000;
+    const timer = setTimeout(() => abortController.abort(new Error(`Claude SDK timed out after ${timeoutMs}ms`)), timeoutMs);
+    let stderr = "";
+    const messages = [];
+    const context = input.context ? `
+
+[KOURO_CONTEXT]
+${JSON.stringify(input.context)}
+[/KOURO_CONTEXT]` : "";
+    const prompt = `${input.prompt}${context}`;
+    const writable = input.nativeConfig?.permissionMode === "acceptEdits";
+    const tools = writable ? ["Read", "Glob", "Grep", "Edit", "Write"] : ["Read", "Glob", "Grep"];
+    const options = {
+      cwd: input.cwd ?? process.cwd(),
+      ...input.modelId ? { model: input.modelId } : {},
+      ...typeof input.nativeConfig?.model === "string" ? { model: input.nativeConfig.model } : {},
+      abortController,
+      permissionMode: writable ? "acceptEdits" : "dontAsk",
+      tools,
+      disallowedTools: writable ? ["Bash", "NotebookEdit"] : ["Bash", "Edit", "Write", "NotebookEdit"],
+      settings: { permissions: { blockReadsOutsideWorkingDirectories: true } },
+      settingSources: [],
+      maxTurns: 30,
+      stderr: (data) => {
+        stderr += data;
+      },
+      ...input.outputSchema ? {
+        outputFormat: {
+          type: "json_schema",
+          schema: input.outputSchema
+        }
+      } : {}
+    };
+    let resultMessage;
+    try {
+      for await (const message of query({ prompt, options })) {
+        messages.push(message);
+        if (message.type === "result")
+          resultMessage = message;
+      }
+    } catch (cause) {
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", abort);
+      const cancelled = input.signal?.aborted === true;
+      return {
+        status: cancelled ? "cancelled" : "failed",
+        error: cancelled ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        stderr,
+        rawOutput: JSON.stringify(messages),
+        usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
+        events: eventsFrom(messages)
+      };
+    }
+    clearTimeout(timer);
+    input.signal?.removeEventListener("abort", abort);
+    if (abortController.signal.aborted) {
+      return {
+        status: input.signal?.aborted ? "cancelled" : "failed",
+        error: input.signal?.aborted ? "cancelled" : `Claude SDK timed out after ${timeoutMs}ms`,
+        stderr,
+        rawOutput: JSON.stringify(messages),
+        usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
+        events: eventsFrom(messages)
+      };
+    }
+    if (resultMessage?.subtype !== "success") {
+      const errors = resultMessage?.errors ?? [];
+      return {
+        status: "failed",
+        error: errors.join(`
+`) || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`,
+        stderr,
+        rawOutput: JSON.stringify(messages),
+        usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
+        events: eventsFrom(messages)
+      };
+    }
+    const structured = "structured_output" in resultMessage ? resultMessage.structured_output : undefined;
+    const parsed = structured ?? parseJson2(resultMessage.result);
+    if (input.outputSchema) {
+      const validation = validateJsonSchema(parsed, input.outputSchema);
+      if (!validation.valid)
+        return {
+          status: "failed",
+          error: `invalid-output: ${validation.error}`,
+          stderr,
+          rawOutput: JSON.stringify(messages),
+          usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
+          events: eventsFrom(messages)
+        };
+    }
+    return {
+      status: "succeeded",
+      output: parsed,
+      stderr,
+      rawOutput: JSON.stringify(messages),
+      usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
+      events: eventsFrom(messages)
+    };
+  }
+}
+function parseJson2(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+function eventsFrom(messages) {
+  const at = new Date().toISOString();
+  return messages.map((message) => ({ type: "log", at, data: JSON.stringify(message) }));
+}
+function usageFrom(message) {
+  if (!message)
+    return unavailableUsage();
+  const models = Object.values(message.modelUsage ?? {});
+  if (!models.length)
+    return unavailableUsage();
+  const sum = (select) => models.reduce((total, item) => total + select(item), 0);
+  const inputTokens = sum((item) => item.inputTokens + item.cacheReadInputTokens + item.cacheCreationInputTokens);
+  const outputTokens = sum((item) => item.outputTokens);
+  const cost = sum((item) => item.costUSD);
+  const value = (number) => ({
+    value: Number.isFinite(number) ? number : null,
+    quality: Number.isFinite(number) ? "observed" : "unavailable",
+    source: "claude-agent-sdk"
+  });
+  return {
+    inputTokens: value(inputTokens),
+    outputTokens: value(outputTokens),
+    totalTokens: value(inputTokens + outputTokens),
+    cost: {
+      value: Number.isFinite(cost) ? cost : null,
+      quality: Number.isFinite(cost) ? "estimated" : "unavailable",
+      source: "claude-agent-sdk"
+    }
+  };
 }
 
 // packages/host/src/adapters/harness/pi.ts
@@ -16206,13 +16779,22 @@ function simpleHash(value) {
 import { mkdirSync } from "fs";
 
 // packages/host/src/adapters/process/common.ts
-import { rmSync as rmSync2 } from "fs";
+import { mkdtempSync as mkdtempSync2, readFileSync, rmSync as rmSync2 } from "fs";
+import { join as join2 } from "path";
+import { tmpdir as tmpdir2 } from "os";
 async function runEnforcedProcess(input) {
   const operationKey = input.operationKey ?? "probe";
-  let process2;
+  const capture3 = capturePaths();
+  let child;
   try {
-    process2 = Bun.spawn(input.command, { stdout: "pipe", stderr: "pipe" });
+    child = Bun.spawn(input.command, {
+      cwd: input.cwd,
+      stdout: Bun.file(capture3.stdout),
+      stderr: Bun.file(capture3.stderr),
+      detached: true
+    });
   } catch (cause) {
+    rmSync2(capture3.directory, { recursive: true, force: true });
     return {
       operationKey,
       evidence: {
@@ -16228,26 +16810,19 @@ async function runEnforcedProcess(input) {
       }
     };
   }
-  const readPipe = async (pipe) => {
-    if (pipe === undefined || typeof pipe === "number")
-      return new Uint8Array;
-    return new Uint8Array(await new Response(pipe).arrayBuffer());
-  };
-  const stdoutPromise = readPipe(process2.stdout);
-  const stderrPromise = readPipe(process2.stderr);
   let timedOut = false;
   let timer;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(() => {
       timedOut = true;
-      process2.kill();
+      terminateGroup(child, "SIGTERM");
       resolve("timeout");
     }, input.timeoutMs);
   });
   try {
-    const outcome = await Promise.race([process2.exited, timeout]);
-    const exitCode = outcome === "timeout" ? await process2.exited.catch(() => null) : outcome;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    const outcome = await Promise.race([child.exited, timeout]);
+    const exitCode = outcome === "timeout" ? await stopGroup(child) : outcome;
+    const [stdout, stderr] = readCaptured(capture3);
     return {
       operationKey,
       evidence: {
@@ -16263,10 +16838,7 @@ async function runEnforcedProcess(input) {
       }
     };
   } catch (cause) {
-    const [stdout, stderr] = await Promise.all([
-      stdoutPromise.catch(() => new Uint8Array),
-      stderrPromise.catch(() => new Uint8Array)
-    ]);
+    const [stdout, stderr] = readCaptured(capture3);
     return {
       operationKey,
       evidence: {
@@ -16284,7 +16856,119 @@ async function runEnforcedProcess(input) {
   } finally {
     if (timer)
       clearTimeout(timer);
+    rmSync2(capture3.directory, { recursive: true, force: true });
   }
+}
+async function runTrustedCommand(input) {
+  const capture3 = capturePaths();
+  let child;
+  try {
+    child = Bun.spawn(input.argv, {
+      cwd: input.cwd,
+      stdout: Bun.file(capture3.stdout),
+      stderr: Bun.file(capture3.stderr),
+      detached: true
+    });
+  } catch (cause) {
+    rmSync2(capture3.directory, { recursive: true, force: true });
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        spawnError: cause instanceof Error ? cause.message : String(cause),
+        stdout: new Uint8Array,
+        stderr: new Uint8Array,
+        enforcementMode: "trusted-unrestricted"
+      }
+    };
+  }
+  let timedOut = false;
+  let timer;
+  try {
+    const result = await Promise.race([
+      child.exited.then((exitCode) => ({ exitCode: Number(exitCode) })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          terminateGroup(child, "SIGTERM");
+          resolve({ exitCode: null });
+        }, input.timeoutMs);
+      })
+    ]);
+    if (timer)
+      clearTimeout(timer);
+    if (timedOut)
+      await stopGroup(child);
+    const [out, err] = readCaptured(capture3);
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: result.exitCode,
+        signal: null,
+        timedOut,
+        spawnError: null,
+        stdout: out,
+        stderr: err,
+        enforcementMode: "trusted-unrestricted"
+      }
+    };
+  } catch (cause) {
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: null,
+        signal: null,
+        timedOut,
+        spawnError: cause instanceof Error ? cause.message : String(cause),
+        stdout: new Uint8Array,
+        stderr: new Uint8Array,
+        enforcementMode: "trusted-unrestricted"
+      }
+    };
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    rmSync2(capture3.directory, { recursive: true, force: true });
+  }
+}
+function terminateGroup(child, signal) {
+  try {
+    globalThis.process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {}
+  }
+}
+async function stopGroup(child) {
+  const exitCode = await Promise.race([
+    child.exited.then((code) => Number(code), () => null),
+    Bun.sleep(250).then(() => null)
+  ]);
+  terminateGroup(child, "SIGKILL");
+  return exitCode;
+}
+function capturePaths() {
+  const directory = mkdtempSync2(join2(tmpdir2(), "kouro-process-output-"));
+  return { directory, stdout: join2(directory, "stdout"), stderr: join2(directory, "stderr") };
+}
+function readCaptured(capture3) {
+  const read = (path) => {
+    try {
+      return new Uint8Array(readFileSync(path));
+    } catch {
+      return new Uint8Array;
+    }
+  };
+  return [read(capture3.stdout), read(capture3.stderr)];
 }
 async function probeEnforcedProcess(spawn, name) {
   const workspace = await Bun.$`mktemp -d /tmp/kouro-${name}-probe.XXXXXX`.text().catch(() => "").then((value) => value.trim());
@@ -16328,6 +17012,27 @@ class DarwinSandboxProcessAdapter {
     return this.spawn(input.workspaceDir, ["/usr/bin/printf", `Kouro M1 command
 `], input.timeoutMs, input.operationKey);
   }
+  async executeCommand(input) {
+    const executable = Bun.which(input.executable) ?? input.executable;
+    const argv = [executable, ...input.args];
+    if (input.executionMode === "trusted-unrestricted")
+      return runTrustedCommand({
+        argv,
+        cwd: input.workspaceDir,
+        timeoutMs: input.timeoutMs,
+        operationKey: input.operationKey
+      });
+    const probe = await this.probe();
+    if (!probe.available)
+      throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
+    return runEnforcedProcess({
+      command: [this.sandboxExecPath, "-p", this.profile(input.workspaceDir, executable), ...argv],
+      argv,
+      cwd: input.workspaceDir,
+      timeoutMs: input.timeoutMs,
+      operationKey: input.operationKey
+    });
+  }
   async spawn(workspaceDir, argv, timeoutMs, operationKey = "probe") {
     return runEnforcedProcess({
       command: [this.sandboxExecPath, "-p", this.profile(workspaceDir), ...argv],
@@ -16337,12 +17042,25 @@ class DarwinSandboxProcessAdapter {
       operationKey
     });
   }
-  profile(workspaceDir) {
+  profile(workspaceDir, executable = "/usr/bin/printf") {
     const path = workspaceDir.replaceAll("\\", "\\\\").replaceAll('"', "\\\"");
+    const execPath = executable.replaceAll("\\", "\\\\").replaceAll('"', "\\\"");
+    const homeBun = process.env.HOME ? escapeSandboxPath(`${process.env.HOME}/.bun`) : undefined;
     return [
       "(version 1)",
       "(deny default)",
-      '(allow process-exec (literal "/usr/bin/printf"))',
+      `(allow process-exec (literal "${execPath}"))`,
+      `(allow file-read* (subpath "${execPath.slice(0, execPath.lastIndexOf("/"))}"))`,
+      '(allow process-exec (subpath "/usr/bin"))',
+      '(allow process-exec (subpath "/bin"))',
+      '(allow file-read* (subpath "/opt/homebrew"))',
+      '(allow file-read* (subpath "/usr/local"))',
+      ...homeBun ? [
+        `(allow file-read* (subpath "${homeBun}"))`,
+        `(allow process-exec (subpath "${homeBun}/bin"))`
+      ] : [],
+      '(allow process-exec (subpath "/opt/homebrew"))',
+      '(allow process-exec (subpath "/usr/local"))',
       "(allow process-fork)",
       "(allow signal (target same-sandbox))",
       "(allow file-read-metadata)",
@@ -16356,10 +17074,14 @@ class DarwinSandboxProcessAdapter {
       '(allow file-read* (literal "/dev/random"))',
       '(allow file-read* (literal "/dev/urandom"))',
       `(allow file-read* (subpath "${path}"))`,
-      `(allow file-write* (subpath "${path}"))`
+      `(allow file-write* (subpath "${path}"))`,
+      `(allow process-exec (subpath "${path}"))`
     ].join(`
 `);
   }
+}
+function escapeSandboxPath(path) {
+  return path.replaceAll("\\", "\\\\").replaceAll('"', "\\\"");
 }
 
 // packages/host/src/adapters/process/bwrap.ts
@@ -16384,6 +17106,20 @@ class BubblewrapProcessAdapter {
     mkdirSync2(input.workspaceDir, { recursive: true, mode: 448 });
     return this.spawn(input.workspaceDir, ["/usr/bin/printf", "Kouro M1 command\\n"], input.timeoutMs, input.operationKey);
   }
+  async executeCommand(input) {
+    const argv = [Bun.which(input.executable) ?? input.executable, ...input.args];
+    if (input.executionMode === "trusted-unrestricted")
+      return runTrustedCommand({
+        argv,
+        cwd: input.workspaceDir,
+        timeoutMs: input.timeoutMs,
+        operationKey: input.operationKey
+      });
+    const probe = await this.probe();
+    if (!probe.available)
+      throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
+    return this.spawn(input.workspaceDir, argv, input.timeoutMs, input.operationKey);
+  }
   async spawn(workspaceDir, argv, timeoutMs, operationKey = "probe") {
     return runEnforcedProcess({
       command: this.bwrapCommand(workspaceDir, argv),
@@ -16405,6 +17141,13 @@ class BubblewrapProcessAdapter {
       "--ro-bind",
       "/bin",
       "/bin",
+      "--ro-bind-try",
+      "/opt/homebrew",
+      "/opt/homebrew",
+      "--ro-bind-try",
+      "/usr/local",
+      "/usr/local",
+      ...process.env.HOME && process.env.HOME.startsWith("/Users/") ? ["--ro-bind-try", `${process.env.HOME}/.bun`, `${process.env.HOME}/.bun`] : [],
       "--ro-bind",
       "/lib",
       "/lib",
@@ -16455,7 +17198,7 @@ init_src();
 import { Database } from "bun:sqlite";
 import { createHash as createHash3 } from "crypto";
 import { mkdirSync as mkdirSync4 } from "fs";
-import { join as join3 } from "path";
+import { join as join4 } from "path";
 
 // packages/host/src/storage/schema.ts
 function migrate(db) {
@@ -16706,6 +17449,71 @@ function migrate(db) {
       message_id TEXT PRIMARY KEY NOT NULL REFERENCES collaboration_messages(id),
       batch_id TEXT NOT NULL REFERENCES collaboration_batches(id)
     );
+
+    CREATE TABLE IF NOT EXISTS scout_requests (
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      request_id TEXT NOT NULL,
+      parent_invocation_id TEXT NOT NULL,
+      parent_attempt_id TEXT NOT NULL,
+      scout_id TEXT NOT NULL,
+      question TEXT NOT NULL,
+      input_json TEXT NOT NULL,
+      request_digest TEXT NOT NULL,
+      input_digest TEXT NOT NULL DEFAULT '',
+      child_definition_id TEXT NOT NULL DEFAULT '',
+      child_agent_id TEXT NOT NULL DEFAULT '',
+      effective_harness TEXT,
+      model_id TEXT,
+      workspace_id TEXT,
+      deadline_at TEXT,
+      dispatch_id TEXT,
+      usage_json TEXT NOT NULL DEFAULT '{}',
+      ordinal INTEGER NOT NULL,
+      optional INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL,
+      result_json TEXT,
+      result_artifact_id TEXT,
+      result_digest TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, parent_attempt_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS scout_requests_parent_idx
+      ON scout_requests(run_id, parent_attempt_id, state);
+    CREATE TABLE IF NOT EXISTS scout_deliveries (
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      parent_attempt_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      planner_attempt_id TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, parent_attempt_id, request_id, planner_attempt_id),
+      FOREIGN KEY(run_id, parent_attempt_id, request_id)
+        REFERENCES scout_requests(run_id, parent_attempt_id, request_id)
+    );
+    CREATE TABLE IF NOT EXISTS delivery_actions (
+      id TEXT PRIMARY KEY NOT NULL,
+      request_key TEXT NOT NULL UNIQUE,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      workspace_id TEXT NOT NULL,
+      invocation_id TEXT,
+      base_tree TEXT NOT NULL,
+      result_tree TEXT NOT NULL,
+      patch_digest TEXT NOT NULL,
+      changed_paths_json TEXT NOT NULL,
+      message TEXT NOT NULL,
+      validation_evidence_json TEXT NOT NULL DEFAULT '[]',
+      review_evidence_json TEXT NOT NULL DEFAULT '[]',
+      action_digest TEXT NOT NULL,
+      operation_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      actor TEXT,
+      commit_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS delivery_actions_run_idx ON delivery_actions(run_id, created_at);
     CREATE TABLE IF NOT EXISTS checkpoints (
       id TEXT PRIMARY KEY NOT NULL,
       source_run_id TEXT NOT NULL REFERENCES runs(id),
@@ -16737,11 +17545,73 @@ function migrate(db) {
   for (const statement of [
     "ALTER TABLE evaluation_evidence ADD COLUMN experiment_id TEXT",
     "ALTER TABLE evaluation_evidence ADD COLUMN cell_key TEXT",
-    "ALTER TABLE experiments ADD COLUMN repository_path TEXT"
+    "ALTER TABLE experiments ADD COLUMN repository_path TEXT",
+    "ALTER TABLE delivery_actions ADD COLUMN invocation_id TEXT",
+    "ALTER TABLE delivery_actions ADD COLUMN validation_evidence_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE delivery_actions ADD COLUMN review_evidence_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE scout_requests ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE scout_requests ADD COLUMN child_definition_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE scout_requests ADD COLUMN child_agent_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE scout_requests ADD COLUMN effective_harness TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN model_id TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN workspace_id TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN deadline_at TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN dispatch_id TEXT",
+    "ALTER TABLE scout_requests ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE scout_requests ADD COLUMN result_digest TEXT"
   ]) {
     try {
       db.exec(statement);
     } catch {}
+  }
+  const scoutColumns = db.query("PRAGMA table_info(scout_requests)").all();
+  const deliveryColumns = db.query("PRAGMA table_info(scout_deliveries)").all();
+  const scoutPrimaryKey = scoutColumns.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk).map((column) => column.name);
+  if (scoutColumns.length > 0 && (!scoutColumns.some((column) => column.name === "parent_attempt_id") || JSON.stringify(scoutPrimaryKey) !== JSON.stringify(["run_id", "parent_attempt_id", "request_id"]))) {
+    db.exec(`
+      ALTER TABLE scout_deliveries RENAME TO scout_deliveries_legacy;
+      ALTER TABLE scout_requests RENAME TO scout_requests_legacy;
+      CREATE TABLE scout_requests (
+        run_id TEXT NOT NULL REFERENCES runs(id), request_id TEXT NOT NULL,
+        parent_invocation_id TEXT NOT NULL, parent_attempt_id TEXT NOT NULL,
+        scout_id TEXT NOT NULL, question TEXT NOT NULL, input_json TEXT NOT NULL,
+        request_digest TEXT NOT NULL, input_digest TEXT NOT NULL DEFAULT '',
+        child_definition_id TEXT NOT NULL DEFAULT '', child_agent_id TEXT NOT NULL DEFAULT '',
+        effective_harness TEXT, model_id TEXT, workspace_id TEXT, deadline_at TEXT,
+        dispatch_id TEXT, usage_json TEXT NOT NULL DEFAULT '{}', ordinal INTEGER NOT NULL,
+        optional INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, result_json TEXT,
+        result_artifact_id TEXT, result_digest TEXT, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, parent_attempt_id, request_id)
+      );
+      INSERT INTO scout_requests(
+        run_id, request_id, parent_invocation_id, parent_attempt_id, scout_id, question,
+        input_json, request_digest, ordinal, optional, state, result_json, result_artifact_id,
+        error, created_at, updated_at
+      )
+        SELECT run_id, request_id, parent_invocation_id, parent_attempt_id, scout_id, question,
+          input_json, request_digest, ordinal, optional, state, result_json, result_artifact_id,
+          error, created_at, updated_at
+        FROM scout_requests_legacy;
+      CREATE INDEX scout_requests_parent_idx ON scout_requests(run_id, parent_attempt_id, state);
+      CREATE TABLE scout_deliveries (
+        run_id TEXT NOT NULL REFERENCES runs(id), parent_attempt_id TEXT NOT NULL,
+        request_id TEXT NOT NULL, planner_attempt_id TEXT NOT NULL, manifest_json TEXT NOT NULL,
+        delivered_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, parent_attempt_id, request_id, planner_attempt_id),
+        FOREIGN KEY(run_id, parent_attempt_id, request_id)
+          REFERENCES scout_requests(run_id, parent_attempt_id, request_id)
+      );
+      INSERT INTO scout_deliveries(run_id,parent_attempt_id,request_id,planner_attempt_id,manifest_json,delivered_at)
+        SELECT d.run_id, r.parent_attempt_id, d.request_id, d.planner_attempt_id,
+          d.manifest_json, d.delivered_at
+        FROM scout_deliveries_legacy d
+        JOIN scout_requests r ON r.run_id=d.run_id AND r.request_id=d.request_id;
+      DROP TABLE scout_deliveries_legacy;
+      DROP TABLE scout_requests_legacy;
+    `);
+  } else if (deliveryColumns.length > 0 && !deliveryColumns.some((column) => column.name === "parent_attempt_id")) {
+    throw new Error("scout delivery schema is inconsistent with scout request schema");
   }
 }
 
@@ -16753,24 +17623,24 @@ import {
   fsyncSync,
   mkdirSync as mkdirSync3,
   openSync,
-  readFileSync,
+  readFileSync as readFileSync2,
   renameSync,
   writeFileSync
 } from "fs";
-import { dirname, join as join2 } from "path";
+import { dirname, join as join3 } from "path";
 class BlobStore {
   root;
   constructor(root) {
     this.root = root;
-    mkdirSync3(join2(root, "blobs"), { recursive: true, mode: 448 });
-    mkdirSync3(join2(root, "tmp"), { recursive: true, mode: 448 });
+    mkdirSync3(join3(root, "blobs"), { recursive: true, mode: 448 });
+    mkdirSync3(join3(root, "tmp"), { recursive: true, mode: 448 });
   }
   put(runId, bytes, mediaType = "application/octet-stream") {
     const digest = createHash2("sha256").update(bytes).digest("hex");
-    const destination = join2(this.root, "blobs", digest.slice(0, 2), digest);
+    const destination = join3(this.root, "blobs", digest.slice(0, 2), digest);
     mkdirSync3(dirname(destination), { recursive: true, mode: 448 });
     if (!existsSync(destination)) {
-      const temporary = join2(this.root, "tmp", `${id("blob")}.partial`);
+      const temporary = join3(this.root, "tmp", `${id("blob")}.partial`);
       writeFileSync(temporary, bytes, { mode: 384 });
       const fd = openSync(temporary, "r");
       try {
@@ -16798,13 +17668,13 @@ class BlobStore {
   pathForDigest(digest) {
     if (!/^[a-f0-9]{64}$/.test(digest))
       throw new Error("Invalid artifact digest");
-    return join2(this.root, "blobs", digest.slice(0, 2), digest);
+    return join3(this.root, "blobs", digest.slice(0, 2), digest);
   }
   read(ref) {
     if (!ref.digest)
       throw new Error("Artifact has no content digest");
     const path = this.pathForDigest(ref.digest);
-    const bytes = new Uint8Array(readFileSync(path));
+    const bytes = new Uint8Array(readFileSync2(path));
     const actual = createHash2("sha256").update(bytes).digest("hex");
     if (actual !== ref.digest)
       throw new Error("Artifact checksum mismatch");
@@ -16863,6 +17733,30 @@ class OwnerLock {
 }
 
 // packages/host/src/storage/journal.ts
+function toDeliveryAction(row) {
+  return {
+    id: row.id,
+    requestKey: row.request_key,
+    runId: row.run_id,
+    workspaceId: row.workspace_id,
+    ...row.invocation_id === null ? {} : { invocationId: row.invocation_id },
+    baseTree: row.base_tree,
+    resultTree: row.result_tree,
+    patchDigest: row.patch_digest,
+    changedPaths: parseJson(row.changed_paths_json),
+    message: row.message,
+    ...parseJson(row.validation_evidence_json).length ? { validationEvidence: parseJson(row.validation_evidence_json) } : {},
+    ...parseJson(row.review_evidence_json).length ? { reviewEvidence: parseJson(row.review_evidence_json) } : {},
+    actionDigest: row.action_digest,
+    operationKey: row.operation_key,
+    status: row.status,
+    ...row.actor === null ? {} : { actor: row.actor },
+    ...row.commit_json === null ? {} : { commit: parseJson(row.commit_json) },
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
 class Journal {
   db;
   blobs;
@@ -16873,11 +17767,11 @@ class Journal {
   constructor(options) {
     this.dataDir = options.dataDir;
     mkdirSync4(options.dataDir, { recursive: true, mode: 448 });
-    this.owner = new OwnerLock(join3(options.dataDir, "owner.lock"));
+    this.owner = new OwnerLock(join4(options.dataDir, "owner.lock"));
     if (options.requireOwner !== false)
       this.owner.acquire();
     try {
-      this.db = new Database(join3(options.dataDir, "kouro.sqlite"));
+      this.db = new Database(join4(options.dataDir, "kouro.sqlite"));
       migrate(this.db);
       this.blobs = new BlobStore(options.dataDir);
     } catch (cause) {
@@ -17190,7 +18084,9 @@ class Journal {
     const requestDigest = createHash3("sha256").update(canonicalize({
       workflowId: input.workflowId,
       bundleDigest: input.bundle.digest,
-      input: input.input ?? {}
+      input: input.input ?? {},
+      executionProfile: input.executionProfile ?? null,
+      workspace: input.workspace ?? null
     })).digest("hex");
     const prior = this.db.query("SELECT result_json, request_digest FROM command_receipts WHERE idempotency_key = ?1").get(input.idempotencyKey);
     if (prior) {
@@ -17223,6 +18119,85 @@ class Journal {
   }
   updateRunInput(runId, input) {
     this.db.query("UPDATE runs SET input_json = ?, updated_at = ? WHERE id = ?").run(json(input), now(), runId);
+  }
+  createDeliveryAction(input) {
+    if (!input.requestKey.trim())
+      throw new Error("delivery request key is required");
+    const base = {
+      runId: input.runId,
+      workspaceId: input.workspaceId,
+      baseTree: input.baseTree,
+      resultTree: input.resultTree,
+      patchDigest: input.patchDigest,
+      changedPaths: input.changedPaths,
+      message: input.message,
+      invocationId: input.invocationId ?? null,
+      validationEvidence: input.validationEvidence ?? [],
+      reviewEvidence: input.reviewEvidence ?? []
+    };
+    const actionDigest = `sha256:${createHash3("sha256").update(canonicalize(base)).digest("hex")}`;
+    return this.tx(() => {
+      const prior = this.db.query("SELECT * FROM delivery_actions WHERE request_key=?1").get(input.requestKey);
+      if (prior) {
+        if (prior.action_digest !== actionDigest)
+          throw new Error("delivery request key payload conflict");
+        return toDeliveryAction(prior);
+      }
+      const timestamp = now();
+      const action = {
+        id: id("delivery"),
+        requestKey: input.requestKey,
+        runId: input.runId,
+        workspaceId: input.workspaceId,
+        ...input.invocationId ? { invocationId: input.invocationId } : {},
+        baseTree: input.baseTree,
+        resultTree: input.resultTree,
+        patchDigest: input.patchDigest,
+        changedPaths: input.changedPaths,
+        message: input.message,
+        ...input.validationEvidence?.length ? { validationEvidence: input.validationEvidence } : {},
+        ...input.reviewEvidence?.length ? { reviewEvidence: input.reviewEvidence } : {},
+        actionDigest,
+        operationKey: `delivery/${input.runId}/${input.requestKey}`,
+        status: "pending",
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      this.db.query("INSERT INTO delivery_actions(id,request_key,run_id,workspace_id,invocation_id,base_tree,result_tree,patch_digest,changed_paths_json,message,validation_evidence_json,review_evidence_json,action_digest,operation_key,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'pending',?15,?15)").run(action.id, action.requestKey, action.runId, action.workspaceId, action.invocationId ?? null, action.baseTree, action.resultTree, action.patchDigest, json(action.changedPaths), action.message, json(action.validationEvidence ?? []), json(action.reviewEvidence ?? []), action.actionDigest, action.operationKey, timestamp);
+      return action;
+    });
+  }
+  getDeliveryAction(actionId) {
+    const row = this.db.query("SELECT * FROM delivery_actions WHERE id=?1").get(actionId);
+    return row ? toDeliveryAction(row) : undefined;
+  }
+  decideDeliveryAction(input) {
+    if (!input.actor.trim())
+      throw new Error("delivery approval actor is required");
+    return this.tx(() => {
+      const action = this.getDeliveryAction(input.actionId);
+      if (!action)
+        throw new Error("delivery action not found");
+      if (action.status === "committed")
+        throw new Error("delivery action is already committed");
+      if (action.status !== "pending" && action.status !== input.decision)
+        throw new Error(`delivery action is ${action.status}`);
+      this.db.query("UPDATE delivery_actions SET status=?1, actor=?2, updated_at=?3 WHERE id=?4").run(input.decision, input.actor, now(), input.actionId);
+      return this.getDeliveryAction(input.actionId);
+    });
+  }
+  completeDeliveryAction(actionId, commit) {
+    return this.tx(() => {
+      const action = this.getDeliveryAction(actionId);
+      if (!action)
+        throw new Error("delivery action not found");
+      if (action.status === "committed")
+        return action;
+      if (action.status !== "approved")
+        throw new Error("delivery action is not approved");
+      this.db.query("UPDATE delivery_actions SET status='committed', commit_json=?1, updated_at=?2 WHERE id=?3").run(json(commit), now(), actionId);
+      return this.getDeliveryAction(actionId);
+    });
   }
   materializeInheritedPrefix(childRunId, sourceRunId, sourceInvocationIds, pendingInvocationIds = [], carriedCounters = {}) {
     const source = this.getView(sourceRunId);
@@ -17492,10 +18467,14 @@ class Journal {
   runSummary(row) {
     const input = parseJson(row.input_json);
     const profile = input.__kouroExecutionProfile;
+    const task = typeof input.task === "string" ? input.task : undefined;
+    const workItem = input.workItem;
     const { input_json: _input, ...summary } = row;
     return {
       ...summary,
-      ...profile === "scripted" || profile === "codex-readonly" ? { executionProfile: profile } : {}
+      ...profile === "scripted" || profile === "codex-readonly" || profile === "codex-workspace-write" || profile === "claude-readonly" || profile === "claude-workspace-write" || profile === "pi-readonly" ? { executionProfile: profile } : {},
+      ...task ? { task } : {},
+      ...workItem && typeof workItem === "object" ? { workItem } : {}
     };
   }
   getView(runId) {
@@ -17947,7 +18926,7 @@ class CollaborationGateway {
   constructor(journal) {
     this.journal = journal;
   }
-  tools(grant) {
+  tools(grant, subagents, subagent) {
     return {
       participantId: grant.participantId,
       send_message: (input) => this.send(grant.grantId, {
@@ -17973,8 +18952,18 @@ class CollaborationGateway {
         attemptId: grant.attemptId,
         maxMessages: Math.max(1, Math.min(64, input.maxMessages ?? 8)),
         idleDeadline: input.idleDeadline ?? new Date().toISOString()
-      })
+      }),
+      ...subagents && subagent ? {
+        subagent: (input) => subagent(input)
+      } : {}
     };
+  }
+  attemptInvocation(runId, attemptId) {
+    const view = this.journal.getView(runId);
+    const attempt = view?.state.attempts[attemptId];
+    if (!attempt)
+      throw new Error("attempt is not registered");
+    return attempt.invocationId;
   }
   ensureBlackboardChannel(runId, channel) {
     const exists = this.journal.db.query("SELECT 1 FROM collaboration_channels WHERE run_id=?1 AND name=?2").get(runId, channel);
@@ -18288,6 +19277,485 @@ async function prepareAgentHandoff(input) {
   return { handoff: handoff2, session };
 }
 
+// packages/host/src/admission.ts
+init_src();
+var HOST_OWNED_INPUTS = new Set([
+  "__kouroExecutionProfile",
+  "__kouroWorkspace",
+  "__kouroFork",
+  "__kouroAllowUnrestrictedCommands"
+]);
+function normalizeWorkItemInput(input) {
+  const rawWorkItem = input.workItem;
+  const rawTask = input.task;
+  const rawTaskText = typeof rawTask === "string" ? rawTask.trim() : undefined;
+  if (rawTask !== undefined && typeof rawTask !== "string")
+    throw new Error("task input must be a string");
+  if (rawTaskText !== undefined && !rawTaskText)
+    throw new Error("task input must be nonblank");
+  let workItem;
+  if (rawWorkItem !== undefined) {
+    if (!isRecord2(rawWorkItem))
+      throw new Error("workItem input must be an object");
+    if (rawWorkItem.version !== 1)
+      throw new Error("workItem.version must be 1");
+    if (typeof rawWorkItem.task !== "string" || !rawWorkItem.task.trim())
+      throw new Error("workItem.task must be nonblank");
+    const workTask = rawWorkItem.task.trim();
+    if (rawTaskText !== undefined && rawTaskText !== workTask)
+      throw new Error("task and workItem.task conflict");
+    const rawTicket = rawWorkItem.ticket;
+    if (rawTicket !== undefined) {
+      if (!isRecord2(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
+        throw new Error("workItem.ticket.reference must be nonblank");
+      if (!isRecord2(rawTicket.snapshot))
+        throw new Error("ticket-only admission is unsupported without an immutable snapshot");
+      validateTicketSnapshot(rawTicket.snapshot);
+    }
+    workItem = {
+      version: 1,
+      task: workTask,
+      ...rawTicket ? { ticket: rawTicket } : {},
+      ...optionalString(rawWorkItem.title, "workItem.title"),
+      ...optionalString(rawWorkItem.description, "workItem.description"),
+      ...optionalString(rawWorkItem.source, "workItem.source")
+    };
+  } else if (rawTaskText !== undefined) {
+    workItem = { version: 1, task: rawTaskText };
+  }
+  if (input.ticket !== undefined)
+    throw new Error("ticket admission requires workItem.ticket with an immutable snapshot");
+  return workItem;
+}
+function normalizeAdmissionInput(bundle, input) {
+  const source = input ? { ...input } : {};
+  for (const key of HOST_OWNED_INPUTS)
+    if (key in source)
+      throw new Error(`input field ${key} is host-owned`);
+  const workItem = normalizeWorkItemInput(source);
+  const normalized = { ...source };
+  if (workItem) {
+    normalized.task = workItem.task;
+    normalized.workItem = workItem;
+  } else {
+    delete normalized.task;
+    delete normalized.workItem;
+  }
+  validateRootInputs(bundle, normalized);
+  return normalized;
+}
+function validateRootInputs(bundle, input) {
+  const root = bundle.definitions[bundle.rootDefinitionId];
+  if (!root)
+    throw new Error(`Bundle root definition ${bundle.rootDefinitionId} is unavailable`);
+  for (const port2 of root.inputPorts)
+    validatePortValue(bundle, port2, input[port2.name]);
+}
+function validatePortValue(bundle, port2, value) {
+  if (value === undefined) {
+    if (port2.required && port2.defaultValue === undefined)
+      throw new Error(`Missing required workflow input ${port2.name}`);
+    return;
+  }
+  const schema = bundle.schemas[port2.schemaDigest];
+  if (schema === undefined)
+    throw new Error(`Missing input schema ${port2.schemaDigest}`);
+  const validation = validateJsonSchema(value, schema);
+  if (!validation.valid)
+    throw new Error(`Invalid workflow input ${port2.name}: ${validation.error}`);
+}
+function validateTicketSnapshot(value) {
+  if (value.version !== 1)
+    throw new Error("ticket snapshot version must be 1");
+  for (const [key, label] of [
+    ["provider", "ticket snapshot provider"],
+    ["externalId", "ticket snapshot external ID"],
+    ["title", "ticket snapshot title"],
+    ["body", "ticket snapshot body"]
+  ])
+    if (typeof value[key] !== "string")
+      throw new Error(`${label} is required`);
+  if (typeof value.revision !== "string" && typeof value.capturedAt !== "string")
+    throw new Error("ticket snapshot requires revision or capturedAt");
+}
+function optionalString(value, field) {
+  if (value === undefined)
+    return {};
+  if (typeof value !== "string")
+    throw new Error(`${field} must be a string`);
+  return { [field.slice(field.indexOf(".") + 1)]: value };
+}
+function isRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// packages/host/src/scouting/gateway.ts
+init_src();
+import { createHash as createHash4 } from "crypto";
+var MAX_TOTAL_REQUESTS = 4;
+var MAX_RESULT_BYTES = 64 * 1024;
+
+class ScoutGateway {
+  journal;
+  inFlight = new Map;
+  constructor(journal) {
+    this.journal = journal;
+  }
+  request(input) {
+    if (!input.requestId.trim())
+      throw new Error("scout request ID is required");
+    if (new TextEncoder().encode(input.requestId).byteLength > 128)
+      throw new Error("scout request ID exceeds 128 bytes");
+    if (!input.question.trim())
+      throw new Error("scout question is required");
+    if (collaborationBodyBytes(input.input) > MAX_RESULT_BYTES)
+      throw new Error("scout request exceeds input byte limit");
+    const requestDigest = canonicalize({
+      parentInvocationId: input.parentInvocationId,
+      parentAttemptId: input.parentAttemptId,
+      scoutId: input.scoutId,
+      input: input.input
+    });
+    return this.journal.transaction(() => {
+      const view = this.journal.getView(input.runId);
+      if (!view)
+        throw new Error(`Run not found: ${input.runId}`);
+      const parent = view.state.invocations[input.parentInvocationId];
+      const attempt = view.state.attempts[input.parentAttemptId];
+      if (!parent || !attempt || attempt.invocationId !== parent.id || attempt.status !== "running")
+        throw new Error("scout request parent attempt is not active");
+      const parentScope = view.state.scopes[parent.scopeId];
+      const parentNode = parentScope ? view.bundle.definitions[parentScope.definitionId]?.nodes.find((candidate) => candidate.id === parent.nodeId) : undefined;
+      if (parentNode?.kind !== "agent")
+        throw new Error("only an agent invocation may start a subagent");
+      const definition = view.bundle.definitions[parent.scopeId === view.state.rootScopeId ? view.bundle.rootDefinitionId : view.state.scopes[parent.scopeId]?.definitionId ?? view.bundle.rootDefinitionId];
+      const scout = definition?.scouts?.find((candidate) => candidate.id === input.scoutId);
+      if (!scout)
+        throw new Error(`subagent ${input.scoutId} is not declared`);
+      const authorizedSubagents = parentNode.uses ?? (definition?.scouts ?? []).map((item) => item.id);
+      if (input.enforceAuthorization && !authorizedSubagents.includes(input.scoutId))
+        throw new Error(`subagent ${input.scoutId} is not authorized for agent ${parentNode.id}`);
+      const prior = this.row(input.runId, input.parentAttemptId, input.requestId);
+      if (prior) {
+        if (prior.request_digest !== digest(requestDigest))
+          throw new Error("scout request ID payload conflict");
+        return toRequest(prior);
+      }
+      const child = view.bundle.definitions[scout.definitionId];
+      if (!child)
+        throw new Error(`scout definition ${scout.definitionId} is unavailable`);
+      const childAgent = child.nodes.find((candidate) => candidate.kind === "agent");
+      if (!childAgent || childAgent.kind !== "agent")
+        throw new Error(`scout definition ${scout.definitionId} has no agent identity`);
+      validateInputs(view.bundle.schemas, child.inputPorts, input.input);
+      const runInput = parseJson(this.journal.getRunRow(input.runId)?.input_json ?? "{}");
+      const configuredProfile = runInput.__kouroExecutionProfile === "codex-readonly" || runInput.__kouroExecutionProfile === "pi-readonly" ? runInput.__kouroExecutionProfile : "scripted";
+      const workspace = runInput.__kouroWorkspace;
+      const workspaceId = workspace && typeof workspace.workspaceId === "string" ? workspace.workspaceId : undefined;
+      const timeoutMs = Math.min(parentNode.timeoutMs, childAgent.timeoutMs, 60000);
+      const deadlineAt = new Date(Date.now() + timeoutMs).toISOString();
+      const spent = this.journal.db.query("SELECT COUNT(*) as count FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND scout_id=?3").get(input.runId, input.parentAttemptId, input.scoutId);
+      if (spent.count >= scout.maxInvocations)
+        throw new Error(`scout ${input.scoutId} budget exceeded`);
+      const total = this.journal.db.query("SELECT COUNT(*) as count FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2").get(input.runId, input.parentAttemptId);
+      const policy = parentNode.scoutPolicy ?? {
+        maxRequests: MAX_TOTAL_REQUESTS,
+        maxConcurrent: 2
+      };
+      if (total.count >= policy.maxRequests)
+        throw new Error("planning-stage scout budget exceeded");
+      const concurrent = this.journal.db.query("SELECT COUNT(*) as count FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND state IN ('accepted','running')").get(input.runId, input.parentAttemptId);
+      const scoutConcurrent = this.journal.db.query("SELECT COUNT(*) as count FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND scout_id=?3 AND state IN ('accepted','running')").get(input.runId, input.parentAttemptId, input.scoutId);
+      if (concurrent.count >= policy.maxConcurrent)
+        throw new Error("planning-stage scout concurrency limit exceeded");
+      if (scoutConcurrent.count >= scout.maxConcurrent)
+        throw new Error(`scout ${input.scoutId} concurrency limit exceeded`);
+      this.journal.db.query("INSERT OR IGNORE INTO collaboration_usage(run_id,started_at) VALUES (?1,?2)").run(input.runId, now());
+      const usage = this.journal.db.query("SELECT invocations FROM collaboration_usage WHERE run_id=?1").get(input.runId);
+      if (usage.invocations >= view.bundle.limits.maxInvocations)
+        throw new Error("run invocation budget exceeded by scout request");
+      const timestamp = now();
+      this.journal.db.query("INSERT INTO scout_requests(run_id,request_id,parent_invocation_id,parent_attempt_id,scout_id,question,input_json,request_digest,input_digest,child_definition_id,child_agent_id,effective_harness,model_id,workspace_id,deadline_at,usage_json,ordinal,optional,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'{}',?16,?17,'accepted',?18,?18)").run(input.runId, input.requestId, input.parentInvocationId, input.parentAttemptId, input.scoutId, input.question, json(input.input), digest(requestDigest), digest(canonicalize(input.input)), scout.definitionId, childAgent.id, childAgent.harness ?? parentNode.harness ?? configuredProfile, childAgent.modelId ?? parentNode.modelId ?? null, workspaceId ?? null, deadlineAt, total.count, scout.optional ? 1 : 0, timestamp);
+      this.journal.db.query("UPDATE collaboration_usage SET invocations=invocations+1 WHERE run_id=?1").run(input.runId);
+      return toRequest(this.row(input.runId, input.parentAttemptId, input.requestId));
+    });
+  }
+  async invoke(input) {
+    const key = `${input.runId}:${input.parentAttemptId}:${input.requestId}`;
+    const existing = this.inFlight.get(key);
+    if (existing)
+      return existing;
+    const promise = (async () => {
+      const question = typeof input.input.question === "string" ? input.input.question : "Scout repository evidence";
+      try {
+        const accepted = this.request({
+          runId: input.runId,
+          parentInvocationId: input.parentInvocationId,
+          parentAttemptId: input.parentAttemptId,
+          requestId: input.requestId,
+          scoutId: input.scoutId,
+          question,
+          input: input.input,
+          enforceAuthorization: true
+        });
+        if (accepted.state === "succeeded")
+          return succeededResult(accepted);
+        if (["failed", "unknown", "cancelled"].includes(accepted.state))
+          return failedResult(accepted);
+        this.claim(input.runId, input.parentAttemptId, input.requestId);
+        const result = await input.runner(accepted, input.signal);
+        const completed = this.complete(input.runId, input.parentAttemptId, input.requestId, result);
+        this.deliver(input.runId, input.parentAttemptId, input.requestId);
+        return succeededResult(completed);
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        const current = this.row(input.runId, input.parentAttemptId, input.requestId);
+        if (current && ["accepted", "running"].includes(current.state))
+          return failedResult(input.signal?.aborted ? this.cancel(input.runId, input.parentAttemptId, input.requestId, message) : this.fail(input.runId, input.parentAttemptId, input.requestId, message));
+        return {
+          requestId: input.requestId,
+          scoutId: input.scoutId,
+          state: "failed",
+          error: { code: "SCOUT_REQUEST_REJECTED", message }
+        };
+      }
+    })();
+    this.inFlight.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+  acceptanceError(runId, parentAttemptId, uses) {
+    for (const scoutId of uses) {
+      const rows = this.journal.db.query("SELECT state, optional, error FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND scout_id=?3 ORDER BY ordinal").all(runId, parentAttemptId, scoutId);
+      if (rows.length === 0) {
+        if (rows.every((row) => row.optional === 1))
+          continue;
+        return `required scout ${scoutId} was not requested`;
+      }
+      const required = rows.some((row) => row.optional === 0);
+      if (!required)
+        continue;
+      const unfinished = rows.find((row) => row.state === "accepted" || row.state === "running");
+      if (unfinished)
+        return `required scout ${scoutId} is still ${unfinished.state}`;
+      const failed = rows.find((row) => row.state !== "succeeded");
+      if (failed)
+        return `required scout ${scoutId} ended in ${failed.state}: ${failed.error ?? "unknown error"}`;
+    }
+    return;
+  }
+  reconcile(runId) {
+    this.journal.transaction(() => {
+      this.journal.db.query("UPDATE scout_requests SET state='cancelled', error='parent attempt interrupted during host recovery', updated_at=?1 WHERE run_id=?2 AND state='accepted'").run(now(), runId);
+      this.journal.db.query("UPDATE scout_requests SET state='unknown', error='child outcome unknown after host recovery', updated_at=?1 WHERE run_id=?2 AND state='running'").run(now(), runId);
+    });
+  }
+  claim(runId, parentAttemptOrRequestId, requestId) {
+    const parentAttemptId = requestId ? parentAttemptOrRequestId : this.findParentAttempt(runId, parentAttemptOrRequestId);
+    const actualRequestId = requestId ?? parentAttemptOrRequestId;
+    return this.journal.transaction(() => {
+      const row = this.require(runId, parentAttemptId, actualRequestId);
+      if (row.state === "accepted") {
+        this.journal.db.query("UPDATE scout_requests SET state='running', dispatch_id=?1, updated_at=?2 WHERE run_id=?3 AND parent_attempt_id=?4 AND request_id=?5 AND state='accepted'").run(`${runId}/${parentAttemptId}/${actualRequestId}`, now(), runId, parentAttemptId, actualRequestId);
+      }
+      return toRequest(this.require(runId, parentAttemptId, actualRequestId));
+    });
+  }
+  complete(runId, parentAttemptOrRequestId, requestIdOrResult, resultMaybe) {
+    const legacy = resultMaybe === undefined;
+    const parentAttemptId = legacy ? this.findParentAttempt(runId, parentAttemptOrRequestId) : parentAttemptOrRequestId;
+    const requestId = legacy ? parentAttemptOrRequestId : String(requestIdOrResult);
+    const result = legacy ? requestIdOrResult : resultMaybe;
+    return this.journal.transaction(() => {
+      const row = this.require(runId, parentAttemptId, requestId);
+      if (row.state !== "accepted" && row.state !== "running")
+        throw new Error(`scout request is ${row.state}`);
+      const view = this.journal.getView(runId);
+      if (!view)
+        throw new Error(`Run not found: ${runId}`);
+      const parent = view.state.invocations[row.parent_invocation_id];
+      const definition = parent ? view.bundle.definitions[view.state.scopes[parent.scopeId]?.definitionId ?? view.bundle.rootDefinitionId] : undefined;
+      const scout = definition?.scouts?.find((candidate) => candidate.id === row.scout_id);
+      const child = scout ? view.bundle.definitions[scout.definitionId] : undefined;
+      if (!child)
+        throw new Error("scout definition is unavailable");
+      validateScoutOutput(view.bundle.schemas, child.outputPorts, result);
+      const bytes = collaborationBodyBytes(result);
+      if (bytes > MAX_RESULT_BYTES)
+        throw new Error("scout result exceeds output byte limit");
+      const artifact = this.journal.blobs.put(runId, new TextEncoder().encode(JSON.stringify(result)), "application/vnd.kouro.scout-result+json");
+      this.journal.insertArtifact(artifact);
+      this.journal.db.query("UPDATE scout_requests SET state='succeeded', result_json=?1, result_artifact_id=?2, result_digest=?3, error=NULL, updated_at=?4 WHERE run_id=?5 AND parent_attempt_id=?6 AND request_id=?7 AND state IN ('accepted','running')").run(json(result), artifact.id, digest(canonicalize(result)), now(), runId, parentAttemptId, requestId);
+      return toRequest(this.require(runId, parentAttemptId, requestId));
+    });
+  }
+  fail(runId, parentAttemptOrRequestId, requestIdOrError, errorOrState, state = "failed") {
+    const legacy = errorOrState === undefined || ["failed", "unknown", "cancelled"].includes(errorOrState);
+    const parentAttemptId = legacy ? this.findParentAttempt(runId, parentAttemptOrRequestId) : parentAttemptOrRequestId;
+    const requestId = legacy ? parentAttemptOrRequestId : requestIdOrError;
+    const error2 = legacy ? requestIdOrError : errorOrState;
+    const actualState = legacy && ["failed", "unknown", "cancelled"].includes(errorOrState ?? "") ? errorOrState : state;
+    return this.journal.transaction(() => {
+      const row = this.require(runId, parentAttemptId, requestId);
+      if (["succeeded", "failed", "cancelled", "unknown"].includes(row.state))
+        return toRequest(row);
+      this.journal.db.query("UPDATE scout_requests SET state=?1, error=?2, updated_at=?3 WHERE run_id=?4 AND parent_attempt_id=?5 AND request_id=?6 AND state IN ('accepted','running')").run(actualState, error2, now(), runId, parentAttemptId, requestId);
+      return toRequest(this.require(runId, parentAttemptId, requestId));
+    });
+  }
+  cancel(runId, parentAttemptOrRequestId, requestIdOrReason, reason = "cancelled") {
+    if (arguments.length === 3)
+      return this.fail(runId, parentAttemptOrRequestId, requestIdOrReason, "cancelled");
+    return this.fail(runId, parentAttemptOrRequestId, requestIdOrReason, reason, "cancelled");
+  }
+  deliver(runId, parentAttemptOrRequestId, requestIdOrPlannerAttempt) {
+    const direct = this.row(runId, parentAttemptOrRequestId, requestIdOrPlannerAttempt);
+    const parentAttemptId = direct ? parentAttemptOrRequestId : this.findParentAttempt(runId, parentAttemptOrRequestId);
+    const requestId = direct ? requestIdOrPlannerAttempt : parentAttemptOrRequestId;
+    return this.journal.transaction(() => {
+      const row = this.require(runId, parentAttemptId, requestId);
+      if (row.state !== "succeeded") {
+        if (row.optional)
+          throw new Error(`optional scout result is unavailable: ${row.state}`);
+        throw new Error(`required scout result is unavailable: ${row.state}`);
+      }
+      const existing = this.journal.db.query("SELECT manifest_json FROM scout_deliveries WHERE run_id=?1 AND parent_attempt_id=?2 AND request_id=?3 AND planner_attempt_id=?2").get(runId, parentAttemptId, requestId);
+      if (existing)
+        return parseJson(existing.manifest_json);
+      const resultBytes = row.result_json ? new TextEncoder().encode(row.result_json).byteLength : 0;
+      const delivery = {
+        requestId,
+        plannerAttemptId: parentAttemptId,
+        manifest: {
+          requestId,
+          scoutId: row.scout_id,
+          ...row.result_artifact_id ? { artifactId: row.result_artifact_id } : {},
+          ...row.result_digest ? { resultDigest: row.result_digest } : {},
+          bytes: resultBytes,
+          source: "scout-result"
+        },
+        ...row.result_json === null ? {} : { result: parseJson(row.result_json) }
+      };
+      this.journal.db.query("INSERT INTO scout_deliveries(run_id,parent_attempt_id,request_id,planner_attempt_id,manifest_json,delivered_at) VALUES (?1,?2,?3,?2,?4,?5)").run(runId, parentAttemptId, requestId, json(delivery), now());
+      return delivery;
+    });
+  }
+  deliveries(runId, plannerAttemptId) {
+    return this.journal.db.query("SELECT d.manifest_json FROM scout_deliveries d JOIN scout_requests r ON r.run_id=d.run_id AND r.parent_attempt_id=d.parent_attempt_id AND r.request_id=d.request_id WHERE d.run_id=?1 AND d.planner_attempt_id=?2 ORDER BY r.ordinal").all(runId, plannerAttemptId).map((row) => parseJson(row.manifest_json));
+  }
+  requests(runId) {
+    return this.journal.db.query("SELECT * FROM scout_requests WHERE run_id=?1 ORDER BY created_at, request_id").all(runId).map(toRequest);
+  }
+  row(runId, parentAttemptId, requestId) {
+    return this.journal.db.query("SELECT * FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND request_id=?3").get(runId, parentAttemptId, requestId);
+  }
+  require(runId, parentAttemptId, requestId) {
+    const row = this.row(runId, parentAttemptId, requestId);
+    if (!row)
+      throw new Error(`scout request not found: ${requestId}`);
+    return row;
+  }
+  findParentAttempt(runId, requestId) {
+    const rows = this.journal.db.query("SELECT parent_attempt_id FROM scout_requests WHERE run_id=?1 AND request_id=?2").all(runId, requestId);
+    if (rows.length !== 1)
+      throw new Error(`scout request not uniquely identified: ${requestId}`);
+    return rows[0].parent_attempt_id;
+  }
+}
+function toRequest(row) {
+  return {
+    runId: row.run_id,
+    requestId: row.request_id,
+    parentInvocationId: row.parent_invocation_id,
+    parentAttemptId: row.parent_attempt_id,
+    scoutId: row.scout_id,
+    question: row.question,
+    input: parseJson(row.input_json),
+    ordinal: row.ordinal,
+    optional: row.optional === 1,
+    state: row.state,
+    ...row.result_json === null ? {} : { result: parseJson(row.result_json) },
+    ...row.result_artifact_id === null ? {} : { resultArtifactId: row.result_artifact_id },
+    ...row.result_digest === null ? {} : { resultDigest: row.result_digest },
+    ...row.child_definition_id ? { childDefinitionId: row.child_definition_id } : {},
+    ...row.child_agent_id ? { childAgentId: row.child_agent_id } : {},
+    ...row.effective_harness === null ? {} : { effectiveHarness: row.effective_harness },
+    ...row.model_id === null ? {} : { modelId: row.model_id },
+    ...row.workspace_id === null ? {} : { workspaceId: row.workspace_id },
+    ...row.deadline_at === null ? {} : { deadlineAt: row.deadline_at },
+    ...row.dispatch_id === null ? {} : { dispatchId: row.dispatch_id },
+    usage: parseJson(row.usage_json),
+    ...row.error === null ? {} : { error: row.error }
+  };
+}
+function digest(value) {
+  return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
+}
+function succeededResult(request) {
+  if (!request.resultArtifactId || request.result === undefined)
+    return {
+      requestId: request.requestId,
+      scoutId: request.scoutId,
+      state: "failed",
+      error: { code: "SCOUT_RESULT_MISSING", message: "Scout success has no durable result" }
+    };
+  return {
+    requestId: request.requestId,
+    scoutId: request.scoutId,
+    state: "succeeded",
+    result: request.result,
+    resultArtifactId: request.resultArtifactId,
+    resultDigest: request.resultDigest ?? digest(canonicalize(request.result))
+  };
+}
+function failedResult(request) {
+  const state = ["failed", "unknown", "cancelled"].includes(request.state) ? request.state : "failed";
+  return {
+    requestId: request.requestId,
+    scoutId: request.scoutId,
+    state,
+    error: { code: `SCOUT_${state.toUpperCase()}`, message: request.error ?? state }
+  };
+}
+function validateInputs(schemas, ports, input) {
+  for (const key of Object.keys(input))
+    if (!ports.some((port2) => port2.name === key))
+      throw new Error(`scout input ${key} is not declared`);
+  for (const port2 of ports) {
+    const value = input[port2.name];
+    if (value === undefined) {
+      if (port2.required && port2.defaultValue === undefined)
+        throw new Error(`missing required scout input ${port2.name}`);
+      continue;
+    }
+    const schema = schemas[port2.schemaDigest];
+    if (!schema)
+      throw new Error(`missing scout input schema ${port2.schemaDigest}`);
+    const check = validateJsonSchema(value, schema);
+    if (!check.valid)
+      throw new Error(`invalid scout input ${port2.name}: ${check.error}`);
+  }
+}
+function validateScoutOutput(schemas, ports, result) {
+  if (ports.length === 0)
+    return;
+  for (const port2 of ports) {
+    const value = ports.length === 1 ? result : isRecord3(result) ? result[port2.name] : undefined;
+    const schema = schemas[port2.schemaDigest];
+    if (!schema)
+      throw new Error(`missing scout output schema ${port2.schemaDigest}`);
+    const check = validateJsonSchema(value, schema);
+    if (!check.valid)
+      throw new Error(`invalid scout output ${port2.name}: ${check.error}`);
+  }
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // packages/host/src/coordinator/coordinator.ts
 function toHarness(value) {
   return isHarness(value) ? value : "scripted";
@@ -18299,6 +19767,7 @@ class Coordinator {
   harness;
   process;
   ownerEpoch;
+  scouts;
   dataDir;
   scriptedDelayMs;
   commandTimeoutMs;
@@ -18312,7 +19781,7 @@ class Coordinator {
   pi;
   piDescriptor;
   claude;
-  claudeDescriptor;
+  claudeDescriptor = claudeSdkDescriptor;
   opencode;
   opencodeDescriptor;
   active = new Map;
@@ -18322,6 +19791,7 @@ class Coordinator {
   constructor(options) {
     this.dataDir = options.dataDir;
     this.journal = new Journal({ dataDir: options.dataDir });
+    this.scouts = new ScoutGateway(this.journal);
     this.agent = options.agent ?? new DelayedScriptedAgent;
     this.harness = options.harness ?? new ScriptedHarnessAdapter;
     this.process = options.process ?? createDefaultProcessAdapter();
@@ -18335,6 +19805,7 @@ class Coordinator {
   }
   async start() {
     for (const run of this.journal.listRuns()) {
+      this.scouts.reconcile(run.runId);
       const row = this.journal.getRunRow(run.runId);
       const configured = row ? parseJson(row.input_json).__kouroWorkspace : undefined;
       if (configured && this.workspaceAdapter) {
@@ -18387,14 +19858,18 @@ class Coordinator {
     this.journal.close();
   }
   async createRun(input) {
+    const normalizedInput = normalizeAdmissionInput(input.bundle, input.input);
     if (input.workspace && !this.workspaceAdapter)
       throw new Error("workspace adapter is not configured");
     const result = this.journal.createRun({
       ...input,
       input: {
-        ...input.input,
-        __kouroExecutionProfile: input.executionProfile ?? this.defaultProfile
-      }
+        ...normalizedInput,
+        __kouroExecutionProfile: input.executionProfile ?? this.defaultProfile,
+        ...input.allowUnrestrictedCommands ? { __kouroAllowUnrestrictedCommands: true } : {}
+      },
+      executionProfile: input.executionProfile ?? this.defaultProfile,
+      workspace: input.workspace
     });
     if (result.created && input.workspace) {
       try {
@@ -18476,12 +19951,47 @@ class Coordinator {
     const ref = this.workspaces.get(input.runId);
     if (!ref || !this.workspaceAdapter)
       throw new Error("run has no repository workspace");
-    return this.workspaceAdapter.prepareCommit({
+    const action = input.deliveryActionId ? this.journal.getDeliveryAction(input.deliveryActionId) : undefined;
+    if (input.deliveryActionId && (!action || action.runId !== input.runId))
+      throw new Error("delivery action not found for run");
+    if (action && action.status !== "approved" && action.status !== "committed")
+      throw new Error(`delivery action is ${action.status}`);
+    if (action && (input.expectedTree !== action.resultTree || input.message !== action.message))
+      throw new Error("delivery action binding changed");
+    const prepared = await this.workspaceAdapter.prepareCommit({
       ref,
-      expectedTree: input.expectedTree,
-      operationKey: input.operationKey,
-      message: input.message
+      expectedTree: action?.resultTree ?? input.expectedTree,
+      operationKey: action?.operationKey ?? input.operationKey,
+      message: action?.message ?? input.message
     });
+    if (action && action.status !== "committed")
+      this.journal.completeDeliveryAction(action.id, prepared);
+    return prepared;
+  }
+  async prepareDelivery(input) {
+    const ref = this.workspaces.get(input.runId);
+    if (!ref || !this.workspaceAdapter)
+      throw new Error("run has no repository workspace");
+    const snapshot = await this.workspaceAdapter.snapshot(ref);
+    return this.journal.createDeliveryAction({
+      requestKey: input.requestKey,
+      runId: input.runId,
+      workspaceId: ref.workspaceId,
+      ...input.invocationId ? { invocationId: input.invocationId } : {},
+      baseTree: snapshot.baseTree,
+      resultTree: snapshot.resultTree,
+      patchDigest: snapshot.patchDigest,
+      changedPaths: snapshot.changedPaths,
+      message: input.message,
+      ...input.validationEvidence ? { validationEvidence: input.validationEvidence } : {},
+      ...input.reviewEvidence ? { reviewEvidence: input.reviewEvidence } : {}
+    });
+  }
+  decideDelivery(input) {
+    return this.journal.decideDeliveryAction(input);
+  }
+  deliveryAction(actionId) {
+    return this.journal.getDeliveryAction(actionId);
   }
   workspaceDiff(runId) {
     return this.snapshots.get(runId) ?? null;
@@ -18572,7 +20082,7 @@ class Coordinator {
       throw new Error("interrupt is unavailable without an active attempt");
     if ((input.action === "cancel" || input.action === "interrupt") && active) {
       const profile = this.profileFor(input.runId);
-      const capabilities = profile === "codex-readonly" ? this.codexDescriptor?.availability === "available" ? { cancel: "supported" } : { cancel: "unsupported" } : this.harness.capabilities();
+      const capabilities = profile === "codex-readonly" || profile === "codex-workspace-write" ? this.codexDescriptor?.availability === "available" ? { cancel: "supported" } : { cancel: "unsupported" } : this.harness.capabilities();
       if (capabilities.cancel !== "supported")
         throw new Error("cancellation-unsupported: adapter cannot cancel active attempt");
     }
@@ -18628,7 +20138,7 @@ class Coordinator {
   profileFor(runId) {
     const row = this.journal.getRunRow(runId);
     const input = row ? parseJson(row.input_json) : {};
-    return input.__kouroExecutionProfile === "codex-readonly" || input.__kouroExecutionProfile === "pi-readonly" ? input.__kouroExecutionProfile : "scripted";
+    return input.__kouroExecutionProfile === "codex-readonly" || input.__kouroExecutionProfile === "codex-workspace-write" || input.__kouroExecutionProfile === "claude-readonly" || input.__kouroExecutionProfile === "claude-workspace-write" || input.__kouroExecutionProfile === "pi-readonly" ? input.__kouroExecutionProfile : "scripted";
   }
   schedule(runId) {
     if (this.closed)
@@ -18872,11 +20382,11 @@ class Coordinator {
       if (executions.length > 1) {
         const definition = view.bundle.definitions[view.bundle.rootDefinitionId];
         const groups = definition ? definition.nodes.filter((candidate) => candidate.kind === "fork").map((fork) => {
-          const join5 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
+          const join6 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
           return {
             id: fork.groupId,
             expectedBranchIds: executions.filter((intent2) => fork.branchIds.includes(view.state.invocations[intent2.invocationId]?.nodeId ?? "")).map((intent2) => intent2.invocationId),
-            mode: join5?.mode === "fail-fast" ? "fail-fast" : "all-settled"
+            mode: join6?.mode === "fail-fast" ? "fail-fast" : "all-settled"
           };
         }).filter((group) => group.expectedBranchIds.length > 0) : [];
         const scheduler = new ReadySetScheduler({
@@ -19125,7 +20635,7 @@ class Coordinator {
     const node = view?.bundle.definitions[scope?.definitionId ?? view.bundle.rootDefinitionId]?.nodes.find((candidate) => candidate.id === invocation.nodeId);
     try {
       if (node?.kind === "command")
-        validateM1Command(node);
+        this.validateCommandForRun(runId, node);
       if (node?.kind === "agent")
         this.resolveAgentInputs(view.bundle, currentState, node, invocationId);
     } catch (cause) {
@@ -19168,8 +20678,17 @@ class Coordinator {
     if (!node || node.kind !== "agent" && node.kind !== "command" && node.kind !== "complete")
       throw new Error(`Unsupported M1 node ${nodeId}`);
     if (node.kind === "command")
-      validateM1Command(node);
+      this.validateCommandForRun(state.runId, node);
     return node.kind;
+  }
+  validateCommandForRun(runId, node) {
+    validateCommandNode(node);
+    if (node.executionMode !== "trusted-unrestricted")
+      return;
+    const row = this.journal.getRunRow(runId);
+    const input = row ? parseJson(row.input_json) : {};
+    if (input.__kouroAllowUnrestrictedCommands !== true)
+      throw new Error("Command requires explicit launch opt-in: enable trusted unrestricted commands");
   }
   async execute(runId, bundle, state, invocationId, attemptId) {
     const attempt = state.attempts[attemptId];
@@ -19187,7 +20706,7 @@ class Coordinator {
       throw new Error(`Node missing from pinned bundle: ${invocationId}`);
     const resolvedInputs = node.kind === "agent" ? this.resolveAgentInputs(bundle, state, node, invocationId) : undefined;
     if (node.kind === "command")
-      validateM1Command(node);
+      this.validateCommandForRun(runId, node);
     if (detail.state === "reserved")
       this.journal.claimEffect(detail.id, this.ownerEpoch);
     if (detail.state !== "claimed" && this.journal.getEffect(detail.id)?.state !== "claimed")
@@ -19199,8 +20718,8 @@ class Coordinator {
     const row = this.journal.getRunRow(runId);
     const runInput = row ? parseJson(row.input_json) : {};
     const collaborationConfig = runInput.__collaboration && typeof runInput.__collaboration === "object" ? runInput.__collaboration : undefined;
-    const profile = runInput.__kouroExecutionProfile === "codex-readonly" || runInput.__kouroExecutionProfile === "pi-readonly" ? runInput.__kouroExecutionProfile : "scripted";
-    const workspaceDir = join4(this.dataDir, "workspaces", runId, invocationId);
+    const profile = runInput.__kouroExecutionProfile === "codex-readonly" || runInput.__kouroExecutionProfile === "codex-workspace-write" || runInput.__kouroExecutionProfile === "claude-readonly" || runInput.__kouroExecutionProfile === "claude-workspace-write" || runInput.__kouroExecutionProfile === "pi-readonly" ? runInput.__kouroExecutionProfile : "scripted";
+    const workspaceDir = join5(this.dataDir, "workspaces", runId, invocationId);
     const registeredWorkspace = this.workspaces.get(runId);
     let invocationWorkspace = registeredWorkspace;
     const sourceInvocationId = state.invocations[invocationId]?.sourceInvocationId;
@@ -19224,7 +20743,10 @@ class Coordinator {
     const invocationWorkspaceDir = invocationWorkspace?.path ?? workspaceDir;
     if (node.kind === "agent") {
       const config = collaborationConfig;
-      const collaborationGateway = config ? new CollaborationGateway(this.journal) : undefined;
+      const definition = bundle.definitions[scope?.definitionId ?? bundle.rootDefinitionId];
+      const subagentIds = node.uses ?? (definition?.scouts ?? []).map((scout) => scout.id);
+      const hasSubagents = subagentIds.length > 0;
+      const collaborationGateway = config || hasSubagents ? new CollaborationGateway(this.journal) : undefined;
       let collaborationGrant;
       let collaborationBatch = null;
       if (collaborationGateway) {
@@ -19307,6 +20829,21 @@ class Coordinator {
             tokenQuality: "unavailable"
           },
           ...inputSegments,
+          ...this.scouts.deliveries(runId, attemptId).flatMap((delivery) => {
+            const content = JSON.stringify(delivery.result);
+            return [
+              {
+                id: `${attemptId}:scout:${delivery.requestId}`,
+                source: "scout-result",
+                content,
+                supplied: true,
+                reason: `durably delivered scout result ${delivery.requestId}`,
+                bytes: new TextEncoder().encode(content).byteLength,
+                tokenCount: null,
+                tokenQuality: "unavailable"
+              }
+            ];
+          }),
           ...collaborationBatch?.visible.map((message) => ({
             id: `${attemptId}:message:${message.id}`,
             source: "collaboration-message",
@@ -19330,7 +20867,15 @@ class Coordinator {
             description: "Publish one typed blackboard entry",
             inputSchema: { type: "object" },
             enabled: true
-          }
+          },
+          ...subagentIds.length ? [
+            {
+              name: "subagent",
+              description: "Run one awaited bounded subagent. The input object must match the selected subagent's declared child inputs.",
+              inputSchema: subagentToolSchema(bundle, scope?.definitionId ?? bundle.rootDefinitionId, subagentIds),
+              enabled: true
+            }
+          ] : []
         ] : [],
         hiddenNativeContext: "unavailable"
       });
@@ -19396,8 +20941,8 @@ class Coordinator {
       let resolvedVersion = this.harness.adapterVersion;
       let resolvedModelId;
       let nativeConfig;
-      const requestedHarness = node.harness ?? (profile === "codex-readonly" ? "codex" : profile === "pi-readonly" ? "pi" : toHarness(this.harness.id));
-      if (requestedHarness === "scripted" && node.harness !== "codex" && node.harness !== "pi" && profile !== "codex-readonly" && profile !== "pi-readonly") {} else if (requestedHarness === "codex") {
+      const requestedHarness = node.harness ?? (profile === "codex-readonly" || profile === "codex-workspace-write" ? "codex" : profile === "claude-readonly" || profile === "claude-workspace-write" ? "claude" : profile === "pi-readonly" ? "pi" : toHarness(this.harness.id));
+      if (requestedHarness === "scripted" && node.harness !== "codex" && node.harness !== "pi" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {} else if (requestedHarness === "codex") {
         this.codexDescriptor ??= await inspectCodex();
         if (this.codexDescriptor.availability !== "available") {
           this.journal.completeEffect({
@@ -19422,7 +20967,9 @@ class Coordinator {
         selected = codex;
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
-        nativeConfig = { sandbox: "read-only" };
+        nativeConfig = {
+          sandbox: profile === "codex-workspace-write" && node.workspaceAccess === "workspace-write" ? "workspace-write" : "read-only"
+        };
       } else if (requestedHarness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available") {
@@ -19457,29 +21004,13 @@ class Coordinator {
         };
       } else if (requestedHarness === "claude" || requestedHarness === "opencode") {
         if (requestedHarness === "claude") {
-          this.claudeDescriptor ??= await inspectExternalCli("claude");
-          if (this.claudeDescriptor.availability !== "available") {
-            this.journal.completeEffect({
-              effectId: detail.id,
-              storedArtifacts: [],
-              artifacts: [],
-              evidence: [],
-              output: [],
-              status: "failed",
-              error: `harness-unavailable: ${this.claudeDescriptor.detail ?? "claude unavailable"}`,
-              diagnostics: ["execution rejected before workspace side effects"],
-              resolvedExecution: {
-                role: node.role,
-                harness: "claude",
-                adapterVersion: this.claudeDescriptor.adapterVersion
-              },
-              contextManifest: JSON.parse(JSON.stringify(contextManifest))
-            });
-            return;
-          }
-          const claude = this.claude ?? new ExternalCliHarnessAdapter("claude", this.claudeDescriptor);
+          const claude = this.claude ?? new ClaudeAgentSdkHarnessAdapter;
           this.claude = claude;
           selected = claude;
+          nativeConfig = {
+            ...node.modelId ? { model: node.modelId } : {},
+            permissionMode: profile === "claude-workspace-write" && node.workspaceAccess === "workspace-write" ? "acceptEdits" : "dontAsk"
+          };
         } else {
           this.opencodeDescriptor ??= await inspectExternalCli("opencode");
           if (this.opencodeDescriptor.availability !== "available") {
@@ -19507,7 +21038,7 @@ class Coordinator {
         }
         resolvedHarness = toHarness(selected.id);
         resolvedVersion = selected.adapterVersion;
-        nativeConfig = { ...node.modelId ? { model: node.modelId } : {} };
+        nativeConfig = node.modelId ? { model: node.modelId } : {};
       } else {
         this.journal.completeEffect({
           effectId: detail.id,
@@ -19526,6 +21057,28 @@ class Coordinator {
           contextManifest: JSON.parse(JSON.stringify(contextManifest))
         });
         return;
+      }
+      if (subagentIds.length) {
+        const capabilities = selected.capabilities();
+        if (capabilities["awaited-subagent-tool"] !== "supported" || capabilities["child-read-only-envelope"] !== "supported") {
+          this.journal.completeEffect({
+            effectId: detail.id,
+            storedArtifacts: [],
+            artifacts: [],
+            evidence: [],
+            output: [],
+            status: "failed",
+            error: "harness-unavailable: awaited subagent tool or child read-only envelope is unsupported",
+            diagnostics: ["subagent admission rejected before provider execution"],
+            resolvedExecution: {
+              role: node.role,
+              harness: resolvedHarness,
+              adapterVersion: resolvedVersion
+            },
+            contextManifest: JSON.parse(JSON.stringify(contextManifest))
+          });
+          return;
+        }
       }
       mkdirSync5(invocationWorkspaceDir, { recursive: true, mode: 448 });
       let harnessResult;
@@ -19548,7 +21101,15 @@ class Coordinator {
           context: contextManifest,
           ...collaborationGateway && collaborationGrant ? {
             collaboration: {
-              ...collaborationGateway.tools(collaborationGrant),
+              ...collaborationGateway.tools(collaborationGrant, subagentIds.length ? this.scouts : undefined, subagentIds.length ? (subagentInput) => this.invokeScout({
+                runId,
+                parentInvocationId: invocationId,
+                parentAttemptId: attemptId,
+                requestId: subagentInput.requestId,
+                scoutId: subagentInput.subagentId,
+                input: subagentInput.input,
+                signal: aborter.signal
+              }) : undefined),
               wait: () => collaborationBatch
             }
           } : {},
@@ -19587,7 +21148,15 @@ class Coordinator {
           error2 = `invalid-output: ${validation.error}`;
         }
       }
+      if (status === "succeeded" && node.uses?.length) {
+        const scoutError = this.scouts.acceptanceError(runId, attemptId, node.uses);
+        if (scoutError) {
+          status = "failed";
+          error2 = `scout-acceptance: ${scoutError}`;
+        }
+      }
       const secretValues = Object.entries(process.env).filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key)).map(([, value]) => value).filter((value) => value.length >= 6);
+      const safeError = error2 ? String(redactSecrets(error2, secretValues)) : undefined;
       const storedArtifacts2 = [];
       const outputRefs2 = [];
       const evidenceRefs2 = [];
@@ -19610,6 +21179,16 @@ class Coordinator {
           id: evidenceArtifact.id,
           digest: evidenceArtifact.digest,
           mediaType: evidenceArtifact.mediaType
+        });
+      }
+      if (harnessResult.stderr) {
+        const stderr = String(redactSecrets(harnessResult.stderr, secretValues));
+        const stderrArtifact = this.journal.blobs.put(runId, new TextEncoder().encode(stderr), "application/vnd.kouro.harness-stderr+text");
+        storedArtifacts2.push(stderrArtifact);
+        evidenceRefs2.push({
+          id: stderrArtifact.id,
+          digest: stderrArtifact.digest,
+          mediaType: stderrArtifact.mediaType
         });
       }
       const retryable = status === "failed" && (harnessResult.status === "unavailable" || error2?.startsWith("invalid-output:") || error2?.startsWith("transport:"));
@@ -19637,8 +21216,10 @@ class Coordinator {
         evidence: evidenceRefs2,
         output: outputRefs2,
         status,
-        ...error2 ? { error: error2 } : {},
-        diagnostics: [harnessResult.error].filter((item) => Boolean(item)),
+        ...safeError ? { error: safeError } : {},
+        diagnostics: [
+          harnessResult.error ? String(redactSecrets(harnessResult.error, secretValues)) : undefined
+        ].filter((item) => Boolean(item)),
         resolvedExecution: {
           role: node.role,
           harness: resolvedHarness,
@@ -19653,7 +21234,7 @@ class Coordinator {
           continuation: "fresh-session",
           handoff: "fresh",
           nativeContinuation: "unavailable",
-          ...profile === "codex-readonly" ? { reason: "codex-native-resume-unsupported" } : {},
+          ...profile === "codex-readonly" || profile === "codex-workspace-write" ? { reason: "codex-native-resume-unsupported" } : {},
           capabilities: selected.capabilities()
         },
         ...retry ? { retry } : {}
@@ -19664,14 +21245,17 @@ class Coordinator {
       status = "failed";
       error2 = "complete node cannot be dispatched as an effect";
     } else {
-      validateM1Command(node);
+      this.validateCommandForRun(runId, node);
       const startedAt = now();
       try {
-        result = await this.process.executeFixedFixture({
+        result = await this.process.executeCommand({
           runId,
           operationKey: detail.operationKey,
           workspaceDir: invocationWorkspaceDir,
-          timeoutMs: node.timeoutMs || this.commandTimeoutMs
+          executable: node.executable,
+          args: node.args,
+          timeoutMs: node.timeoutMs || this.commandTimeoutMs,
+          executionMode: node.executionMode
         });
       } catch (cause) {
         status = "failed";
@@ -19680,14 +21264,14 @@ class Coordinator {
           operationKey: detail.operationKey,
           evidence: {
             argv: [node.executable, ...node.args],
-            cwd: workspaceDir,
+            cwd: invocationWorkspaceDir,
             exitCode: null,
             signal: null,
             timedOut: null,
             spawnError: error2,
             stdout: new Uint8Array,
             stderr: new Uint8Array,
-            enforcementMode: this.process.enforcementMode
+            enforcementMode: node.executionMode === "trusted-unrestricted" ? "trusted-unrestricted" : "enforced"
           }
         };
       }
@@ -19700,6 +21284,7 @@ class Coordinator {
         kind: "command.evidence",
         executable: node.executable,
         args: [...node.args],
+        executionMode: result.evidence.enforcementMode,
         exitCode: result.evidence.exitCode,
         signal: result.evidence.signal,
         timeout: result.evidence.timedOut,
@@ -19738,6 +21323,7 @@ class Coordinator {
     if (commandEvidence) {
       const resultArtifact = this.journal.blobs.put(runId, new TextEncoder().encode(json({
         exitCode: commandEvidence.exitCode,
+        executionMode: commandEvidence.executionMode,
         signal: commandEvidence.signal,
         timeout: commandEvidence.timeout,
         spawnError: commandEvidence.spawnError,
@@ -19781,7 +21367,7 @@ class Coordinator {
         throw new Error(`Input binding targets unknown port ${node.id}.${name}`);
     for (const port2 of node.inputPorts) {
       const binding = invocation.inputBindings[port2.name];
-      let value = binding ? this.resolveBoundInput(binding, state) : undefined;
+      let value = binding ? this.resolveBoundInput(binding, state, invocationId) : undefined;
       if (value !== undefined && binding?.path?.length)
         value = selectJsonPath(value, binding.path);
       if (value === undefined) {
@@ -19803,9 +21389,105 @@ class Coordinator {
     }
     return resolved;
   }
-  resolveBoundInput(binding, state) {
+  async invokeScout(input) {
+    const view = this.journal.getView(input.runId);
+    if (!view)
+      throw new Error(`Run not found: ${input.runId}`);
+    const parent = view.state.invocations[input.parentInvocationId];
+    const scope = parent ? view.state.scopes[parent.scopeId] : undefined;
+    const definition = scope ? view.bundle.definitions[scope.definitionId] : view.bundle.definitions[view.bundle.rootDefinitionId];
+    const scout = definition?.scouts?.find((candidate) => candidate.id === input.scoutId);
+    const child = scout ? view.bundle.definitions[scout.definitionId] : undefined;
+    const childAgent = child?.nodes.find((node) => node.kind === "agent");
+    if (!child || !scout || childAgent?.kind !== "agent")
+      throw new Error(`subagent ${input.scoutId} is unavailable`);
+    if (childAgent.harness && childAgent.harness !== this.harness.id)
+      throw new Error(`subagent harness ${childAgent.harness} is unavailable in this host`);
+    const outputSchema = childAgent.outputPorts[0] ? view.bundle.schemas[childAgent.outputPorts[0].schemaDigest] : undefined;
+    const childInvocationId = `${input.parentAttemptId}:scout:${input.requestId}`;
+    return this.scouts.invoke({
+      ...input,
+      runner: async (request, signal) => {
+        const segments = Object.entries(request.input).map(([name, value]) => {
+          const content = JSON.stringify(value);
+          return {
+            id: `${childInvocationId}:input:${name}`,
+            source: "artifact-input",
+            content,
+            supplied: true,
+            reason: `resolved scout input ${name}`,
+            bytes: new TextEncoder().encode(content).byteLength,
+            tokenCount: null,
+            tokenQuality: "unavailable"
+          };
+        });
+        const context = await createContextManifest({
+          attemptId: childInvocationId,
+          segments: [
+            {
+              id: `${childInvocationId}:role-prompt`,
+              source: "role-prompt",
+              content: childAgent.prompt,
+              supplied: true,
+              reason: `declared by scout role ${childAgent.role}`,
+              bytes: new TextEncoder().encode(childAgent.prompt).byteLength,
+              tokenCount: null,
+              tokenQuality: "unavailable"
+            },
+            ...segments
+          ],
+          tools: [],
+          hiddenNativeContext: "unavailable"
+        });
+        const childAborter = new AbortController;
+        const abort = () => childAborter.abort();
+        signal?.addEventListener("abort", abort, { once: true });
+        const timeout = setTimeout(() => childAborter.abort(), Math.min(childAgent.timeoutMs, 60000));
+        try {
+          const result = await this.harness.run({
+            runId: input.runId,
+            invocationId: childInvocationId,
+            role: childAgent.role,
+            prompt: childAgent.prompt,
+            ...outputSchema ? { outputSchema } : {},
+            delayMs: this.scriptedDelayMs,
+            timeoutMs: Math.min(childAgent.timeoutMs, 60000),
+            cwd: this.workspaces.get(input.runId)?.path,
+            context,
+            signal: childAborter.signal
+          });
+          if (result.status !== "succeeded" || result.output === undefined)
+            throw new Error(result.error ?? `scout harness ${result.status}`);
+          return result.output;
+        } finally {
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", abort);
+        }
+      }
+    });
+  }
+  resolveBoundInput(binding, state, consumerInvocationId) {
     if (binding.value !== undefined)
       return binding.value;
+    if (binding.source.kind === "scout-results") {
+      const source = binding.source;
+      if (!consumerInvocationId)
+        return;
+      const consumer = state.invocations[consumerInvocationId];
+      const planner = Object.values(state.invocations).filter((candidate) => candidate.scopeId === consumer?.scopeId && candidate.nodeId === source.sourceId && candidate.status === "succeeded").sort((a, b) => b.activationOrdinal - a.activationOrdinal)[0];
+      if (!planner)
+        return [];
+      const attempt = Object.values(state.attempts).filter((candidate) => candidate.invocationId === planner.id && candidate.status === "succeeded").sort((a, b) => b.ordinal - a.ordinal)[0];
+      if (!attempt)
+        return [];
+      return this.scouts.deliveries(state.runId, attempt.id).filter((delivery) => delivery.manifest.scoutId === source.scoutId).map((delivery) => ({
+        requestId: delivery.requestId,
+        scoutId: delivery.manifest.scoutId,
+        resultArtifactId: delivery.manifest.artifactId ?? null,
+        resultDigest: delivery.manifest.resultDigest ?? null,
+        result: delivery.result
+      }));
+    }
     if (!binding.artifactId)
       return;
     const ref = allArtifactRefs(state).find((candidate) => candidate.id === binding.artifactId);
@@ -19843,6 +21525,50 @@ class Coordinator {
     }
   }
 }
+function subagentToolSchema(bundle, definitionId, subagentIds) {
+  const definition = bundle.definitions[definitionId];
+  const choices = (subagentIds ?? []).flatMap((subagentId) => {
+    const scout = definition?.scouts?.find((candidate) => candidate.id === subagentId);
+    const child = scout ? bundle.definitions[scout.definitionId] : undefined;
+    if (!child)
+      return [];
+    const properties = {};
+    const required = [];
+    for (const port2 of child.inputPorts) {
+      const schema = bundle.schemas[port2.schemaDigest] ?? {};
+      properties[port2.name] = schema;
+      if (port2.required && port2.defaultValue === undefined)
+        required.push(port2.name);
+    }
+    return [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["subagentId", "requestId", "input"],
+        properties: {
+          subagentId: { const: subagentId },
+          requestId: { type: "string", maxLength: 128 },
+          input: {
+            type: "object",
+            additionalProperties: false,
+            ...required.length ? { required } : {},
+            properties
+          }
+        }
+      }
+    ];
+  });
+  return {
+    type: "object",
+    oneOf: choices,
+    properties: {
+      subagentId: { type: "string", enum: Array.from(subagentIds ?? []) },
+      requestId: { type: "string", maxLength: 128 },
+      input: { type: "object" }
+    },
+    required: ["subagentId", "requestId", "input"]
+  };
+}
 function selectJsonPath(value, path) {
   let current = value;
   for (const segment of path) {
@@ -19868,15 +21594,15 @@ function allArtifactRefs(state) {
     refs.push(...attempt.output, ...attempt.evidence, ...attempt.artifacts);
   return refs;
 }
-function validateM1Command(node) {
-  if (node.executable !== "/usr/bin/printf" || node.args.length !== 1 || node.args[0] !== "Kouro M1 command\\n")
-    throw new Error("M1 process adapter allowlist rejected compiled command");
+function validateCommandNode(node) {
+  if (!node.executable.trim() || node.executable.includes("\x00") || node.args.some((arg) => arg.includes("\x00")))
+    throw new Error("Command executable and arguments must be non-empty and contain no NUL bytes");
 }
 
 // packages/host/src/adapters/workspace/git.ts
 import {
   mkdirSync as mkdirSync6,
-  readFileSync as readFileSync2,
+  readFileSync as readFileSync3,
   rmSync as rmSync3,
   writeFileSync as writeFileSync2,
   existsSync as existsSync2,
@@ -19884,7 +21610,7 @@ import {
   readdirSync,
   chmodSync
 } from "fs";
-import { join as join5, resolve } from "path";
+import { join as join6, resolve } from "path";
 import { randomUUID as randomUUID3 } from "crypto";
 
 class GitWorkspaceAdapter {
@@ -19894,8 +21620,8 @@ class GitWorkspaceAdapter {
     this.root = resolve(options.worktreeRoot);
     this.executable = options.gitExecutable ?? "git";
     mkdirSync6(this.root, { recursive: true, mode: 448 });
-    mkdirSync6(join5(this.root, "claims"), { recursive: true, mode: 448 });
-    mkdirSync6(join5(this.root, "indexes"), { recursive: true, mode: 448 });
+    mkdirSync6(join6(this.root, "claims"), { recursive: true, mode: 448 });
+    mkdirSync6(join6(this.root, "indexes"), { recursive: true, mode: 448 });
   }
   async create(input) {
     const repositoryPath = await this.repositoryRoot(input.repositoryPath);
@@ -19904,10 +21630,10 @@ class GitWorkspaceAdapter {
       `${input.baseCommit ?? "HEAD"}^{commit}`
     ]);
     const baseTree = await this.git(repositoryPath, ["rev-parse", `${baseCommit}^{tree}`]);
-    const path = join5(this.root, safePart(input.runId), safePart(input.workspaceId));
+    const path = join6(this.root, safePart(input.runId), safePart(input.workspaceId));
     if (existsSync2(path))
       throw new Error(`workspace path already exists: ${path}`);
-    mkdirSync6(join5(this.root, safePart(input.runId)), { recursive: true, mode: 448 });
+    mkdirSync6(join6(this.root, safePart(input.runId)), { recursive: true, mode: 448 });
     await this.git(repositoryPath, ["worktree", "add", "--detach", path, baseCommit]);
     const claim2 = {
       repositoryPath,
@@ -19969,11 +21695,11 @@ class GitWorkspaceAdapter {
     const claimPath = this.claimPath({ runId, workspaceId });
     if (!existsSync2(claimPath))
       throw new Error(`workspace claim not found: ${runId}/${workspaceId}`);
-    return this.load(JSON.parse(readFileSync2(claimPath, "utf8")));
+    return this.load(JSON.parse(readFileSync3(claimPath, "utf8")));
   }
   async listClaims(runId) {
     const prefix = `${safePart(runId)}--`;
-    return readdirSync(join5(this.root, "claims")).filter((name) => name.startsWith(prefix) && name.endsWith(".json") && !name.endsWith(".prepared.json")).map((name) => JSON.parse(readFileSync2(join5(this.root, "claims", name), "utf8"))).filter((claim2) => claim2.runId === runId).map((claim2) => claim2);
+    return readdirSync(join6(this.root, "claims")).filter((name) => name.startsWith(prefix) && name.endsWith(".json") && !name.endsWith(".prepared.json")).map((name) => JSON.parse(readFileSync3(join6(this.root, "claims", name), "utf8"))).filter((claim2) => claim2.runId === runId).map((claim2) => claim2);
   }
   async load(ref) {
     const claim2 = this.readClaim(ref);
@@ -19985,7 +21711,7 @@ class GitWorkspaceAdapter {
   }
   async snapshot(ref) {
     const claim2 = await this.load(ref);
-    const temp = join5(this.root, "indexes", `${randomUUID3()}.index`);
+    const temp = join6(this.root, "indexes", `${randomUUID3()}.index`);
     try {
       await this.git(claim2.path, ["read-tree", "HEAD"], { GIT_INDEX_FILE: temp });
       await this.git(claim2.path, ["add", "-A", "--", "."], { GIT_INDEX_FILE: temp });
@@ -20030,13 +21756,13 @@ class GitWorkspaceAdapter {
     const conflicts = [...paths.entries()].filter(([, count]) => count > 1).map(([path]) => path).sort();
     if (conflicts.length)
       return { target, sources, conflicts };
-    const backup = join5(this.root, "integration-backups", randomUUID3());
+    const backup = join6(this.root, "integration-backups", randomUUID3());
     mkdirSync6(backup, { recursive: true, mode: 448 });
     try {
       for (const entry of readdirSync(input.target.path)) {
         if (entry === ".git")
           continue;
-        cpSync(join5(input.target.path, entry), join5(backup, entry), {
+        cpSync(join6(input.target.path, entry), join6(backup, entry), {
           recursive: true,
           force: true
         });
@@ -20045,14 +21771,14 @@ class GitWorkspaceAdapter {
         const source = sources[sourceIndex];
         for (const change of source.changedPaths) {
           const sourceRef = input.sources[sourceIndex];
-          const sourcePath = join5(sourceRef.path, change.path);
-          const targetPath = join5(input.target.path, change.path);
+          const sourcePath = join6(sourceRef.path, change.path);
+          const targetPath = join6(input.target.path, change.path);
           if (change.oldPath && change.status.startsWith("R"))
-            rmSync3(join5(input.target.path, change.oldPath), { recursive: true, force: true });
+            rmSync3(join6(input.target.path, change.oldPath), { recursive: true, force: true });
           if (change.status.startsWith("D"))
             rmSync3(targetPath, { recursive: true, force: true });
           else if (existsSync2(sourcePath)) {
-            mkdirSync6(join5(targetPath, ".."), { recursive: true });
+            mkdirSync6(join6(targetPath, ".."), { recursive: true });
             rmSync3(targetPath, { recursive: true, force: true });
             cpSync(sourcePath, targetPath, { recursive: true, force: true });
             if (change.mode && !change.mode.endsWith("000"))
@@ -20065,10 +21791,10 @@ class GitWorkspaceAdapter {
       try {
         for (const entry of readdirSync(input.target.path)) {
           if (entry !== ".git")
-            rmSync3(join5(input.target.path, entry), { recursive: true, force: true });
+            rmSync3(join6(input.target.path, entry), { recursive: true, force: true });
         }
         for (const entry of readdirSync(backup))
-          cpSync(join5(backup, entry), join5(input.target.path, entry), {
+          cpSync(join6(backup, entry), join6(input.target.path, entry), {
             recursive: true,
             force: true
           });
@@ -20122,7 +21848,7 @@ class GitWorkspaceAdapter {
     const marker = this.preparedPath(claim2);
     if (!existsSync2(marker))
       return null;
-    const value = JSON.parse(readFileSync2(marker, "utf8"));
+    const value = JSON.parse(readFileSync3(marker, "utf8"));
     if (value.operationKey !== input.operationKey || value.tree !== input.expectedTree)
       return null;
     const verified = await this.verifyCommit(claim2, {
@@ -20165,16 +21891,16 @@ class GitWorkspaceAdapter {
     };
   }
   readClaim(ref) {
-    return JSON.parse(readFileSync2(this.claimPath(ref), "utf8"));
+    return JSON.parse(readFileSync3(this.claimPath(ref), "utf8"));
   }
   writeClaim(claim2) {
     writeFileSync2(this.claimPath(claim2), JSON.stringify(claim2, null, 2), { mode: 384 });
   }
   claimPath(ref) {
-    return join5(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.json`);
+    return join6(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.json`);
   }
   preparedPath(ref) {
-    return join5(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.prepared.json`);
+    return join6(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.prepared.json`);
   }
   async repositoryRoot(path) {
     const root = await this.git(resolve(path), ["rev-parse", "--show-toplevel"]);
@@ -20245,8 +21971,8 @@ function parseNameStatus(raw, summary, numstat) {
   });
 }
 async function sha256(value) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  const digest2 = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest2)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 function sameIdentity(a, b) {
   return a.repositoryPath === b.repositoryPath && a.runId === b.runId && a.workspaceId === b.workspaceId && resolve(a.path) === resolve(b.path) && a.claimToken === b.claimToken;
@@ -20257,9 +21983,9 @@ init_src();
 
 // packages/host/src/evaluation/verifier.ts
 init_src();
-import { createHash as createHash4 } from "crypto";
-import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync7, mkdtempSync as mkdtempSync2, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
-import { join as join6, resolve as resolve2 } from "path";
+import { createHash as createHash5 } from "crypto";
+import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync7, mkdtempSync as mkdtempSync3, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
+import { join as join7, resolve as resolve2 } from "path";
 
 class BunVerifierProcess {
   async execute(input) {
@@ -20314,8 +22040,8 @@ class BunVerifierProcess {
     }
   }
 }
-function digest(bytes) {
-  return createHash4("sha256").update(bytes).digest("hex");
+function digest2(bytes) {
+  return createHash5("sha256").update(bytes).digest("hex");
 }
 async function runDeterministicCommandEvaluator(input) {
   const candidate = resolve2(input.candidateWorkspace);
@@ -20329,13 +22055,13 @@ async function runDeterministicCommandEvaluator(input) {
   if (observedTreeDigest !== input.candidateTreeDigest)
     throw new Error(`candidate tree digest mismatch: expected ${input.candidateTreeDigest}, observed ${observedTreeDigest}`);
   mkdirSync7(verifier, { recursive: true, mode: 448 });
-  const runVerifier = mkdtempSync2(join6(verifier, "run-"));
-  const acceptance = join6(runVerifier, "acceptance-source");
-  const isolatedCandidate = join6(runVerifier, "candidate");
+  const runVerifier = mkdtempSync3(join7(verifier, "run-"));
+  const acceptance = join7(runVerifier, "acceptance-source");
+  const isolatedCandidate = join7(runVerifier, "candidate");
   cpSync2(candidate, isolatedCandidate, { recursive: true, force: false, errorOnExist: true });
   writeFileSync3(acceptance, input.acceptanceSource, { mode: 256 });
   chmodSync2(acceptance, 256);
-  const sourceDigest = digest(input.acceptanceSource);
+  const sourceDigest = digest2(input.acceptanceSource);
   const process2 = input.process ?? new BunVerifierProcess;
   let result;
   try {
@@ -20433,9 +22159,9 @@ class ExperimentService {
     };
   }
   async createDataset(dataset) {
-    const digest2 = await datasetDigest(dataset);
-    this.app.coordinator.journal.saveDataset({ ...dataset, digest: digest2 });
-    return { id: dataset.id, version: dataset.version, digest: digest2 };
+    const digest3 = await datasetDigest(dataset);
+    this.app.coordinator.journal.saveDataset({ ...dataset, digest: digest3 });
+    return { id: dataset.id, version: dataset.version, digest: digest3 };
   }
   listDatasets() {
     return this.app.coordinator.journal.listDatasets();
@@ -20472,7 +22198,7 @@ class ExperimentService {
     };
   }
   async runScriptedJudge(input) {
-    const digest2 = (await this.app.bundle("tiny")).digest;
+    const digest3 = (await this.app.bundle("tiny")).digest;
     const run = await this.app.createRun({
       workflowId: "tiny",
       idempotencyKey: `judge:${input.experimentId}:${input.cellKey}`,
@@ -20484,7 +22210,7 @@ class ExperimentService {
           candidateRunId: input.candidateRunId,
           context: "candidate summary and deterministic evidence",
           usage: { inputTokens: null, outputTokens: null, cost: null },
-          workflowDigest: digest2
+          workflowDigest: digest3
         }
       }
     });
@@ -20630,7 +22356,7 @@ class ExperimentService {
         const target = {
           runId: run.runId,
           revision: view.revision,
-          treeDigest: Object.values(view.state.invocations).map((invocation) => invocation.workspace?.treeDigest).find((digest2) => Boolean(digest2))
+          treeDigest: Object.values(view.state.invocations).map((invocation) => invocation.workspace?.treeDigest).find((digest3) => Boolean(digest3))
         };
         const evaluator2 = {
           id: "kouro.builtin.metrics",
@@ -20735,7 +22461,7 @@ class ExperimentService {
 
 // packages/host/src/checkpoints/materializer.ts
 init_src();
-import { createHash as createHash5 } from "crypto";
+import { createHash as createHash6 } from "crypto";
 class CheckpointMaterializer {
   options;
   constructor(options) {
@@ -20758,10 +22484,10 @@ class CheckpointMaterializer {
       const artifact = this.options.journal.getArtifact(root);
       return artifact?.digest ?? root;
     });
-    for (const digest2 of artifactRoots) {
-      if (!/^[a-f0-9]{64}$/.test(digest2))
-        throw new Error(`checkpoint artifact root is not a content digest: ${digest2}`);
-      this.options.journal.blobs.read({ digest: digest2 });
+    for (const digest3 of artifactRoots) {
+      if (!/^[a-f0-9]{64}$/.test(digest3))
+        throw new Error(`checkpoint artifact root is not a content digest: ${digest3}`);
+      this.options.journal.blobs.read({ digest: digest3 });
     }
     const certificate = await createCheckpointCut({
       ...input.checkpoint,
@@ -20803,7 +22529,14 @@ class CheckpointMaterializer {
       throw new Error("checkpoint source bundle not found");
     const projection = prepareForkProjection(certificate);
     const childBundle = await materializePromptVariant(sourceBundle, input.promptVariants ?? {}, this.options.journal.getView(certificate.sourceRunId), certificate.inheritedSourceInvocationIds);
-    if (input.executionProfile !== undefined && !["scripted", "codex-readonly", "pi-readonly"].includes(input.executionProfile))
+    if (input.executionProfile !== undefined && ![
+      "scripted",
+      "codex-readonly",
+      "codex-workspace-write",
+      "claude-readonly",
+      "claude-workspace-write",
+      "pi-readonly"
+    ].includes(input.executionProfile))
       throw new Error("unsupported fork execution profile");
     const sourceInput = this.options.journal.getRunInput(certificate.sourceRunId) ?? {};
     const childInput = { ...sourceInput, ...input.input };
@@ -20817,7 +22550,7 @@ class CheckpointMaterializer {
     if (canonicalize(withoutProfile(childInput)) !== canonicalize(withoutProfile(sourceInput)))
       throw new Error("fork variant may change only execution profile");
     const childProfile = typeof childInput.__kouroExecutionProfile === "string" ? childInput.__kouroExecutionProfile : "scripted";
-    const childConfigDependencyDigest = `sha256:${createHash5("sha256").update(canonicalize({
+    const childConfigDependencyDigest = `sha256:${createHash6("sha256").update(canonicalize({
       input: childInput,
       profile: childProfile,
       promptVariants: input.promptVariants ?? {},
@@ -20895,7 +22628,7 @@ class CheckpointMaterializer {
   }
 }
 function stableCheckpointId(requestKey) {
-  return `cp_${createHash5("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
+  return `cp_${createHash6("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
 }
 async function materializePromptVariant(source, replacements, sourceView, inheritedInvocationIds) {
   const entries = Object.entries(replacements);
@@ -20940,8 +22673,8 @@ async function materializePromptVariant(source, replacements, sourceView, inheri
     boundSummary: source.boundSummary
   };
   const canonicalJson = canonicalize(executable);
-  const digest2 = `sha256:${await sha256Hex(canonicalJson)}`;
-  const candidate = { ...executable, digest: digest2, canonicalJson };
+  const digest3 = `sha256:${await sha256Hex(canonicalJson)}`;
+  const candidate = { ...executable, digest: digest3, canonicalJson };
   if (structuralIdentity(source) !== structuralIdentity(candidate))
     throw new Error("prompt variant changed workflow graph or schema");
   return candidate;
@@ -20965,16 +22698,16 @@ function structuralIdentity(bundle) {
   });
 }
 // packages/host/src/checkpoints/retention.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync8, readFileSync as readFileSync3, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
-import { join as join7 } from "path";
+import { existsSync as existsSync3, mkdirSync as mkdirSync8, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
+import { join as join8 } from "path";
 
 class CheckpointRetention {
   path;
   marks;
   constructor(dataDir) {
     mkdirSync8(dataDir, { recursive: true, mode: 448 });
-    this.path = join7(dataDir, "checkpoint-retention.json");
-    this.marks = existsSync3(this.path) ? JSON.parse(readFileSync3(this.path, "utf8")) : {};
+    this.path = join8(dataDir, "checkpoint-retention.json");
+    this.marks = existsSync3(this.path) ? JSON.parse(readFileSync4(this.path, "utf8")) : {};
   }
   retain(checkpointId, roots) {
     for (const root of roots)
@@ -21311,6 +23044,47 @@ class ApplicationService {
         unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host"
       },
       {
+        id: "codex-workspace-write",
+        name: "Codex \xB7 workspace write",
+        description: "Codex can write inside the workspace for explicitly writable roles.",
+        available: codexAvailable,
+        harness: "codex",
+        capabilities: codexCapabilities,
+        unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host"
+      },
+      {
+        id: "claude-readonly",
+        name: "Claude Agent SDK \xB7 read-only",
+        description: "Use the Claude Agent SDK with built-in file tools restricted to the workspace.",
+        available: true,
+        harness: "claude",
+        capabilities: {
+          "structured-output": "supported",
+          cancel: "supported",
+          resume: "unsupported",
+          reattach: "unsupported",
+          tools: "conditional",
+          usage: "supported",
+          "cost-cap": "unsupported"
+        }
+      },
+      {
+        id: "claude-workspace-write",
+        name: "Claude Agent SDK \xB7 workspace write",
+        description: "Claude may edit workspace files for roles declaring workspace-write access.",
+        available: true,
+        harness: "claude",
+        capabilities: {
+          "structured-output": "supported",
+          cancel: "supported",
+          resume: "unsupported",
+          reattach: "unsupported",
+          tools: "conditional",
+          usage: "supported",
+          "cost-cap": "unsupported"
+        }
+      },
+      {
         id: "pi-readonly",
         name: "Pi \xB7 read-only RPC",
         description: "Run the installed Pi CLI through its native RPC protocol with read-only tools.",
@@ -21398,6 +23172,9 @@ class ApplicationService {
   collaboration(runId) {
     return new CollaborationGateway(this.coordinator.journal).snapshot(runId);
   }
+  scouts(runId) {
+    return this.coordinator.scouts.requests(runId);
+  }
   getView(runId) {
     return this.coordinator.journal.getView(runId);
   }
@@ -21436,6 +23213,15 @@ class ApplicationService {
   }
   workspaceCommit(input) {
     return this.coordinator.workspaceCommit(input);
+  }
+  prepareDelivery(input) {
+    return this.coordinator.prepareDelivery(input);
+  }
+  decideDelivery(input) {
+    return this.coordinator.decideDelivery(input);
+  }
+  deliveryAction(actionId) {
+    return this.coordinator.deliveryAction(actionId);
   }
   async cleanupWorkspace(runId) {
     const captures = this.coordinator.journal.listRuns().some((run) => run.runId === runId) ? this.coordinator.journal.db.query("SELECT certificate_json FROM checkpoints WHERE source_run_id = ?1").all(runId) : [];
@@ -21669,6 +23455,32 @@ var AgentSummary = artifactType("kouro.agent-summary.v1", {
   required: ["summary"],
   properties: { summary: { type: "string", minLength: 1 } }
 });
+var WorkItem = artifactType("kouro.work-item.v1", {
+  type: "object",
+  additionalProperties: false,
+  required: ["version", "task"],
+  properties: {
+    version: { const: 1 },
+    task: { type: "string", minLength: 1 },
+    title: { type: "string" },
+    description: { type: "string" },
+    source: { type: "string" },
+    ticket: { type: "object" }
+  }
+});
+var ScoutQuestion = artifactType("kouro.scout-question.v1", {
+  type: "string",
+  minLength: 1
+});
+var ScoutReport = artifactType("kouro.scout-report.v1", {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary", "findings"],
+  properties: {
+    summary: { type: "string", minLength: 1 },
+    findings: { type: "array", items: { type: "string" } }
+  }
+});
 async function compileTiny() {
   const builder2 = new WorkflowBuilder({ id: "tiny", version: "1" });
   const agent = builder2.agent("scripted-agent", {
@@ -21689,22 +23501,41 @@ async function compileTiny() {
   return compileWorkflow(builder2.build());
 }
 async function compileFeature() {
+  const taskSchema = artifactType("kouro.workflow-task.v1", {
+    type: "string",
+    minLength: 1
+  });
   const builder2 = new WorkflowBuilder({ id: "feature", version: "2" });
-  const task = builder2.input("task", artifactType("kouro.workflow-task.v1", { type: "string", minLength: 1 }), { required: false });
+  const task = builder2.input("task", taskSchema, { required: false });
+  const workItem = builder2.input("workItem", WorkItem, { required: false });
+  builder2.subagent("repositoryScout", {
+    role: "repository-scout",
+    prompt: "Inspect the read-only repository view and return a structured repository report.",
+    input: { task: taskSchema, question: ScoutQuestion },
+    produces: ScoutReport,
+    scripted: { output: { summary: "Repository scout fixture", findings: [] } }
+  });
+  builder2.subagent("testScout", {
+    role: "test-scout",
+    prompt: "Inspect the read-only repository view and return a structured test/build report.",
+    input: { task: taskSchema, question: ScoutQuestion },
+    produces: ScoutReport,
+    scripted: { output: { summary: "Test scout fixture", findings: [] } }
+  });
   const plan = builder2.agent("plan", {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",
-    input: { task },
+    input: { task, workItem },
     produces: AgentSummary
   });
   const approval = builder2.approval("approve-plan", {
     action: "accept-plan",
-    input: { task, plan: plan.output }
+    input: { task, workItem, plan: plan.output }
   });
   const implement = builder2.agent("implement", {
     role: "implementer",
     prompt: "Inspect the supplied plan and perform the authorized implementation.",
-    input: { plan: plan.output }
+    input: { task, workItem, plan: plan.output }
   });
   const validate = builder2.command("validate", {
     executable: "/usr/bin/printf",
@@ -21741,17 +23572,17 @@ async function compileParallelFixture() {
   const branchA = root.call("branch-a", child);
   const branchB = root.call("branch-b", child);
   const fork = root.parallel("reviewers", { branches: [branchA, branchB], maxConcurrent: 2 });
-  const join8 = root.join("join-reviewers", {
+  const join9 = root.join("join-reviewers", {
     groupId: "reviewers",
     mode: "all-settled",
     failure: "wait-for-all"
   });
   const done = root.complete("done");
   root.startAt(fork);
-  fork.on("success").to(join8);
-  branchA.on("success").to(join8);
-  branchB.on("success").to(join8);
-  join8.on("success").to(done);
+  fork.on("success").to(join9);
+  branchA.on("success").to(join9);
+  branchB.on("success").to(join9);
+  join9.on("success").to(done);
   return compileWorkflow(root.build());
 }
 async function loadFileTemplates(root) {
@@ -21791,7 +23622,7 @@ async function loadFileTemplates(root) {
 
 // packages/host/src/http/server.ts
 import { randomBytes as randomBytes2, randomUUID as randomUUID5 } from "crypto";
-import { join as join8, normalize, relative } from "path";
+import { join as join9, normalize, relative } from "path";
 
 // node_modules/.bun/memoirist@0.4.0/node_modules/memoirist/dist/bun/index.js
 var Y = (v, b) => {
@@ -28987,8 +30818,8 @@ var StatusMap = {
   "Network Authentication Required": 511
 };
 var InvertedStatusMap = Object.fromEntries(Object.entries(StatusMap).map(([k2, v]) => [v, k2]));
-function removeTrailingEquals(digest2) {
-  let trimmedDigest = digest2;
+function removeTrailingEquals(digest3) {
+  let trimmedDigest = digest3;
   for (;trimmedDigest.endsWith("="); )
     trimmedDigest = trimmedDigest.slice(0, -1);
   return trimmedDigest;
@@ -34439,7 +36270,7 @@ for(const [k,v] of c.request.headers.entries())c.headers[k]=v
       normalize: app.config.normalize
     });
     app.route("WS", path, async (context) => {
-      const server = context.server ?? app.server, { set, path: path2, qi, headers, query, params } = context;
+      const server = context.server ?? app.server, { set, path: path2, qi, headers, query: query2, params } = context;
       if (context.validator = responseValidator, options.upgrade)
         if (typeof options.upgrade == "function") {
           const temp = options.upgrade(context);
@@ -35624,14 +37455,14 @@ var _Elysia = class _Elysia2 {
         const {
           body,
           headers,
-          query,
+          query: query2,
           params,
           cookie,
           response,
           ...hook
         } = schemaOrRun, localHook = hooks;
         this.applyMacro(hook);
-        const hasStandaloneSchema = body || headers || query || params || cookie || response;
+        const hasStandaloneSchema = body || headers || query2 || params || cookie || response;
         this.add(method, path, handler, mergeHook(hook, {
           ...localHook || {},
           error: localHook.error ? Array.isArray(localHook.error) ? [
@@ -35648,7 +37479,7 @@ var _Elysia = class _Elysia2 {
               {
                 body,
                 headers,
-                query,
+                query: query2,
                 params,
                 cookie,
                 response
@@ -35713,12 +37544,12 @@ var _Elysia = class _Elysia2 {
       const {
         body,
         headers,
-        query,
+        query: query2,
         params,
         cookie,
         response,
         ...guardHook
-      } = hook, hasStandaloneSchema = body || headers || query || params || cookie || response;
+      } = hook, hasStandaloneSchema = body || headers || query2 || params || cookie || response;
       this.add(method, path, handler, mergeHook(guardHook, {
         ...localHook || {},
         error: localHook.error ? Array.isArray(localHook.error) ? [
@@ -35733,7 +37564,7 @@ var _Elysia = class _Elysia2 {
           {
             body,
             headers,
-            query,
+            query: query2,
             params,
             cookie,
             response
@@ -35747,12 +37578,12 @@ var _Elysia = class _Elysia2 {
           const {
             body,
             headers,
-            query,
+            query: query2,
             params,
             cookie,
             response,
             ...guardHook
-          } = hook, hasStandaloneSchema = body || headers || query || params || cookie || response, startIndex = processedUntil;
+          } = hook, hasStandaloneSchema = body || headers || query2 || params || cookie || response, startIndex = processedUntil;
           processedUntil = instance.router.history.length;
           for (let i = startIndex;i < instance.router.history.length; i++) {
             const {
@@ -35775,7 +37606,7 @@ var _Elysia = class _Elysia2 {
                 {
                   body,
                   headers,
-                  query,
+                  query: query2,
                   params,
                   cookie,
                   response
@@ -36300,7 +38131,14 @@ function createHostServer(service, options = {}) {
       const input = bodyObject(body);
       if (typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim())
         throw new Error("idempotencyKey is required");
-      if (input.executionProfile !== undefined && !["scripted", "codex-readonly", "pi-readonly"].includes(String(input.executionProfile)))
+      if (input.executionProfile !== undefined && ![
+        "scripted",
+        "codex-readonly",
+        "codex-workspace-write",
+        "claude-readonly",
+        "claude-workspace-write",
+        "pi-readonly"
+      ].includes(String(input.executionProfile)))
         throw new Error("unsupported execution profile");
       return toWebRun(await service.runPromptFixture({
         fixture: input.fixture,
@@ -36406,7 +38244,7 @@ function createHostServer(service, options = {}) {
       };
     }
   });
-  app.get("/api/runs", ({ request, set, query }) => checked(request, set) ? service.listRunsPage(Math.min(100, nonnegativeInt(query.limit) || 100), nonnegativeInt(query.offset)).map(toWebRun) : denied(set));
+  app.get("/api/runs", ({ request, set, query: query2 }) => checked(request, set) ? service.listRunsPage(Math.min(100, nonnegativeInt(query2.limit) || 100), nonnegativeInt(query2.offset)).map(toWebRun) : denied(set));
   app.get("/api/runs/:id/checkpoint", async ({ request, set, params }) => {
     if (!checked(request, set))
       return denied(set);
@@ -36499,6 +38337,15 @@ function createHostServer(service, options = {}) {
       };
     }
   });
+  app.get("/api/runs/:id/scouts", ({ request, set, params }) => {
+    if (!checked(request, set))
+      return denied(set);
+    if (!service.getView(params.id)) {
+      set.status = 404;
+      return { error: "run-not-found" };
+    }
+    return service.scouts(params.id);
+  });
   app.post("/api/runs", async ({ request, set, body }) => {
     if (!checked(request, set, true))
       return denied(set);
@@ -36508,7 +38355,7 @@ function createHostServer(service, options = {}) {
       set.status = 400;
       return { error: "invalid-run-request" };
     }
-    if (input.executionProfile !== undefined && input.executionProfile !== "scripted" && input.executionProfile !== "codex-readonly" && input.executionProfile !== "pi-readonly") {
+    if (input.executionProfile !== undefined && input.executionProfile !== "scripted" && input.executionProfile !== "codex-readonly" && input.executionProfile !== "pi-readonly" && input.executionProfile !== "codex-workspace-write" && input.executionProfile !== "claude-readonly" && input.executionProfile !== "claude-workspace-write") {
       set.status = 400;
       return { error: "invalid-execution-profile" };
     }
@@ -36518,6 +38365,7 @@ function createHostServer(service, options = {}) {
         idempotencyKey: input.idempotencyKey,
         input: typeof input.input === "object" && input.input !== null ? input.input : undefined,
         executionProfile: input.executionProfile,
+        allowUnrestrictedCommands: input.allowUnrestrictedCommands === true,
         workspace: typeof input.workspace === "object" && input.workspace !== null && typeof input.workspace.repositoryPath === "string" ? {
           repositoryPath: String(input.workspace.repositoryPath),
           workspaceId: typeof input.workspace.workspaceId === "string" ? String(input.workspace.workspaceId) : undefined
@@ -36574,12 +38422,13 @@ function createHostServer(service, options = {}) {
           actor: "local-operator",
           idempotencyKey: input.idempotencyKey
         });
-      if (input.action === "deliver" && typeof input.expectedTree === "string")
+      if (input.action === "deliver" && (typeof input.expectedTree === "string" || typeof input.deliveryActionId === "string"))
         return service.workspaceCommit({
           runId: params.id,
-          expectedTree: input.expectedTree,
+          expectedTree: typeof input.expectedTree === "string" ? input.expectedTree : service.deliveryAction(String(input.deliveryActionId))?.resultTree ?? "",
           operationKey: input.idempotencyKey,
-          message: typeof input.message === "string" && input.message.trim() ? input.message : `Deliver ${params.id}`
+          message: typeof input.message === "string" && input.message.trim() ? input.message : `Deliver ${params.id}`,
+          ...typeof input.deliveryActionId === "string" ? { deliveryActionId: input.deliveryActionId } : {}
         });
       if (input.action !== "approve" && input.action !== "reject" || typeof input.invocationId !== "string")
         throw new Error("unsupported-or-invalid-action");
@@ -36622,31 +38471,91 @@ function createHostServer(service, options = {}) {
       }
     };
   });
-  app.get("/api/runs/:id/events", ({ request, set, params, query }) => {
+  app.get("/api/runs/:id/events", ({ request, set, params, query: query2 }) => {
     if (!checked(request, set))
       return denied(set);
     if (!service.getView(params.id)) {
       set.status = 404;
       return { error: "run-not-found" };
     }
-    const after = nonnegativeInt(query.after);
+    const after = nonnegativeInt(query2.after);
     return {
       events: service.getEvents(params.id, after),
       nextCursor: service.getView(params.id)?.eventCursor ?? after
     };
   });
-  app.get("/api/runs/:id/evidence", ({ request, set, params, query }) => {
+  app.get("/api/runs/:id/evidence", ({ request, set, params, query: query2 }) => {
     if (!checked(request, set))
       return denied(set);
     if (!service.getView(params.id)) {
       set.status = 404;
       return { error: "run-not-found" };
     }
-    const revision = query.revision === undefined ? undefined : Number(query.revision);
+    const revision = query2.revision === undefined ? undefined : Number(query2.revision);
     return service.getEvaluationEvidence(params.id, {
       revision: Number.isSafeInteger(revision) ? revision : undefined,
-      evaluatorId: typeof query.evaluatorId === "string" ? query.evaluatorId : undefined
+      evaluatorId: typeof query2.evaluatorId === "string" ? query2.evaluatorId : undefined
     });
+  });
+  app.get("/api/runs/:id/delivery/:actionId", ({ request, set, params }) => {
+    if (!checked(request, set))
+      return denied(set);
+    const action = service.deliveryAction(params.actionId);
+    if (!action || action.runId !== params.id) {
+      set.status = 404;
+      return { error: "delivery-action-not-found" };
+    }
+    return action;
+  });
+  app.post("/api/runs/:id/delivery", async ({ request, set, params, body }) => {
+    if (!checked(request, set, true))
+      return denied(set);
+    try {
+      const input = bodyObject(body);
+      if (typeof input.requestKey !== "string" || !input.requestKey.trim())
+        throw new Error("delivery requestKey is required");
+      return await service.prepareDelivery({
+        runId: params.id,
+        requestKey: input.requestKey,
+        ...typeof input.invocationId === "string" ? { invocationId: input.invocationId } : {},
+        message: typeof input.message === "string" && input.message.trim() ? input.message : `Deliver ${params.id}`,
+        ...Array.isArray(input.validationEvidence) ? {
+          validationEvidence: input.validationEvidence.filter((item) => typeof item === "string")
+        } : {},
+        ...Array.isArray(input.reviewEvidence) ? {
+          reviewEvidence: input.reviewEvidence.filter((item) => typeof item === "string")
+        } : {}
+      });
+    } catch (cause) {
+      set.status = 409;
+      return {
+        error: "delivery-preparation-rejected",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  });
+  app.post("/api/runs/:id/delivery/:actionId", ({ request, set, params, body }) => {
+    if (!checked(request, set, true))
+      return denied(set);
+    try {
+      const input = bodyObject(body);
+      if (input.decision !== "approved" && input.decision !== "rejected")
+        throw new Error("delivery decision must be approved or rejected");
+      const action = service.deliveryAction(params.actionId);
+      if (!action || action.runId !== params.id)
+        throw new Error("delivery action not found");
+      return service.decideDelivery({
+        actionId: params.actionId,
+        decision: input.decision,
+        actor: typeof input.actor === "string" ? input.actor : "local-operator"
+      });
+    } catch (cause) {
+      set.status = 409;
+      return {
+        error: "delivery-decision-rejected",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
   });
   app.get("/api/experiments/:id/cells/:cellKey/evidence", ({ request, set, params }) => {
     if (!checked(request, set))
@@ -36666,14 +38575,14 @@ function createHostServer(service, options = {}) {
       cellKey: params.cellKey
     });
   });
-  app.get("/api/runs/:id/stream", ({ request, set, params, query }) => {
+  app.get("/api/runs/:id/stream", ({ request, set, params, query: query2 }) => {
     if (!checked(request, set))
       return denied(set);
     if (!service.getView(params.id)) {
       set.status = 404;
       return { error: "run-not-found" };
     }
-    const after = Math.max(nonnegativeInt(query.after), nonnegativeInt(request.headers.get("last-event-id")));
+    const after = Math.max(nonnegativeInt(query2.after), nonnegativeInt(request.headers.get("last-event-id")));
     const abortController = new AbortController;
     request.signal.addEventListener("abort", () => abortController.abort(), { once: true });
     const stream = new ReadableStream({
@@ -36789,11 +38698,11 @@ data: ${JSON.stringify(frame)}
       };
     }
   });
-  app.get("/api/pairwise/:id", ({ request, set, params, query }) => {
+  app.get("/api/pairwise/:id", ({ request, set, params, query: query2 }) => {
     if (!checked(request, set))
       return denied(set);
     try {
-      return service.pairwise(params.id, typeof query.actor === "string" ? query.actor : "");
+      return service.pairwise(params.id, typeof query2.actor === "string" ? query2.actor : "");
     } catch (cause) {
       set.status = 403;
       return {
@@ -36845,7 +38754,7 @@ data: ${JSON.stringify(frame)}
       return { error: "artifact-not-found" };
     }
   });
-  app.get("/", () => options.staticRoot ? Bun.file(join8(options.staticRoot, "index.html")) : "Kouro local host");
+  app.get("/", () => options.staticRoot ? Bun.file(join9(options.staticRoot, "index.html")) : "Kouro local host");
   if (options.staticRoot)
     app.get("/*", async ({ request, set }) => {
       if (!validOriginHost(request)) {
@@ -36853,7 +38762,7 @@ data: ${JSON.stringify(frame)}
         return { error: "invalid-origin" };
       }
       const root = normalize(options.staticRoot);
-      const path = normalize(join8(root, decodeURIComponent(new URL(request.url).pathname).replace(/^\//, "")));
+      const path = normalize(join9(root, decodeURIComponent(new URL(request.url).pathname).replace(/^\//, "")));
       if (relative(root, path).startsWith("..")) {
         set.status = 400;
         return { error: "invalid-path" };
@@ -36861,7 +38770,7 @@ data: ${JSON.stringify(frame)}
       const file2 = Bun.file(path);
       if (await file2.exists())
         return file2;
-      const fallback = Bun.file(join8(root, "index.html"));
+      const fallback = Bun.file(join9(root, "index.html"));
       if (await fallback.exists())
         return fallback;
       set.status = 404;
@@ -36914,7 +38823,9 @@ function toWebRun(run) {
     revision: run.revision,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
-    executionProfile: run.executionProfile
+    executionProfile: run.executionProfile,
+    ...run.task ? { task: run.task } : {},
+    ...run.workItem ? { workItem: run.workItem } : {}
   };
 }
 
@@ -36924,7 +38835,7 @@ var usage = `Kouro v2 M1
 Usage:
   kouro serve     Start the loopback-only local workbench
   kouro create template NAME --template ID  Create a project template under .kouro
-  kouro run [--profile ID]  Execute the tiny workflow headlessly
+  kouro run [WORKFLOW] [--task TEXT] [--profile ID] [--allow-unrestricted-commands]  Execute a workflow headlessly
   kouro inspect ID  Print one durable run view as JSON
   kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
   kouro retry ID INVOCATION REV  Retry one failed invocation
@@ -36961,27 +38872,54 @@ ${usage}`);
   const service = new ApplicationService({ dataDir });
   await service.start();
   if (command === "run") {
+    const valueOptions = new Set(["--profile", "--task", "--workspace", "--ticket"]);
+    let workflowId = "tiny";
+    for (let index = 1;index < argv.length; index += 1) {
+      const arg = argv[index];
+      if (valueOptions.has(arg)) {
+        index += 1;
+        continue;
+      }
+      if (arg.startsWith("--"))
+        continue;
+      workflowId = arg;
+      break;
+    }
     const profileArg = argv.find((arg) => arg.startsWith("--profile="));
     const profileIndex = argv.indexOf("--profile");
     const profile = profileArg?.slice("--profile=".length) ?? (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
-    if (profile !== undefined && profile !== "scripted" && profile !== "codex-readonly" && profile !== "pi-readonly") {
+    const task = optionValue(argv, "--task");
+    const workspace = optionValue(argv, "--workspace");
+    const ticket = optionValue(argv, "--ticket");
+    if (profile !== undefined && profile !== "scripted" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {
       process.stderr.write(`Unknown execution profile: ${profile}
 `);
       await service.close();
       return 2;
     }
     const run = await service.createRun({
-      workflowId: "tiny",
+      workflowId,
       idempotencyKey: crypto.randomUUID(),
       actor: "cli",
-      executionProfile: profile
+      executionProfile: profile,
+      allowUnrestrictedCommands: argv.includes("--allow-unrestricted-commands"),
+      input: {
+        ...task === undefined ? {} : { task },
+        ...ticket === undefined ? {} : { ticket }
+      },
+      ...workspace === undefined ? {} : { workspace: { repositoryPath: workspace } }
     });
     let view = service.getView(run.runId);
-    while (view && (view.state.status === "pending" || view.state.status === "running")) {
+    while (view && (view.state.status === "pending" || view.state.status === "running") && !Object.values(view.state.approvals).some((approval) => approval.status === "pending")) {
       await Bun.sleep(50);
       view = service.getView(run.runId);
     }
-    process.stdout.write(`${JSON.stringify({ runId: run.runId, status: view?.state.status ?? "unknown", revision: view?.revision ?? 0 })}
+    process.stdout.write(`${JSON.stringify({
+      runId: run.runId,
+      status: view?.state.status ?? "unknown",
+      revision: view?.revision ?? 0,
+      unrestrictedCommandOptIn: argv.includes("--allow-unrestricted-commands")
+    })}
 `);
     await service.close();
     return view?.state.status === "succeeded" ? 0 : 1;
@@ -37112,6 +39050,13 @@ Data: ${dataDir}
     close();
   });
   return 0;
+}
+function optionValue(argv, name) {
+  const inline = argv.find((arg) => arg.startsWith(`${name}=`));
+  if (inline)
+    return inline.slice(name.length + 1);
+  const index = argv.indexOf(name);
+  return index >= 0 ? argv[index + 1] : undefined;
 }
 var templateIds = [
   "feature",

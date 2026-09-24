@@ -96,6 +96,7 @@ export interface AgentNode {
   /** Optional per-agent harness override. Defaults to the run execution profile. */
   readonly harness?: Harness;
   readonly modelId?: string;
+  readonly workspaceAccess?: "read-only" | "workspace-write";
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];
   readonly bindings: readonly Binding[];
@@ -111,6 +112,8 @@ export interface CommandNode {
   readonly id: string;
   readonly kind: "command";
   readonly executable: string;
+  /** Runs outside OS containment only when explicitly selected by the workflow author. */
+  readonly executionMode?: "enforced" | "trusted-unrestricted";
   readonly args: readonly string[];
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];
@@ -313,6 +316,7 @@ export interface CommandEvidence {
   readonly kind: "command.evidence";
   readonly executable: string;
   readonly args: readonly string[];
+  readonly executionMode?: "enforced" | "trusted-unrestricted";
   /** Null means the process did not provide an exit code. */
   readonly exitCode: number | null;
   /** Null means no terminating signal was observed. */

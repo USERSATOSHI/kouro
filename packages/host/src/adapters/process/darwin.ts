@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import type { ProcessAdapter, ProcessResult } from "../../types.ts";
-import { probeEnforcedProcess, runEnforcedProcess } from "./common.ts";
+import { probeEnforcedProcess, runEnforcedProcess, runTrustedCommand } from "./common.ts";
 
 export interface DarwinSandboxOptions {
   sandboxExecPath?: string;
@@ -47,6 +47,30 @@ export class DarwinSandboxProcessAdapter implements ProcessAdapter {
     );
   }
 
+  async executeCommand(
+    input: Parameters<ProcessAdapter["executeCommand"]>[0],
+  ): Promise<ProcessResult> {
+    const executable = Bun.which(input.executable) ?? input.executable;
+    const argv = [executable, ...input.args];
+    if (input.executionMode === "trusted-unrestricted")
+      return runTrustedCommand({
+        argv,
+        cwd: input.workspaceDir,
+        timeoutMs: input.timeoutMs,
+        operationKey: input.operationKey,
+      });
+    const probe = await this.probe();
+    if (!probe.available)
+      throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
+    return runEnforcedProcess({
+      command: [this.sandboxExecPath, "-p", this.profile(input.workspaceDir, executable), ...argv],
+      argv,
+      cwd: input.workspaceDir,
+      timeoutMs: input.timeoutMs,
+      operationKey: input.operationKey,
+    });
+  }
+
   private async spawn(
     workspaceDir: string,
     argv: string[],
@@ -62,12 +86,27 @@ export class DarwinSandboxProcessAdapter implements ProcessAdapter {
     });
   }
 
-  private profile(workspaceDir: string): string {
+  private profile(workspaceDir: string, executable = "/usr/bin/printf"): string {
     const path = workspaceDir.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+    const execPath = executable.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+    const homeBun = process.env.HOME ? escapeSandboxPath(`${process.env.HOME}/.bun`) : undefined;
     return [
       "(version 1)",
       "(deny default)",
-      '(allow process-exec (literal "/usr/bin/printf"))',
+      `(allow process-exec (literal "${execPath}"))`,
+      `(allow file-read* (subpath "${execPath.slice(0, execPath.lastIndexOf("/"))}"))`,
+      '(allow process-exec (subpath "/usr/bin"))',
+      '(allow process-exec (subpath "/bin"))',
+      '(allow file-read* (subpath "/opt/homebrew"))',
+      '(allow file-read* (subpath "/usr/local"))',
+      ...(homeBun
+        ? [
+            `(allow file-read* (subpath "${homeBun}"))`,
+            `(allow process-exec (subpath "${homeBun}/bin"))`,
+          ]
+        : []),
+      '(allow process-exec (subpath "/opt/homebrew"))',
+      '(allow process-exec (subpath "/usr/local"))',
       "(allow process-fork)",
       "(allow signal (target same-sandbox))",
       "(allow file-read-metadata)",
@@ -82,6 +121,11 @@ export class DarwinSandboxProcessAdapter implements ProcessAdapter {
       '(allow file-read* (literal "/dev/urandom"))',
       `(allow file-read* (subpath "${path}"))`,
       `(allow file-write* (subpath "${path}"))`,
+      `(allow process-exec (subpath "${path}"))`,
     ].join("\n");
   }
+}
+
+function escapeSandboxPath(path: string): string {
+  return path.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }

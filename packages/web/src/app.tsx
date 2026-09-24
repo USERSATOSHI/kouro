@@ -126,6 +126,8 @@ const normalizeRun = (raw: unknown): RunSummary | null => {
     endedAt: typeof item.endedAt === "string" ? item.endedAt : undefined,
     revision: typeof item.revision === "number" ? item.revision : undefined,
     executionProfile: typeof item.executionProfile === "string" ? item.executionProfile : undefined,
+    task: typeof item.task === "string" ? item.task : undefined,
+    workItem: item.workItem,
   };
 };
 const normalizeWorkflow = (raw: unknown): WorkflowSummary | null => {
@@ -269,13 +271,14 @@ export function App() {
   const [workspacePath, setWorkspacePath] = useState("");
   const [profiles, setProfiles] = useState<ExecutionProfile[]>([]);
   const [profileId, setProfileId] = useState<ExecutionProfile["id"]>("scripted");
+  const [allowUnrestrictedCommands, setAllowUnrestrictedCommands] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(
     () => new URLSearchParams(window.location.search).get("run") ?? undefined,
   );
   const [store] = useState(() => new RunSyncStore());
   const [selectedInvocationId, setSelectedInvocationId] = useState<string>();
   const [surface, setSurface] = useState<
-    "runs" | "evals" | "swarm" | "development" | "checkpoints"
+    "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints"
   >("runs");
   const [experiments, setExperiments] = useState<EvalExperiment[]>([]);
   const [selectedExperimentId, setSelectedExperimentId] = useState<string>();
@@ -683,6 +686,7 @@ export function App() {
         body: JSON.stringify({
           workflowId,
           executionProfile: profileId,
+          allowUnrestrictedCommands,
           idempotencyKey: crypto.randomUUID(),
           ...(task.trim() ? { input: { task: task.trim() } } : {}),
           ...(workspacePath.trim() ? { workspace: { repositoryPath: workspacePath.trim() } } : {}),
@@ -690,11 +694,19 @@ export function App() {
       });
       setRuns((old) => [created, ...old.filter((run) => run.id !== created.id)]);
       setSelectedRunId(created.id);
+      setSelectedInvocationId(undefined);
+      setSurface("runs");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to launch run");
     } finally {
       setLaunching(false);
     }
+  };
+
+  const openNewRun = () => {
+    setTask("");
+    setError(undefined);
+    setSurface("new-run");
   };
 
   const controlRun = async (action: string, invocationId?: string) => {
@@ -798,28 +810,41 @@ export function App() {
         onShowOlderRuns={showOlderRuns}
         workflowId={workflowId}
         selectedRunId={selectedRunId}
-        setWorkflowId={setWorkflowId}
-        setSelectedRunId={setSelectedRunId}
+        setWorkflowId={(id) => {
+          setWorkflowId(id);
+          openNewRun();
+        }}
+        setSelectedRunId={(id) => {
+          setSelectedRunId(id);
+          setSelectedInvocationId(undefined);
+          setSurface("runs");
+        }}
         surface={surface}
         setSurface={setSurface}
         onResizeStart={(event) => startPanelResize("sidebar", event)}
       />
       <main className="main-column">
         <Topbar
-          run={activeRun}
-          view={snapshot}
+          run={surface === "new-run" ? undefined : activeRun}
+          view={surface === "new-run" ? null : snapshot}
           store={store}
           onLaunch={launch}
+          onNewRun={openNewRun}
           launching={launching}
           profiles={profiles}
           profileId={profileId}
           setProfileId={setProfileId}
+          allowUnrestrictedCommands={allowUnrestrictedCommands}
+          setAllowUnrestrictedCommands={setAllowUnrestrictedCommands}
           pendingAction={pendingAction}
           actionNotice={actionNotice}
           onControl={controlRun}
           workflows={workflows}
           workflowId={workflowId}
-          setWorkflowId={setWorkflowId}
+          setWorkflowId={(id) => {
+            setWorkflowId(id);
+            openNewRun();
+          }}
           surface={surface}
           setSurface={setSurface}
         />
@@ -882,7 +907,7 @@ export function App() {
             <div className="loader" />
             Loading local workbench…
           </div>
-        ) : selectedRunId && snapshot ? (
+        ) : surface !== "new-run" && selectedRunId && snapshot ? (
           <Workbench
             workflow={workflow}
             view={snapshot}
@@ -1040,8 +1065,10 @@ function Sidebar({
   selectedRunId?: string;
   setWorkflowId: (id: string) => void;
   setSelectedRunId: (id: string) => void;
-  surface: "runs" | "evals" | "swarm" | "development" | "checkpoints";
-  setSurface: (surface: "runs" | "evals" | "swarm" | "development" | "checkpoints") => void;
+  surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints";
+  setSurface: (
+    surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints",
+  ) => void;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
   return (
@@ -1165,10 +1192,13 @@ function Topbar({
   view,
   store,
   onLaunch,
+  onNewRun,
   launching,
   profiles,
   profileId,
   setProfileId,
+  allowUnrestrictedCommands,
+  setAllowUnrestrictedCommands,
   pendingAction,
   actionNotice,
   onControl,
@@ -1182,18 +1212,23 @@ function Topbar({
   view: UiRunView | null;
   store: RunSyncStore;
   onLaunch: () => void;
+  onNewRun: () => void;
   launching: boolean;
   profiles: ExecutionProfile[];
   profileId: ExecutionProfile["id"];
   setProfileId: (id: ExecutionProfile["id"]) => void;
+  allowUnrestrictedCommands: boolean;
+  setAllowUnrestrictedCommands: (enabled: boolean) => void;
   pendingAction?: string;
   actionNotice?: string;
   onControl: (action: string, invocationId?: string) => void;
   workflows: WorkflowSummary[];
   workflowId: string;
   setWorkflowId: (id: string) => void;
-  surface: "runs" | "evals" | "swarm" | "development" | "checkpoints";
-  setSurface: (surface: "runs" | "evals" | "swarm" | "development" | "checkpoints") => void;
+  surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints";
+  setSurface: (
+    surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints",
+  ) => void;
 }) {
   const now = useServerNow(view?.servedAt, 250);
   const start = isoMs(view?.startedAt ?? run?.startedAt ?? view?.serverClock, now);
@@ -1285,6 +1320,15 @@ function Topbar({
             ))}
           </select>
         </label>
+        <label className="profile-picker">
+          <input
+            type="checkbox"
+            aria-label="Allow trusted unrestricted commands"
+            checked={allowUnrestrictedCommands}
+            onChange={(event) => setAllowUnrestrictedCommands(event.target.checked)}
+          />
+          <span>ALLOW UNRESTRICTED COMMANDS</span>
+        </label>
         <span className={`stream-state ${store.status}`}>
           <i />
           {store.status === "live" ? "LIVE" : store.status.toUpperCase()}
@@ -1296,6 +1340,15 @@ function Topbar({
         <span data-testid="run-status" className="sr-only">
           {state ?? "idle"}
         </span>
+        {run && (
+          <button
+            className="subtle-button"
+            aria-label="New run with different input"
+            onClick={onNewRun}
+          >
+            New run
+          </button>
+        )}
         <button
           data-testid="start-run"
           className="launch-button"
@@ -2618,6 +2671,9 @@ function EvidencePanel({
               <code>
                 {attempt.command.executable} {(attempt.command.args ?? []).join(" ")}
               </code>
+            )}
+            {attempt.command?.executionMode === "trusted-unrestricted" && (
+              <small>TRUSTED UNRESTRICTED COMMAND</small>
             )}
             {attempt.result && (
               <p>

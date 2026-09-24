@@ -1329,7 +1329,12 @@ export class Journal {
     const { input_json: _input, ...summary } = row;
     return {
       ...summary,
-      ...(profile === "scripted" || profile === "codex-readonly" || profile === "pi-readonly"
+      ...(profile === "scripted" ||
+      profile === "codex-readonly" ||
+      profile === "codex-workspace-write" ||
+      profile === "claude-readonly" ||
+      profile === "claude-workspace-write" ||
+      profile === "pi-readonly"
         ? { executionProfile: profile }
         : {}),
       ...(task ? { task } : {}),

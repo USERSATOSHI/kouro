@@ -64,7 +64,13 @@ export interface RunSummary {
   workItem?: unknown;
 }
 export interface ExecutionProfile {
-  id: "scripted" | "codex-readonly" | "pi-readonly";
+  id:
+    | "scripted"
+    | "codex-readonly"
+    | "codex-workspace-write"
+    | "claude-readonly"
+    | "claude-workspace-write"
+    | "pi-readonly";
   name: string;
   description: string;
   available: boolean;
@@ -120,7 +126,12 @@ export interface UiAttempt {
   artifactIds: string[];
   output?: unknown;
   error?: string;
-  command?: { executable?: string; args?: string[] };
+  command?: {
+    executable?: string;
+    args?: string[];
+    executionMode?: "enforced" | "trusted-unrestricted";
+    stderrArtifactId?: string;
+  };
   result?: { exitCode?: number; status?: string };
   resolvedExecution?: unknown;
   sessionRef?: unknown;
@@ -260,7 +271,7 @@ export function viewFromCore(view: CoreRunView): UiRunView {
       endedAt: item.completedAt ?? undefined,
       outputArtifactIds: item.output.map((ref) => ref.id),
       evidenceArtifactIds: item.evidence.map((ref) => ref.id),
-      artifactIds: item.artifacts.map((ref) => ref.id),
+      artifactIds: [...item.artifacts, ...item.evidence].map((ref) => ref.id),
       error: item.error,
       approval: (() => {
         const approval = Object.values(view.state.approvals).find(
@@ -288,7 +299,12 @@ export function viewFromCore(view: CoreRunView): UiRunView {
       error: item.error,
       output: item.output,
       command: item.commandEvidence
-        ? { executable: item.commandEvidence.executable, args: [...item.commandEvidence.args] }
+        ? {
+            executable: item.commandEvidence.executable,
+            args: [...item.commandEvidence.args],
+            executionMode: item.commandEvidence.executionMode,
+            stderrArtifactId: item.commandEvidence.stderrArtifactId,
+          }
         : undefined,
       result: item.commandEvidence
         ? {

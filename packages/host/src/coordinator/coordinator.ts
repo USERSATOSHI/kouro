@@ -26,6 +26,10 @@ import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harnes
 import { CodexCliHarness, CodexHarnessAdapter, inspectCodex } from "../adapters/harness/codex.ts";
 import { ExternalCliHarnessAdapter, inspectExternalCli } from "../adapters/harness/external-cli.ts";
 import {
+  ClaudeAgentSdkHarnessAdapter,
+  claudeSdkDescriptor,
+} from "../adapters/harness/claude-agent-sdk.ts";
+import {
   PiCliHarness,
   PiHarnessAdapter,
   inspectPi,
@@ -56,7 +60,13 @@ export interface CoordinatorOptions {
   dataDir: string;
   agent?: ScriptedAgent;
   harness?: HarnessAdapter;
-  executionProfile?: "scripted" | "codex-readonly" | "pi-readonly";
+  executionProfile?:
+    | "scripted"
+    | "codex-readonly"
+    | "codex-workspace-write"
+    | "claude-readonly"
+    | "claude-workspace-write"
+    | "pi-readonly";
   process?: ProcessAdapter;
   scriptedDelayMs?: number;
   commandTimeoutMs?: number;
@@ -78,7 +88,13 @@ export class Coordinator {
   private readonly dataDir: string;
   private readonly scriptedDelayMs: number;
   private readonly commandTimeoutMs: number;
-  private readonly defaultProfile: "scripted" | "codex-readonly" | "pi-readonly";
+  private readonly defaultProfile:
+    | "scripted"
+    | "codex-readonly"
+    | "codex-workspace-write"
+    | "claude-readonly"
+    | "claude-workspace-write"
+    | "pi-readonly";
   private readonly workspaceAdapter?: GitWorkspaceAdapter;
   private readonly workspaces = new Map<string, WorkspaceRef>();
   private readonly branchWorkspaces = new Map<string, WorkspaceRef>();
@@ -88,7 +104,7 @@ export class Coordinator {
   private pi?: HarnessAdapter;
   private piDescriptor?: Awaited<ReturnType<typeof inspectPi>>;
   private claude?: HarnessAdapter;
-  private claudeDescriptor?: Awaited<ReturnType<typeof inspectExternalCli>>;
+  private claudeDescriptor = claudeSdkDescriptor;
   private opencode?: HarnessAdapter;
   private opencodeDescriptor?: Awaited<ReturnType<typeof inspectExternalCli>>;
   private readonly active = new Map<string, Promise<void>>();
@@ -190,8 +206,15 @@ export class Coordinator {
     input?: Record<string, unknown>;
     idempotencyKey: string;
     actor?: string;
-    executionProfile?: "scripted" | "codex-readonly" | "pi-readonly";
+    executionProfile?:
+      | "scripted"
+      | "codex-readonly"
+      | "codex-workspace-write"
+      | "claude-readonly"
+      | "claude-workspace-write"
+      | "pi-readonly";
     workspace?: { repositoryPath: string; workspaceId?: string };
+    allowUnrestrictedCommands?: boolean;
   }): Promise<{ run: RunSummary; created: boolean }> {
     const normalizedInput = normalizeAdmissionInput(input.bundle, input.input);
     if (input.workspace && !this.workspaceAdapter)
@@ -201,6 +224,7 @@ export class Coordinator {
       input: {
         ...normalizedInput,
         __kouroExecutionProfile: input.executionProfile ?? this.defaultProfile,
+        ...(input.allowUnrestrictedCommands ? { __kouroAllowUnrestrictedCommands: true } : {}),
       },
       executionProfile: input.executionProfile ?? this.defaultProfile,
       workspace: input.workspace,
@@ -489,7 +513,7 @@ export class Coordinator {
     if ((input.action === "cancel" || input.action === "interrupt") && active) {
       const profile = this.profileFor(input.runId);
       const capabilities =
-        profile === "codex-readonly"
+        profile === "codex-readonly" || profile === "codex-workspace-write"
           ? this.codexDescriptor?.availability === "available"
             ? { cancel: "supported" }
             : { cancel: "unsupported" }
@@ -572,10 +596,21 @@ export class Coordinator {
     return { revision: next.revision, status: next.state.status };
   }
 
-  private profileFor(runId: string): "scripted" | "codex-readonly" | "pi-readonly" {
+  private profileFor(
+    runId: string,
+  ):
+    | "scripted"
+    | "codex-readonly"
+    | "codex-workspace-write"
+    | "claude-readonly"
+    | "claude-workspace-write"
+    | "pi-readonly" {
     const row = this.journal.getRunRow(runId);
     const input = row ? parseJson<Record<string, unknown>>(row.input_json) : {};
     return input.__kouroExecutionProfile === "codex-readonly" ||
+      input.__kouroExecutionProfile === "codex-workspace-write" ||
+      input.__kouroExecutionProfile === "claude-readonly" ||
+      input.__kouroExecutionProfile === "claude-workspace-write" ||
       input.__kouroExecutionProfile === "pi-readonly"
       ? input.__kouroExecutionProfile
       : "scripted";
@@ -1238,7 +1273,7 @@ export class Coordinator {
       scope?.definitionId ?? view.bundle.rootDefinitionId
     ]?.nodes.find((candidate) => candidate.id === invocation.nodeId);
     try {
-      if (node?.kind === "command") validateM1Command(node);
+      if (node?.kind === "command") this.validateCommandForRun(runId, node);
       if (node?.kind === "agent")
         this.resolveAgentInputs(view!.bundle, currentState, node, invocationId);
     } catch (cause) {
@@ -1289,8 +1324,22 @@ export class Coordinator {
     ]?.nodes.find((candidate) => candidate.id === nodeId);
     if (!node || (node.kind !== "agent" && node.kind !== "command" && node.kind !== "complete"))
       throw new Error(`Unsupported M1 node ${nodeId}`);
-    if (node.kind === "command") validateM1Command(node);
+    if (node.kind === "command") this.validateCommandForRun(state.runId, node);
     return node.kind;
+  }
+
+  private validateCommandForRun(
+    runId: string,
+    node: Extract<Bundle["definitions"][string]["nodes"][number], { kind: "command" }>,
+  ): void {
+    validateCommandNode(node);
+    if (node.executionMode !== "trusted-unrestricted") return;
+    const row = this.journal.getRunRow(runId);
+    const input = row ? parseJson<Record<string, unknown>>(row.input_json) : {};
+    if (input.__kouroAllowUnrestrictedCommands !== true)
+      throw new Error(
+        "Command requires explicit launch opt-in: enable trusted unrestricted commands",
+      );
   }
 
   private async execute(
@@ -1320,7 +1369,7 @@ export class Coordinator {
       node.kind === "agent"
         ? this.resolveAgentInputs(bundle, state, node, invocationId)
         : undefined;
-    if (node.kind === "command") validateM1Command(node);
+    if (node.kind === "command") this.validateCommandForRun(runId, node);
     if (detail.state === "reserved") this.journal.claimEffect(detail.id, this.ownerEpoch);
     if (detail.state !== "claimed" && this.journal.getEffect(detail.id)?.state !== "claimed")
       return;
@@ -1336,6 +1385,9 @@ export class Coordinator {
         : undefined;
     const profile =
       runInput.__kouroExecutionProfile === "codex-readonly" ||
+      runInput.__kouroExecutionProfile === "codex-workspace-write" ||
+      runInput.__kouroExecutionProfile === "claude-readonly" ||
+      runInput.__kouroExecutionProfile === "claude-workspace-write" ||
       runInput.__kouroExecutionProfile === "pi-readonly"
         ? runInput.__kouroExecutionProfile
         : "scripted";
@@ -1593,16 +1645,21 @@ export class Coordinator {
       let nativeConfig: import("@kouro/core").JsonObject | undefined;
       const requestedHarness =
         node.harness ??
-        (profile === "codex-readonly"
+        (profile === "codex-readonly" || profile === "codex-workspace-write"
           ? "codex"
-          : profile === "pi-readonly"
-            ? "pi"
-            : toHarness(this.harness.id));
+          : profile === "claude-readonly" || profile === "claude-workspace-write"
+            ? "claude"
+            : profile === "pi-readonly"
+              ? "pi"
+              : toHarness(this.harness.id));
       if (
         requestedHarness === "scripted" &&
         node.harness !== "codex" &&
         node.harness !== "pi" &&
         profile !== "codex-readonly" &&
+        profile !== "codex-workspace-write" &&
+        profile !== "claude-readonly" &&
+        profile !== "claude-workspace-write" &&
         profile !== "pi-readonly"
       ) {
         // The injected/default harness is the run's scripted (or test) adapter.
@@ -1633,7 +1690,12 @@ export class Coordinator {
         selected = codex;
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
-        nativeConfig = { sandbox: "read-only" };
+        nativeConfig = {
+          sandbox:
+            profile === "codex-workspace-write" && node.workspaceAccess === "workspace-write"
+              ? "workspace-write"
+              : "read-only",
+        };
       } else if (requestedHarness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available") {
@@ -1671,30 +1733,16 @@ export class Coordinator {
         };
       } else if (requestedHarness === "claude" || requestedHarness === "opencode") {
         if (requestedHarness === "claude") {
-          this.claudeDescriptor ??= await inspectExternalCli("claude");
-          if (this.claudeDescriptor.availability !== "available") {
-            this.journal.completeEffect({
-              effectId: detail.id,
-              storedArtifacts: [],
-              artifacts: [],
-              evidence: [],
-              output: [],
-              status: "failed",
-              error: `harness-unavailable: ${this.claudeDescriptor.detail ?? "claude unavailable"}`,
-              diagnostics: ["execution rejected before workspace side effects"],
-              resolvedExecution: {
-                role: node.role,
-                harness: "claude",
-                adapterVersion: this.claudeDescriptor.adapterVersion,
-              },
-              contextManifest: JSON.parse(JSON.stringify(contextManifest)),
-            });
-            return;
-          }
-          const claude =
-            this.claude ?? new ExternalCliHarnessAdapter("claude", this.claudeDescriptor);
+          const claude = this.claude ?? new ClaudeAgentSdkHarnessAdapter();
           this.claude = claude;
           selected = claude;
+          nativeConfig = {
+            ...(node.modelId ? { model: node.modelId } : {}),
+            permissionMode:
+              profile === "claude-workspace-write" && node.workspaceAccess === "workspace-write"
+                ? "acceptEdits"
+                : "dontAsk",
+          };
         } else {
           this.opencodeDescriptor ??= await inspectExternalCli("opencode");
           if (this.opencodeDescriptor.availability !== "available") {
@@ -1875,6 +1923,7 @@ export class Coordinator {
         .filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key))
         .map(([, value]) => value!)
         .filter((value) => value.length >= 6);
+      const safeError = error ? String(redactSecrets(error, secretValues)) : undefined;
       const storedArtifacts: StoredArtifact[] = [];
       const outputRefs: import("@kouro/core").ArtifactRef[] = [];
       const evidenceRefs: import("@kouro/core").ArtifactRef[] = [];
@@ -1905,6 +1954,20 @@ export class Coordinator {
           id: evidenceArtifact.id,
           digest: evidenceArtifact.digest,
           mediaType: evidenceArtifact.mediaType,
+        });
+      }
+      if (harnessResult.stderr) {
+        const stderr = String(redactSecrets(harnessResult.stderr, secretValues));
+        const stderrArtifact = this.journal.blobs.put(
+          runId,
+          new TextEncoder().encode(stderr),
+          "application/vnd.kouro.harness-stderr+text",
+        ) as StoredArtifact;
+        storedArtifacts.push(stderrArtifact);
+        evidenceRefs.push({
+          id: stderrArtifact.id,
+          digest: stderrArtifact.digest,
+          mediaType: stderrArtifact.mediaType,
         });
       }
       const retryable =
@@ -1944,8 +2007,12 @@ export class Coordinator {
         evidence: evidenceRefs,
         output: outputRefs,
         status,
-        ...(error ? { error } : {}),
-        diagnostics: [harnessResult.error].filter((item): item is string => Boolean(item)),
+        ...(safeError ? { error: safeError } : {}),
+        diagnostics: [
+          harnessResult.error
+            ? String(redactSecrets(harnessResult.error, secretValues))
+            : undefined,
+        ].filter((item): item is string => Boolean(item)),
         resolvedExecution: {
           role: node.role,
           harness: resolvedHarness,
@@ -1960,7 +2027,9 @@ export class Coordinator {
           continuation: "fresh-session",
           handoff: "fresh",
           nativeContinuation: "unavailable",
-          ...(profile === "codex-readonly" ? { reason: "codex-native-resume-unsupported" } : {}),
+          ...(profile === "codex-readonly" || profile === "codex-workspace-write"
+            ? { reason: "codex-native-resume-unsupported" }
+            : {}),
           capabilities: selected.capabilities(),
         },
         ...(retry ? { retry } : {}),
@@ -1971,14 +2040,17 @@ export class Coordinator {
       status = "failed";
       error = "complete node cannot be dispatched as an effect";
     } else {
-      validateM1Command(node);
+      this.validateCommandForRun(runId, node);
       const startedAt = now();
       try {
-        result = await this.process.executeFixedFixture({
+        result = await this.process.executeCommand({
           runId,
           operationKey: detail.operationKey,
           workspaceDir: invocationWorkspaceDir,
+          executable: node.executable,
+          args: node.args,
           timeoutMs: node.timeoutMs || this.commandTimeoutMs,
+          executionMode: node.executionMode,
         });
       } catch (cause) {
         status = "failed";
@@ -1987,14 +2059,15 @@ export class Coordinator {
           operationKey: detail.operationKey,
           evidence: {
             argv: [node.executable, ...node.args],
-            cwd: workspaceDir,
+            cwd: invocationWorkspaceDir,
             exitCode: null,
             signal: null,
             timedOut: null,
             spawnError: error,
             stdout: new Uint8Array(),
             stderr: new Uint8Array(),
-            enforcementMode: this.process.enforcementMode,
+            enforcementMode:
+              node.executionMode === "trusted-unrestricted" ? "trusted-unrestricted" : "enforced",
           },
         };
       }
@@ -2016,6 +2089,7 @@ export class Coordinator {
         kind: "command.evidence",
         executable: node.executable,
         args: [...node.args],
+        executionMode: result.evidence.enforcementMode,
         exitCode: result.evidence.exitCode,
         signal: result.evidence.signal,
         timeout: result.evidence.timedOut,
@@ -2063,6 +2137,7 @@ export class Coordinator {
         new TextEncoder().encode(
           json({
             exitCode: commandEvidence.exitCode,
+            executionMode: commandEvidence.executionMode,
             signal: commandEvidence.signal,
             timeout: commandEvidence.timeout,
             spawnError: commandEvidence.spawnError,
@@ -2387,13 +2462,13 @@ function allArtifactRefs(state: ExecutionState): ArtifactRef[] {
   return refs;
 }
 
-function validateM1Command(
+function validateCommandNode(
   node: Extract<Bundle["definitions"][string]["nodes"][number], { kind: "command" }>,
 ): void {
   if (
-    node.executable !== "/usr/bin/printf" ||
-    node.args.length !== 1 ||
-    node.args[0] !== "Kouro M1 command\\n"
+    !node.executable.trim() ||
+    node.executable.includes("\0") ||
+    node.args.some((arg) => arg.includes("\0"))
   )
-    throw new Error("M1 process adapter allowlist rejected compiled command");
+    throw new Error("Command executable and arguments must be non-empty and contain no NUL bytes");
 }

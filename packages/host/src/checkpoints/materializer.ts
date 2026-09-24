@@ -28,7 +28,13 @@ export interface MaterializedFork {
   readonly pendingInvocationIds: readonly string[];
 }
 
-type ExecutionProfile = "scripted" | "codex-readonly" | "pi-readonly";
+type ExecutionProfile =
+  | "scripted"
+  | "codex-readonly"
+  | "codex-workspace-write"
+  | "claude-readonly"
+  | "claude-workspace-write"
+  | "pi-readonly";
 
 /** Host-side M7.2 capture and fork materialization. */
 export class CheckpointMaterializer {
@@ -131,7 +137,14 @@ export class CheckpointMaterializer {
     );
     if (
       input.executionProfile !== undefined &&
-      !["scripted", "codex-readonly", "pi-readonly"].includes(input.executionProfile)
+      ![
+        "scripted",
+        "codex-readonly",
+        "codex-workspace-write",
+        "claude-readonly",
+        "claude-workspace-write",
+        "pi-readonly",
+      ].includes(input.executionProfile)
     )
       throw new Error("unsupported fork execution profile");
     const sourceInput = this.options.journal.getRunInput(certificate.sourceRunId) ?? {};

@@ -54,7 +54,13 @@ export interface WorkItemInput {
   readonly source?: string;
 }
 
-export type ExecutionProfileId = "scripted" | "codex-readonly" | "pi-readonly";
+export type ExecutionProfileId =
+  | "scripted"
+  | "codex-readonly"
+  | "codex-workspace-write"
+  | "claude-readonly"
+  | "claude-workspace-write"
+  | "pi-readonly";
 
 export interface ExecutionProfileSummary {
   id: ExecutionProfileId;
@@ -75,6 +81,7 @@ export interface CreateRunInput {
   actor?: string;
   executionProfile?: ExecutionProfileId;
   workspace?: { repositoryPath: string; workspaceId?: string };
+  allowUnrestrictedCommands?: boolean;
 }
 
 export interface CommandReceipt {
@@ -112,6 +119,15 @@ export interface ProcessAdapter {
     workspaceDir: string;
     timeoutMs: number;
   }): Promise<ProcessResult>;
+  executeCommand(input: {
+    runId: string;
+    operationKey: string;
+    workspaceDir: string;
+    executable: string;
+    args: readonly string[];
+    timeoutMs: number;
+    executionMode?: "enforced" | "trusted-unrestricted";
+  }): Promise<ProcessResult>;
 }
 
 export interface ScriptedAgent {
@@ -148,6 +164,7 @@ export interface HarnessAdapter {
   }): Promise<{
     output?: import("@kouro/core").JsonValue;
     rawOutput?: string;
+    stderr?: string;
     status: "succeeded" | "failed" | "cancelled" | "unavailable";
     error?: string;
     events: readonly import("@kouro/core").JsonValue[];

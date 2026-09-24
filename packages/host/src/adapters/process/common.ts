@@ -1,4 +1,6 @@
-import { rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { ProcessResult } from "../../types.ts";
 
 export async function runEnforcedProcess(input: {
@@ -9,10 +11,17 @@ export async function runEnforcedProcess(input: {
   operationKey?: string;
 }): Promise<ProcessResult> {
   const operationKey = input.operationKey ?? "probe";
-  let process: ReturnType<typeof Bun.spawn>;
+  const capture = capturePaths();
+  let child: ReturnType<typeof Bun.spawn>;
   try {
-    process = Bun.spawn(input.command, { stdout: "pipe", stderr: "pipe" });
+    child = Bun.spawn(input.command, {
+      cwd: input.cwd,
+      stdout: Bun.file(capture.stdout),
+      stderr: Bun.file(capture.stderr),
+      detached: true,
+    });
   } catch (cause) {
+    rmSync(capture.directory, { recursive: true, force: true });
     return {
       operationKey,
       evidence: {
@@ -28,25 +37,19 @@ export async function runEnforcedProcess(input: {
       },
     };
   }
-  const readPipe = async (pipe: typeof process.stdout): Promise<Uint8Array> => {
-    if (pipe === undefined || typeof pipe === "number") return new Uint8Array();
-    return new Uint8Array(await new Response(pipe).arrayBuffer());
-  };
-  const stdoutPromise = readPipe(process.stdout);
-  const stderrPromise = readPipe(process.stderr);
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => {
       timedOut = true;
-      process.kill();
+      terminateGroup(child, "SIGTERM");
       resolve("timeout");
     }, input.timeoutMs);
   });
   try {
-    const outcome = await Promise.race([process.exited, timeout]);
-    const exitCode = outcome === "timeout" ? await process.exited.catch(() => null) : outcome;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    const outcome = await Promise.race([child.exited, timeout]);
+    const exitCode = outcome === "timeout" ? await stopGroup(child) : outcome;
+    const [stdout, stderr] = readCaptured(capture);
     return {
       operationKey,
       evidence: {
@@ -62,10 +65,7 @@ export async function runEnforcedProcess(input: {
       },
     };
   } catch (cause) {
-    const [stdout, stderr] = await Promise.all([
-      stdoutPromise.catch(() => new Uint8Array()),
-      stderrPromise.catch(() => new Uint8Array()),
-    ]);
+    const [stdout, stderr] = readCaptured(capture);
     return {
       operationKey,
       evidence: {
@@ -82,7 +82,131 @@ export async function runEnforcedProcess(input: {
     };
   } finally {
     if (timer) clearTimeout(timer);
+    rmSync(capture.directory, { recursive: true, force: true });
   }
+}
+
+export async function runTrustedCommand(input: {
+  argv: string[];
+  cwd: string;
+  timeoutMs: number;
+  operationKey: string;
+}): Promise<ProcessResult> {
+  const capture = capturePaths();
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = Bun.spawn(input.argv, {
+      cwd: input.cwd,
+      stdout: Bun.file(capture.stdout),
+      stderr: Bun.file(capture.stderr),
+      detached: true,
+    });
+  } catch (cause) {
+    rmSync(capture.directory, { recursive: true, force: true });
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        spawnError: cause instanceof Error ? cause.message : String(cause),
+        stdout: new Uint8Array(),
+        stderr: new Uint8Array(),
+        enforcementMode: "trusted-unrestricted",
+      },
+    };
+  }
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      child.exited.then((exitCode) => ({ exitCode: Number(exitCode) })),
+      new Promise<{ exitCode: null }>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          terminateGroup(child, "SIGTERM");
+          resolve({ exitCode: null });
+        }, input.timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (timedOut) await stopGroup(child);
+    const [out, err] = readCaptured(capture);
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: result.exitCode,
+        signal: null,
+        timedOut,
+        spawnError: null,
+        stdout: out,
+        stderr: err,
+        enforcementMode: "trusted-unrestricted",
+      },
+    };
+  } catch (cause) {
+    return {
+      operationKey: input.operationKey,
+      evidence: {
+        argv: input.argv,
+        cwd: input.cwd,
+        exitCode: null,
+        signal: null,
+        timedOut,
+        spawnError: cause instanceof Error ? cause.message : String(cause),
+        stdout: new Uint8Array(),
+        stderr: new Uint8Array(),
+        enforcementMode: "trusted-unrestricted",
+      },
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+    rmSync(capture.directory, { recursive: true, force: true });
+  }
+}
+
+function terminateGroup(child: ReturnType<typeof Bun.spawn>, signal: "SIGTERM" | "SIGKILL"): void {
+  try {
+    globalThis.process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      /* exited during cancellation */
+    }
+  }
+}
+
+async function stopGroup(child: ReturnType<typeof Bun.spawn>): Promise<number | null> {
+  const exitCode = await Promise.race([
+    child.exited.then(
+      (code) => Number(code),
+      () => null,
+    ),
+    Bun.sleep(250).then(() => null),
+  ]);
+  terminateGroup(child, "SIGKILL");
+  return exitCode;
+}
+
+function capturePaths() {
+  const directory = mkdtempSync(join(tmpdir(), "kouro-process-output-"));
+  return { directory, stdout: join(directory, "stdout"), stderr: join(directory, "stderr") };
+}
+
+function readCaptured(capture: ReturnType<typeof capturePaths>): [Uint8Array, Uint8Array] {
+  const read = (path: string) => {
+    try {
+      return new Uint8Array(readFileSync(path));
+    } catch {
+      return new Uint8Array();
+    }
+  };
+  return [read(capture.stdout), read(capture.stderr)];
 }
 
 export async function probeEnforcedProcess(

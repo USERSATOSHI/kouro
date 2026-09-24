@@ -27,7 +27,6 @@ export interface CodexRunInput {
 }
 
 interface CodexProcess {
-  stdin: { write(data: string): unknown; end(): unknown };
   stdout: ReadableStream<Uint8Array>;
   stderr: ReadableStream<Uint8Array>;
   exited: Promise<number>;
@@ -128,8 +127,8 @@ export class CodexCliHarness implements HarnessPort {
       input.cwd,
     ];
     if (typeof config.model === "string") args.push("--model", config.model);
-    // The Kouro M2 Codex profile is deliberately read-only. A future native
-    // profile may opt into a different sandbox through a separate adapter.
+    // Workspace writes require both the explicit run profile and per-role
+    // workspaceAccess declaration, set by host policy in nativeConfig.
     args.push("--sandbox", typeof config.sandbox === "string" ? config.sandbox : "read-only");
     const schemaPath = join(tempDir, "output-schema.json");
     if (input.role.outputSchema) {
@@ -142,19 +141,17 @@ export class CodexCliHarness implements HarnessPort {
     };
     if (process.env.CODEX_HOME) env.CODEX_HOME = process.env.CODEX_HOME;
     let proc: CodexProcess;
+    const handoff = input.context
+      ? `\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]\n[KOURO_HANDOFF_BEGIN]\n${input.role.prompt}\n[KOURO_HANDOFF_END]`
+      : input.role.prompt;
     try {
       proc = Bun.spawn(args, {
-        stdin: "pipe",
+        stdin: new Blob([handoff]),
         stdout: "pipe",
         stderr: "pipe",
         signal: input.signal,
         env,
       }) as unknown as CodexProcess;
-      const handoff = input.context
-        ? `\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]\n[KOURO_HANDOFF_BEGIN]\n${input.role.prompt}\n[KOURO_HANDOFF_END]`
-        : input.role.prompt;
-      proc.stdin.write(handoff);
-      proc.stdin.end();
     } catch (cause) {
       cleanupCodexTemp(schemaPath, tempDir);
       return {
@@ -219,6 +216,7 @@ export class CodexCliHarness implements HarnessPort {
         status: "failed",
         error: `codex timed out after ${timeoutMs}ms`,
         rawOutput: stdout,
+        stderr,
         usage: unavailableUsage(),
         events: [{ type: "log", at: new Date().toISOString(), data: "timed out" }],
       };
@@ -228,6 +226,7 @@ export class CodexCliHarness implements HarnessPort {
         error: "cancelled",
         usage: unavailableUsage(),
         rawOutput: stdout,
+        stderr,
         events: [{ type: "log", at: new Date().toISOString(), data: "cancelled" }],
       };
     if (code === undefined) code = await proc.exited.catch(() => -1);
@@ -300,6 +299,7 @@ export class CodexCliHarness implements HarnessPort {
       return {
         status: "failed",
         rawOutput: stdout,
+        stderr,
         error: stderr || `codex exited ${code}`,
         usage,
         events,
@@ -310,12 +310,13 @@ export class CodexCliHarness implements HarnessPort {
         return {
           status: "failed",
           rawOutput: stdout,
+          stderr,
           error: `invalid-output: ${check.error}`,
           usage,
           events,
         };
     }
-    return { status: "succeeded", output: parsed, rawOutput: stdout, usage, events };
+    return { status: "succeeded", output: parsed, rawOutput: stdout, stderr, usage, events };
   }
 }
 

@@ -83,6 +83,8 @@ export interface HarnessResult {
   readonly status: "succeeded" | "failed" | "cancelled" | "unavailable";
   readonly output?: JsonValue;
   readonly rawOutput?: string;
+  /** Separate native stderr stream, retained independently from stdout. */
+  readonly stderr?: string;
   readonly usage: UsageSummary;
   readonly error?: string;
   readonly events: readonly HarnessEvent[];

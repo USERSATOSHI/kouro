@@ -129,7 +129,14 @@ export function createHostServer(
         throw new Error("idempotencyKey is required");
       if (
         input.executionProfile !== undefined &&
-        !["scripted", "codex-readonly", "pi-readonly"].includes(String(input.executionProfile))
+        ![
+          "scripted",
+          "codex-readonly",
+          "codex-workspace-write",
+          "claude-readonly",
+          "claude-workspace-write",
+          "pi-readonly",
+        ].includes(String(input.executionProfile))
       )
         throw new Error("unsupported execution profile");
       return toWebRun(
@@ -139,6 +146,9 @@ export function createHostServer(
           executionProfile: input.executionProfile as
             | "scripted"
             | "codex-readonly"
+            | "codex-workspace-write"
+            | "claude-readonly"
+            | "claude-workspace-write"
             | "pi-readonly"
             | undefined,
         }),
@@ -328,7 +338,13 @@ export function createHostServer(
         name: typeof input.name === "string" ? input.name : undefined,
         executionProfile:
           typeof input.executionProfile === "string"
-            ? (input.executionProfile as "scripted" | "codex-readonly" | "pi-readonly")
+            ? (input.executionProfile as
+                | "scripted"
+                | "codex-readonly"
+                | "codex-workspace-write"
+                | "claude-readonly"
+                | "claude-workspace-write"
+                | "pi-readonly")
             : undefined,
         promptVariants:
           input.promptVariants &&
@@ -390,7 +406,10 @@ export function createHostServer(
       input.executionProfile !== undefined &&
       input.executionProfile !== "scripted" &&
       input.executionProfile !== "codex-readonly" &&
-      input.executionProfile !== "pi-readonly"
+      input.executionProfile !== "pi-readonly" &&
+      input.executionProfile !== "codex-workspace-write" &&
+      input.executionProfile !== "claude-readonly" &&
+      input.executionProfile !== "claude-workspace-write"
     ) {
       set.status = 400;
       return { error: "invalid-execution-profile" };
@@ -407,8 +426,12 @@ export function createHostServer(
           executionProfile: input.executionProfile as
             | "scripted"
             | "codex-readonly"
+            | "codex-workspace-write"
+            | "claude-readonly"
+            | "claude-workspace-write"
             | "pi-readonly"
             | undefined,
+          allowUnrestrictedCommands: input.allowUnrestrictedCommands === true,
           workspace:
             typeof input.workspace === "object" &&
             input.workspace !== null &&

@@ -80,6 +80,7 @@ export interface AgentOptions<T = unknown> {
   readonly harness?: Harness;
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
+  readonly workspaceAccess?: "read-only" | "workspace-write";
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly produces?: ArtifactType<T>;
   readonly timeoutMs?: number;
@@ -113,6 +114,7 @@ export interface SubagentLimits {
 
 export interface CommandOptions {
   readonly executable: string;
+  readonly executionMode?: "enforced" | "trusted-unrestricted";
   readonly args?: readonly string[];
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly timeoutMs?: number;
@@ -486,6 +488,9 @@ export class WorkflowBuilder {
       prompt: options.prompt,
       ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+      ...(options.workspaceAccess === undefined
+        ? {}
+        : { workspaceAccess: options.workspaceAccess }),
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true),
       ),
@@ -519,6 +524,7 @@ export class WorkflowBuilder {
       id,
       kind: "command",
       executable: options.executable,
+      ...(options.executionMode ? { executionMode: options.executionMode } : {}),
       args: [...(options.args ?? [])],
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), true),
@@ -1034,6 +1040,7 @@ function stripInternal(node: InternalNode): Node {
       prompt: node.prompt,
       ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
+      ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
       timeoutMs: node.timeoutMs,
       ...(node.uses === undefined ? {} : { uses: node.uses }),
       ...(node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy }),
@@ -1044,6 +1051,7 @@ function stripInternal(node: InternalNode): Node {
     return {
       ...base,
       executable: node.executable,
+      ...(node.executionMode === undefined ? {} : { executionMode: node.executionMode }),
       args: node.args,
       timeoutMs: node.timeoutMs,
       acceptedExitCodes: node.acceptedExitCodes,
@@ -1078,6 +1086,7 @@ export const commandEvidenceSchema: JsonValue = {
     executable: { type: "string" },
     args: { type: "array", items: { type: "string" } },
     exitCode: { type: ["integer", "null"] },
+    executionMode: { enum: ["enforced", "trusted-unrestricted"] },
     signal: { type: ["string", "null"] },
     timeout: { type: ["boolean", "null"] },
     spawnError: { type: ["string", "null"] },
@@ -1090,6 +1099,7 @@ export const commandResultSchema: JsonValue = {
   type: "object",
   properties: {
     exitCode: { type: ["integer", "null"] },
+    executionMode: { enum: ["enforced", "trusted-unrestricted"] },
     signal: { type: ["string", "null"] },
     timeout: { type: ["boolean", "null"] },
     spawnError: { type: ["string", "null"] },
