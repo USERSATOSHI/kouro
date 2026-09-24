@@ -2,7 +2,7 @@ import type { Harness, JsonObject, JsonValue, RuntimeHarness } from "./contracts
 import { canonicalize, sha256Hex } from "./canonical";
 import Ajv2020 from "ajv/dist/2020.js";
 
-export type Capability =
+type BaseCapability =
   | "structured-output"
   | "cancel"
   | "resume"
@@ -10,6 +10,7 @@ export type Capability =
   | "tools"
   | "usage"
   | "cost-cap";
+export type Capability = BaseCapability | "awaited-subagent-tool" | "child-read-only-envelope";
 export type Availability = "available" | "unavailable";
 export interface CapabilityState {
   readonly state: "supported" | "unsupported" | "conditional";
@@ -20,7 +21,10 @@ export interface HarnessDescriptor {
   readonly id: RuntimeHarness;
   readonly adapterVersion: string;
   readonly version: string;
-  readonly capabilities: Readonly<Record<Capability, CapabilityState>>;
+  readonly capabilities: Readonly<
+    Record<BaseCapability, CapabilityState> &
+      Partial<Record<Exclude<Capability, BaseCapability>, CapabilityState>>
+  >;
   readonly nativeConfigSchema: JsonValue;
   readonly availability: Availability;
   readonly detail?: string;

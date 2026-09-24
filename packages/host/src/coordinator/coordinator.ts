@@ -1771,7 +1771,8 @@ export class Coordinator {
         }
         resolvedHarness = toHarness(selected.id);
         resolvedVersion = selected.adapterVersion;
-        nativeConfig = node.modelId ? { model: node.modelId } : {};
+        if (requestedHarness !== "claude")
+          nativeConfig = node.modelId ? { model: node.modelId } : {};
       } else {
         this.journal.completeEffect({
           effectId: detail.id,
@@ -1851,6 +1852,9 @@ export class Coordinator {
                             requestId: subagentInput.requestId,
                             scoutId: subagentInput.subagentId,
                             input: subagentInput.input,
+                            adapter: selected,
+                            cwd: invocationWorkspaceDir,
+                            parentModelId: resolvedModelId ?? node.modelId,
                             signal: aborter.signal,
                           })
                       : undefined,
@@ -1912,8 +1916,16 @@ export class Coordinator {
           error = `invalid-output: ${validation.error}`;
         }
       }
-      if (status === "succeeded" && node.uses?.length) {
-        const scoutError = this.scouts.acceptanceError(runId, attemptId, node.uses);
+      if (status === "succeeded" && subagentIds.length) {
+        const scoutError = this.scouts.acceptanceError(
+          runId,
+          attemptId,
+          subagentIds.map((id) => {
+            const scout = definition?.scouts?.find((item) => item.id === id);
+            if (!scout) throw new Error(`Declared subagent ${id} is missing`);
+            return { id: scout.id, optional: scout.optional === true };
+          }),
+        );
         if (scoutError) {
           status = "failed";
           error = `scout-acceptance: ${scoutError}`;
@@ -2224,6 +2236,9 @@ export class Coordinator {
     requestId: string;
     scoutId: string;
     input: Record<string, unknown>;
+    adapter: HarnessAdapter;
+    cwd: string;
+    parentModelId?: string;
     signal?: AbortSignal;
   }): Promise<import("../types.ts").ScoutResult> {
     const view = this.journal.getView(input.runId);
@@ -2238,8 +2253,25 @@ export class Coordinator {
     const childAgent = child?.nodes.find((node) => node.kind === "agent");
     if (!child || !scout || childAgent?.kind !== "agent")
       throw new Error(`subagent ${input.scoutId} is unavailable`);
-    if (childAgent.harness && childAgent.harness !== this.harness.id)
-      throw new Error(`subagent harness ${childAgent.harness} is unavailable in this host`);
+    let childAdapter = input.adapter;
+    if (childAgent.harness && childAgent.harness !== input.adapter.id) {
+      if (childAgent.harness === "claude")
+        childAdapter = this.claude ?? (this.claude = new ClaudeAgentSdkHarnessAdapter());
+      else if (childAgent.harness === "codex") {
+        this.codexDescriptor ??= await inspectCodex();
+        if (this.codexDescriptor.availability !== "available")
+          throw new Error(`subagent Codex unavailable: ${this.codexDescriptor.detail}`);
+        childAdapter =
+          this.codex ??
+          (this.codex = new CodexHarnessAdapter(new CodexCliHarness(this.codexDescriptor)));
+      } else if (childAgent.harness === "pi") {
+        this.piDescriptor ??= await inspectPi();
+        if (this.piDescriptor.availability !== "available")
+          throw new Error(`subagent Pi unavailable: ${this.piDescriptor.detail}`);
+        childAdapter =
+          this.pi ?? (this.pi = new PiHarnessAdapter(new PiCliHarness(this.piDescriptor)));
+      } else throw new Error(`subagent harness ${childAgent.harness} is unavailable in this host`);
+    }
     const outputSchema = childAgent.outputPorts[0]
       ? view.bundle.schemas[childAgent.outputPorts[0].schemaDigest]
       : undefined;
@@ -2286,7 +2318,7 @@ export class Coordinator {
           Math.min(childAgent.timeoutMs, 60_000),
         );
         try {
-          const result = await this.harness.run({
+          const result = await childAdapter.run({
             runId: input.runId,
             invocationId: childInvocationId,
             role: childAgent.role,
@@ -2294,7 +2326,18 @@ export class Coordinator {
             ...(outputSchema ? { outputSchema } : {}),
             delayMs: this.scriptedDelayMs,
             timeoutMs: Math.min(childAgent.timeoutMs, 60_000),
-            cwd: this.workspaces.get(input.runId)?.path,
+            cwd: input.cwd,
+            ...(childAgent.modelId
+              ? { modelId: childAgent.modelId }
+              : childAdapter.id === input.adapter.id && input.parentModelId
+                ? { modelId: input.parentModelId }
+                : {}),
+            nativeConfig:
+              childAdapter.id === "claude"
+                ? { permissionMode: "dontAsk" }
+                : childAdapter.id === "codex"
+                  ? { sandbox: "read-only" }
+                  : {},
             context,
             signal: childAborter.signal,
           });

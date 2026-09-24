@@ -19,9 +19,14 @@ separate `allowUnrestrictedCommands` launch option (CLI:
 choice is recorded with command evidence. Choose it only for a workflow and
 workspace whose commands you trust.
 
-The starter does not declare native scouts. Codex and Pi adapters do not yet
-provide the awaited, read-only same-turn child call required by Kouro's scout
-contract, so adding scouts would prevent the planner from running. The
-repository-scout and test-scout prompt/schema assets remain available for a
-future adapter that implements that contract; this starter does not claim v1
-scout parity.
+The feature starter declares a required `repositoryScout` and an optional
+`testScout`. The planner invokes them as bounded `subagent` tool calls and gets
+each typed result in the same turn. The implementer receives the reports from
+the accepted planner attempt. Child agents use read-only tools and cannot run
+commands, edit files, or start nested subagents.
+
+Codex uses a run-scoped MCP server, Pi loads a run-scoped extension, and Claude
+uses an in-process MCP server from the Claude Agent SDK. Real provider use still
+requires the corresponding harness to be installed and authenticated. The local
+test suite exercises the MCP and extension bridges; it does not make a live
+provider call.

@@ -14,6 +14,10 @@ import {
 } from "@kouro/core";
 import type { HarnessAdapter } from "../../types.ts";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import type { CollaborationTools } from "../../types.ts";
+import { startScoutBridge } from "./scout-bridge.ts";
 
 export interface PiRpcProcess {
   stdin: { write(data: string): unknown; end?(): unknown };
@@ -49,7 +53,9 @@ export async function inspectPi(spawn: PiRpcSpawn = defaultSpawn): Promise<Harne
     version.code === 0 &&
     help.code === 0 &&
     help.stdout.includes("--mode") &&
-    help.stdout.includes("rpc");
+    help.stdout.includes("rpc") &&
+    help.stdout.includes("--extension") &&
+    help.stdout.includes("--no-extensions");
   const state = available ? ("supported" as const) : ("unsupported" as const);
   return {
     id: "pi",
@@ -73,6 +79,8 @@ export async function inspectPi(spawn: PiRpcSpawn = defaultSpawn): Promise<Harne
         state: "unsupported",
         constraints: ["provider cost is not enforceable locally"],
       },
+      "awaited-subagent-tool": { state },
+      "child-read-only-envelope": { state },
     },
     nativeConfigSchema,
   };
@@ -86,6 +94,7 @@ export interface PiRunInput {
   readonly signal?: AbortSignal;
   readonly context?: StartTurnRequest["context"];
   readonly onEvent?: (event: HarnessEvent) => void;
+  readonly collaboration?: CollaborationTools;
 }
 
 export function parsePiRpcLine(line: string): Record<string, unknown> | undefined {
@@ -226,6 +235,19 @@ export class PiCliHarness {
       "--no-context-files",
       "--no-skills",
     ];
+    const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
+    const bridge =
+      scoutTool && input.collaboration?.subagent
+        ? await startScoutBridge(input.collaboration.subagent)
+        : undefined;
+    if (bridge) {
+      const sourceAsset = resolve(import.meta.dir, "../../../assets/scout-pi-extension.mjs");
+      const asset = existsSync(sourceAsset)
+        ? sourceAsset
+        : resolve(import.meta.dir, "assets/scout-pi-extension.mjs");
+      args[4] = "read,subagent";
+      args.push("--no-extensions", "--extension", asset);
+    }
     const resolved = resolvePiSelection(input.selection, config);
     if (resolved.provider) args.push("--provider", resolved.provider);
     if (resolved.model) args.push("--model", resolved.model);
@@ -235,6 +257,16 @@ export class PiCliHarness {
       stdout: "pipe",
       stderr: "pipe",
       cwd: input.cwd,
+      ...(bridge && scoutTool
+        ? {
+            env: {
+              ...process.env,
+              KOURO_SCOUT_ENDPOINT: bridge.endpoint,
+              KOURO_SCOUT_TOKEN: bridge.token,
+              KOURO_SCOUT_SCHEMA: JSON.stringify(scoutTool.inputSchema),
+            },
+          }
+        : {}),
     });
     const events: HarnessEvent[] = [];
     const records: Record<string, unknown>[] = [];
@@ -402,6 +434,7 @@ export class PiCliHarness {
       return { status: "succeeded", output, rawOutput: stdout, usage, events };
     } finally {
       input.signal?.removeEventListener("abort", abort);
+      await bridge?.close();
     }
   }
 
@@ -474,6 +507,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
       cwd: input.cwd ?? ".",
       signal: input.signal,
       context: input.context,
+      collaboration: input.collaboration,
       onEvent: undefined,
     });
     return {

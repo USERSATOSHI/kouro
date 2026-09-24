@@ -1,9 +1,12 @@
 import {
+  createSdkMcpServer,
   query,
+  tool,
   type Options,
   type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 import {
   unavailableUsage,
   validateJsonSchema,
@@ -26,6 +29,8 @@ export const claudeSdkDescriptor: HarnessDescriptor = {
     tools: { state: "conditional", constraints: ["built-in tools are explicitly allowlisted"] },
     usage: { state: "supported" },
     "cost-cap": { state: "unsupported" },
+    "awaited-subagent-tool": { state: "supported" },
+    "child-read-only-envelope": { state: "supported" },
   },
   nativeConfigSchema: {
     type: "object",
@@ -64,6 +69,56 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     const prompt = `${input.prompt}${context}`;
     const writable = input.nativeConfig?.permissionMode === "acceptEdits";
     const tools = writable ? ["Read", "Glob", "Grep", "Edit", "Write"] : ["Read", "Glob", "Grep"];
+    const scoutTool = input.context?.tools.find((candidate) => candidate.name === "subagent");
+    const subagent = input.collaboration?.subagent;
+    const allowedSubagentIds =
+      scoutTool?.inputSchema &&
+      typeof scoutTool.inputSchema === "object" &&
+      !Array.isArray(scoutTool.inputSchema) &&
+      "properties" in scoutTool.inputSchema &&
+      scoutTool.inputSchema.properties &&
+      typeof scoutTool.inputSchema.properties === "object" &&
+      !Array.isArray(scoutTool.inputSchema.properties) &&
+      "subagentId" in scoutTool.inputSchema.properties &&
+      scoutTool.inputSchema.properties.subagentId &&
+      typeof scoutTool.inputSchema.properties.subagentId === "object" &&
+      !Array.isArray(scoutTool.inputSchema.properties.subagentId) &&
+      "enum" in scoutTool.inputSchema.properties.subagentId &&
+      Array.isArray(scoutTool.inputSchema.properties.subagentId.enum)
+        ? scoutTool.inputSchema.properties.subagentId.enum.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : undefined;
+    const mcpServers =
+      scoutTool && subagent
+        ? {
+            kouro: createSdkMcpServer({
+              name: "kouro",
+              version: "1.0.0",
+              tools: [
+                tool(
+                  "subagent",
+                  `${scoutTool.description} Authorized subagents and their input schemas: ${JSON.stringify(scoutTool.inputSchema)}`,
+                  {
+                    subagentId: allowedSubagentIds?.length
+                      ? z.enum(allowedSubagentIds as [string, ...string[]])
+                      : z.string(),
+                    requestId: z.string(),
+                    input: z.record(z.string(), z.unknown()),
+                  },
+                  async (args) => {
+                    const result = await subagent(args);
+                    return {
+                      content: [{ type: "text" as const, text: JSON.stringify(result) }],
+                      isError: result.state !== "succeeded",
+                    };
+                  },
+                ),
+              ],
+              timeout: timeoutMs,
+            }),
+          }
+        : undefined;
     const options: Options = {
       cwd: input.cwd ?? process.cwd(),
       ...(input.modelId ? { model: input.modelId } : {}),
@@ -71,6 +126,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
       abortController,
       permissionMode: writable ? "acceptEdits" : "dontAsk",
       tools,
+      ...(mcpServers ? { mcpServers, allowedTools: ["mcp__kouro__subagent"] } : {}),
       disallowedTools: writable
         ? ["Bash", "NotebookEdit"]
         : ["Bash", "Edit", "Write", "NotebookEdit"],

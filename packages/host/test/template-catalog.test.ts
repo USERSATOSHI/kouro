@@ -38,9 +38,17 @@ describe("workflow template catalog", () => {
     expect(ids).toEqual(["tiny", "feature", "parallel", "catalog-feature", "catalog-fusion"]);
     const feature = catalog.find((entry) => entry.id === "catalog-feature")!;
     const featureRoot = feature.bundle.definitions[feature.bundle.rootDefinitionId];
-    // Current harnesses do not support awaited same-turn scout callbacks.
-    // The starter stays runnable and intentionally does not claim scout parity.
-    expect(featureRoot.scouts ?? []).toEqual([]);
+    expect(featureRoot.scouts?.map((scout) => scout.id)).toEqual(["repositoryScout", "testScout"]);
+    expect(featureRoot.nodes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "plan",
+          kind: "agent",
+          uses: ["repositoryScout", "testScout"],
+        }),
+        expect.objectContaining({ id: "implement", kind: "agent" }),
+      ]),
+    );
     expect(featureRoot.nodes).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ id: "implement", kind: "agent" }),

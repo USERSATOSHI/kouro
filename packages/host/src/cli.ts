@@ -5,6 +5,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/p
 import { dirname, resolve } from "node:path";
 import { ApplicationService } from "./application/service.ts";
 import { createHostServer } from "./http/server.ts";
+import { serveScoutMcp } from "./adapters/harness/scout-mcp.ts";
 
 const usage = `Kouro v2 M1
 
@@ -27,6 +28,10 @@ Environment:
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? "serve";
+  if (command === "__scout_mcp") {
+    await serveScoutMcp();
+    return 0;
+  }
   if (command === "--help" || command === "-h" || command === "help") {
     process.stdout.write(usage);
     return 0;

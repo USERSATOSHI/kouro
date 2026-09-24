@@ -63,6 +63,16 @@ test("bounded scout gateway keeps request identity, typed results, delivery, and
   });
 
   const gateway = new ScoutGateway(journal);
+  expect(
+    gateway.acceptanceError(run.run.runId, "implementer-attempt", [
+      { id: "repository", optional: false },
+    ]),
+  ).toBe("required scout repository was not requested");
+  expect(
+    gateway.acceptanceError(run.run.runId, "implementer-attempt", [
+      { id: "repository", optional: true },
+    ]),
+  ).toBeUndefined();
   const request = gateway.request({
     runId: run.run.runId,
     parentInvocationId: "implementer-inv",

@@ -1,10 +1,9 @@
 # Planner scout tool design
 
-Status: final design decision; implementation handoff to Luna.
-
-This document specifies target behavior, not shipped functionality. Examples
-using scout handles, `uses`, `scoutPolicy`, and `scoutResults` describe API
-additions to implement. Preserve unrelated work in the current checkout.
+Status: implementation is included in Kouro 2.0.5. Codex, Pi, and Claude Agent
+SDK have run-scoped awaited tool bridges. The shipped feature starter declares
+repository and test scouts. Full provider-backed acceptance remains dependent
+on live runs against each installed harness; the local suite is not that proof.
 
 ## Final decision
 
@@ -297,25 +296,18 @@ evidence without exposing credentials or private provider context downstream.
 
 ## Provider implementation boundary
 
-Add a specific `awaited-subagent-tool` capability; generic native tools support is
-insufficient. Check it for every agent with declared subagents, including optional subagents,
-before starting provider execution. Check the separate child read-only envelope
-capability for each resolved child profile.
+The coordinator checks `awaited-subagent-tool` and
+`child-read-only-envelope` before provider execution. Codex gets an MCP stdio
+server backed by a per-turn authenticated loopback bridge; Pi gets a Kouro
+extension with the same bridge; Claude gets an in-process SDK MCP server. Each
+bridge carries the declared input schema and waits for the host's validated
+child result. Child calls use the selected harness and enforce read-only tools.
+OpenCode does not advertise or accept this capability.
 
-- Codex: implement an app-server-backed path with awaited dynamic-tool responses.
-  The current `codex exec` path does not implement this contract.
-- Pi: implement a Kouro-owned awaited custom tool through an in-process SDK path.
-  The current CLI RPC wrapper does not implement this contract.
-- Scripted: await the same controller and incorporate returned report content
-  into planner output so tests prove more than request acceptance.
-- Claude/OpenCode/external CLI profiles: report unavailable until an authenticated
-  awaited callback bridge and appropriate child restrictions are implemented.
-
-Verify native protocol support against installed/pinned dependencies. Only
-advertise capability after implementation and validation. Initially support one
-outstanding scout callback per native planner adapter. The host may allow higher
-parallelism for scripted tests. Excess native callbacks receive a capacity tool
-error. Per-planner and run limits still apply across separate planner processes.
+The bridge tests exercise actual MCP tool discovery/call and the Pi extension
+loader. They do not establish same-turn model behavior for every provider;
+record live parent and child evidence before claiming that acceptance gate is
+closed. Per-scout, per-parent, and run-wide limits remain authoritative.
 
 ## Downstream context
 

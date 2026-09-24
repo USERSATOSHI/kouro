@@ -106,11 +106,15 @@ export class ScoutGateway {
       const runInput = parseJson<Record<string, unknown>>(
         (this.journal.getRunRow(input.runId)?.input_json ?? "{}") as string,
       );
-      const configuredProfile =
-        runInput.__kouroExecutionProfile === "codex-readonly" ||
-        runInput.__kouroExecutionProfile === "pi-readonly"
-          ? runInput.__kouroExecutionProfile
-          : "scripted";
+      const profile = runInput.__kouroExecutionProfile;
+      const configuredHarness =
+        profile === "codex-readonly" || profile === "codex-workspace-write"
+          ? "codex"
+          : profile === "claude-readonly" || profile === "claude-workspace-write"
+            ? "claude"
+            : profile === "pi-readonly"
+              ? "pi"
+              : "scripted";
       const workspace = runInput.__kouroWorkspace as { workspaceId?: unknown } | undefined;
       const workspaceId =
         workspace && typeof workspace.workspaceId === "string" ? workspace.workspaceId : undefined;
@@ -173,7 +177,7 @@ export class ScoutGateway {
           digest(canonicalize(input.input)),
           scout.definitionId,
           childAgent.id,
-          childAgent.harness ?? parentNode.harness ?? configuredProfile,
+          childAgent.harness ?? parentNode.harness ?? configuredHarness,
           childAgent.modelId ?? parentNode.modelId ?? null,
           workspaceId ?? null,
           deadlineAt,
@@ -258,9 +262,10 @@ export class ScoutGateway {
   acceptanceError(
     runId: string,
     parentAttemptId: string,
-    uses: readonly string[],
+    uses: readonly { id: string; optional: boolean }[],
   ): string | undefined {
-    for (const scoutId of uses) {
+    for (const scout of uses) {
+      const scoutId = scout.id;
       const rows = this.journal.db
         .query(
           "SELECT state, optional, error FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND scout_id=?3 ORDER BY ordinal",
@@ -271,7 +276,7 @@ export class ScoutGateway {
         error: string | null;
       }>;
       if (rows.length === 0) {
-        if (rows.every((row) => row.optional === 1)) continue;
+        if (scout.optional) continue;
         return `required scout ${scoutId} was not requested`;
       }
       const required = rows.some((row) => row.optional === 0);

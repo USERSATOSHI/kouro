@@ -1,6 +1,6 @@
 import type { JsonValue } from "@kouro/core";
-import { mkdtempSync, unlinkSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, unlinkSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   unavailableUsage,
@@ -14,7 +14,8 @@ import {
   type StartTurnRequest,
   type TurnHandle,
 } from "@kouro/core";
-import type { HarnessAdapter } from "../../types.ts";
+import type { CollaborationTools, HarnessAdapter } from "../../types.ts";
+import { startScoutBridge } from "./scout-bridge.ts";
 
 export interface CodexRunInput {
   readonly attemptId: string;
@@ -24,6 +25,7 @@ export interface CodexRunInput {
   readonly context?: StartTurnRequest["context"];
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  readonly collaboration?: CollaborationTools;
 }
 
 interface CodexProcess {
@@ -37,9 +39,11 @@ interface CodexProcess {
 export async function inspectCodex(): Promise<HarnessDescriptor> {
   const version = await capture(["codex", "--version"]);
   const help = await capture(["codex", "exec", "--help"]);
+  const mcpHelp = await capture(["codex", "mcp", "--help"]);
   const available =
     version.exitCode === 0 &&
     help.exitCode === 0 &&
+    mcpHelp.exitCode === 0 &&
     help.stdout.includes("--json") &&
     help.stdout.includes("--output-schema");
   const supported = { state: available ? ("supported" as const) : ("unsupported" as const) };
@@ -50,7 +54,7 @@ export async function inspectCodex(): Promise<HarnessDescriptor> {
     availability: available ? "available" : "unavailable",
     detail: available
       ? undefined
-      : `codex exec structured interface unavailable (${version.stderr || help.stderr || "not installed"})`,
+      : `codex exec or MCP interface unavailable (${version.stderr || help.stderr || mcpHelp.stderr || "not installed"})`,
     capabilities: {
       "structured-output": supported,
       cancel: supported,
@@ -65,6 +69,8 @@ export async function inspectCodex(): Promise<HarnessDescriptor> {
         state: "unsupported",
         constraints: ["provider cost is not enforceable locally"],
       },
+      "awaited-subagent-tool": supported,
+      "child-read-only-envelope": supported,
     },
     nativeConfigSchema: {
       type: "object",
@@ -135,11 +141,35 @@ export class CodexCliHarness implements HarnessPort {
       await Bun.write(schemaPath, JSON.stringify(input.role.outputSchema));
       args.push("--output-schema", schemaPath);
     }
+    const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
+    const bridge =
+      scoutTool && input.collaboration?.subagent
+        ? await startScoutBridge(input.collaboration.subagent)
+        : undefined;
+    if (bridge) {
+      const sourceEntrypoint = resolve(import.meta.dir, "../../cli.ts");
+      const entrypoint = existsSync(sourceEntrypoint)
+        ? sourceEntrypoint
+        : resolve(import.meta.dir, "kouro.js");
+      args.push(
+        "--config",
+        `mcp_servers.kouro_scout.command=${JSON.stringify(process.execPath)}`,
+        "--config",
+        `mcp_servers.kouro_scout.args=${JSON.stringify([entrypoint, "__scout_mcp"])}`,
+        "--config",
+        'mcp_servers.kouro_scout.env_vars=["KOURO_SCOUT_ENDPOINT","KOURO_SCOUT_TOKEN","KOURO_SCOUT_SCHEMA"]',
+      );
+    }
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: process.env.HOME ?? "/tmp",
     };
     if (process.env.CODEX_HOME) env.CODEX_HOME = process.env.CODEX_HOME;
+    if (bridge && scoutTool) {
+      env.KOURO_SCOUT_ENDPOINT = bridge.endpoint;
+      env.KOURO_SCOUT_TOKEN = bridge.token;
+      env.KOURO_SCOUT_SCHEMA = JSON.stringify(scoutTool.inputSchema);
+    }
     let proc: CodexProcess;
     const handoff = input.context
       ? `\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]\n[KOURO_HANDOFF_BEGIN]\n${input.role.prompt}\n[KOURO_HANDOFF_END]`
@@ -154,6 +184,7 @@ export class CodexCliHarness implements HarnessPort {
       }) as unknown as CodexProcess;
     } catch (cause) {
       cleanupCodexTemp(schemaPath, tempDir);
+      await bridge?.close();
       return {
         status: input.signal?.aborted ? "cancelled" : "failed",
         error: input.signal?.aborted
@@ -211,6 +242,7 @@ export class CodexCliHarness implements HarnessPort {
     }
     if (timeoutTimer) clearTimeout(timeoutTimer);
     cleanupCodexTemp(schemaPath, tempDir);
+    await bridge?.close();
     if (timedOut)
       return {
         status: "failed",
@@ -350,6 +382,7 @@ export class CodexHarnessAdapter implements HarnessAdapter {
       },
       cwd: input.cwd ?? ".",
       context: input.context,
+      collaboration: input.collaboration,
       timeoutMs: input.timeoutMs,
       signal: input.signal,
     });
