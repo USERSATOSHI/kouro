@@ -184,7 +184,7 @@ function directSubagentSource(id, options) {
       source: { kind: "input", sourceId: input.name, port: input.name },
       missing: "error"
     })),
-    timeoutMs: finitePositive(options.timeoutMs, 5000),
+    ...options.timeoutMs === undefined ? {} : { timeoutMs: finitePositive(options.timeoutMs, 5000) },
     ...options.scripted === undefined ? {} : { scripted: options.scripted },
     ...options.resources === undefined ? {} : { resources: options.resources }
   };
@@ -330,7 +330,7 @@ class WorkflowBuilder {
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true)),
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),
-      timeoutMs: finitePositive(options.timeoutMs, 5000),
+      ...options.timeoutMs === undefined ? {} : { timeoutMs: finitePositive(options.timeoutMs, 5000) },
       ...options.uses === undefined ? {} : {
         uses: options.uses.map((scout) => {
           assertScoutOwner(scout, this);
@@ -776,7 +776,7 @@ function stripInternal(node) {
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
       ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
       ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
-      timeoutMs: node.timeoutMs,
+      ...node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs },
       ...node.uses === undefined ? {} : { uses: node.uses },
       ...node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy },
       ...node.scripted === undefined ? {} : { scripted: node.scripted }
@@ -16293,14 +16293,14 @@ class CodexSdkHarness {
         events: []
       };
     }
-    const timeoutMs = typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0 ? input.timeoutMs : 120000;
+    const timeoutMs = typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0 ? input.timeoutMs : undefined;
     const abortController = new AbortController;
     const abort = () => abortController.abort(input.signal?.reason);
     if (input.signal?.aborted)
       abort();
     else
       input.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)), timeoutMs);
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)), timeoutMs);
     const prompt = input.context ? `${input.role.prompt}
 
 [KOURO_CONTEXT_BEGIN]
@@ -16334,13 +16334,14 @@ ${JSON.stringify(input.context)}
     } catch (cause) {
       streamError = cause instanceof Error ? cause.message : String(cause);
     } finally {
-      clearTimeout(timer);
+      if (timer)
+        clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       await closeBridge();
     }
     const rawOutput = raw.join(`
 `);
-    const timedOut = abortController.signal.aborted && !input.signal?.aborted;
+    const timedOut = timeoutMs !== undefined && abortController.signal.aborted && !input.signal?.aborted;
     if (input.signal?.aborted || timedOut) {
       const message = timedOut ? `Codex timed out after ${timeoutMs}ms` : "cancelled";
       return {
@@ -16582,16 +16583,16 @@ ${input.prompt}` : input.prompt;
     }
     const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
     const stderrPromise = new Response(proc.stderr).text().catch(() => "");
-    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : 120000;
+    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : undefined;
     let timer;
-    const timeout = new Promise((resolve) => {
+    const timeout = timeoutMs === undefined ? undefined : new Promise((resolve) => {
       timer = setTimeout(() => {
         proc.kill("SIGTERM");
         resolve("timeout");
       }, timeoutMs);
     });
     const completed = Promise.all([stdoutPromise, stderrPromise, proc.exited]).then(([stdout, stderr, code]) => ({ stdout, stderr, code }));
-    const result = await Promise.race([completed, timeout]);
+    const result = timeout ? await Promise.race([completed, timeout]) : await completed;
     if (timer)
       clearTimeout(timer);
     if (result === "timeout")
@@ -36050,8 +36051,8 @@ class ClaudeAgentSdkHarnessAdapter {
       abort();
     else
       input2.signal?.addEventListener("abort", abort, { once: true });
-    const timeoutMs = input2.timeoutMs && input2.timeoutMs > 0 ? input2.timeoutMs : 120000;
-    const timer = setTimeout(() => abortController.abort(new Error(`Claude SDK timed out after ${timeoutMs}ms`)), timeoutMs);
+    const timeoutMs = input2.timeoutMs && input2.timeoutMs > 0 ? input2.timeoutMs : undefined;
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => abortController.abort(new Error(`Claude SDK timed out after ${timeoutMs}ms`)), timeoutMs);
     let stderr = "";
     const messages = [];
     const context = input2.context ? `
@@ -36082,7 +36083,7 @@ ${JSON.stringify(input2.context)}
             };
           })
         ],
-        timeout: timeoutMs
+        ...timeoutMs === undefined ? {} : { timeout: timeoutMs }
       })
     } : undefined;
     const options = {
@@ -36115,7 +36116,8 @@ ${JSON.stringify(input2.context)}
           resultMessage = message;
       }
     } catch (cause) {
-      clearTimeout(timer);
+      if (timer)
+        clearTimeout(timer);
       input2.signal?.removeEventListener("abort", abort);
       const cancelled = input2.signal?.aborted === true;
       return {
@@ -36127,12 +36129,13 @@ ${JSON.stringify(input2.context)}
         events: eventsFrom(messages)
       };
     }
-    clearTimeout(timer);
+    if (timer)
+      clearTimeout(timer);
     input2.signal?.removeEventListener("abort", abort);
     if (abortController.signal.aborted) {
       return {
         status: input2.signal?.aborted ? "cancelled" : "failed",
-        error: input2.signal?.aborted ? "cancelled" : `Claude SDK timed out after ${timeoutMs}ms`,
+        error: input2.signal?.aborted ? "cancelled" : `Claude SDK timed out after ${timeoutMs ?? "configured"}ms`,
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
@@ -36262,7 +36265,13 @@ async function inspectPi() {
   };
 }
 function piNativeConfig(config2 = {}) {
-  const safe = redactSecrets(config2, ["apiKey", "api_key", "token", "password", "secret"]);
+  const safe = redactSecrets(config2, [
+    "apiKey",
+    "api_key",
+    "token",
+    "password",
+    "secret"
+  ]);
   return { ...safe, checksum: `sha256:${simpleHash(canonicalize(safe))}` };
 }
 function resolvePiSelection(selection, config2 = {}, env = Bun.env) {
@@ -36356,8 +36365,8 @@ class PiSdkHarness {
       input2.onEvent?.(event);
     };
     let timeout = false;
-    const timeoutMs = typeof config2.timeoutMs === "number" ? config2.timeoutMs : 120000;
-    const timer = setTimeout(() => {
+    const timeoutMs = typeof config2.timeoutMs === "number" ? config2.timeoutMs : undefined;
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
       timeout = true;
       session?.abort();
     }, timeoutMs);
@@ -36396,7 +36405,12 @@ class PiSdkHarness {
       if (input2.signal?.aborted || timeout)
         await session.abort();
       if (input2.signal?.aborted)
-        return { status: "cancelled", error: "cancelled", usage: piUsage(session.getSessionStats()), events };
+        return {
+          status: "cancelled",
+          error: "cancelled",
+          usage: piUsage(session.getSessionStats()),
+          events
+        };
       if (timeout)
         return {
           status: "failed",
@@ -36437,7 +36451,13 @@ ${JSON.stringify(input2.role.outputSchema)}` : handoff3;
       if (input2.role.outputSchema) {
         const check2 = validateJsonSchema(output2, input2.role.outputSchema);
         if (!check2.valid)
-          return { status: "failed", error: `invalid-output: ${check2.error}`, rawOutput: message, usage, events };
+          return {
+            status: "failed",
+            error: `invalid-output: ${check2.error}`,
+            rawOutput: message,
+            usage,
+            events
+          };
       }
       return { status: "succeeded", output: output2, rawOutput: message, usage, events };
     } catch (cause) {
@@ -36448,7 +36468,8 @@ ${JSON.stringify(input2.role.outputSchema)}` : handoff3;
         events
       };
     } finally {
-      clearTimeout(timer);
+      if (timer)
+        clearTimeout(timer);
       input2.signal?.removeEventListener("abort", abort);
       session?.dispose();
     }
@@ -36488,7 +36509,10 @@ function createSubagentTool(manifestTool, invoke) {
       if (!check2.valid)
         throw new Error(`Invalid subagent request: ${check2.error}`);
       const result = await invoke(args);
-      return { content: [{ type: "text", text: JSON.stringify(result) }], details: undefined };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        details: undefined
+      };
     }
   });
 }
@@ -36555,7 +36579,10 @@ class PiHarnessAdapter {
     this.harness = harness2;
   }
   capabilities() {
-    return Object.fromEntries(Object.entries(this.harness.descriptor.capabilities).map(([key, value]) => [key, value.state]));
+    return Object.fromEntries(Object.entries(this.harness.descriptor.capabilities).map(([key, value]) => [
+      key,
+      value.state
+    ]));
   }
   async run(input2) {
     const result = await this.harness.run({
@@ -39258,8 +39285,9 @@ class ScoutGateway {
       const configuredHarness = profile === "codex-readonly" || profile === "codex-workspace-write" ? "codex" : profile === "claude-readonly" || profile === "claude-workspace-write" ? "claude" : profile === "pi-readonly" ? "pi" : "scripted";
       const workspace = runInput.__kouroWorkspace;
       const workspaceId = workspace && typeof workspace.workspaceId === "string" ? workspace.workspaceId : undefined;
-      const timeoutMs = Math.min(parentNode.timeoutMs, childAgent.timeoutMs, 60000);
-      const deadlineAt = new Date(Date.now() + timeoutMs).toISOString();
+      const configuredTimeouts = [parentNode.timeoutMs, childAgent.timeoutMs].filter((value) => typeof value === "number");
+      const timeoutMs = configuredTimeouts.length === 0 ? undefined : Math.min(...configuredTimeouts, 60000);
+      const deadlineAt = timeoutMs === undefined ? null : new Date(Date.now() + timeoutMs).toISOString();
       const spent = this.journal.db.query("SELECT COUNT(*) as count FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND scout_id=?3").get(input2.runId, input2.parentAttemptId, input2.scoutId);
       if (spent.count >= scout.maxInvocations)
         throw new Error(`scout ${input2.scoutId} budget exceeded`);
@@ -39672,10 +39700,9 @@ class Coordinator {
       ...input2,
       input: {
         ...normalizedInput,
-        __kouroExecutionProfile: input2.executionProfile ?? this.defaultProfile,
-        ...input2.allowUnrestrictedCommands ? { __kouroAllowUnrestrictedCommands: true } : {}
+        ...input2.executionProfile ? { __kouroExecutionProfile: input2.executionProfile } : {}
       },
-      executionProfile: input2.executionProfile ?? this.defaultProfile,
+      ...input2.executionProfile ? { executionProfile: input2.executionProfile } : {},
       workspace: input2.workspace
     });
     if (result.created && input2.workspace) {
@@ -40492,12 +40519,8 @@ class Coordinator {
     validateCommandNode(node2);
     if (node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE))
       return;
-    if (node2.executionMode !== "trusted-unrestricted")
-      return;
-    const row = this.journal.getRunRow(runId);
-    const input2 = row ? parseJson(row.input_json) : {};
-    if (input2.__kouroAllowUnrestrictedCommands !== true)
-      throw new Error("Command requires explicit launch opt-in: enable trusted unrestricted commands");
+    if (node2.executionMode === "trusted-unrestricted")
+      throw new Error(`Command node ${node2.id} uses removed unrestricted mode; add terminal.execute to that node`);
   }
   async execute(runId, bundle, state, invocationId, attemptId) {
     const attempt = state.attempts[attemptId];
@@ -40804,10 +40827,13 @@ class Coordinator {
         selected = pi;
         resolvedHarness = toHarness(pi.id);
         resolvedVersion = pi.adapterVersion;
-        const piSelection = resolvePiSelection({ harness: "pi", model: { id: node2.modelId ?? "" } }, { timeoutMs: node2.timeoutMs, ...node2.modelId ? { model: node2.modelId } : {} });
+        const piSelection = resolvePiSelection({ harness: "pi", model: { id: node2.modelId ?? "" } }, {
+          ...node2.timeoutMs === undefined ? {} : { timeoutMs: node2.timeoutMs },
+          ...node2.modelId ? { model: node2.modelId } : {}
+        });
         resolvedModelId = piSelection.model;
         nativeConfig = {
-          timeoutMs: node2.timeoutMs,
+          ...node2.timeoutMs === undefined ? {} : { timeoutMs: node2.timeoutMs },
           ...piSelection.provider ? { provider: piSelection.provider } : {},
           ...piSelection.model ? { model: piSelection.model } : {}
         };
@@ -41275,7 +41301,8 @@ class Coordinator {
         const childAborter = new AbortController;
         const abort = () => childAborter.abort();
         signal?.addEventListener("abort", abort, { once: true });
-        const timeout = setTimeout(() => childAborter.abort(), Math.min(childAgent.timeoutMs, 60000));
+        const timeoutMs = childAgent.timeoutMs === undefined ? undefined : Math.min(childAgent.timeoutMs, 60000);
+        const timeout = timeoutMs === undefined ? undefined : setTimeout(() => childAborter.abort(), timeoutMs);
         try {
           const result = await childAdapter.run({
             runId: input2.runId,
@@ -41284,7 +41311,7 @@ class Coordinator {
             prompt: childAgent.prompt,
             ...outputSchema ? { outputSchema } : {},
             delayMs: this.scriptedDelayMs,
-            timeoutMs: Math.min(childAgent.timeoutMs, 60000),
+            ...timeoutMs === undefined ? {} : { timeoutMs },
             cwd: input2.cwd,
             ...childAgent.modelId ? { modelId: childAgent.modelId } : childAdapter.id === input2.adapter.id && input2.parentModelId ? { modelId: input2.parentModelId } : {},
             nativeConfig: childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : childAdapter.id === "codex" ? { sandbox: "read-only" } : {},
@@ -41295,7 +41322,8 @@ class Coordinator {
             throw new Error(result.error ?? `scout harness ${result.status}`);
           return result.output;
         } finally {
-          clearTimeout(timeout);
+          if (timeout)
+            clearTimeout(timeout);
           signal?.removeEventListener("abort", abort);
         }
       }
@@ -42947,10 +42975,12 @@ class ApplicationService {
     ];
   }
   async createRun(input2) {
-    const bundle = this.bundles.get(input2.workflowId);
-    if (!bundle)
+    const source = this.bundles.get(input2.workflowId);
+    if (!source)
       throw new Error(`Unknown workflow ${input2.workflowId}`);
-    return (await this.coordinator.createRun({ ...input2, bundle })).run;
+    const bundle = input2.nodeSettings ? await configureBundle(source, input2.nodeSettings) : source;
+    const { nodeSettings: _nodeSettings, ...runInput } = input2;
+    return (await this.coordinator.createRun({ ...runInput, bundle })).run;
   }
   async runPromptFixture(input2) {
     const rendered = await renderPromptFixture(input2.fixture);
@@ -42967,7 +42997,6 @@ class ApplicationService {
       workflowId,
       bundle,
       idempotencyKey: input2.idempotencyKey,
-      executionProfile: input2.executionProfile ?? "scripted",
       input: {
         __kouroPromptFixture: {
           id: input2.fixture.id,
@@ -43283,6 +43312,54 @@ class ApplicationService {
       entries
     };
   }
+}
+async function configureBundle(source, settings) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings))
+    throw new Error("nodeSettings must be an object keyed by workflow node ID");
+  const definitions = Object.fromEntries(Object.entries(source.definitions).map(([definitionId, definition]) => [
+    definitionId,
+    {
+      ...definition,
+      nodes: definition.nodes.map((node2) => {
+        const setting = settings[node2.id];
+        if (!setting)
+          return node2;
+        if (typeof setting !== "object" || Array.isArray(setting))
+          throw new Error(`Invalid settings for node ${node2.id}`);
+        if (node2.kind !== "agent" && node2.kind !== "command")
+          throw new Error(`Node ${node2.id} cannot have runtime settings`);
+        if (setting.harness !== undefined && (node2.kind !== "agent" || !isHarness(setting.harness)))
+          throw new Error(`Invalid harness for node ${node2.id}`);
+        if (setting.modelId !== undefined && (typeof setting.modelId !== "string" || setting.modelId.length > 200))
+          throw new Error(`Invalid model for node ${node2.id}`);
+        const allowed = Object.values(CAPABILITY);
+        if (setting.capabilities !== undefined && (!Array.isArray(setting.capabilities) || setting.capabilities.some((capability) => typeof capability !== "string" || !allowed.includes(capability))))
+          throw new Error(`Invalid capability for node ${node2.id}`);
+        return {
+          ...node2,
+          ...setting.harness === undefined ? {} : { harness: setting.harness },
+          ...setting.modelId === undefined ? {} : { modelId: setting.modelId },
+          ...setting.capabilities === undefined ? {} : { capabilities: [...new Set(setting.capabilities)].sort() }
+        };
+      })
+    }
+  ]));
+  for (const nodeId of Object.keys(settings))
+    if (!Object.values(source.definitions).some((definition) => definition.nodes.some((node2) => node2.id === nodeId)))
+      throw new Error(`Unknown workflow node ${nodeId}`);
+  const executable = {
+    formatVersion: source.formatVersion,
+    semanticVersions: source.semanticVersions,
+    rootDefinitionId: source.rootDefinitionId,
+    definitions,
+    schemas: source.schemas,
+    limits: source.limits,
+    sourceMap: source.sourceMap,
+    boundSummary: source.boundSummary
+  };
+  const canonicalJson = canonicalize(executable);
+  const digest3 = `sha256:${await sha256Hex(canonicalJson)}`;
+  return Object.freeze({ ...JSON.parse(canonicalJson), digest: digest3, canonicalJson });
 }
 var AgentSummary = artifactType("kouro.agent-summary.v1", {
   type: "object",
@@ -57966,19 +58043,9 @@ function createHostServer(service, options = {}) {
       const input2 = bodyObject(body);
       if (typeof input2.idempotencyKey !== "string" || !input2.idempotencyKey.trim())
         throw new Error("idempotencyKey is required");
-      if (input2.executionProfile !== undefined && ![
-        "scripted",
-        "codex-readonly",
-        "codex-workspace-write",
-        "claude-readonly",
-        "claude-workspace-write",
-        "pi-readonly"
-      ].includes(String(input2.executionProfile)))
-        throw new Error("unsupported execution profile");
       return toWebRun(await service.runPromptFixture({
         fixture: input2.fixture,
-        idempotencyKey: input2.idempotencyKey,
-        executionProfile: input2.executionProfile
+        idempotencyKey: input2.idempotencyKey
       }));
     } catch (cause) {
       set2.status = 400;
@@ -58190,17 +58257,19 @@ function createHostServer(service, options = {}) {
       set2.status = 400;
       return { error: "invalid-run-request" };
     }
-    if (input2.executionProfile !== undefined && input2.executionProfile !== "scripted" && input2.executionProfile !== "codex-readonly" && input2.executionProfile !== "pi-readonly" && input2.executionProfile !== "codex-workspace-write" && input2.executionProfile !== "claude-readonly" && input2.executionProfile !== "claude-workspace-write") {
+    if (input2.executionProfile !== undefined || input2.allowUnrestrictedCommands !== undefined) {
       set2.status = 400;
-      return { error: "invalid-execution-profile" };
+      return {
+        error: "obsolete-run-settings",
+        message: "Set harnesses and capabilities on workflow nodes before launching."
+      };
     }
     try {
       return toWebRun(await service.createRun({
         workflowId: String(input2.workflowId),
         idempotencyKey: input2.idempotencyKey,
         input: typeof input2.input === "object" && input2.input !== null ? input2.input : undefined,
-        executionProfile: input2.executionProfile,
-        allowUnrestrictedCommands: input2.allowUnrestrictedCommands === true,
+        nodeSettings: input2.nodeSettings && typeof input2.nodeSettings === "object" ? input2.nodeSettings : undefined,
         workspace: typeof input2.workspace === "object" && input2.workspace !== null && typeof input2.workspace.repositoryPath === "string" ? {
           repositoryPath: String(input2.workspace.repositoryPath),
           workspaceId: typeof input2.workspace.workspaceId === "string" ? String(input2.workspace.workspaceId) : undefined
@@ -61071,7 +61140,7 @@ Usage:
 
 Environment:
   KOURO_DATA_DIR  Durable local state directory (default: .kouro-data)
-  KOURO_PORT      Loopback port (default: 43127)
+  KOURO_PORT      Loopback port (default: 43127; forward it over SSH for remote hosts)
   KOURO_TOKEN     Optional fixed one-time browser pairing token
 `;
 async function main(argv = process.argv.slice(2)) {
@@ -61265,6 +61334,12 @@ ${usage}`);
   process.stdout.write(`Kouro workbench: ${url2}
 Data: ${dataDir}
 `);
+  if (process.env.SSH_CONNECTION) {
+    process.stdout.write(`SSH browser access: on your computer run:
+  ssh -N -L ${host.port}:127.0.0.1:${host.port} <same-SSH-target>
+Then open the workbench URL above in your local browser. Keep the tunnel running.
+`);
+  }
   let closing = false;
   const close = async () => {
     if (closing)
