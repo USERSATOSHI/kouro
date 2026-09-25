@@ -1323,11 +1323,11 @@ function Topbar({
         <label className="profile-picker">
           <input
             type="checkbox"
-            aria-label="Allow trusted unrestricted commands"
+            aria-label="Allow legacy unrestricted commands"
             checked={allowUnrestrictedCommands}
             onChange={(event) => setAllowUnrestrictedCommands(event.target.checked)}
           />
-          <span>ALLOW UNRESTRICTED COMMANDS</span>
+          <span>ALLOW LEGACY COMMANDS</span>
         </label>
         <span className={`stream-state ${store.status}`}>
           <i />

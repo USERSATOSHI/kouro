@@ -4,20 +4,20 @@ The editable `feature` starter takes a task, asks for plan approval, runs the
 implementer with workspace write access, then runs `bun run typecheck` and
 `bun test`. Edit these command nodes for a project's scripts.
 
-Run it with `codex-workspace-write` or `claude-workspace-write` to grant file
-write access only to roles that explicitly declare
-`workspaceAccess: "workspace-write"`. The planner stays read-only. The
-corresponding `*-readonly` profile stays read-only for every role. Claude runs
-through the Claude Agent SDK and uses the SDK's supported local authentication;
-Kouro does not require an API-key-only setup.
+Run it with `codex-workspace-write` or `claude-workspace-write` to allow writes
+only for roles that declare `repository.write`; the planner declares only
+`repository.read`. The run profile selects the default harness; explicit node
+capabilities control each agent's permissions.
+Claude runs through the Claude Agent SDK and uses the SDK's supported local
+authentication; Kouro does not require an API-key-only setup.
 
-The starter's Bun validation commands are marked
-`executionMode: "trusted-unrestricted"` because local Bun/npm installations
-and their child tools vary by machine. Starting this workflow requires the
-separate `allowUnrestrictedCommands` launch option (CLI:
-`--allow-unrestricted-commands`; web: “Allow unrestricted commands”). This
-choice is recorded with command evidence. Choose it only for a workflow and
-workspace whose commands you trust.
+The starter's Bun validation commands declare `terminal.execute`. This is an
+explicit workflow-author grant for those command nodes and avoids a second
+launch-time opt-in. It runs the command outside OS containment, matching the
+v1 command-node behavior. Use this only for workflows and workspaces whose
+commands you trust. Older workflows using
+`executionMode: "trusted-unrestricted"` can still require the CLI
+`--allow-unrestricted-commands` or web “Allow unrestricted commands” option.
 
 The feature starter declares a required `repositoryScout` and an optional
 `testScout`. The planner invokes them as bounded `subagent` tool calls and gets

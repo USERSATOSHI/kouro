@@ -8,8 +8,24 @@
 export const PROJECTION_VERSION = 1 as const;
 export const BUNDLE_FORMAT_VERSION = 1 as const;
 export const HARNESS = ["codex", "pi", "claude", "opencode"] as const;
+/** Named workflow-facing harness IDs. */
+export const HARNESS_ID = Object.freeze({
+  CODEX: "codex",
+  PI: "pi",
+  CLAUDE: "claude",
+  OPENCODE: "opencode",
+} as const);
 export type Harness = (typeof HARNESS)[number];
 export type RuntimeHarness = Harness | "scripted";
+
+/** Stable capability identifiers for workflow authors and host adapters. */
+export const CAPABILITY = Object.freeze({
+  REPOSITORY_READ: "repository.read",
+  REPOSITORY_WRITE: "repository.write",
+  TERMINAL_EXECUTE: "terminal.execute",
+  NETWORK_ACCESS: "network.access",
+} as const);
+export type WorkflowCapability = (typeof CAPABILITY)[keyof typeof CAPABILITY];
 
 export function isHarness(value: unknown): value is Harness {
   return typeof value === "string" && (HARNESS as readonly string[]).includes(value);
@@ -97,6 +113,8 @@ export interface AgentNode {
   readonly harness?: Harness;
   readonly modelId?: string;
   readonly workspaceAccess?: "read-only" | "workspace-write";
+  /** Node-scoped authority requested from the selected harness. */
+  readonly capabilities?: readonly WorkflowCapability[];
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];
   readonly bindings: readonly Binding[];
@@ -112,8 +130,10 @@ export interface CommandNode {
   readonly id: string;
   readonly kind: "command";
   readonly executable: string;
-  /** Runs outside OS containment only when explicitly selected by the workflow author. */
+  /** Legacy unrestricted mode; new workflows should declare terminal.execute. */
   readonly executionMode?: "enforced" | "trusted-unrestricted";
+  /** Node-scoped authority requested by this command. */
+  readonly capabilities?: readonly WorkflowCapability[];
   readonly args: readonly string[];
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];

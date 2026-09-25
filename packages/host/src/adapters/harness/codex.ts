@@ -1,7 +1,5 @@
+import { Codex, type CodexOptions, type ThreadEvent } from "@openai/codex-sdk";
 import type { JsonValue } from "@kouro/core";
-import { existsSync, mkdtempSync, unlinkSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import {
   unavailableUsage,
   validateJsonSchema,
@@ -9,8 +7,8 @@ import {
   type HarnessEvent,
   type HarnessResult,
   type HarnessSelection,
-  type RoleSpec,
   type HarnessPort,
+  type RoleSpec,
   type StartTurnRequest,
   type TurnHandle,
 } from "@kouro/core";
@@ -28,33 +26,22 @@ export interface CodexRunInput {
   readonly collaboration?: CollaborationTools;
 }
 
-interface CodexProcess {
-  stdout: ReadableStream<Uint8Array>;
-  stderr: ReadableStream<Uint8Array>;
-  exited: Promise<number>;
-  kill(signal?: string): void;
-}
-
-/** Read-only preflight: capability claims are based on the installed CLI help/version. */
+/** Capability discovery checks that the installed SDK can resolve its bundled runtime. */
 export async function inspectCodex(): Promise<HarnessDescriptor> {
-  const version = await capture(["codex", "--version"]);
-  const help = await capture(["codex", "exec", "--help"]);
-  const mcpHelp = await capture(["codex", "mcp", "--help"]);
-  const available =
-    version.exitCode === 0 &&
-    help.exitCode === 0 &&
-    mcpHelp.exitCode === 0 &&
-    help.stdout.includes("--json") &&
-    help.stdout.includes("--output-schema");
+  let detail: string | undefined;
+  try {
+    new Codex();
+  } catch (cause) {
+    detail = cause instanceof Error ? cause.message : String(cause);
+  }
+  const available = detail === undefined;
   const supported = { state: available ? ("supported" as const) : ("unsupported" as const) };
   return {
     id: "codex",
-    adapterVersion: "1",
-    version: version.stdout.trim() || "unknown",
+    adapterVersion: "sdk",
+    version: "OpenAI Codex TypeScript SDK",
     availability: available ? "available" : "unavailable",
-    detail: available
-      ? undefined
-      : `codex exec or MCP interface unavailable (${version.stderr || help.stderr || mcpHelp.stderr || "not installed"})`,
+    detail: available ? undefined : `Codex SDK runtime unavailable (${detail})`,
     capabilities: {
       "structured-output": supported,
       cancel: supported,
@@ -64,7 +51,7 @@ export async function inspectCodex(): Promise<HarnessDescriptor> {
         state: "conditional",
         constraints: ["only tools explicitly enabled by native profile"],
       },
-      usage: { state: available ? "supported" : "unsupported" },
+      usage: { state: supported.state },
       "cost-cap": {
         state: "unsupported",
         constraints: ["provider cost is not enforceable locally"],
@@ -84,11 +71,13 @@ export async function inspectCodex(): Promise<HarnessDescriptor> {
   };
 }
 
-export class CodexCliHarness implements HarnessPort {
+/** SDK adapter for Codex turns. The official SDK owns process invocation and JSONL parsing. */
+export class CodexSdkHarness implements HarnessPort {
   readonly descriptor: HarnessDescriptor;
   constructor(descriptor: HarnessDescriptor) {
     this.descriptor = descriptor;
   }
+
   async startTurn(request: StartTurnRequest): Promise<TurnHandle> {
     const controller = new AbortController();
     const result = this.run({
@@ -113,53 +102,23 @@ export class CodexCliHarness implements HarnessPort {
       },
     };
   }
+
   async run(input: CodexRunInput): Promise<HarnessResult> {
-    if (this.descriptor.availability !== "available")
+    if (this.descriptor.availability !== "available") {
       return {
         status: "unavailable",
         error: this.descriptor.detail,
         usage: unavailableUsage(),
         events: [],
       };
-    const config = input.selection.nativeConfig ?? {};
-    const tempDir = mkdtempSync(join(tmpdir(), "kouro-codex-"), { encoding: "utf8" });
-    const args = [
-      "codex",
-      "exec",
-      "--json",
-      "--ephemeral",
-      "--skip-git-repo-check",
-      "--cd",
-      input.cwd,
-    ];
-    if (typeof config.model === "string") args.push("--model", config.model);
-    // Workspace writes require both the explicit run profile and per-role
-    // workspaceAccess declaration, set by host policy in nativeConfig.
-    args.push("--sandbox", typeof config.sandbox === "string" ? config.sandbox : "read-only");
-    const schemaPath = join(tempDir, "output-schema.json");
-    if (input.role.outputSchema) {
-      await Bun.write(schemaPath, JSON.stringify(input.role.outputSchema));
-      args.push("--output-schema", schemaPath);
     }
+
+    const config = input.selection.nativeConfig ?? {};
     const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
     const bridge =
       scoutTool && input.collaboration?.subagent
         ? await startScoutBridge(input.collaboration.subagent)
         : undefined;
-    if (bridge) {
-      const sourceEntrypoint = resolve(import.meta.dir, "../../cli.ts");
-      const entrypoint = existsSync(sourceEntrypoint)
-        ? sourceEntrypoint
-        : resolve(import.meta.dir, "kouro.js");
-      args.push(
-        "--config",
-        `mcp_servers.kouro_scout.command=${JSON.stringify(process.execPath)}`,
-        "--config",
-        `mcp_servers.kouro_scout.args=${JSON.stringify([entrypoint, "__scout_mcp"])}`,
-        "--config",
-        'mcp_servers.kouro_scout.env_vars=["KOURO_SCOUT_ENDPOINT","KOURO_SCOUT_TOKEN","KOURO_SCOUT_SCHEMA"]',
-      );
-    }
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: process.env.HOME ?? "/tmp",
@@ -170,193 +129,176 @@ export class CodexCliHarness implements HarnessPort {
       env.KOURO_SCOUT_TOKEN = bridge.token;
       env.KOURO_SCOUT_SCHEMA = JSON.stringify(scoutTool.inputSchema);
     }
-    let proc: CodexProcess;
-    const handoff = input.context
-      ? `\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]\n[KOURO_HANDOFF_BEGIN]\n${input.role.prompt}\n[KOURO_HANDOFF_END]`
-      : input.role.prompt;
+
+    const codexConfig: NonNullable<CodexOptions["config"]> = {};
+    if (bridge) {
+      const sourceEntrypoint = new URL("../../cli.ts", import.meta.url);
+      const entrypoint = await Bun.file(sourceEntrypoint).exists()
+        ? sourceEntrypoint.pathname
+        : new URL("kouro.js", import.meta.url).pathname;
+      codexConfig.mcp_servers = {
+        kouro_scout: {
+          command: process.execPath,
+          args: [entrypoint, "__scout_mcp"],
+          env_vars: ["KOURO_SCOUT_ENDPOINT", "KOURO_SCOUT_TOKEN", "KOURO_SCOUT_SCHEMA"],
+        },
+      };
+    }
+    const sdkOptions: CodexOptions = {
+      env,
+      ...(Object.keys(codexConfig).length > 0 ? { config: codexConfig } : {}),
+    };
+    let thread: ReturnType<Codex["startThread"]>;
     try {
-      proc = Bun.spawn(args, {
-        stdin: new Blob([handoff]),
-        stdout: "pipe",
-        stderr: "pipe",
-        signal: input.signal,
-        env,
-      }) as unknown as CodexProcess;
+      thread = new Codex(sdkOptions).startThread({
+        ...(typeof config.model === "string" ? { model: config.model } : {}),
+        workingDirectory: input.cwd,
+        skipGitRepoCheck: true,
+        sandboxMode: config.sandbox === "workspace-write" ? "workspace-write" : "read-only",
+      });
     } catch (cause) {
-      cleanupCodexTemp(schemaPath, tempDir);
       await bridge?.close();
       return {
-        status: input.signal?.aborted ? "cancelled" : "failed",
-        error: input.signal?.aborted
-          ? "cancelled"
-          : `codex spawn failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        status: "unavailable",
+        error: cause instanceof Error ? cause.message : String(cause),
         usage: unavailableUsage(),
         events: [],
       };
     }
-
-    let timedOut = false;
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     const timeoutMs =
       typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
         ? input.timeoutMs
         : 120_000;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        proc.kill("SIGTERM");
-        resolve("timeout");
-      }, timeoutMs);
-    });
-    const aborted = new Promise<"aborted">((resolve) => {
-      if (input.signal?.aborted) resolve("aborted");
-      else input.signal?.addEventListener("abort", () => resolve("aborted"), { once: true });
-    });
-    let stdout = "";
-    let stderr = "";
-    const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
-    const stderrPromise = new Response(proc.stderr).text().catch(() => "");
-    const output = Promise.all([stdoutPromise, stderrPromise]).then(([nextStdout, nextStderr]) => {
-      stdout = nextStdout;
-      stderr = nextStderr;
-      return "output" as const;
-    });
-    const first = await Promise.race([output, timeout, aborted]);
-    let code: number | undefined;
-    if (first === "output") {
-      const exited = proc.exited.then((value) => {
-        code = value;
-        return "exited" as const;
+    const abortController = new AbortController();
+    const abort = () => abortController.abort(input.signal?.reason);
+    if (input.signal?.aborted) abort();
+    else input.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(
+      () => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    const prompt = input.context
+      ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
+      : input.role.prompt;
+    const events: HarnessEvent[] = [];
+    const raw: string[] = [];
+    let response: string | undefined;
+    let usageRecord:
+      | { input_tokens: number; output_tokens: number; cached_input_tokens?: number }
+      | undefined;
+    let streamError: string | undefined;
+    let bridgeClosed = false;
+    const closeBridge = async () => {
+      if (!bridgeClosed) {
+        bridgeClosed = true;
+        await bridge?.close();
+      }
+    };
+    try {
+      const { events: stream } = await thread.runStreamed(prompt, {
+        ...(input.role.outputSchema ? { outputSchema: input.role.outputSchema } : {}),
+        signal: abortController.signal,
       });
-      await Promise.race([exited, timeout, aborted]);
-    } else {
-      proc.kill("SIGTERM");
-      const stopped = await Promise.race([
-        proc.exited.then(
-          () => true,
-          () => true,
-        ),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 25)),
-      ]);
-      if (!stopped) proc.kill("SIGKILL");
+      for await (const event of stream) {
+        raw.push(JSON.stringify(event));
+        events.push({ type: "log", at: new Date().toISOString(), data: JSON.stringify(event) });
+        consumeCodexEvent(event, (text) => (response = text), (usage) => (usageRecord = usage));
+        if (event.type === "turn.failed" || event.type === "error") {
+          streamError = event.type === "turn.failed" ? event.error.message : event.message;
+        }
+      }
+    } catch (cause) {
+      streamError = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", abort);
+      await closeBridge();
     }
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-    cleanupCodexTemp(schemaPath, tempDir);
-    await bridge?.close();
-    if (timedOut)
+
+    const rawOutput = raw.join("\n");
+    const timedOut = abortController.signal.aborted && !input.signal?.aborted;
+    if (input.signal?.aborted || timedOut) {
+      const message = timedOut ? `Codex timed out after ${timeoutMs}ms` : "cancelled";
+      return {
+        status: input.signal?.aborted ? "cancelled" : "failed",
+        error: message,
+        rawOutput,
+        usage: codexUsage(usageRecord),
+        events: [...events, { type: "log", at: new Date().toISOString(), data: message }],
+      };
+    }
+    if (streamError) {
       return {
         status: "failed",
-        error: `codex timed out after ${timeoutMs}ms`,
-        rawOutput: stdout,
-        stderr,
-        usage: unavailableUsage(),
-        events: [{ type: "log", at: new Date().toISOString(), data: "timed out" }],
+        error: streamError,
+        rawOutput,
+        usage: codexUsage(usageRecord),
+        events,
       };
-    if (input.signal?.aborted)
-      return {
-        status: "cancelled",
-        error: "cancelled",
-        usage: unavailableUsage(),
-        rawOutput: stdout,
-        stderr,
-        events: [{ type: "log", at: new Date().toISOString(), data: "cancelled" }],
-      };
-    if (code === undefined) code = await proc.exited.catch(() => -1);
-    const lines = stdout.split("\n").filter(Boolean);
-    const records = lines.flatMap((line) => {
-      try {
-        return [JSON.parse(line) as Record<string, unknown>];
-      } catch {
-        return [];
-      }
-    });
-    const events: HarnessEvent[] = lines.map((line) => ({
-      type: "log",
-      at: new Date().toISOString(),
-      data: line,
-    }));
-    const message =
-      [...records]
-        .reverse()
-        .find(
-          (item) =>
-            item.type === "item.completed" &&
-            (item.item as Record<string, unknown> | undefined)?.type === "agent_message",
-        ) ??
-      [...records]
-        .reverse()
-        .find((item) => item.type === "agent_message" || item.type === "message");
-    const messageItem = message?.item as Record<string, unknown> | undefined;
-    let parsed: JsonValue | undefined = (messageItem?.text ??
-      message?.text ??
-      message?.message ??
-      message?.content) as JsonValue | undefined;
+    }
+
+    let parsed: JsonValue | undefined = response;
     if (typeof parsed === "string") {
       try {
         parsed = JSON.parse(parsed) as JsonValue;
       } catch {
-        /* raw evidence remains authoritative */
+        /* preserve the raw assistant response for consumers of unstructured turns */
       }
     }
-    const completion = records.find((item) => item.type === "turn.completed");
-    const usageRecord = completion?.usage as Record<string, unknown> | undefined;
-    const number = (key: string) =>
-      typeof usageRecord?.[key] === "number" && Number.isFinite(usageRecord[key])
-        ? Number(usageRecord[key])
-        : null;
-    const usage = usageRecord
-      ? {
-          inputTokens: {
-            value: number("input_tokens"),
-            quality:
-              number("input_tokens") === null ? ("unavailable" as const) : ("observed" as const),
-            source: "codex",
-          },
-          outputTokens: {
-            value: number("output_tokens"),
-            quality:
-              number("output_tokens") === null ? ("unavailable" as const) : ("observed" as const),
-            source: "codex",
-          },
-          totalTokens: {
-            value: number("total_tokens"),
-            quality:
-              number("total_tokens") === null ? ("unavailable" as const) : ("observed" as const),
-            source: "codex",
-          },
-          cost: { value: null, quality: "unavailable" as const },
-        }
-      : unavailableUsage();
-    if (code !== 0)
-      return {
-        status: "failed",
-        rawOutput: stdout,
-        stderr,
-        error: stderr || `codex exited ${code}`,
-        usage,
-        events,
-      };
     if (input.role.outputSchema) {
       const check = validateJsonSchema(parsed, input.role.outputSchema);
-      if (!check.valid)
+      if (!check.valid) {
         return {
           status: "failed",
-          rawOutput: stdout,
-          stderr,
+          rawOutput,
           error: `invalid-output: ${check.error}`,
-          usage,
+          usage: codexUsage(usageRecord),
           events,
         };
+      }
     }
-    return { status: "succeeded", output: parsed, rawOutput: stdout, stderr, usage, events };
+    return {
+      status: "succeeded",
+      output: parsed,
+      rawOutput,
+      usage: codexUsage(usageRecord),
+      events,
+    };
   }
+}
+
+function consumeCodexEvent(
+  event: ThreadEvent,
+  onResponse: (text: string) => void,
+  onUsage: (usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number }) => void,
+): void {
+  if (event.type === "item.completed" && event.item.type === "agent_message") {
+    onResponse(event.item.text);
+  } else if (event.type === "turn.completed") {
+    onUsage(event.usage);
+  }
+}
+
+function codexUsage(
+  usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number } | undefined,
+) {
+  if (!usage) return unavailableUsage();
+  const inputTokens = usage.input_tokens;
+  const outputTokens = usage.output_tokens;
+  const totalTokens = inputTokens + outputTokens;
+  return {
+    inputTokens: { value: inputTokens, quality: "observed" as const, source: "codex" },
+    outputTokens: { value: outputTokens, quality: "observed" as const, source: "codex" },
+    totalTokens: { value: totalTokens, quality: "observed" as const, source: "codex" },
+    cost: { value: null, quality: "unavailable" as const },
+  };
 }
 
 /** Adapter for the host's small legacy boundary; the portable contract remains core-owned. */
 export class CodexHarnessAdapter implements HarnessAdapter {
   readonly id = "codex";
-  readonly adapterVersion = "1";
-  constructor(private readonly harness: CodexCliHarness) {}
+  readonly adapterVersion = "sdk";
+  constructor(private readonly harness: CodexSdkHarness) {}
   capabilities(): Record<string, "supported" | "unsupported" | "conditional"> {
     return Object.fromEntries(
       Object.entries(this.harness.descriptor.capabilities).map(([name, value]) => [
@@ -391,29 +333,5 @@ export class CodexHarnessAdapter implements HarnessAdapter {
       events: result.events.map((event) => JSON.parse(JSON.stringify(event))),
       usage: JSON.parse(JSON.stringify(result.usage)),
     } as Awaited<ReturnType<HarnessAdapter["run"]>>;
-  }
-}
-
-function cleanupCodexTemp(schemaPath: string, tempDir: string): void {
-  try {
-    unlinkSync(schemaPath);
-    rmSync(tempDir, { recursive: true, force: true });
-  } catch {
-    /* best effort cleanup; evidence does not depend on it */
-  }
-}
-
-async function capture(
-  args: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  try {
-    const p = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr] = await Promise.all([
-      new Response(p.stdout).text(),
-      new Response(p.stderr).text(),
-    ]);
-    return { exitCode: await p.exited, stdout, stderr };
-  } catch (error) {
-    return { exitCode: -1, stdout: "", stderr: String(error) };
   }
 }

@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   canonicalize,
+  CAPABILITY,
   createContextManifest,
   decide,
   isHarness,
@@ -23,14 +24,14 @@ import type {
 import type { RuntimeHarness } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harness/scripted.ts";
-import { CodexCliHarness, CodexHarnessAdapter, inspectCodex } from "../adapters/harness/codex.ts";
+import { CodexSdkHarness, CodexHarnessAdapter, inspectCodex } from "../adapters/harness/codex.ts";
 import { ExternalCliHarnessAdapter, inspectExternalCli } from "../adapters/harness/external-cli.ts";
 import {
   ClaudeAgentSdkHarnessAdapter,
   claudeSdkDescriptor,
 } from "../adapters/harness/claude-agent-sdk.ts";
 import {
-  PiCliHarness,
+  PiSdkHarness,
   PiHarnessAdapter,
   inspectPi,
   resolvePiSelection,
@@ -1333,6 +1334,7 @@ export class Coordinator {
     node: Extract<Bundle["definitions"][string]["nodes"][number], { kind: "command" }>,
   ): void {
     validateCommandNode(node);
+    if (node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE)) return;
     if (node.executionMode !== "trusted-unrestricted") return;
     const row = this.journal.getRunRow(runId);
     const input = row ? parseJson<Record<string, unknown>>(row.input_json) : {};
@@ -1685,14 +1687,17 @@ export class Coordinator {
           return;
         }
         const codex = (this.codex ??= new CodexHarnessAdapter(
-          new CodexCliHarness(this.codexDescriptor),
+          new CodexSdkHarness(this.codexDescriptor),
         ));
         selected = codex;
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = {
           sandbox:
-            profile === "codex-workspace-write" && node.workspaceAccess === "workspace-write"
+            (node.capabilities
+              ? node.capabilities.includes(CAPABILITY.REPOSITORY_WRITE)
+              : profile === "codex-workspace-write" &&
+                node.workspaceAccess === "workspace-write")
               ? "workspace-write"
               : "read-only",
         };
@@ -1706,7 +1711,7 @@ export class Coordinator {
             evidence: [],
             output: [],
             status: "failed",
-            error: `harness-unavailable: ${this.piDescriptor.detail ?? "pi RPC unavailable"}`,
+            error: `harness-unavailable: ${this.piDescriptor.detail ?? "Pi SDK unavailable"}`,
             diagnostics: ["execution rejected before workspace side effects"],
             resolvedExecution: {
               role: node.role,
@@ -1717,7 +1722,7 @@ export class Coordinator {
           });
           return;
         }
-        const pi = (this.pi ??= new PiHarnessAdapter(new PiCliHarness(this.piDescriptor)));
+        const pi = (this.pi ??= new PiHarnessAdapter(new PiSdkHarness(this.piDescriptor)));
         selected = pi;
         resolvedHarness = toHarness(pi.id);
         resolvedVersion = pi.adapterVersion;
@@ -1739,7 +1744,10 @@ export class Coordinator {
           nativeConfig = {
             ...(node.modelId ? { model: node.modelId } : {}),
             permissionMode:
-              profile === "claude-workspace-write" && node.workspaceAccess === "workspace-write"
+              (node.capabilities
+                ? node.capabilities.includes(CAPABILITY.REPOSITORY_WRITE)
+                : profile === "claude-workspace-write" &&
+                  node.workspaceAccess === "workspace-write")
                 ? "acceptEdits"
                 : "dontAsk",
           };
@@ -2062,7 +2070,9 @@ export class Coordinator {
           executable: node.executable,
           args: node.args,
           timeoutMs: node.timeoutMs || this.commandTimeoutMs,
-          executionMode: node.executionMode,
+          executionMode: node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE)
+            ? "trusted-unrestricted"
+            : node.executionMode,
         });
       } catch (cause) {
         status = "failed";
@@ -2079,7 +2089,10 @@ export class Coordinator {
             stdout: new Uint8Array(),
             stderr: new Uint8Array(),
             enforcementMode:
-              node.executionMode === "trusted-unrestricted" ? "trusted-unrestricted" : "enforced",
+              node.executionMode === "trusted-unrestricted" ||
+              node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE)
+                ? "trusted-unrestricted"
+                : "enforced",
           },
         };
       }
@@ -2263,13 +2276,13 @@ export class Coordinator {
           throw new Error(`subagent Codex unavailable: ${this.codexDescriptor.detail}`);
         childAdapter =
           this.codex ??
-          (this.codex = new CodexHarnessAdapter(new CodexCliHarness(this.codexDescriptor)));
+          (this.codex = new CodexHarnessAdapter(new CodexSdkHarness(this.codexDescriptor)));
       } else if (childAgent.harness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available")
           throw new Error(`subagent Pi unavailable: ${this.piDescriptor.detail}`);
         childAdapter =
-          this.pi ?? (this.pi = new PiHarnessAdapter(new PiCliHarness(this.piDescriptor)));
+          this.pi ?? (this.pi = new PiHarnessAdapter(new PiSdkHarness(this.piDescriptor)));
       } else throw new Error(`subagent harness ${childAgent.harness} is unavailable in this host`);
     }
     const outputSchema = childAgent.outputPorts[0]

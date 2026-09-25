@@ -25,6 +25,7 @@ import type {
   Harness,
   ScoutDefinition,
   ScoutPolicy,
+  WorkflowCapability,
 } from "./contracts";
 
 export type SchemaInput<T = unknown> = ArtifactType<T> | JsonValue;
@@ -81,6 +82,7 @@ export interface AgentOptions<T = unknown> {
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
   readonly workspaceAccess?: "read-only" | "workspace-write";
+  readonly capabilities?: readonly WorkflowCapability[];
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly produces?: ArtifactType<T>;
   readonly timeoutMs?: number;
@@ -115,6 +117,7 @@ export interface SubagentLimits {
 export interface CommandOptions {
   readonly executable: string;
   readonly executionMode?: "enforced" | "trusted-unrestricted";
+  readonly capabilities?: readonly WorkflowCapability[];
   readonly args?: readonly string[];
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly timeoutMs?: number;
@@ -491,6 +494,9 @@ export class WorkflowBuilder {
       ...(options.workspaceAccess === undefined
         ? {}
         : { workspaceAccess: options.workspaceAccess }),
+      ...(options.capabilities === undefined
+        ? {}
+        : { capabilities: [...new Set(options.capabilities)].sort() }),
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true),
       ),
@@ -525,6 +531,9 @@ export class WorkflowBuilder {
       kind: "command",
       executable: options.executable,
       ...(options.executionMode ? { executionMode: options.executionMode } : {}),
+      ...(options.capabilities === undefined
+        ? {}
+        : { capabilities: [...new Set(options.capabilities)].sort() }),
       args: [...(options.args ?? [])],
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), true),
@@ -1041,6 +1050,7 @@ function stripInternal(node: InternalNode): Node {
       ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
       ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
+      ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),
       timeoutMs: node.timeoutMs,
       ...(node.uses === undefined ? {} : { uses: node.uses }),
       ...(node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy }),
@@ -1052,6 +1062,7 @@ function stripInternal(node: InternalNode): Node {
       ...base,
       executable: node.executable,
       ...(node.executionMode === undefined ? {} : { executionMode: node.executionMode }),
+      ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),
       args: node.args,
       timeoutMs: node.timeoutMs,
       acceptedExitCodes: node.acceptedExitCodes,

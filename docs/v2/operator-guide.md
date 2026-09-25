@@ -76,14 +76,14 @@ experiment metadata and deterministic evidence distinguished from model or
 human opinions. A blinded pairwise decision does not modify deterministic
 acceptance evidence.
 
-The scripted harness requires no model credentials. Codex/Pi availability and
-native capabilities are discovered at runtime; a successful scripted exchange
-is not proof of real-provider collaboration. A local Pi model completed a tiny
-agent → command → complete run through the native RPC adapter, but a live
-model-to-model collaboration exchange remains unverified.
+The scripted harness requires no model credentials. Pi now runs through the Pi
+SDK in-process and Codex uses the official TypeScript SDK with its bundled
+runtime. Codex's SDK still starts a managed Codex process internally. A
+successful scripted exchange is not proof of real-provider collaboration. The
+older local Pi RPC smoke run predates this SDK adapter; the SDK-backed local
+model and model-to-model collaboration paths still need a live run.
 
 For a Pi-backed run, set `KOURO_PI_MODEL` to the native model id and keep the
-llama.cpp endpoint in `LLAMA_BASE_URL`. If the system Pi install is not writable
-or has a provider patch applied in a user-owned copy, set `KOURO_PI_BIN` to that
-executable; the adapter records provider/model identity but never treats missing
-or all-zero provider telemetry as observed usage.
+llama.cpp endpoint in `LLAMA_BASE_URL`. Pi CLI installation and a separate scout
+extension are no longer required. The adapter records provider/model identity
+and uses token/cost telemetry reported by the SDK session.

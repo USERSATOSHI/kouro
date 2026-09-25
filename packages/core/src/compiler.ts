@@ -1,5 +1,6 @@
 import {
   BUNDLE_FORMAT_VERSION,
+  CAPABILITY,
   CompileError,
   DEFAULT_LIMITS,
   isHarness,
@@ -143,6 +144,26 @@ export async function compileWorkflowDetailed(
     }
     if (node.kind === "agent" && node.harness !== undefined && !isHarness(node.harness))
       diagnostics.push(error("INVALID_HARNESS", `Unsupported harness ${node.harness}`, node.id));
+    if (node.kind === "agent" || node.kind === "command") {
+      const validCapabilities = new Set<string>(Object.values(CAPABILITY));
+      const capabilities = node.capabilities ?? [];
+      if (
+        !Array.isArray(capabilities) ||
+        capabilities.some((capability) => !validCapabilities.has(capability)) ||
+        new Set(capabilities).size !== capabilities.length
+      )
+        diagnostics.push(
+          error("INVALID_CAPABILITIES", "Node capabilities contain an unknown or duplicate value", node.id),
+        );
+      if (
+        node.kind === "command" &&
+        capabilities.length > 0 &&
+        !capabilities.includes(CAPABILITY.TERMINAL_EXECUTE)
+      )
+        diagnostics.push(
+          error("MISSING_TERMINAL_CAPABILITY", "Command nodes must declare terminal.execute", node.id),
+        );
+    }
     validatePorts(node.inputPorts, schemaDigests, diagnostics, node.id);
     validatePorts(node.outputPorts, schemaDigests, diagnostics, node.id);
     if (node.kind === "call" && !source.definitions?.[node.definitionId])

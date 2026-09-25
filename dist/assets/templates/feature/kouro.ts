@@ -1,4 +1,4 @@
-import { WorkflowBuilder } from "@kouro/core";
+import { CAPABILITY, WorkflowBuilder } from "@kouro/core";
 import { ScoutQuestion, ScoutReport, Summary, Task, WorkItem } from "./schemas/schema.ts";
 
 const planPrompt = await Bun.file(new URL("./prompts/plan.md", import.meta.url)).text();
@@ -37,6 +37,7 @@ const plan = workflow.agent("plan", {
   input: { task, workItem },
   produces: Summary,
   uses: [repositoryScout, testScout],
+  capabilities: [CAPABILITY.REPOSITORY_READ],
   scoutPolicy: { maxRequests: 4, maxConcurrent: 2 },
 });
 const approval = workflow.approval("approve-plan", {
@@ -57,19 +58,19 @@ const implement = workflow.agent("implement", {
     repositoryReports: workflow.subagentResults(plan, repositoryScout),
     testReports: workflow.subagentResults(plan, testScout),
   },
-  workspaceAccess: "workspace-write",
+  capabilities: [CAPABILITY.REPOSITORY_READ, CAPABILITY.REPOSITORY_WRITE],
 });
 const validate = workflow.command("validate", {
   executable: "bun",
   args: ["test"],
-  executionMode: "trusted-unrestricted",
+  capabilities: [CAPABILITY.REPOSITORY_READ, CAPABILITY.TERMINAL_EXECUTE],
 });
 const done = workflow.complete("done");
 const failed = workflow.complete("failed", { result: "failed" });
 const typecheck = workflow.command("typecheck", {
   executable: "bun",
   args: ["run", "typecheck"],
-  executionMode: "trusted-unrestricted",
+  capabilities: [CAPABILITY.REPOSITORY_READ, CAPABILITY.TERMINAL_EXECUTE],
 });
 workflow.startAt(plan);
 plan.on("success").to(approval);

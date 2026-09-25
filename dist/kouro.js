@@ -51,9 +51,21 @@ var __require = import.meta.require;
 function isHarness(value) {
   return typeof value === "string" && HARNESS.includes(value);
 }
-var PROJECTION_VERSION = 1, BUNDLE_FORMAT_VERSION = 1, HARNESS, DEFAULT_LIMITS, CompileError;
+var PROJECTION_VERSION = 1, BUNDLE_FORMAT_VERSION = 1, HARNESS, HARNESS_ID, CAPABILITY, DEFAULT_LIMITS, CompileError;
 var init_contracts = __esm(() => {
   HARNESS = ["codex", "pi", "claude", "opencode"];
+  HARNESS_ID = Object.freeze({
+    CODEX: "codex",
+    PI: "pi",
+    CLAUDE: "claude",
+    OPENCODE: "opencode"
+  });
+  CAPABILITY = Object.freeze({
+    REPOSITORY_READ: "repository.read",
+    REPOSITORY_WRITE: "repository.write",
+    TERMINAL_EXECUTE: "terminal.execute",
+    NETWORK_ACCESS: "network.access"
+  });
   DEFAULT_LIMITS = Object.freeze({
     maxScopes: 16,
     maxInvocations: 128,
@@ -314,6 +326,7 @@ class WorkflowBuilder {
       ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
       ...options.workspaceAccess === undefined ? {} : { workspaceAccess: options.workspaceAccess },
+      ...options.capabilities === undefined ? {} : { capabilities: [...new Set(options.capabilities)].sort() },
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true)),
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),
@@ -342,6 +355,7 @@ class WorkflowBuilder {
       kind: "command",
       executable: options.executable,
       ...options.executionMode ? { executionMode: options.executionMode } : {},
+      ...options.capabilities === undefined ? {} : { capabilities: [...new Set(options.capabilities)].sort() },
       args: [...options.args ?? []],
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), true)),
       outputPorts: [output],
@@ -761,6 +775,7 @@ function stripInternal(node) {
       ...node.harness === undefined ? {} : { harness: node.harness },
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
       ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
+      ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
       timeoutMs: node.timeoutMs,
       ...node.uses === undefined ? {} : { uses: node.uses },
       ...node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy },
@@ -772,6 +787,7 @@ function stripInternal(node) {
       ...base,
       executable: node.executable,
       ...node.executionMode === undefined ? {} : { executionMode: node.executionMode },
+      ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
       args: node.args,
       timeoutMs: node.timeoutMs,
       acceptedExitCodes: node.acceptedExitCodes
@@ -970,6 +986,14 @@ async function compileWorkflowDetailed(source) {
     }
     if (node.kind === "agent" && node.harness !== undefined && !isHarness(node.harness))
       diagnostics.push(error("INVALID_HARNESS", `Unsupported harness ${node.harness}`, node.id));
+    if (node.kind === "agent" || node.kind === "command") {
+      const validCapabilities = new Set(Object.values(CAPABILITY));
+      const capabilities = node.capabilities ?? [];
+      if (!Array.isArray(capabilities) || capabilities.some((capability) => !validCapabilities.has(capability)) || new Set(capabilities).size !== capabilities.length)
+        diagnostics.push(error("INVALID_CAPABILITIES", "Node capabilities contain an unknown or duplicate value", node.id));
+      if (node.kind === "command" && capabilities.length > 0 && !capabilities.includes(CAPABILITY.TERMINAL_EXECUTE))
+        diagnostics.push(error("MISSING_TERMINAL_CAPABILITY", "Command nodes must declare terminal.execute", node.id));
+    }
     validatePorts(node.inputPorts, schemaDigests, diagnostics, node.id);
     validatePorts(node.outputPorts, schemaDigests, diagnostics, node.id);
     if (node.kind === "call" && !source.definitions?.[node.definitionId])
@@ -10090,10 +10114,12 @@ __export(exports_src, {
   WorkflowBuilder: () => WorkflowBuilder,
   PROJECTION_VERSION: () => PROJECTION_VERSION,
   NodeHandle: () => NodeHandle,
+  HARNESS_ID: () => HARNESS_ID,
   HARNESS: () => HARNESS,
   EdgeBuilder: () => EdgeBuilder,
   DEFAULT_LIMITS: () => DEFAULT_LIMITS,
   CompileError: () => CompileError,
+  CAPABILITY: () => CAPABILITY,
   BUNDLE_FORMAT_VERSION: () => BUNDLE_FORMAT_VERSION
 });
 function createLifecycleEvent(type, values, payload) {
@@ -15878,9 +15904,9 @@ var require_dist2 = __commonJS((exports, module) => {
 
 // packages/host/src/cli.ts
 import { randomUUID as randomUUID6 } from "crypto";
-import { existsSync as existsSync6 } from "fs";
+import { existsSync as existsSync4 } from "fs";
 import { mkdir, readdir as readdir2, readFile as readFile2, rename, rm, stat as stat2, writeFile } from "fs/promises";
-import { dirname as dirname2, resolve as resolve6 } from "path";
+import { dirname as dirname3, resolve as resolve5 } from "path";
 
 // packages/host/src/application/service.ts
 init_src();
@@ -15888,7 +15914,7 @@ init_src();
 // packages/host/src/coordinator/coordinator.ts
 init_src();
 import { mkdirSync as mkdirSync5 } from "fs";
-import { join as join5 } from "path";
+import { join as join4 } from "path";
 
 // packages/host/src/id.ts
 import { randomUUID } from "crypto";
@@ -16089,9 +16115,7 @@ function wait(delayMs, signal) {
 
 // packages/host/src/adapters/harness/codex.ts
 init_src();
-import { existsSync, mkdtempSync, unlinkSync, rmSync } from "fs";
-import { join, resolve } from "path";
-import { tmpdir } from "os";
+import { Codex } from "@openai/codex-sdk";
 
 // packages/host/src/adapters/harness/scout-bridge.ts
 import { randomBytes, timingSafeEqual } from "crypto";
@@ -16141,17 +16165,20 @@ async function startScoutBridge(subagent) {
 
 // packages/host/src/adapters/harness/codex.ts
 async function inspectCodex() {
-  const version = await capture(["codex", "--version"]);
-  const help = await capture(["codex", "exec", "--help"]);
-  const mcpHelp = await capture(["codex", "mcp", "--help"]);
-  const available = version.exitCode === 0 && help.exitCode === 0 && mcpHelp.exitCode === 0 && help.stdout.includes("--json") && help.stdout.includes("--output-schema");
+  let detail;
+  try {
+    new Codex;
+  } catch (cause) {
+    detail = cause instanceof Error ? cause.message : String(cause);
+  }
+  const available = detail === undefined;
   const supported = { state: available ? "supported" : "unsupported" };
   return {
     id: "codex",
-    adapterVersion: "1",
-    version: version.stdout.trim() || "unknown",
+    adapterVersion: "sdk",
+    version: "OpenAI Codex TypeScript SDK",
     availability: available ? "available" : "unavailable",
-    detail: available ? undefined : `codex exec or MCP interface unavailable (${version.stderr || help.stderr || mcpHelp.stderr || "not installed"})`,
+    detail: available ? undefined : `Codex SDK runtime unavailable (${detail})`,
     capabilities: {
       "structured-output": supported,
       cancel: supported,
@@ -16161,7 +16188,7 @@ async function inspectCodex() {
         state: "conditional",
         constraints: ["only tools explicitly enabled by native profile"]
       },
-      usage: { state: available ? "supported" : "unsupported" },
+      usage: { state: supported.state },
       "cost-cap": {
         state: "unsupported",
         constraints: ["provider cost is not enforceable locally"]
@@ -16181,7 +16208,7 @@ async function inspectCodex() {
   };
 }
 
-class CodexCliHarness {
+class CodexSdkHarness {
   descriptor;
   constructor(descriptor) {
     this.descriptor = descriptor;
@@ -16211,39 +16238,17 @@ class CodexCliHarness {
     };
   }
   async run(input) {
-    if (this.descriptor.availability !== "available")
+    if (this.descriptor.availability !== "available") {
       return {
         status: "unavailable",
         error: this.descriptor.detail,
         usage: unavailableUsage(),
         events: []
       };
-    const config = input.selection.nativeConfig ?? {};
-    const tempDir = mkdtempSync(join(tmpdir(), "kouro-codex-"), { encoding: "utf8" });
-    const args = [
-      "codex",
-      "exec",
-      "--json",
-      "--ephemeral",
-      "--skip-git-repo-check",
-      "--cd",
-      input.cwd
-    ];
-    if (typeof config.model === "string")
-      args.push("--model", config.model);
-    args.push("--sandbox", typeof config.sandbox === "string" ? config.sandbox : "read-only");
-    const schemaPath = join(tempDir, "output-schema.json");
-    if (input.role.outputSchema) {
-      await Bun.write(schemaPath, JSON.stringify(input.role.outputSchema));
-      args.push("--output-schema", schemaPath);
     }
+    const config = input.selection.nativeConfig ?? {};
     const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
     const bridge = scoutTool && input.collaboration?.subagent ? await startScoutBridge(input.collaboration.subagent) : undefined;
-    if (bridge) {
-      const sourceEntrypoint = resolve(import.meta.dir, "../../cli.ts");
-      const entrypoint = existsSync(sourceEntrypoint) ? sourceEntrypoint : resolve(import.meta.dir, "kouro.js");
-      args.push("--config", `mcp_servers.kouro_scout.command=${JSON.stringify(process.execPath)}`, "--config", `mcp_servers.kouro_scout.args=${JSON.stringify([entrypoint, "__scout_mcp"])}`, "--config", 'mcp_servers.kouro_scout.env_vars=["KOURO_SCOUT_ENDPOINT","KOURO_SCOUT_TOKEN","KOURO_SCOUT_SCHEMA"]');
-    }
     const env = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: process.env.HOME ?? "/tmp"
@@ -16255,171 +16260,158 @@ class CodexCliHarness {
       env.KOURO_SCOUT_TOKEN = bridge.token;
       env.KOURO_SCOUT_SCHEMA = JSON.stringify(scoutTool.inputSchema);
     }
-    let proc;
-    const handoff2 = input.context ? `
-
-[KOURO_CONTEXT_BEGIN]
-${JSON.stringify(input.context)}
-[KOURO_CONTEXT_END]
-[KOURO_HANDOFF_BEGIN]
-${input.role.prompt}
-[KOURO_HANDOFF_END]` : input.role.prompt;
+    const codexConfig = {};
+    if (bridge) {
+      const sourceEntrypoint = new URL("../../cli.ts", import.meta.url);
+      const entrypoint = await Bun.file(sourceEntrypoint).exists() ? sourceEntrypoint.pathname : new URL("kouro.js", import.meta.url).pathname;
+      codexConfig.mcp_servers = {
+        kouro_scout: {
+          command: process.execPath,
+          args: [entrypoint, "__scout_mcp"],
+          env_vars: ["KOURO_SCOUT_ENDPOINT", "KOURO_SCOUT_TOKEN", "KOURO_SCOUT_SCHEMA"]
+        }
+      };
+    }
+    const sdkOptions = {
+      env,
+      ...Object.keys(codexConfig).length > 0 ? { config: codexConfig } : {}
+    };
+    let thread;
     try {
-      proc = Bun.spawn(args, {
-        stdin: new Blob([handoff2]),
-        stdout: "pipe",
-        stderr: "pipe",
-        signal: input.signal,
-        env
+      thread = new Codex(sdkOptions).startThread({
+        ...typeof config.model === "string" ? { model: config.model } : {},
+        workingDirectory: input.cwd,
+        skipGitRepoCheck: true,
+        sandboxMode: config.sandbox === "workspace-write" ? "workspace-write" : "read-only"
       });
     } catch (cause) {
-      cleanupCodexTemp(schemaPath, tempDir);
       await bridge?.close();
       return {
-        status: input.signal?.aborted ? "cancelled" : "failed",
-        error: input.signal?.aborted ? "cancelled" : `codex spawn failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        status: "unavailable",
+        error: cause instanceof Error ? cause.message : String(cause),
         usage: unavailableUsage(),
         events: []
       };
     }
-    let timedOut = false;
-    let timeoutTimer;
     const timeoutMs = typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0 ? input.timeoutMs : 120000;
-    const timeout = new Promise((resolve2) => {
-      timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        proc.kill("SIGTERM");
-        resolve2("timeout");
-      }, timeoutMs);
-    });
-    const aborted = new Promise((resolve2) => {
-      if (input.signal?.aborted)
-        resolve2("aborted");
-      else
-        input.signal?.addEventListener("abort", () => resolve2("aborted"), { once: true });
-    });
-    let stdout = "";
-    let stderr = "";
-    const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
-    const stderrPromise = new Response(proc.stderr).text().catch(() => "");
-    const output = Promise.all([stdoutPromise, stderrPromise]).then(([nextStdout, nextStderr]) => {
-      stdout = nextStdout;
-      stderr = nextStderr;
-      return "output";
-    });
-    const first = await Promise.race([output, timeout, aborted]);
-    let code;
-    if (first === "output") {
-      const exited = proc.exited.then((value) => {
-        code = value;
-        return "exited";
+    const abortController = new AbortController;
+    const abort = () => abortController.abort(input.signal?.reason);
+    if (input.signal?.aborted)
+      abort();
+    else
+      input.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)), timeoutMs);
+    const prompt = input.context ? `${input.role.prompt}
+
+[KOURO_CONTEXT_BEGIN]
+${JSON.stringify(input.context)}
+[KOURO_CONTEXT_END]` : input.role.prompt;
+    const events = [];
+    const raw = [];
+    let response;
+    let usageRecord;
+    let streamError;
+    let bridgeClosed = false;
+    const closeBridge = async () => {
+      if (!bridgeClosed) {
+        bridgeClosed = true;
+        await bridge?.close();
+      }
+    };
+    try {
+      const { events: stream } = await thread.runStreamed(prompt, {
+        ...input.role.outputSchema ? { outputSchema: input.role.outputSchema } : {},
+        signal: abortController.signal
       });
-      await Promise.race([exited, timeout, aborted]);
-    } else {
-      proc.kill("SIGTERM");
-      const stopped = await Promise.race([
-        proc.exited.then(() => true, () => true),
-        new Promise((resolve2) => setTimeout(() => resolve2(false), 25))
-      ]);
-      if (!stopped)
-        proc.kill("SIGKILL");
+      for await (const event of stream) {
+        raw.push(JSON.stringify(event));
+        events.push({ type: "log", at: new Date().toISOString(), data: JSON.stringify(event) });
+        consumeCodexEvent(event, (text) => response = text, (usage) => usageRecord = usage);
+        if (event.type === "turn.failed" || event.type === "error") {
+          streamError = event.type === "turn.failed" ? event.error.message : event.message;
+        }
+      }
+    } catch (cause) {
+      streamError = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", abort);
+      await closeBridge();
     }
-    if (timeoutTimer)
-      clearTimeout(timeoutTimer);
-    cleanupCodexTemp(schemaPath, tempDir);
-    await bridge?.close();
-    if (timedOut)
+    const rawOutput = raw.join(`
+`);
+    const timedOut = abortController.signal.aborted && !input.signal?.aborted;
+    if (input.signal?.aborted || timedOut) {
+      const message = timedOut ? `Codex timed out after ${timeoutMs}ms` : "cancelled";
+      return {
+        status: input.signal?.aborted ? "cancelled" : "failed",
+        error: message,
+        rawOutput,
+        usage: codexUsage(usageRecord),
+        events: [...events, { type: "log", at: new Date().toISOString(), data: message }]
+      };
+    }
+    if (streamError) {
       return {
         status: "failed",
-        error: `codex timed out after ${timeoutMs}ms`,
-        rawOutput: stdout,
-        stderr,
-        usage: unavailableUsage(),
-        events: [{ type: "log", at: new Date().toISOString(), data: "timed out" }]
+        error: streamError,
+        rawOutput,
+        usage: codexUsage(usageRecord),
+        events
       };
-    if (input.signal?.aborted)
-      return {
-        status: "cancelled",
-        error: "cancelled",
-        usage: unavailableUsage(),
-        rawOutput: stdout,
-        stderr,
-        events: [{ type: "log", at: new Date().toISOString(), data: "cancelled" }]
-      };
-    if (code === undefined)
-      code = await proc.exited.catch(() => -1);
-    const lines = stdout.split(`
-`).filter(Boolean);
-    const records = lines.flatMap((line) => {
-      try {
-        return [JSON.parse(line)];
-      } catch {
-        return [];
-      }
-    });
-    const events = lines.map((line) => ({
-      type: "log",
-      at: new Date().toISOString(),
-      data: line
-    }));
-    const message = [...records].reverse().find((item) => item.type === "item.completed" && item.item?.type === "agent_message") ?? [...records].reverse().find((item) => item.type === "agent_message" || item.type === "message");
-    const messageItem = message?.item;
-    let parsed = messageItem?.text ?? message?.text ?? message?.message ?? message?.content;
+    }
+    let parsed = response;
     if (typeof parsed === "string") {
       try {
         parsed = JSON.parse(parsed);
       } catch {}
     }
-    const completion = records.find((item) => item.type === "turn.completed");
-    const usageRecord = completion?.usage;
-    const number = (key) => typeof usageRecord?.[key] === "number" && Number.isFinite(usageRecord[key]) ? Number(usageRecord[key]) : null;
-    const usage = usageRecord ? {
-      inputTokens: {
-        value: number("input_tokens"),
-        quality: number("input_tokens") === null ? "unavailable" : "observed",
-        source: "codex"
-      },
-      outputTokens: {
-        value: number("output_tokens"),
-        quality: number("output_tokens") === null ? "unavailable" : "observed",
-        source: "codex"
-      },
-      totalTokens: {
-        value: number("total_tokens"),
-        quality: number("total_tokens") === null ? "unavailable" : "observed",
-        source: "codex"
-      },
-      cost: { value: null, quality: "unavailable" }
-    } : unavailableUsage();
-    if (code !== 0)
-      return {
-        status: "failed",
-        rawOutput: stdout,
-        stderr,
-        error: stderr || `codex exited ${code}`,
-        usage,
-        events
-      };
     if (input.role.outputSchema) {
       const check = validateJsonSchema(parsed, input.role.outputSchema);
-      if (!check.valid)
+      if (!check.valid) {
         return {
           status: "failed",
-          rawOutput: stdout,
-          stderr,
+          rawOutput,
           error: `invalid-output: ${check.error}`,
-          usage,
+          usage: codexUsage(usageRecord),
           events
         };
+      }
     }
-    return { status: "succeeded", output: parsed, rawOutput: stdout, stderr, usage, events };
+    return {
+      status: "succeeded",
+      output: parsed,
+      rawOutput,
+      usage: codexUsage(usageRecord),
+      events
+    };
   }
+}
+function consumeCodexEvent(event, onResponse, onUsage) {
+  if (event.type === "item.completed" && event.item.type === "agent_message") {
+    onResponse(event.item.text);
+  } else if (event.type === "turn.completed") {
+    onUsage(event.usage);
+  }
+}
+function codexUsage(usage) {
+  if (!usage)
+    return unavailableUsage();
+  const inputTokens = usage.input_tokens;
+  const outputTokens = usage.output_tokens;
+  const totalTokens = inputTokens + outputTokens;
+  return {
+    inputTokens: { value: inputTokens, quality: "observed", source: "codex" },
+    outputTokens: { value: outputTokens, quality: "observed", source: "codex" },
+    totalTokens: { value: totalTokens, quality: "observed", source: "codex" },
+    cost: { value: null, quality: "unavailable" }
+  };
 }
 
 class CodexHarnessAdapter {
   harness;
   id = "codex";
-  adapterVersion = "1";
+  adapterVersion = "sdk";
   constructor(harness2) {
     this.harness = harness2;
   }
@@ -16455,31 +16447,13 @@ class CodexHarnessAdapter {
     };
   }
 }
-function cleanupCodexTemp(schemaPath, tempDir) {
-  try {
-    unlinkSync(schemaPath);
-    rmSync(tempDir, { recursive: true, force: true });
-  } catch {}
-}
-async function capture(args) {
-  try {
-    const p = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr] = await Promise.all([
-      new Response(p.stdout).text(),
-      new Response(p.stderr).text()
-    ]);
-    return { exitCode: await p.exited, stdout, stderr };
-  } catch (error2) {
-    return { exitCode: -1, stdout: "", stderr: String(error2) };
-  }
-}
 
 // packages/host/src/adapters/harness/external-cli.ts
 init_src();
 function binary() {
   return process.env.KOURO_OPENCODE_BIN?.trim() || "opencode";
 }
-async function capture2(args) {
+async function capture(args) {
   try {
     const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, exitCode] = await Promise.all([
@@ -16498,8 +16472,8 @@ async function capture2(args) {
 }
 async function inspectExternalCli(kind) {
   const command = binary();
-  const version = await capture2([command, "--version"]);
-  const help = await capture2([command, "run", "--help"]);
+  const version = await capture([command, "--version"]);
+  const help = await capture([command, "run", "--help"]);
   const available = version.exitCode === 0 && help.exitCode === 0;
   const supported = { state: available ? "supported" : "unsupported" };
   return {
@@ -16610,10 +16584,10 @@ ${input.prompt}` : input.prompt;
     const stderrPromise = new Response(proc.stderr).text().catch(() => "");
     const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : 120000;
     let timer;
-    const timeout = new Promise((resolve2) => {
+    const timeout = new Promise((resolve) => {
       timer = setTimeout(() => {
         proc.kill("SIGTERM");
-        resolve2("timeout");
+        resolve("timeout");
       }, timeoutMs);
     });
     const completed = Promise.all([stdoutPromise, stderrPromise, proc.exited]).then(([stdout, stderr, code]) => ({ stdout, stderr, code }));
@@ -21674,7 +21648,7 @@ var recursive = /* @__PURE__ */ new WeakMap;
 var NONE = 0;
 var ASSUMED = 1;
 var PROVEN = 2;
-function isRecursive(inst, stack, resolve2) {
+function isRecursive(inst, stack, resolve) {
   const cached2 = recursive.get(inst);
   if (cached2 !== undefined)
     return cached2 ? PROVEN : NONE;
@@ -21684,7 +21658,7 @@ function isRecursive(inst, stack, resolve2) {
   let result = NONE;
   const check = (child) => {
     if (result !== PROVEN && child?._zod) {
-      const answer = isRecursive(child, stack, resolve2);
+      const answer = isRecursive(child, stack, resolve);
       if (answer > result)
         result = answer;
     }
@@ -21695,7 +21669,7 @@ function isRecursive(inst, stack, resolve2) {
       const desc = Object.getOwnPropertyDescriptor(sh, key);
       if (spread && !desc.enumerable)
         continue;
-      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve2) : NONE;
+      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve) : NONE;
       if (child > answer)
         answer = child;
     }
@@ -21758,7 +21732,7 @@ function isRecursive(inst, stack, resolve2) {
       check(def.output);
       break;
     case "lazy": {
-      const inner = def._cachedInner ?? (resolve2 ? inst._zod.innerType : undefined);
+      const inner = def._cachedInner ?? (resolve ? inst._zod.innerType : undefined);
       merge2(inner ? isRecursive(inner, stack, false) : ASSUMED);
       break;
     }
@@ -36241,9 +36215,18 @@ function usageFrom(message) {
 
 // packages/host/src/adapters/harness/pi.ts
 init_src();
-import { createHash } from "crypto";
-import { existsSync as existsSync2 } from "fs";
-import { resolve as resolve2 } from "path";
+import {
+  createAgentSessionFromServices,
+  createAgentSessionServices,
+  defineTool,
+  getAgentDir,
+  ModelRuntime,
+  SessionManager,
+  VERSION as PI_SDK_VERSION
+} from "@earendil-works/pi-coding-agent";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+import { Type } from "typebox";
 var nativeConfigSchema = {
   type: "object",
   additionalProperties: false,
@@ -36255,56 +36238,31 @@ var nativeConfigSchema = {
     checksum: { type: "string" }
   }
 };
-function piCommand() {
-  return Bun.env.KOURO_PI_BIN?.trim() || "pi";
-}
-async function inspectPi(spawn = defaultSpawn) {
-  const version2 = await capturePi(spawn, ["--version"]);
-  const help = await capturePi(spawn, ["--help"]);
-  const available = version2.code === 0 && help.code === 0 && help.stdout.includes("--mode") && help.stdout.includes("rpc") && help.stdout.includes("--extension") && help.stdout.includes("--no-extensions");
-  const state = available ? "supported" : "unsupported";
+async function inspectPi() {
   return {
     id: "pi",
-    adapterVersion: "1",
-    version: version2.stdout.trim() || "unknown",
-    availability: available ? "available" : "unavailable",
-    detail: available ? undefined : `pi RPC interface unavailable (${version2.stderr || help.stderr || "not installed"})`,
+    adapterVersion: "sdk",
+    version: PI_SDK_VERSION,
+    availability: "available",
     capabilities: {
-      "structured-output": { state },
-      cancel: { state },
-      resume: {
-        state: "unsupported",
-        constraints: ["native session resume is not exposed by this adapter"]
-      },
+      "structured-output": { state: "supported" },
+      cancel: { state: "supported" },
+      resume: { state: "unsupported", constraints: ["each Kouro invocation is ephemeral"] },
       reattach: { state: "unsupported" },
-      tools: { state: "conditional", constraints: ["read-only native tool allowlist only"] },
-      usage: { state },
+      tools: { state: "conditional", constraints: ["read-only built-in tools only"] },
+      usage: { state: "supported" },
       "cost-cap": {
         state: "unsupported",
         constraints: ["provider cost is not enforceable locally"]
       },
-      "awaited-subagent-tool": { state },
-      "child-read-only-envelope": { state }
+      "awaited-subagent-tool": { state: "supported" },
+      "child-read-only-envelope": { state: "supported" }
     },
     nativeConfigSchema
   };
 }
-function parsePiRpcLine(line) {
-  try {
-    const value = JSON.parse(line.endsWith("\r") ? line.slice(0, -1) : line);
-    return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
-  } catch {
-    return;
-  }
-}
 function piNativeConfig(config2 = {}) {
-  const safe = redactSecrets(config2, [
-    "apiKey",
-    "api_key",
-    "token",
-    "password",
-    "secret"
-  ]);
+  const safe = redactSecrets(config2, ["apiKey", "api_key", "token", "password", "secret"]);
   return { ...safe, checksum: `sha256:${simpleHash(canonicalize(safe))}` };
 }
 function resolvePiSelection(selection, config2 = {}, env = Bun.env) {
@@ -36320,18 +36278,13 @@ function resolvePiSelection(selection, config2 = {}, env = Bun.env) {
       model = model.slice(slash + 1);
     }
   }
-  return {
-    ...provider ? { provider } : {},
-    ...model ? { model } : {}
-  };
+  return { ...provider ? { provider } : {}, ...model ? { model } : {} };
 }
 
-class PiCliHarness {
+class PiSdkHarness {
   descriptor;
-  spawn;
-  constructor(descriptor, spawn = defaultSpawn) {
+  constructor(descriptor) {
     this.descriptor = descriptor;
-    this.spawn = spawn;
   }
   async startTurn(request) {
     const controller = new AbortController;
@@ -36360,8 +36313,8 @@ class PiCliHarness {
       observations: async function* () {
         while (!done || queue.length) {
           if (!queue.length)
-            await new Promise((resolve3) => {
-              wake = resolve3;
+            await new Promise((resolve2) => {
+              wake = resolve2;
             });
           while (queue.length)
             yield queue.shift();
@@ -36370,290 +36323,239 @@ class PiCliHarness {
       cancel: async () => {
         controller.abort();
         await result;
-        done = true;
-        wake?.();
       },
       close: async () => {
         await result;
-        done = true;
-        wake?.();
       }
     };
   }
   async run(input2) {
-    if (this.descriptor.availability !== "available")
+    if (this.descriptor.availability !== "available") {
       return {
         status: "unavailable",
         error: this.descriptor.detail,
         usage: unavailableUsage(),
         events: []
       };
+    }
     const supplied = input2.selection.nativeConfig ?? {};
     const config2 = piNativeConfig(supplied);
     const validation = validateJsonSchema(config2, nativeConfigSchema);
-    if (!validation.valid)
+    if (!validation.valid) {
       return {
         status: "failed",
         error: `invalid-native-config: ${validation.error}`,
         usage: unavailableUsage(),
         events: []
       };
-    const args = [
-      "--mode",
-      "rpc",
-      "--no-session",
-      "--tools",
-      "read",
-      "--no-context-files",
-      "--no-skills"
-    ];
-    const scoutTool = input2.context?.tools.find((item) => item.name === "subagent");
-    const bridge = scoutTool && input2.collaboration?.subagent ? await startScoutBridge(input2.collaboration.subagent) : undefined;
-    if (bridge) {
-      const sourceAsset = resolve2(import.meta.dir, "../../../assets/scout-pi-extension.mjs");
-      const asset = existsSync2(sourceAsset) ? sourceAsset : resolve2(import.meta.dir, "assets/scout-pi-extension.mjs");
-      args[4] = "read,subagent";
-      args.push("--no-extensions", "--extension", asset);
     }
-    const resolved = resolvePiSelection(input2.selection, config2);
-    if (resolved.provider)
-      args.push("--provider", resolved.provider);
-    if (resolved.model)
-      args.push("--model", resolved.model);
-    if (typeof config2.thinking === "string")
-      args.push("--thinking", config2.thinking);
-    const proc = this.spawn([piCommand(), ...args], {
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: input2.cwd,
-      ...bridge && scoutTool ? {
-        env: {
-          ...process.env,
-          KOURO_SCOUT_ENDPOINT: bridge.endpoint,
-          KOURO_SCOUT_TOKEN: bridge.token,
-          KOURO_SCOUT_SCHEMA: JSON.stringify(scoutTool.inputSchema)
-        }
-      } : {}
-    });
+    let session;
     const events = [];
-    const records = [];
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let cancelled = false;
-    let stoppedAfterSettled = false;
-    let statsRequested = false;
-    const abort = () => {
-      cancelled = true;
-      try {
-        proc.stdin.write(`${JSON.stringify({ type: "abort", id: `${input2.attemptId}:abort` })}
-`);
-      } catch {}
-      proc.kill?.("SIGTERM");
+    const emit = (event) => {
+      events.push(event);
+      input2.onEvent?.(event);
     };
+    let timeout = false;
+    const timeoutMs = typeof config2.timeoutMs === "number" ? config2.timeoutMs : 120000;
+    const timer = setTimeout(() => {
+      timeout = true;
+      session?.abort();
+    }, timeoutMs);
+    const abort = () => void session?.abort();
     input2.signal?.addEventListener("abort", abort, { once: true });
     try {
-      const handoff3 = input2.context ? `
-
-[KOURO_CONTEXT_BEGIN]
-${JSON.stringify(input2.context)}
-[KOURO_CONTEXT_END]
-[KOURO_HANDOFF_BEGIN]
-${input2.role.prompt}
-[KOURO_HANDOFF_END]` : input2.role.prompt;
-      proc.stdin.write(`${JSON.stringify({ id: `${input2.attemptId}:prompt`, type: "prompt", message: handoff3 })}
-`);
-      const reader = proc.stdout.getReader();
-      const decoder = new TextDecoder;
-      let buffer = "";
-      const consume = async () => {
-        while (true) {
-          const next = await reader.read();
-          if (next.done)
-            break;
-          buffer += decoder.decode(next.value, { stream: true });
-          let index = buffer.indexOf(`
-`);
-          while (index >= 0) {
-            const line = buffer.slice(0, index);
-            buffer = buffer.slice(index + 1);
-            stdout += `${line}
-`;
-            this.record(line, records, events, input2.onEvent);
-            if (records.at(-1)?.type === "agent_settled")
-              settled = true;
-            if (settled && !statsRequested) {
-              statsRequested = true;
-              proc.stdin.write(`${JSON.stringify({ id: `${input2.attemptId}:stats`, type: "get_session_stats" })}
-`);
-            }
-            if (settled && records.at(-1)?.type === "response" && records.at(-1)?.command === "get_session_stats") {
-              stoppedAfterSettled = true;
-              proc.stdin.end?.();
-              proc.kill?.("SIGTERM");
-              return;
-            }
-            index = buffer.indexOf(`
-`);
-          }
+      const resolved = resolvePiSelection(input2.selection, config2);
+      const requestedModel = resolved.provider && resolved.model ? `${resolved.provider}/${resolved.model}` : resolved.model;
+      const agentDir = getAgentDir();
+      const services = await createAgentSessionServices({
+        cwd: input2.cwd,
+        agentDir,
+        modelRuntime: await ModelRuntime.create(),
+        resourceLoaderOptions: {
+          noSkills: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          extensionFactories: await loadPiBuiltInExtensions()
         }
-        buffer += decoder.decode();
-        if (buffer) {
-          stdout += buffer;
-          this.record(buffer, records, events, input2.onEvent);
-        }
-      };
-      const stderrPromise = new Response(proc.stderr).text().then((value) => {
-        stderr = value;
       });
-      const timeoutMs = typeof config2.timeoutMs === "number" ? config2.timeoutMs : 120000;
-      let timedOut = false;
-      let timer;
-      const timeout = new Promise((resolve3) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          abort();
-          resolve3("timeout");
-        }, timeoutMs);
+      const model = requestedModel ? await modelFor(services.modelRuntime, requestedModel) : undefined;
+      if (requestedModel && !model)
+        throw new Error(`Pi model is unavailable: ${requestedModel}`);
+      const scoutTool = input2.context?.tools.find((item) => item.name === "subagent");
+      const subagent = input2.collaboration?.subagent;
+      const customTools = scoutTool && subagent ? [createSubagentTool(scoutTool, subagent)] : [];
+      const created = await createAgentSessionFromServices({
+        services,
+        sessionManager: SessionManager.inMemory(input2.cwd),
+        ...model ? { model } : {},
+        ...typeof config2.thinking === "string" ? { thinkingLevel: config2.thinking } : {},
+        tools: ["read", "grep", "find", "ls"],
+        customTools
       });
-      const consumed = consume().catch(() => {
-        return;
-      });
-      await Promise.race([consumed, timeout]);
-      let code;
-      if (!timedOut) {
-        const exited = proc.exited.then((value) => {
-          code = value;
-          return "exited";
-        });
-        await Promise.race([exited, timeout]);
-      }
-      if (timedOut) {
-        const stopped = await Promise.race([
-          proc.exited.then(() => true, () => true),
-          new Promise((resolve3) => setTimeout(() => resolve3(false), 25))
-        ]);
-        if (!stopped)
-          proc.kill?.("SIGKILL");
-      } else
-        await Promise.race([stderrPromise, timeout]);
-      if (timer)
-        clearTimeout(timer);
-      if (timedOut)
+      session = created.session;
+      if (input2.signal?.aborted || timeout)
+        await session.abort();
+      if (input2.signal?.aborted)
+        return { status: "cancelled", error: "cancelled", usage: piUsage(session.getSessionStats()), events };
+      if (timeout)
         return {
           status: "failed",
           error: `pi timed out after ${timeoutMs}ms`,
-          rawOutput: stdout,
-          usage: unavailableUsage(),
+          usage: piUsage(session.getSessionStats()),
           events
         };
-      if (code === undefined)
-        code = await proc.exited.catch(() => -1);
-      if (input2.signal?.aborted || cancelled)
-        return {
-          status: "cancelled",
-          error: "cancelled",
-          usage: unavailableUsage(),
-          rawOutput: stdout,
-          events
-        };
-      const message = findMessage(records);
+      const unsubscribe = session.subscribe((event) => emitPiEvent(event, emit));
+      const handoff3 = input2.context ? `${input2.role.prompt}
+
+[KOURO_CONTEXT_BEGIN]
+${JSON.stringify(input2.context)}
+[KOURO_CONTEXT_END]` : input2.role.prompt;
+      const prompt = input2.role.outputSchema ? `${handoff3}
+
+Return only JSON matching this schema:
+${JSON.stringify(input2.role.outputSchema)}` : handoff3;
+      await session.prompt(prompt);
+      unsubscribe();
+      const lastMessage = [...session.messages].reverse().find((candidate) => candidate.role === "assistant");
+      const message = lastMessage ? assistantText(lastMessage) : undefined;
       let output2 = message;
-      if (typeof output2 === "string") {
+      if (typeof output2 === "string")
         output2 = parseJsonOutput(output2);
-      }
-      const usage = mergeUsage(observedUsage(records), sessionStatsUsage(records));
-      const promptResponse = records.find((record2) => record2.type === "response" && record2.id === `${input2.attemptId}:prompt`);
-      if (promptResponse && promptResponse.success === false)
+      const usage = piUsage(session.getSessionStats());
+      if (input2.signal?.aborted)
+        return { status: "cancelled", error: "cancelled", usage, events };
+      if (timeout)
+        return { status: "failed", error: `pi timed out after ${timeoutMs}ms`, usage, events };
+      if (lastMessage && lastMessage.stopReason === "error")
         return {
           status: "failed",
-          error: `pi prompt rejected: ${String(promptResponse.error ?? "unknown RPC error")}`,
-          rawOutput: stdout,
-          usage,
-          events
-        };
-      if (code !== 0 && !stoppedAfterSettled)
-        return {
-          status: "failed",
-          error: stderr || `pi exited ${code}`,
-          rawOutput: stdout,
-          usage,
-          events
-        };
-      if (!settled)
-        return {
-          status: "failed",
-          error: "pi process ended before agent_settled",
-          rawOutput: stdout,
+          error: message ?? "Pi SDK turn failed",
+          rawOutput: message,
           usage,
           events
         };
       if (input2.role.outputSchema) {
         const check2 = validateJsonSchema(output2, input2.role.outputSchema);
         if (!check2.valid)
-          return {
-            status: "failed",
-            error: `invalid-output: ${check2.error}`,
-            rawOutput: stdout,
-            usage,
-            events
-          };
+          return { status: "failed", error: `invalid-output: ${check2.error}`, rawOutput: message, usage, events };
       }
-      return { status: "succeeded", output: output2, rawOutput: stdout, usage, events };
+      return { status: "succeeded", output: output2, rawOutput: message, usage, events };
+    } catch (cause) {
+      return {
+        status: input2.signal?.aborted ? "cancelled" : "failed",
+        error: input2.signal?.aborted ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        usage: session ? piUsage(session.getSessionStats()) : unavailableUsage(),
+        events
+      };
     } finally {
+      clearTimeout(timer);
       input2.signal?.removeEventListener("abort", abort);
-      await bridge?.close();
+      session?.dispose();
     }
   }
-  record(line, records, events, onEvent) {
-    const emit = (event) => {
-      events.push(event);
-      onEvent?.(event);
-    };
-    const record2 = parsePiRpcLine(line);
-    if (!record2) {
-      emit({ type: "log", at: new Date().toISOString(), data: line });
-      return;
+}
+async function modelFor(runtime, requested) {
+  if (!requested)
+    return;
+  const separator = requested.indexOf("/");
+  if (separator >= 1)
+    return runtime.getModel(requested.slice(0, separator), requested.slice(separator + 1));
+  return (await runtime.getAvailable()).find(({ id: id2 }) => id2 === requested);
+}
+async function loadPiBuiltInExtensions() {
+  const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const loaded = await import(resolve(dirname(entry), "extensions/index.js"));
+  if (!isRecord2(loaded) || !Array.isArray(loaded.builtInExtensions))
+    throw new Error("Pi built-in extensions are unavailable in the installed SDK");
+  return loaded.builtInExtensions.filter(isInlineExtension);
+}
+function createSubagentTool(manifestTool, invoke) {
+  return defineTool({
+    name: "subagent",
+    label: "Subagent",
+    description: `${manifestTool.description} Input schema: ${JSON.stringify(manifestTool.inputSchema)}`,
+    promptSnippet: "Delegate a bounded task to a declared Kouro scout.",
+    executionMode: "parallel",
+    parameters: Type.Object({
+      requestId: Type.String({ minLength: 1 }),
+      subagentId: Type.String({ minLength: 1 }),
+      input: Type.Record(Type.String(), Type.Unknown())
+    }),
+    async execute(_id, args, signal) {
+      if (signal?.aborted)
+        throw new Error("Subagent request cancelled");
+      const check2 = validateJsonSchema(args, manifestTool.inputSchema);
+      if (!check2.valid)
+        throw new Error(`Invalid subagent request: ${check2.error}`);
+      const result = await invoke(args);
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: undefined };
     }
-    records.push(record2);
-    const type = record2.type;
-    const update = record2.assistantMessageEvent;
-    if (type === "message_update" && update?.type === "text_delta" && typeof update.delta === "string")
-      emit({ type: "text", at: new Date().toISOString(), data: update.delta });
-    else if (type === "message_update" && usageFromRecord(record2))
-      emit({
-        type: "usage",
-        at: new Date().toISOString(),
-        data: usageFromRecord(record2)
-      });
-    else if (typeof type === "string" && type.includes("tool"))
-      emit({
-        type: "tool",
-        at: new Date().toISOString(),
-        data: record2
-      });
-    else
-      emit({
-        type: "log",
-        at: new Date().toISOString(),
-        data: record2
-      });
+  });
+}
+function emitPiEvent(event, emit) {
+  if (!isRecord2(event) || typeof event.type !== "string")
+    return;
+  const at = new Date().toISOString();
+  const update = event.assistantMessageEvent;
+  if (event.type === "message_update" && isRecord2(update) && update.type === "text_delta") {
+    if (typeof update.delta === "string")
+      emit({ type: "text", at, data: update.delta });
+  } else if (event.type.includes("tool")) {
+    emit({ type: "tool", at, data: event });
+  } else {
+    emit({ type: "log", at, data: event });
   }
+}
+function assistantText(message) {
+  if (typeof message.text === "string")
+    return message.text;
+  if (!Array.isArray(message.content))
+    return;
+  const text = message.content.filter(isRecord2).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => String(part.text)).join("");
+  return text || undefined;
+}
+function piUsage(stats) {
+  const tokens = stats.tokens;
+  return {
+    inputTokens: { value: tokens.input, quality: "observed", source: "pi" },
+    outputTokens: { value: tokens.output, quality: "observed", source: "pi" },
+    totalTokens: { value: tokens.total, quality: "observed", source: "pi" },
+    cost: { value: stats.cost, quality: "observed" }
+  };
+}
+function parseJsonOutput(value) {
+  const trimmed = value.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
+  try {
+    return JSON.parse(fenced ?? trimmed);
+  } catch {
+    return value;
+  }
+}
+function simpleHash(value) {
+  let hash2 = 2166136261;
+  for (let index = 0;index < value.length; index++) {
+    hash2 ^= value.charCodeAt(index);
+    hash2 = Math.imul(hash2, 16777619);
+  }
+  return (hash2 >>> 0).toString(16).padStart(8, "0");
+}
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function isInlineExtension(value) {
+  return typeof value === "function" || isRecord2(value) && typeof value.name === "string" && typeof value.factory === "function";
 }
 
 class PiHarnessAdapter {
   harness;
   id = "pi";
-  adapterVersion = "1";
+  adapterVersion = "sdk";
   constructor(harness2) {
     this.harness = harness2;
   }
   capabilities() {
-    return Object.fromEntries(Object.entries(this.harness.descriptor.capabilities).map(([key, value]) => [
-      key,
-      value.state
-    ]));
+    return Object.fromEntries(Object.entries(this.harness.descriptor.capabilities).map(([key, value]) => [key, value.state]));
   }
   async run(input2) {
     const result = await this.harness.run({
@@ -36667,8 +36569,7 @@ class PiHarnessAdapter {
       cwd: input2.cwd ?? ".",
       signal: input2.signal,
       context: input2.context,
-      collaboration: input2.collaboration,
-      onEvent: undefined
+      collaboration: input2.collaboration
     });
     return {
       ...result,
@@ -36677,139 +36578,27 @@ class PiHarnessAdapter {
     };
   }
 }
-function parseJsonOutput(value) {
-  const trimmed = value.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
-  try {
-    return JSON.parse(fenced ?? trimmed);
-  } catch {
-    return value;
-  }
-}
-function findMessage(records) {
-  for (let index = records.length - 1;index >= 0; index--) {
-    const record2 = records[index];
-    if (record2.type !== "message_end")
-      continue;
-    const message = record2.message;
-    if (message?.role && message.role !== "assistant")
-      continue;
-    if (typeof message?.text === "string")
-      return message.text;
-    if (Array.isArray(message?.content)) {
-      const text = message.content.map((part) => typeof part === "string" ? part : part && typeof part === "object" && part.type === "text" ? part.text : undefined).filter((part) => typeof part === "string").join("");
-      if (text)
-        return text;
-    }
-  }
-  return;
-}
-function observedUsage(records) {
-  const values = records.map((record2) => usageFromRecord(record2)).filter((value) => Boolean(value));
-  const valuesWithObservedTokens = values.filter((value) => ["input", "inputTokens", "output", "outputTokens", "total", "totalTokens"].some((key) => typeof value[key] === "number" && Number(value[key]) > 0));
-  const latest = valuesWithObservedTokens.at(-1) ?? values.at(-1);
-  const n = (key) => typeof latest?.[key] === "number" && Number.isFinite(latest[key]) ? Number(latest[key]) : null;
-  const input2 = n("input") ?? n("inputTokens");
-  const output2 = n("output") ?? n("outputTokens");
-  const total = n("total") ?? n("totalTokens") ?? (input2 !== null && output2 !== null ? input2 + output2 : null);
-  return {
-    inputTokens: {
-      value: input2,
-      quality: input2 === null ? "unavailable" : "observed",
-      source: "pi"
-    },
-    outputTokens: {
-      value: output2,
-      quality: output2 === null ? "unavailable" : "observed",
-      source: "pi"
-    },
-    totalTokens: {
-      value: total,
-      quality: total === null ? "unavailable" : "observed",
-      source: "pi"
-    },
-    cost: { value: null, quality: "unavailable" }
-  };
-}
-function sessionStatsUsage(records) {
-  const response = records.find((record2) => record2.type === "response" && record2.command === "get_session_stats");
-  const data = response?.data;
-  const tokens = data?.tokens;
-  if (!tokens)
-    return unavailableUsage();
-  const number4 = (key) => typeof tokens[key] === "number" && Number.isFinite(tokens[key]) ? Number(tokens[key]) : null;
-  const input2 = number4("input");
-  const output2 = number4("output");
-  const total = number4("total");
-  if (![input2, output2, total].some((value) => value !== null && value > 0))
-    return unavailableUsage();
-  return {
-    inputTokens: {
-      value: input2,
-      quality: input2 === null ? "unavailable" : "observed",
-      source: "pi-session-stats"
-    },
-    outputTokens: {
-      value: output2,
-      quality: output2 === null ? "unavailable" : "observed",
-      source: "pi-session-stats"
-    },
-    totalTokens: {
-      value: total,
-      quality: total === null ? "unavailable" : "observed",
-      source: "pi-session-stats"
-    },
-    cost: { value: null, quality: "unavailable" }
-  };
-}
-function mergeUsage(streamed, session) {
-  return streamed.totalTokens.value && streamed.totalTokens.value > 0 ? streamed : session;
-}
-function usageFromRecord(record2) {
-  const message = record2.message;
-  const update = record2.assistantMessageEvent;
-  const partial2 = update?.partial;
-  return record2.usage ?? message?.usage ?? update?.usage ?? partial2?.usage;
-}
-async function capturePi(spawn, args) {
-  try {
-    const proc = spawn([piCommand(), ...args], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    return {
-      code: await proc.exited,
-      stdout: await new Response(proc.stdout).text(),
-      stderr: await new Response(proc.stderr).text()
-    };
-  } catch (error63) {
-    return { code: 1, stdout: "", stderr: String(error63) };
-  }
-}
-function defaultSpawn(args, options) {
-  return Bun.spawn(args, options);
-}
-function simpleHash(value) {
-  return createHash("sha256").update(value).digest("hex");
-}
 
 // packages/host/src/adapters/process/darwin.ts
 import { mkdirSync } from "fs";
 
 // packages/host/src/adapters/process/common.ts
-import { mkdtempSync as mkdtempSync2, readFileSync, rmSync as rmSync2 } from "fs";
-import { join as join2 } from "path";
-import { tmpdir as tmpdir2 } from "os";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 async function runEnforcedProcess(input2) {
   const operationKey = input2.operationKey ?? "probe";
-  const capture3 = capturePaths();
+  const capture2 = capturePaths();
   let child;
   try {
     child = Bun.spawn(input2.command, {
       cwd: input2.cwd,
-      stdout: Bun.file(capture3.stdout),
-      stderr: Bun.file(capture3.stderr),
+      stdout: Bun.file(capture2.stdout),
+      stderr: Bun.file(capture2.stderr),
       detached: true
     });
   } catch (cause) {
-    rmSync2(capture3.directory, { recursive: true, force: true });
+    rmSync(capture2.directory, { recursive: true, force: true });
     return {
       operationKey,
       evidence: {
@@ -36827,24 +36616,24 @@ async function runEnforcedProcess(input2) {
   }
   let timedOut = false;
   let timer;
-  const timeout = new Promise((resolve3) => {
+  const timeout = new Promise((resolve2) => {
     timer = setTimeout(() => {
       timedOut = true;
       terminateGroup(child, "SIGTERM");
-      resolve3("timeout");
+      resolve2("timeout");
     }, input2.timeoutMs);
   });
   try {
     const outcome = await Promise.race([child.exited, timeout]);
     const exitCode = outcome === "timeout" ? await stopGroup(child) : outcome;
-    const [stdout, stderr] = readCaptured(capture3);
+    const [stdout, stderr] = readCaptured(capture2);
     return {
       operationKey,
       evidence: {
         argv: input2.argv,
         cwd: input2.cwd,
         exitCode: exitCode === null ? null : Number(exitCode),
-        signal: null,
+        signal: child.signalCode ?? null,
         timedOut,
         spawnError: null,
         stdout,
@@ -36853,7 +36642,7 @@ async function runEnforcedProcess(input2) {
       }
     };
   } catch (cause) {
-    const [stdout, stderr] = readCaptured(capture3);
+    const [stdout, stderr] = readCaptured(capture2);
     return {
       operationKey,
       evidence: {
@@ -36871,21 +36660,21 @@ async function runEnforcedProcess(input2) {
   } finally {
     if (timer)
       clearTimeout(timer);
-    rmSync2(capture3.directory, { recursive: true, force: true });
+    rmSync(capture2.directory, { recursive: true, force: true });
   }
 }
 async function runTrustedCommand(input2) {
-  const capture3 = capturePaths();
+  const capture2 = capturePaths();
   let child;
   try {
     child = Bun.spawn(input2.argv, {
       cwd: input2.cwd,
-      stdout: Bun.file(capture3.stdout),
-      stderr: Bun.file(capture3.stderr),
+      stdout: Bun.file(capture2.stdout),
+      stderr: Bun.file(capture2.stderr),
       detached: true
     });
   } catch (cause) {
-    rmSync2(capture3.directory, { recursive: true, force: true });
+    rmSync(capture2.directory, { recursive: true, force: true });
     return {
       operationKey: input2.operationKey,
       evidence: {
@@ -36906,11 +36695,11 @@ async function runTrustedCommand(input2) {
   try {
     const result = await Promise.race([
       child.exited.then((exitCode) => ({ exitCode: Number(exitCode) })),
-      new Promise((resolve3) => {
+      new Promise((resolve2) => {
         timer = setTimeout(() => {
           timedOut = true;
           terminateGroup(child, "SIGTERM");
-          resolve3({ exitCode: null });
+          resolve2({ exitCode: null });
         }, input2.timeoutMs);
       })
     ]);
@@ -36918,14 +36707,14 @@ async function runTrustedCommand(input2) {
       clearTimeout(timer);
     if (timedOut)
       await stopGroup(child);
-    const [out, err] = readCaptured(capture3);
+    const [out, err] = readCaptured(capture2);
     return {
       operationKey: input2.operationKey,
       evidence: {
         argv: input2.argv,
         cwd: input2.cwd,
         exitCode: result.exitCode,
-        signal: null,
+        signal: child.signalCode ?? null,
         timedOut,
         spawnError: null,
         stdout: out,
@@ -36940,7 +36729,7 @@ async function runTrustedCommand(input2) {
         argv: input2.argv,
         cwd: input2.cwd,
         exitCode: null,
-        signal: null,
+        signal: child.signalCode ?? null,
         timedOut,
         spawnError: cause instanceof Error ? cause.message : String(cause),
         stdout: new Uint8Array,
@@ -36951,7 +36740,7 @@ async function runTrustedCommand(input2) {
   } finally {
     if (timer)
       clearTimeout(timer);
-    rmSync2(capture3.directory, { recursive: true, force: true });
+    rmSync(capture2.directory, { recursive: true, force: true });
   }
 }
 function terminateGroup(child, signal) {
@@ -36972,10 +36761,10 @@ async function stopGroup(child) {
   return exitCode;
 }
 function capturePaths() {
-  const directory = mkdtempSync2(join2(tmpdir2(), "kouro-process-output-"));
-  return { directory, stdout: join2(directory, "stdout"), stderr: join2(directory, "stderr") };
+  const directory = mkdtempSync(join(tmpdir(), "kouro-process-output-"));
+  return { directory, stdout: join(directory, "stdout"), stderr: join(directory, "stderr") };
 }
-function readCaptured(capture3) {
+function readCaptured(capture2) {
   const read = (path) => {
     try {
       return new Uint8Array(readFileSync(path));
@@ -36983,7 +36772,7 @@ function readCaptured(capture3) {
       return new Uint8Array;
     }
   };
-  return [read(capture3.stdout), read(capture3.stderr)];
+  return [read(capture2.stdout), read(capture2.stderr)];
 }
 async function probeEnforcedProcess(spawn, name) {
   const workspace = await Bun.$`mktemp -d /tmp/kouro-${name}-probe.XXXXXX`.text().catch(() => "").then((value) => value.trim());
@@ -37001,7 +36790,7 @@ async function probeEnforcedProcess(spawn, name) {
   } catch (cause) {
     return { available: false, detail: cause instanceof Error ? cause.message : String(cause) };
   } finally {
-    rmSync2(workspace, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
   }
 }
 
@@ -37082,6 +36871,7 @@ class DarwinSandboxProcessAdapter {
       '(allow file-read* (subpath "/System"))',
       '(allow file-read* (subpath "/usr"))',
       '(allow file-read* (subpath "/bin"))',
+      '(allow file-read* (subpath "/etc"))',
       '(allow file-read* (subpath "/private/etc"))',
       '(allow file-read* (subpath "/private/var/db/timezone"))',
       '(allow file-read* file-write* (subpath "/private/tmp"))',
@@ -37211,9 +37001,9 @@ function createDefaultProcessAdapter(platform = process.platform) {
 init_src();
 init_src();
 import { Database } from "bun:sqlite";
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash2 } from "crypto";
 import { mkdirSync as mkdirSync4 } from "fs";
-import { join as join4 } from "path";
+import { join as join3 } from "path";
 
 // packages/host/src/storage/schema.ts
 function migrate(db) {
@@ -37631,10 +37421,10 @@ function migrate(db) {
 }
 
 // packages/host/src/storage/blob-store.ts
-import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
+import { createHash, randomUUID as randomUUID2 } from "crypto";
 import {
   closeSync,
-  existsSync as existsSync3,
+  existsSync,
   fsyncSync,
   mkdirSync as mkdirSync3,
   openSync,
@@ -37642,20 +37432,20 @@ import {
   renameSync,
   writeFileSync
 } from "fs";
-import { dirname, join as join3 } from "path";
+import { dirname as dirname2, join as join2 } from "path";
 class BlobStore {
   root;
   constructor(root) {
     this.root = root;
-    mkdirSync3(join3(root, "blobs"), { recursive: true, mode: 448 });
-    mkdirSync3(join3(root, "tmp"), { recursive: true, mode: 448 });
+    mkdirSync3(join2(root, "blobs"), { recursive: true, mode: 448 });
+    mkdirSync3(join2(root, "tmp"), { recursive: true, mode: 448 });
   }
   put(runId, bytes, mediaType = "application/octet-stream") {
-    const digest = createHash2("sha256").update(bytes).digest("hex");
-    const destination = join3(this.root, "blobs", digest.slice(0, 2), digest);
-    mkdirSync3(dirname(destination), { recursive: true, mode: 448 });
-    if (!existsSync3(destination)) {
-      const temporary = join3(this.root, "tmp", `${id("blob")}.partial`);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const destination = join2(this.root, "blobs", digest.slice(0, 2), digest);
+    mkdirSync3(dirname2(destination), { recursive: true, mode: 448 });
+    if (!existsSync(destination)) {
+      const temporary = join2(this.root, "tmp", `${id("blob")}.partial`);
       writeFileSync(temporary, bytes, { mode: 384 });
       const fd = openSync(temporary, "r");
       try {
@@ -37664,7 +37454,7 @@ class BlobStore {
         closeSync(fd);
       }
       renameSync(temporary, destination);
-      const directoryFd = openSync(dirname(destination), "r");
+      const directoryFd = openSync(dirname2(destination), "r");
       try {
         fsyncSync(directoryFd);
       } finally {
@@ -37683,14 +37473,14 @@ class BlobStore {
   pathForDigest(digest) {
     if (!/^[a-f0-9]{64}$/.test(digest))
       throw new Error("Invalid artifact digest");
-    return join3(this.root, "blobs", digest.slice(0, 2), digest);
+    return join2(this.root, "blobs", digest.slice(0, 2), digest);
   }
   read(ref) {
     if (!ref.digest)
       throw new Error("Artifact has no content digest");
     const path = this.pathForDigest(ref.digest);
     const bytes = new Uint8Array(readFileSync2(path));
-    const actual = createHash2("sha256").update(bytes).digest("hex");
+    const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== ref.digest)
       throw new Error("Artifact checksum mismatch");
     return bytes;
@@ -37782,11 +37572,11 @@ class Journal {
   constructor(options) {
     this.dataDir = options.dataDir;
     mkdirSync4(options.dataDir, { recursive: true, mode: 448 });
-    this.owner = new OwnerLock(join4(options.dataDir, "owner.lock"));
+    this.owner = new OwnerLock(join3(options.dataDir, "owner.lock"));
     if (options.requireOwner !== false)
       this.owner.acquire();
     try {
-      this.db = new Database(join4(options.dataDir, "kouro.sqlite"));
+      this.db = new Database(join3(options.dataDir, "kouro.sqlite"));
       migrate(this.db);
       this.blobs = new BlobStore(options.dataDir);
     } catch (cause) {
@@ -38096,7 +37886,7 @@ class Journal {
     });
   }
   createRun(input2) {
-    const requestDigest = createHash3("sha256").update(canonicalize({
+    const requestDigest = createHash2("sha256").update(canonicalize({
       workflowId: input2.workflowId,
       bundleDigest: input2.bundle.digest,
       input: input2.input ?? {},
@@ -38150,7 +37940,7 @@ class Journal {
       validationEvidence: input2.validationEvidence ?? [],
       reviewEvidence: input2.reviewEvidence ?? []
     };
-    const actionDigest = `sha256:${createHash3("sha256").update(canonicalize(base)).digest("hex")}`;
+    const actionDigest = `sha256:${createHash2("sha256").update(canonicalize(base)).digest("hex")}`;
     return this.tx(() => {
       const prior = this.db.query("SELECT * FROM delivery_actions WHERE request_key=?1").get(input2.requestKey);
       if (prior) {
@@ -38672,8 +38462,8 @@ class Journal {
         continue;
       }
       let wake;
-      const wait2 = new Promise((resolve3) => {
-        wake = resolve3;
+      const wait2 = new Promise((resolve2) => {
+        wake = resolve2;
       });
       const unsubscribe = this.subscribe(runId, () => wake?.());
       const reread = this.getFrames(runId, cursor);
@@ -38886,7 +38676,7 @@ class ReadySetScheduler {
   }
   async waitForTask(task, terminals) {
     while (!terminals.has(task.branchId) && this.active.has(task.id))
-      await new Promise((resolve3) => setTimeout(resolve3, 0));
+      await new Promise((resolve2) => setTimeout(resolve2, 0));
   }
   validate(tasks, groups) {
     const taskIds = new Set;
@@ -39310,7 +39100,7 @@ function normalizeWorkItemInput(input2) {
     throw new Error("task input must be nonblank");
   let workItem;
   if (rawWorkItem !== undefined) {
-    if (!isRecord2(rawWorkItem))
+    if (!isRecord3(rawWorkItem))
       throw new Error("workItem input must be an object");
     if (rawWorkItem.version !== 1)
       throw new Error("workItem.version must be 1");
@@ -39321,9 +39111,9 @@ function normalizeWorkItemInput(input2) {
       throw new Error("task and workItem.task conflict");
     const rawTicket = rawWorkItem.ticket;
     if (rawTicket !== undefined) {
-      if (!isRecord2(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
+      if (!isRecord3(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
         throw new Error("workItem.ticket.reference must be nonblank");
-      if (!isRecord2(rawTicket.snapshot))
+      if (!isRecord3(rawTicket.snapshot))
         throw new Error("ticket-only admission is unsupported without an immutable snapshot");
       validateTicketSnapshot(rawTicket.snapshot);
     }
@@ -39400,13 +39190,13 @@ function optionalString(value, field) {
     throw new Error(`${field} must be a string`);
   return { [field.slice(field.indexOf(".") + 1)]: value };
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // packages/host/src/scouting/gateway.ts
 init_src();
-import { createHash as createHash4 } from "crypto";
+import { createHash as createHash3 } from "crypto";
 var MAX_TOTAL_REQUESTS = 4;
 var MAX_RESULT_BYTES = 64 * 1024;
 
@@ -39709,7 +39499,7 @@ function toRequest(row) {
   };
 }
 function digest(value) {
-  return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
+  return `sha256:${createHash3("sha256").update(value).digest("hex")}`;
 }
 function succeededResult(request) {
   if (!request.resultArtifactId || request.result === undefined)
@@ -39760,7 +39550,7 @@ function validateScoutOutput(schemas3, ports, result) {
   if (ports.length === 0)
     return;
   for (const port2 of ports) {
-    const value = ports.length === 1 ? result : isRecord3(result) ? result[port2.name] : undefined;
+    const value = ports.length === 1 ? result : isRecord4(result) ? result[port2.name] : undefined;
     const schema = schemas3[port2.schemaDigest];
     if (!schema)
       throw new Error(`missing scout output schema ${port2.schemaDigest}`);
@@ -39769,7 +39559,7 @@ function validateScoutOutput(schemas3, ports, result) {
       throw new Error(`invalid scout output ${port2.name}: ${check2.error}`);
   }
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -40399,11 +40189,11 @@ class Coordinator {
       if (executions.length > 1) {
         const definition = view.bundle.definitions[view.bundle.rootDefinitionId];
         const groups = definition ? definition.nodes.filter((candidate) => candidate.kind === "fork").map((fork) => {
-          const join6 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
+          const join5 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
           return {
             id: fork.groupId,
             expectedBranchIds: executions.filter((intent2) => fork.branchIds.includes(view.state.invocations[intent2.invocationId]?.nodeId ?? "")).map((intent2) => intent2.invocationId),
-            mode: join6?.mode === "fail-fast" ? "fail-fast" : "all-settled"
+            mode: join5?.mode === "fail-fast" ? "fail-fast" : "all-settled"
           };
         }).filter((group) => group.expectedBranchIds.length > 0) : [];
         const scheduler = new ReadySetScheduler({
@@ -40700,6 +40490,8 @@ class Coordinator {
   }
   validateCommandForRun(runId, node2) {
     validateCommandNode(node2);
+    if (node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE))
+      return;
     if (node2.executionMode !== "trusted-unrestricted")
       return;
     const row = this.journal.getRunRow(runId);
@@ -40736,7 +40528,7 @@ class Coordinator {
     const runInput = row ? parseJson(row.input_json) : {};
     const collaborationConfig = runInput.__collaboration && typeof runInput.__collaboration === "object" ? runInput.__collaboration : undefined;
     const profile = runInput.__kouroExecutionProfile === "codex-readonly" || runInput.__kouroExecutionProfile === "codex-workspace-write" || runInput.__kouroExecutionProfile === "claude-readonly" || runInput.__kouroExecutionProfile === "claude-workspace-write" || runInput.__kouroExecutionProfile === "pi-readonly" ? runInput.__kouroExecutionProfile : "scripted";
-    const workspaceDir = join5(this.dataDir, "workspaces", runId, invocationId);
+    const workspaceDir = join4(this.dataDir, "workspaces", runId, invocationId);
     const registeredWorkspace = this.workspaces.get(runId);
     let invocationWorkspace = registeredWorkspace;
     const sourceInvocationId = state.invocations[invocationId]?.sourceInvocationId;
@@ -40980,12 +40772,12 @@ class Coordinator {
           });
           return;
         }
-        const codex = this.codex ??= new CodexHarnessAdapter(new CodexCliHarness(this.codexDescriptor));
+        const codex = this.codex ??= new CodexHarnessAdapter(new CodexSdkHarness(this.codexDescriptor));
         selected = codex;
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = {
-          sandbox: profile === "codex-workspace-write" && node2.workspaceAccess === "workspace-write" ? "workspace-write" : "read-only"
+          sandbox: (node2.capabilities ? node2.capabilities.includes(CAPABILITY.REPOSITORY_WRITE) : profile === "codex-workspace-write" && node2.workspaceAccess === "workspace-write") ? "workspace-write" : "read-only"
         };
       } else if (requestedHarness === "pi") {
         this.piDescriptor ??= await inspectPi();
@@ -40997,7 +40789,7 @@ class Coordinator {
             evidence: [],
             output: [],
             status: "failed",
-            error: `harness-unavailable: ${this.piDescriptor.detail ?? "pi RPC unavailable"}`,
+            error: `harness-unavailable: ${this.piDescriptor.detail ?? "Pi SDK unavailable"}`,
             diagnostics: ["execution rejected before workspace side effects"],
             resolvedExecution: {
               role: node2.role,
@@ -41008,7 +40800,7 @@ class Coordinator {
           });
           return;
         }
-        const pi = this.pi ??= new PiHarnessAdapter(new PiCliHarness(this.piDescriptor));
+        const pi = this.pi ??= new PiHarnessAdapter(new PiSdkHarness(this.piDescriptor));
         selected = pi;
         resolvedHarness = toHarness(pi.id);
         resolvedVersion = pi.adapterVersion;
@@ -41026,7 +40818,7 @@ class Coordinator {
           selected = claude;
           nativeConfig = {
             ...node2.modelId ? { model: node2.modelId } : {},
-            permissionMode: profile === "claude-workspace-write" && node2.workspaceAccess === "workspace-write" ? "acceptEdits" : "dontAsk"
+            permissionMode: (node2.capabilities ? node2.capabilities.includes(CAPABILITY.REPOSITORY_WRITE) : profile === "claude-workspace-write" && node2.workspaceAccess === "workspace-write") ? "acceptEdits" : "dontAsk"
           };
         } else {
           this.opencodeDescriptor ??= await inspectExternalCli("opencode");
@@ -41281,7 +41073,7 @@ class Coordinator {
           executable: node2.executable,
           args: node2.args,
           timeoutMs: node2.timeoutMs || this.commandTimeoutMs,
-          executionMode: node2.executionMode
+          executionMode: node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE) ? "trusted-unrestricted" : node2.executionMode
         });
       } catch (cause) {
         status = "failed";
@@ -41297,7 +41089,7 @@ class Coordinator {
             spawnError: error63,
             stdout: new Uint8Array,
             stderr: new Uint8Array,
-            enforcementMode: node2.executionMode === "trusted-unrestricted" ? "trusted-unrestricted" : "enforced"
+            enforcementMode: node2.executionMode === "trusted-unrestricted" || node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE) ? "trusted-unrestricted" : "enforced"
           }
         };
       }
@@ -41435,12 +41227,12 @@ class Coordinator {
         this.codexDescriptor ??= await inspectCodex();
         if (this.codexDescriptor.availability !== "available")
           throw new Error(`subagent Codex unavailable: ${this.codexDescriptor.detail}`);
-        childAdapter = this.codex ?? (this.codex = new CodexHarnessAdapter(new CodexCliHarness(this.codexDescriptor)));
+        childAdapter = this.codex ?? (this.codex = new CodexHarnessAdapter(new CodexSdkHarness(this.codexDescriptor)));
       } else if (childAgent.harness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available")
           throw new Error(`subagent Pi unavailable: ${this.piDescriptor.detail}`);
-        childAdapter = this.pi ?? (this.pi = new PiHarnessAdapter(new PiCliHarness(this.piDescriptor)));
+        childAdapter = this.pi ?? (this.pi = new PiHarnessAdapter(new PiSdkHarness(this.piDescriptor)));
       } else
         throw new Error(`subagent harness ${childAgent.harness} is unavailable in this host`);
     }
@@ -41646,25 +41438,25 @@ function validateCommandNode(node2) {
 import {
   mkdirSync as mkdirSync6,
   readFileSync as readFileSync3,
-  rmSync as rmSync3,
+  rmSync as rmSync2,
   writeFileSync as writeFileSync2,
-  existsSync as existsSync4,
+  existsSync as existsSync2,
   cpSync,
   readdirSync,
   chmodSync
 } from "fs";
-import { join as join6, resolve as resolve3 } from "path";
+import { join as join5, resolve as resolve2 } from "path";
 import { randomUUID as randomUUID3 } from "crypto";
 
 class GitWorkspaceAdapter {
   executable;
   root;
   constructor(options) {
-    this.root = resolve3(options.worktreeRoot);
+    this.root = resolve2(options.worktreeRoot);
     this.executable = options.gitExecutable ?? "git";
     mkdirSync6(this.root, { recursive: true, mode: 448 });
-    mkdirSync6(join6(this.root, "claims"), { recursive: true, mode: 448 });
-    mkdirSync6(join6(this.root, "indexes"), { recursive: true, mode: 448 });
+    mkdirSync6(join5(this.root, "claims"), { recursive: true, mode: 448 });
+    mkdirSync6(join5(this.root, "indexes"), { recursive: true, mode: 448 });
   }
   async create(input2) {
     const repositoryPath = await this.repositoryRoot(input2.repositoryPath);
@@ -41673,10 +41465,10 @@ class GitWorkspaceAdapter {
       `${input2.baseCommit ?? "HEAD"}^{commit}`
     ]);
     const baseTree = await this.git(repositoryPath, ["rev-parse", `${baseCommit}^{tree}`]);
-    const path = join6(this.root, safePart(input2.runId), safePart(input2.workspaceId));
-    if (existsSync4(path))
+    const path = join5(this.root, safePart(input2.runId), safePart(input2.workspaceId));
+    if (existsSync2(path))
       throw new Error(`workspace path already exists: ${path}`);
-    mkdirSync6(join6(this.root, safePart(input2.runId)), { recursive: true, mode: 448 });
+    mkdirSync6(join5(this.root, safePart(input2.runId)), { recursive: true, mode: 448 });
     await this.git(repositoryPath, ["worktree", "add", "--detach", path, baseCommit]);
     const claim3 = {
       repositoryPath,
@@ -41696,8 +41488,8 @@ class GitWorkspaceAdapter {
       try {
         await this.git(repositoryPath, ["worktree", "remove", "--force", path]);
       } catch {}
-      rmSync3(path, { recursive: true, force: true });
-      rmSync3(this.claimPath(claim3), { force: true });
+      rmSync2(path, { recursive: true, force: true });
+      rmSync2(this.claimPath(claim3), { force: true });
       throw cause;
     }
   }
@@ -41736,13 +41528,13 @@ class GitWorkspaceAdapter {
   }
   async loadByIdentity(runId, workspaceId) {
     const claimPath = this.claimPath({ runId, workspaceId });
-    if (!existsSync4(claimPath))
+    if (!existsSync2(claimPath))
       throw new Error(`workspace claim not found: ${runId}/${workspaceId}`);
     return this.load(JSON.parse(readFileSync3(claimPath, "utf8")));
   }
   async listClaims(runId) {
     const prefix = `${safePart(runId)}--`;
-    return readdirSync(join6(this.root, "claims")).filter((name) => name.startsWith(prefix) && name.endsWith(".json") && !name.endsWith(".prepared.json")).map((name) => JSON.parse(readFileSync3(join6(this.root, "claims", name), "utf8"))).filter((claim3) => claim3.runId === runId).map((claim3) => claim3);
+    return readdirSync(join5(this.root, "claims")).filter((name) => name.startsWith(prefix) && name.endsWith(".json") && !name.endsWith(".prepared.json")).map((name) => JSON.parse(readFileSync3(join5(this.root, "claims", name), "utf8"))).filter((claim3) => claim3.runId === runId).map((claim3) => claim3);
   }
   async load(ref) {
     const claim3 = this.readClaim(ref);
@@ -41754,7 +41546,7 @@ class GitWorkspaceAdapter {
   }
   async snapshot(ref) {
     const claim3 = await this.load(ref);
-    const temp = join6(this.root, "indexes", `${randomUUID3()}.index`);
+    const temp = join5(this.root, "indexes", `${randomUUID3()}.index`);
     try {
       await this.git(claim3.path, ["read-tree", "HEAD"], { GIT_INDEX_FILE: temp });
       await this.git(claim3.path, ["add", "-A", "--", "."], { GIT_INDEX_FILE: temp });
@@ -41778,7 +41570,7 @@ class GitWorkspaceAdapter {
         changedPaths
       };
     } finally {
-      rmSync3(temp, { force: true });
+      rmSync2(temp, { force: true });
     }
   }
   async integrate(input2) {
@@ -41799,13 +41591,13 @@ class GitWorkspaceAdapter {
     const conflicts = [...paths.entries()].filter(([, count]) => count > 1).map(([path]) => path).sort();
     if (conflicts.length)
       return { target, sources, conflicts };
-    const backup = join6(this.root, "integration-backups", randomUUID3());
+    const backup = join5(this.root, "integration-backups", randomUUID3());
     mkdirSync6(backup, { recursive: true, mode: 448 });
     try {
       for (const entry of readdirSync(input2.target.path)) {
         if (entry === ".git")
           continue;
-        cpSync(join6(input2.target.path, entry), join6(backup, entry), {
+        cpSync(join5(input2.target.path, entry), join5(backup, entry), {
           recursive: true,
           force: true
         });
@@ -41814,15 +41606,15 @@ class GitWorkspaceAdapter {
         const source = sources[sourceIndex];
         for (const change of source.changedPaths) {
           const sourceRef = input2.sources[sourceIndex];
-          const sourcePath = join6(sourceRef.path, change.path);
-          const targetPath = join6(input2.target.path, change.path);
+          const sourcePath = join5(sourceRef.path, change.path);
+          const targetPath = join5(input2.target.path, change.path);
           if (change.oldPath && change.status.startsWith("R"))
-            rmSync3(join6(input2.target.path, change.oldPath), { recursive: true, force: true });
+            rmSync2(join5(input2.target.path, change.oldPath), { recursive: true, force: true });
           if (change.status.startsWith("D"))
-            rmSync3(targetPath, { recursive: true, force: true });
-          else if (existsSync4(sourcePath)) {
-            mkdirSync6(join6(targetPath, ".."), { recursive: true });
-            rmSync3(targetPath, { recursive: true, force: true });
+            rmSync2(targetPath, { recursive: true, force: true });
+          else if (existsSync2(sourcePath)) {
+            mkdirSync6(join5(targetPath, ".."), { recursive: true });
+            rmSync2(targetPath, { recursive: true, force: true });
             cpSync(sourcePath, targetPath, { recursive: true, force: true });
             if (change.mode && !change.mode.endsWith("000"))
               chmodSync(targetPath, Number.parseInt(change.mode, 8) & 511);
@@ -41834,17 +41626,17 @@ class GitWorkspaceAdapter {
       try {
         for (const entry of readdirSync(input2.target.path)) {
           if (entry !== ".git")
-            rmSync3(join6(input2.target.path, entry), { recursive: true, force: true });
+            rmSync2(join5(input2.target.path, entry), { recursive: true, force: true });
         }
         for (const entry of readdirSync(backup))
-          cpSync(join6(backup, entry), join6(input2.target.path, entry), {
+          cpSync(join5(backup, entry), join5(input2.target.path, entry), {
             recursive: true,
             force: true
           });
       } catch {}
       throw cause;
     } finally {
-      rmSync3(backup, { recursive: true, force: true });
+      rmSync2(backup, { recursive: true, force: true });
     }
   }
   async prepareCommit(input2) {
@@ -41860,7 +41652,7 @@ class GitWorkspaceAdapter {
       throw new Error("workspace HEAD changed after approval");
     }
     const marker = this.preparedPath(claim3);
-    if (existsSync4(marker)) {
+    if (existsSync2(marker)) {
       const existing = await this.verifyCommit(claim3, input2);
       if (existing)
         return { ...existing, idempotent: true };
@@ -41889,7 +41681,7 @@ class GitWorkspaceAdapter {
   async verifyPreparedCommit(input2) {
     const claim3 = await this.load(input2.ref);
     const marker = this.preparedPath(claim3);
-    if (!existsSync4(marker))
+    if (!existsSync2(marker))
       return null;
     const value = JSON.parse(readFileSync3(marker, "utf8"));
     if (value.operationKey !== input2.operationKey || value.tree !== input2.expectedTree)
@@ -41914,9 +41706,9 @@ class GitWorkspaceAdapter {
     if (!registered)
       throw new Error("refusing cleanup of unregistered workspace");
     await this.git(claim3.repositoryPath, ["worktree", "remove", "--force", claim3.path]);
-    rmSync3(claim3.path, { recursive: true, force: true });
-    rmSync3(this.claimPath(claim3), { force: true });
-    rmSync3(this.preparedPath(claim3), { force: true });
+    rmSync2(claim3.path, { recursive: true, force: true });
+    rmSync2(this.claimPath(claim3), { force: true });
+    rmSync2(this.preparedPath(claim3), { force: true });
   }
   async verifyCommit(claim3, input2) {
     const head = await this.git(claim3.path, ["rev-parse", "HEAD"]);
@@ -41940,14 +41732,14 @@ class GitWorkspaceAdapter {
     writeFileSync2(this.claimPath(claim3), JSON.stringify(claim3, null, 2), { mode: 384 });
   }
   claimPath(ref) {
-    return join6(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.json`);
+    return join5(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.json`);
   }
   preparedPath(ref) {
-    return join6(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.prepared.json`);
+    return join5(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.prepared.json`);
   }
   async repositoryRoot(path) {
-    const root = await this.git(resolve3(path), ["rev-parse", "--show-toplevel"]);
-    return resolve3(root);
+    const root = await this.git(resolve2(path), ["rev-parse", "--show-toplevel"]);
+    return resolve2(root);
   }
   async assertRegistered(claim3) {
     const registered = await this.registeredPath(claim3.repositoryPath, claim3.path);
@@ -41960,7 +41752,7 @@ class GitWorkspaceAdapter {
   async registeredPath(repository, path) {
     const out = await this.git(repository, ["worktree", "list", "--porcelain"]);
     return out.split(`
-`).some((line) => line === `worktree ${resolve3(path)}`);
+`).some((line) => line === `worktree ${resolve2(path)}`);
   }
   async git(cwd, args, extraEnv, stdin) {
     const proc = Bun.spawn([this.executable, ...args], {
@@ -42018,7 +41810,7 @@ async function sha256(value) {
   return [...new Uint8Array(digest2)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 function sameIdentity(a, b) {
-  return a.repositoryPath === b.repositoryPath && a.runId === b.runId && a.workspaceId === b.workspaceId && resolve3(a.path) === resolve3(b.path) && a.claimToken === b.claimToken;
+  return a.repositoryPath === b.repositoryPath && a.runId === b.runId && a.workspaceId === b.workspaceId && resolve2(a.path) === resolve2(b.path) && a.claimToken === b.claimToken;
 }
 
 // packages/host/src/evaluations.ts
@@ -42026,9 +41818,9 @@ init_src();
 
 // packages/host/src/evaluation/verifier.ts
 init_src();
-import { createHash as createHash5 } from "crypto";
-import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync7, mkdtempSync as mkdtempSync3, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
-import { join as join7, resolve as resolve4 } from "path";
+import { createHash as createHash4 } from "crypto";
+import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync7, mkdtempSync as mkdtempSync2, rmSync as rmSync3, writeFileSync as writeFileSync3 } from "fs";
+import { join as join6, resolve as resolve3 } from "path";
 
 class BunVerifierProcess {
   async execute(input2) {
@@ -42084,11 +41876,11 @@ class BunVerifierProcess {
   }
 }
 function digest2(bytes) {
-  return createHash5("sha256").update(bytes).digest("hex");
+  return createHash4("sha256").update(bytes).digest("hex");
 }
 async function runDeterministicCommandEvaluator(input2) {
-  const candidate = resolve4(input2.candidateWorkspace);
-  const verifier = resolve4(input2.verifierWorkspace);
+  const candidate = resolve3(input2.candidateWorkspace);
+  const verifier = resolve3(input2.verifierWorkspace);
   if (candidate === verifier || verifier.startsWith(`${candidate}/`)) {
     throw new Error("verifier workspace must be outside the candidate workspace");
   }
@@ -42098,9 +41890,9 @@ async function runDeterministicCommandEvaluator(input2) {
   if (observedTreeDigest !== input2.candidateTreeDigest)
     throw new Error(`candidate tree digest mismatch: expected ${input2.candidateTreeDigest}, observed ${observedTreeDigest}`);
   mkdirSync7(verifier, { recursive: true, mode: 448 });
-  const runVerifier = mkdtempSync3(join7(verifier, "run-"));
-  const acceptance = join7(runVerifier, "acceptance-source");
-  const isolatedCandidate = join7(runVerifier, "candidate");
+  const runVerifier = mkdtempSync2(join6(verifier, "run-"));
+  const acceptance = join6(runVerifier, "acceptance-source");
+  const isolatedCandidate = join6(runVerifier, "candidate");
   cpSync2(candidate, isolatedCandidate, { recursive: true, force: false, errorOnExist: true });
   writeFileSync3(acceptance, input2.acceptanceSource, { mode: 256 });
   chmodSync2(acceptance, 256);
@@ -42144,7 +41936,7 @@ async function runDeterministicCommandEvaluator(input2) {
       })
     };
   } finally {
-    rmSync4(runVerifier, { recursive: true, force: true });
+    rmSync3(runVerifier, { recursive: true, force: true });
   }
   const stdoutRef = input2.artifactSink?.put(input2.target.runId, result.stdout, "text/plain");
   const stderrRef = input2.artifactSink?.put(input2.target.runId, result.stderr, "text/plain");
@@ -42504,7 +42296,7 @@ class ExperimentService {
 
 // packages/host/src/checkpoints/materializer.ts
 init_src();
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash5 } from "crypto";
 class CheckpointMaterializer {
   options;
   constructor(options) {
@@ -42563,10 +42355,10 @@ class CheckpointMaterializer {
     const invalidation = invalidateCheckpoint(certificate, input2.config);
     if (!invalidation.valid)
       throw new Error(`checkpoint invalidated: ${invalidation.reasons.join(", ")}`);
-    const capture3 = this.options.journal.listCheckpointOperations(certificate.checkpointId, "checkpoint.capture")[0];
-    if (!capture3)
+    const capture2 = this.options.journal.listCheckpointOperations(certificate.checkpointId, "checkpoint.capture")[0];
+    if (!capture2)
       throw new Error("checkpoint capture materialization record not found");
-    const record2 = capture3.record;
+    const record2 = capture2.record;
     const sourceBundle = input2.bundle;
     if (!sourceBundle)
       throw new Error("checkpoint source bundle not found");
@@ -42593,7 +42385,7 @@ class CheckpointMaterializer {
     if (canonicalize(withoutProfile(childInput)) !== canonicalize(withoutProfile(sourceInput)))
       throw new Error("fork variant may change only execution profile");
     const childProfile = typeof childInput.__kouroExecutionProfile === "string" ? childInput.__kouroExecutionProfile : "scripted";
-    const childConfigDependencyDigest = `sha256:${createHash6("sha256").update(canonicalize({
+    const childConfigDependencyDigest = `sha256:${createHash5("sha256").update(canonicalize({
       input: childInput,
       profile: childProfile,
       promptVariants: input2.promptVariants ?? {},
@@ -42671,7 +42463,7 @@ class CheckpointMaterializer {
   }
 }
 function stableCheckpointId(requestKey) {
-  return `cp_${createHash6("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
+  return `cp_${createHash5("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
 }
 async function materializePromptVariant(source, replacements, sourceView, inheritedInvocationIds) {
   const entries = Object.entries(replacements);
@@ -42741,16 +42533,16 @@ function structuralIdentity(bundle) {
   });
 }
 // packages/host/src/checkpoints/retention.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync8, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
-import { join as join8 } from "path";
+import { existsSync as existsSync3, mkdirSync as mkdirSync8, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
+import { join as join7 } from "path";
 
 class CheckpointRetention {
   path;
   marks;
   constructor(dataDir) {
     mkdirSync8(dataDir, { recursive: true, mode: 448 });
-    this.path = join8(dataDir, "checkpoint-retention.json");
-    this.marks = existsSync5(this.path) ? JSON.parse(readFileSync4(this.path, "utf8")) : {};
+    this.path = join7(dataDir, "checkpoint-retention.json");
+    this.marks = existsSync3(this.path) ? JSON.parse(readFileSync4(this.path, "utf8")) : {};
   }
   retain(checkpointId, roots) {
     for (const root of roots)
@@ -42810,7 +42602,7 @@ class CheckpointRetention {
 init_src();
 import { randomBytes as randomBytes2, randomUUID as randomUUID4 } from "crypto";
 import { readdir, readFile } from "fs/promises";
-import { resolve as resolve5 } from "path";
+import { resolve as resolve4 } from "path";
 import { pathToFileURL } from "url";
 
 class ApplicationService {
@@ -42825,7 +42617,7 @@ class ApplicationService {
   parallelPromise;
   fileTemplatePromise;
   constructor(options) {
-    this.templateRoot = options.templateRoot ?? resolve5(process.cwd(), ".kouro");
+    this.templateRoot = options.templateRoot ?? resolve4(process.cwd(), ".kouro");
     const workspaceAdapter = options.workspaceAdapter === null ? undefined : options.workspaceAdapter ?? new GitWorkspaceAdapter({ worktreeRoot: `${options.dataDir}/worktrees` });
     this.coordinator = new Coordinator({ ...options, workspaceAdapter });
     this.checkpointRetention = new CheckpointRetention(options.dataDir);
@@ -43058,7 +42850,7 @@ class ApplicationService {
   executionProfiles() {
     const scripted = this.coordinator.harness.capabilities();
     const profileHost = this.coordinator;
-    const codexAvailable = profileHost.availableProfiles?.includes("codex-readonly") ?? Boolean(Bun.which("codex"));
+    const codexAvailable = profileHost.availableProfiles?.includes("codex-readonly") ?? true;
     const codexCapabilities = profileHost.profileCapabilities?.("codex-readonly") ?? {
       "structured-output": codexAvailable ? "supported" : "unsupported",
       cancel: codexAvailable ? "supported" : "unsupported",
@@ -43067,7 +42859,7 @@ class ApplicationService {
       usage: codexAvailable ? "supported" : "unsupported",
       "cost-cap": "unsupported"
     };
-    const piAvailable = profileHost.availableProfiles?.includes("pi-readonly") ?? Boolean(Bun.which("pi"));
+    const piAvailable = profileHost.availableProfiles?.includes("pi-readonly") ?? true;
     return [
       {
         id: "scripted",
@@ -43080,11 +42872,11 @@ class ApplicationService {
       {
         id: "codex-readonly",
         name: "Codex \xB7 read-only",
-        description: "Run the agent through the local Codex CLI without workspace writes.",
+        description: "Run the agent through the Codex SDK without workspace writes.",
         available: codexAvailable,
         harness: "codex",
         capabilities: codexCapabilities,
-        unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host"
+        unavailableReason: codexAvailable ? undefined : "Codex SDK runtime is not available on this host"
       },
       {
         id: "codex-workspace-write",
@@ -43093,7 +42885,7 @@ class ApplicationService {
         available: codexAvailable,
         harness: "codex",
         capabilities: codexCapabilities,
-        unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host"
+        unavailableReason: codexAvailable ? undefined : "Codex SDK runtime is not available on this host"
       },
       {
         id: "claude-readonly",
@@ -43129,8 +42921,8 @@ class ApplicationService {
       },
       {
         id: "pi-readonly",
-        name: "Pi \xB7 read-only RPC",
-        description: "Run the installed Pi CLI through its native RPC protocol with read-only tools.",
+        name: "Pi SDK \xB7 read-only",
+        description: "Run Pi in-process through its SDK with read-only tools.",
         available: piAvailable,
         harness: "pi",
         capabilities: piAvailable ? {
@@ -43615,17 +43407,17 @@ async function compileParallelFixture() {
   const branchA = root.call("branch-a", child);
   const branchB = root.call("branch-b", child);
   const fork = root.parallel("reviewers", { branches: [branchA, branchB], maxConcurrent: 2 });
-  const join9 = root.join("join-reviewers", {
+  const join8 = root.join("join-reviewers", {
     groupId: "reviewers",
     mode: "all-settled",
     failure: "wait-for-all"
   });
   const done = root.complete("done");
   root.startAt(fork);
-  fork.on("success").to(join9);
-  branchA.on("success").to(join9);
-  branchB.on("success").to(join9);
-  join9.on("success").to(done);
+  fork.on("success").to(join8);
+  branchA.on("success").to(join8);
+  branchB.on("success").to(join8);
+  join8.on("success").to(done);
   return compileWorkflow(root.build());
 }
 async function loadFileTemplates(root) {
@@ -43639,10 +43431,10 @@ async function loadFileTemplates(root) {
   }
   const templates = [];
   for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
-    const directory = resolve5(root, entry.name);
+    const directory = resolve4(root, entry.name);
     let manifest;
     try {
-      manifest = JSON.parse(await readFile(resolve5(directory, "manifest.json"), "utf8"));
+      manifest = JSON.parse(await readFile(resolve4(directory, "manifest.json"), "utf8"));
     } catch (cause) {
       if (cause && typeof cause === "object" && "code" in cause && cause.code === "ENOENT")
         continue;
@@ -43652,7 +43444,7 @@ async function loadFileTemplates(root) {
       throw new Error(`Invalid file template id: ${manifest.id}`);
     if (!manifest.name || !manifest.version || !manifest.entrypoint)
       throw new Error(`Invalid file template manifest: ${directory}`);
-    const module = await import(pathToFileURL(resolve5(directory, manifest.entrypoint)).href);
+    const module = await import(pathToFileURL(resolve4(directory, manifest.entrypoint)).href);
     const exported = module.default;
     if (!exported)
       throw new Error(`Template entrypoint has no default export: ${directory}`);
@@ -43665,7 +43457,7 @@ async function loadFileTemplates(root) {
 
 // packages/host/src/http/server.ts
 import { randomBytes as randomBytes3, randomUUID as randomUUID5 } from "crypto";
-import { join as join9, normalize, relative } from "path";
+import { join as join8, normalize, relative } from "path";
 
 // node_modules/.bun/memoirist@0.4.0/node_modules/memoirist/dist/bun/index.js
 var Y = (v, b) => {
@@ -46177,8 +45969,8 @@ function FromProperties15(properties, propertyKeys) {
       result[K2] = properties[K2];
   return result;
 }
-function FromObject4(Type, keys, properties) {
-  const options = Discard(Type, [TransformKind, "$id", "required", "properties"]);
+function FromObject4(Type2, keys, properties) {
+  const options = Discard(Type2, [TransformKind, "$id", "required", "properties"]);
   const mappedProperties = FromProperties15(properties, keys);
   return Object2(mappedProperties, options);
 }
@@ -46568,7 +46360,7 @@ __export(exports_type3, {
 });
 
 // node_modules/.bun/@sinclair+typebox@0.34.52/node_modules/@sinclair/typebox/build/esm/type/type/index.mjs
-var Type = exports_type3;
+var Type2 = exports_type3;
 
 // node_modules/.bun/elysia@1.4.30+770bef35d3ee8fa9/node_modules/elysia/dist/index.mjs
 var import_fast_decode_uri_component4 = __toESM(require_fast_decode_uri_component(), 1);
@@ -51540,7 +51332,7 @@ exports_format.Has("date") || exports_format.Set("date", (value) => {
 });
 
 // node_modules/.bun/elysia@1.4.30+770bef35d3ee8fa9/node_modules/elysia/dist/type-system/index.mjs
-var t = Object.assign({}, Type);
+var t = Object.assign({}, Type2);
 createType("UnionEnum", (schema, value) => (typeof value == "number" || typeof value == "string" || value === null) && schema.enum.includes(value)), createType("ArrayBuffer", (schema, value) => value instanceof ArrayBuffer);
 var internalFiles = createType("Files", (options, value) => {
   if (options.minItems && options.minItems > 1 && !Array.isArray(value))
@@ -51566,9 +51358,9 @@ var internalFormData = createType("ElysiaForm", ({ compiler: compiler2, ...schem
   return true;
 });
 var ElysiaType = {
-  String: (property) => Type.String(property),
+  String: (property) => Type2.String(property),
   Numeric: (property) => {
-    const schema = Type.Number(property), compiler2 = compile3(schema);
+    const schema = Type2.Number(property), compiler2 = compile3(schema);
     return t.Transform(t.Union([
       t.String({
         format: "numeric",
@@ -51585,7 +51377,7 @@ var ElysiaType = {
     }).Encode((value) => value);
   },
   NumericEnum(item, property) {
-    const schema = Type.Enum(item, property), compiler2 = compile3(schema);
+    const schema = Type2.Enum(item, property), compiler2 = compile3(schema);
     return t.Transform(t.Union([t.String({ format: "numeric" }), t.Number()], property)).Decode((value) => {
       const number4 = +value;
       if (isNaN(number4) || !compiler2.Check(number4))
@@ -51594,13 +51386,13 @@ var ElysiaType = {
     }).Encode((value) => value);
   },
   Integer: (property) => {
-    const schema = Type.Integer(property), compiler2 = compile3(schema);
+    const schema = Type2.Integer(property), compiler2 = compile3(schema);
     return t.Transform(t.Union([
       t.String({
         format: "integer",
         default: 0
       }),
-      Type.Integer(property)
+      Type2.Integer(property)
     ], property)).Decode((value) => {
       const number4 = +value;
       if (!compiler2.Check(number4))
@@ -51609,9 +51401,9 @@ var ElysiaType = {
     }).Encode((value) => value);
   },
   Date: (property) => {
-    const schema = Type.Date(property), compiler2 = compile3(schema), _default3 = property?.default ? new Date(property.default) : undefined;
+    const schema = Type2.Date(property), compiler2 = compile3(schema), _default3 = property?.default ? new Date(property.default) : undefined;
     return t.Transform(t.Union([
-      Type.Date(property),
+      Type2.Date(property),
       t.String({
         format: "date-time",
         default: _default3?.toISOString()
@@ -51651,7 +51443,7 @@ var ElysiaType = {
     });
   },
   BooleanString: (property) => {
-    const schema = Type.Boolean(property), compiler2 = compile3(schema);
+    const schema = Type2.Boolean(property), compiler2 = compile3(schema);
     return t.Transform(t.Union([
       t.Boolean(property),
       t.String({
@@ -51831,8 +51623,8 @@ var ElysiaType = {
     };
   },
   Uint8Array: (options) => {
-    const schema = Type.Uint8Array(options), compiler2 = compile3(schema);
-    return t.Transform(t.Union([t.ArrayBuffer(), Type.Uint8Array(options)])).Decode((value) => {
+    const schema = Type2.Uint8Array(options), compiler2 = compile3(schema);
+    return t.Transform(t.Union([t.ArrayBuffer(), Type2.Uint8Array(options)])).Decode((value) => {
       if (value instanceof ArrayBuffer) {
         if (!compiler2.Check(value = new Uint8Array(value)))
           throw compiler2.Error(value);
@@ -52578,7 +52370,7 @@ async function tee(source, branches = 2) {
       else {
         if (done)
           return;
-        await new Promise((resolve6) => waiting.push({ resolve: resolve6 }));
+        await new Promise((resolve5) => waiting.push({ resolve: resolve5 }));
       }
   }
   return Array.from({ length: branches }, makeIterator);
@@ -53442,7 +53234,7 @@ function parseQuery(input2) {
 // node_modules/.bun/elysia@1.4.30+770bef35d3ee8fa9/node_modules/elysia/dist/trace.mjs
 var ELYSIA_TRACE = Symbol("ElysiaTrace");
 var createProcess = () => {
-  const { promise: promise2, resolve: resolve6 } = Promise.withResolvers(), { promise: end, resolve: resolveEnd } = Promise.withResolvers(), { promise: error63, resolve: resolveError } = Promise.withResolvers(), callbacks = [], callbacksEnd = [];
+  const { promise: promise2, resolve: resolve5 } = Promise.withResolvers(), { promise: end, resolve: resolveEnd } = Promise.withResolvers(), { promise: error63, resolve: resolveError } = Promise.withResolvers(), callbacks = [], callbacksEnd = [];
   return [
     (callback) => (callback && callbacks.push(callback), promise2),
     (process2) => {
@@ -53491,7 +53283,7 @@ var createProcess = () => {
           return callback && callbacksEnd.push(callback), end;
         }
       };
-      resolve6(result);
+      resolve5(result);
       for (let i = 0;i < callbacks.length; i++)
         callbacks[i](result);
       return {
@@ -57355,11 +57147,11 @@ var _Elysia = class _Elysia2 {
   onTransform(options, handler) {
     return handler ? this.on(options, "transform", handler) : this.on("transform", options);
   }
-  resolve(optionsOrResolve, resolve6) {
-    resolve6 || (resolve6 = optionsOrResolve, optionsOrResolve = { as: "local" });
+  resolve(optionsOrResolve, resolve5) {
+    resolve5 || (resolve5 = optionsOrResolve, optionsOrResolve = { as: "local" });
     const hook = {
       subType: "resolve",
-      fn: resolve6
+      fn: resolve5
     };
     return this.onBeforeHandle(optionsOrResolve, hook);
   }
@@ -58797,7 +58589,7 @@ data: ${JSON.stringify(frame)}
       return { error: "artifact-not-found" };
     }
   });
-  app.get("/", () => options.staticRoot ? Bun.file(join9(options.staticRoot, "index.html")) : "Kouro local host");
+  app.get("/", () => options.staticRoot ? Bun.file(join8(options.staticRoot, "index.html")) : "Kouro local host");
   if (options.staticRoot)
     app.get("/*", async ({ request, set: set2 }) => {
       if (!validOriginHost(request)) {
@@ -58805,7 +58597,7 @@ data: ${JSON.stringify(frame)}
         return { error: "invalid-origin" };
       }
       const root = normalize(options.staticRoot);
-      const path = normalize(join9(root, decodeURIComponent(new URL(request.url).pathname).replace(/^\//, "")));
+      const path = normalize(join8(root, decodeURIComponent(new URL(request.url).pathname).replace(/^\//, "")));
       if (relative(root, path).startsWith("..")) {
         set2.status = 400;
         return { error: "invalid-path" };
@@ -58813,7 +58605,7 @@ data: ${JSON.stringify(frame)}
       const file3 = Bun.file(path);
       if (await file3.exists())
         return file3;
-      const fallback = Bun.file(join9(root, "index.html"));
+      const fallback = Bun.file(join8(root, "index.html"));
       if (await fallback.exists())
         return fallback;
       set2.status = 404;
@@ -60261,7 +60053,7 @@ class Protocol {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1000;
-        await new Promise((resolve6) => setTimeout(resolve6, pollInterval));
+        await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error63) {
@@ -60273,7 +60065,7 @@ class Protocol {
   }
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve6, reject) => {
+    return new Promise((resolve5, reject) => {
       const earlyReject = (error63) => {
         reject(error63);
       };
@@ -60351,7 +60143,7 @@ class Protocol {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve6(parseResult.data);
+            resolve5(parseResult.data);
           }
         } catch (error63) {
           reject(error63);
@@ -60542,12 +60334,12 @@ class Protocol {
         interval = task.pollInterval;
       }
     } catch {}
-    return new Promise((resolve6, reject) => {
+    return new Promise((resolve5, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve6, interval);
+      const timeoutId = setTimeout(resolve5, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -61212,12 +61004,12 @@ class StdioServerTransport {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve6) => {
+    return new Promise((resolve5) => {
       const json3 = serializeMessage(message);
       if (this._stdout.write(json3)) {
-        resolve6();
+        resolve5();
       } else {
-        this._stdout.once("drain", resolve6);
+        this._stdout.once("drain", resolve5);
       }
     });
   }
@@ -61300,12 +61092,12 @@ ${usage}`);
   }
   if (command === "create")
     return createCommand(argv.slice(1));
-  const dataDir = resolve6(process.env.KOURO_DATA_DIR ?? ".kouro-data");
+  const dataDir = resolve5(process.env.KOURO_DATA_DIR ?? ".kouro-data");
   const staticRoot = firstExistingPath([
-    resolve6("packages/web/dist"),
-    resolve6(import.meta.dir, "web"),
-    resolve6(import.meta.dir, "../../web/dist"),
-    resolve6(import.meta.dir, "../web")
+    resolve5("packages/web/dist"),
+    resolve5(import.meta.dir, "web"),
+    resolve5(import.meta.dir, "../../web/dist"),
+    resolve5(import.meta.dir, "../web")
   ]);
   const service = new ApplicationService({ dataDir });
   await service.start();
@@ -61528,26 +61320,26 @@ async function createCommand(args) {
 `);
     return 2;
   }
-  const target = resolve6(output2, name);
+  const target = resolve5(output2, name);
   if (await exists(target)) {
     process.stderr.write(`target already exists: ${target}
 `);
     return 1;
   }
   const templateRoot = firstExistingPath([
-    resolve6(import.meta.dir, "..", "assets", "templates"),
-    resolve6(import.meta.dir, "assets", "templates")
+    resolve5(import.meta.dir, "..", "assets", "templates"),
+    resolve5(import.meta.dir, "assets", "templates")
   ]);
   if (!templateRoot) {
     process.stderr.write(`Kouro CLI template assets are not installed
 `);
     return 1;
   }
-  const source = resolve6(templateRoot, template);
+  const source = resolve5(templateRoot, template);
   const temporary = `${target}.tmp-${randomUUID6()}`;
   try {
     await renderDirectory(source, temporary, name);
-    await mkdir(dirname2(target), { recursive: true });
+    await mkdir(dirname3(target), { recursive: true });
     await rename(temporary, target);
     process.stdout.write(`Created ${target} from ${template}
 `);
@@ -61560,7 +61352,7 @@ async function createCommand(args) {
   }
 }
 function firstExistingPath(paths) {
-  return paths.find((path) => existsSync6(path));
+  return paths.find((path) => existsSync4(path));
 }
 async function exists(path) {
   try {
@@ -61573,8 +61365,8 @@ async function exists(path) {
 async function renderDirectory(source, target, name) {
   await mkdir(target, { recursive: true });
   for (const entry of await readdir2(source, { withFileTypes: true })) {
-    const sourcePath = resolve6(source, entry.name);
-    const targetPath = resolve6(target, entry.name);
+    const sourcePath = resolve5(source, entry.name);
+    const targetPath = resolve5(target, entry.name);
     if (entry.isDirectory())
       await renderDirectory(sourcePath, targetPath, name);
     else if (entry.isFile())

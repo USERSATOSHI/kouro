@@ -1,6 +1,6 @@
 {
   "name": "kouro",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "description": "A local workbench for declarative agent workflows",
   "homepage": "https://github.com/usersatoshi/kouro#readme",
   "bugs": {
@@ -35,7 +35,11 @@
     "format:check": "oxfmt --check packages scripts package.json tsconfig.json playwright.config.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.281"
+    "@anthropic-ai/claude-agent-sdk": "^0.3.281",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@openai/codex": "0.156.1",
+    "@openai/codex-sdk": "0.156.1",
+    "typebox": "1.1.38"
   },
   "devDependencies": {
     "@playwright/test": "1.58.2",

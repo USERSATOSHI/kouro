@@ -176,11 +176,14 @@ count. Never drop terminal/control/artifact facts silently. Child provider proce
 are owned by the adapter with tracked process-group identity and termination grace;
 server-hosted native sessions use their native status/cancel reconciliation instead.
 
-Persist `enforcementMode: enforced | trusted-unrestricted` per run/attempt. The latter
-requires affirmative user launch/profile configuration and is visibly unrestricted in
-web/CLI/API. It cannot satisfy a request marked enforcement-required. M1's real command
-uses the enforced process adapter by default; absent support blocks that demo, while
-scripted fixtures remain runnable. No implicit downgrade in fallback resolution.
+Persist `enforcementMode: enforced | trusted-unrestricted` per run/attempt. A command
+node may explicitly request `terminal.execute` in its node capabilities; that workflow
+author grant runs the command outside OS containment, matching v1 command-node
+semantics. Legacy `executionMode: trusted-unrestricted` still requires affirmative
+launch opt-in. Unrestricted execution is visible in command evidence and cannot satisfy
+a request marked enforcement-required. M1's real command uses the enforced process
+adapter by default; absent support blocks that demo. No implicit downgrade in fallback
+resolution.
 
 Distinguish network authority:
 

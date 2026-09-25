@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import type { ContextManifest } from "@kouro/core";
 import {
-  CodexCliHarness,
+  CodexSdkHarness,
   CodexHarnessAdapter,
   inspectCodex,
 } from "../src/adapters/harness/codex.ts";
 import { ClaudeAgentSdkHarnessAdapter } from "../src/adapters/harness/claude-agent-sdk.ts";
-import { inspectPi, PiCliHarness, PiHarnessAdapter } from "../src/adapters/harness/pi.ts";
+import { inspectPi, PiSdkHarness, PiHarnessAdapter } from "../src/adapters/harness/pi.ts";
 import type { CollaborationTools, HarnessAdapter } from "../src/types.ts";
 
 const live = process.env.KOURO_LIVE_SUBAGENT_HARNESS;
@@ -17,11 +17,11 @@ if (live) {
     if (live === "codex") {
       const descriptor = await inspectCodex();
       expect(descriptor.availability).toBe("available");
-      adapter = new CodexHarnessAdapter(new CodexCliHarness(descriptor));
+      adapter = new CodexHarnessAdapter(new CodexSdkHarness(descriptor));
     } else if (live === "pi") {
       const descriptor = await inspectPi();
       expect(descriptor.availability).toBe("available");
-      adapter = new PiHarnessAdapter(new PiCliHarness(descriptor));
+      adapter = new PiHarnessAdapter(new PiSdkHarness(descriptor));
     } else if (live === "claude") adapter = new ClaudeAgentSdkHarnessAdapter();
     else throw new Error(`Unknown live harness ${live}`);
     const called: string[] = [];

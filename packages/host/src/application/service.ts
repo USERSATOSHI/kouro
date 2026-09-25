@@ -371,8 +371,7 @@ export class ApplicationService {
       availableProfiles?: string[];
       profileCapabilities?: (id: string) => ExecutionProfileSummary["capabilities"];
     };
-    const codexAvailable =
-      profileHost.availableProfiles?.includes("codex-readonly") ?? Boolean(Bun.which("codex"));
+    const codexAvailable = profileHost.availableProfiles?.includes("codex-readonly") ?? true;
     const codexCapabilities =
       profileHost.profileCapabilities?.("codex-readonly") ??
       ({
@@ -383,8 +382,7 @@ export class ApplicationService {
         usage: codexAvailable ? "supported" : "unsupported",
         "cost-cap": "unsupported",
       } as const);
-    const piAvailable =
-      profileHost.availableProfiles?.includes("pi-readonly") ?? Boolean(Bun.which("pi"));
+    const piAvailable = profileHost.availableProfiles?.includes("pi-readonly") ?? true;
     return [
       {
         id: "scripted",
@@ -397,11 +395,11 @@ export class ApplicationService {
       {
         id: "codex-readonly",
         name: "Codex · read-only",
-        description: "Run the agent through the local Codex CLI without workspace writes.",
+        description: "Run the agent through the Codex SDK without workspace writes.",
         available: codexAvailable,
         harness: "codex",
         capabilities: codexCapabilities,
-        unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host",
+        unavailableReason: codexAvailable ? undefined : "Codex SDK runtime is not available on this host",
       },
       {
         id: "codex-workspace-write",
@@ -410,7 +408,7 @@ export class ApplicationService {
         available: codexAvailable,
         harness: "codex",
         capabilities: codexCapabilities,
-        unavailableReason: codexAvailable ? undefined : "codex CLI is not available on this host",
+        unavailableReason: codexAvailable ? undefined : "Codex SDK runtime is not available on this host",
       },
       {
         id: "claude-readonly",
@@ -447,9 +445,8 @@ export class ApplicationService {
       },
       {
         id: "pi-readonly",
-        name: "Pi · read-only RPC",
-        description:
-          "Run the installed Pi CLI through its native RPC protocol with read-only tools.",
+        name: "Pi SDK · read-only",
+        description: "Run Pi in-process through its SDK with read-only tools.",
         available: piAvailable,
         harness: "pi",
         capabilities: piAvailable

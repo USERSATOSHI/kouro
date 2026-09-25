@@ -54,12 +54,9 @@ test("Codex MCP awaits the host-owned subagent callback used by native tool brid
     expect(result.isError).toBe(false);
     expect(JSON.stringify(result.content)).toContain("found");
     expect(received).toEqual([args]);
-    const piExtension = await Bun.file(
-      new URL("../assets/scout-pi-extension.mjs", import.meta.url),
-    ).text();
-    expect(piExtension).toContain('import { Type } from "typebox"');
-    expect(piExtension).toContain('name: "subagent"');
-    expect(piExtension).toContain("KOURO_SCOUT_ENDPOINT");
+    expect(
+      await Bun.file(new URL("../assets/scout-pi-extension.mjs", import.meta.url)).exists(),
+    ).toBe(false);
   } finally {
     await client.close();
     await bridge.close();

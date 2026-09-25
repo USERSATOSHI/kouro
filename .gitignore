@@ -7,3 +7,5 @@ packages/*/dist/
 test-results/
 playwright-report/
 *.tsbuildinfo
+.kouro
+.kouro-data

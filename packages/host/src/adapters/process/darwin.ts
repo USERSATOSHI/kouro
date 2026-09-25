@@ -113,6 +113,10 @@ export class DarwinSandboxProcessAdapter implements ProcessAdapter {
       '(allow file-read* (subpath "/System"))',
       '(allow file-read* (subpath "/usr"))',
       '(allow file-read* (subpath "/bin"))',
+      // /etc is a symlink to /private/etc on macOS, but dyld and several
+      // system libraries still probe the logical /etc path during startup.
+      // Allow both spellings: Seatbelt may evaluate the pre-resolution path.
+      '(allow file-read* (subpath "/etc"))',
       '(allow file-read* (subpath "/private/etc"))',
       '(allow file-read* (subpath "/private/var/db/timezone"))',
       '(allow file-read* file-write* (subpath "/private/tmp"))',
