@@ -24,7 +24,12 @@ import type {
 import type { RuntimeHarness } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harness/scripted.ts";
-import { CodexSdkHarness, CodexHarnessAdapter, inspectCodex } from "../adapters/harness/codex.ts";
+import { TrackingHarnessDecorator } from "../adapters/harness/tracking.ts";
+import {
+  CodexAppServerHarness,
+  CodexHarnessAdapter,
+  inspectCodex,
+} from "../adapters/harness/codex.ts";
 import { ExternalCliHarnessAdapter, inspectExternalCli } from "../adapters/harness/external-cli.ts";
 import {
   ClaudeAgentSdkHarnessAdapter,
@@ -111,6 +116,8 @@ export class Coordinator {
   private readonly active = new Map<string, Promise<void>>();
   private readonly reschedule = new Set<string>();
   private readonly aborters = new Map<string, Map<string, AbortController>>();
+  private readonly activeAdapters = new Map<string, Map<string, HarnessAdapter>>();
+  private readonly activityEvents = new Map<string, import("@kouro/core").JsonValue[]>();
   private closed = false;
 
   constructor(options: CoordinatorOptions) {
@@ -489,6 +496,84 @@ export class Coordinator {
       runId: input.runId,
       execute: () => this.controlOnce(input),
     }).result;
+  }
+
+  async steer(input: {
+    runId: string;
+    invocationId: string;
+    message: string;
+    expectedRevision: number;
+    actor: string;
+  }): Promise<{ revision: number }> {
+    const view = this.journal.getView(input.runId);
+    if (!view) throw new Error(`Run not found: ${input.runId}`);
+    if (view.revision !== input.expectedRevision)
+      throw new Error("stale-action: run revision changed");
+    const invocation = view.state.invocations[input.invocationId];
+    if (!invocation || invocation.status !== "running")
+      throw new Error("steer-unavailable: invocation is not running");
+    const adapter = this.activeAdapters.get(input.runId)?.get(input.invocationId);
+    if (!adapter?.steer)
+      throw new Error("steer-unavailable: active harness does not support mid-turn steering");
+    const message = input.message.trim();
+    if (!message || message.length > 4000)
+      throw new Error("steer message must be 1 to 4000 characters");
+    const attempt = Object.values(view.state.attempts).find(
+      (item) => item.invocationId === invocation.id && item.status === "running",
+    );
+    if (!attempt) throw new Error("steer-unavailable: active attempt is missing");
+    const secrets = Object.entries(process.env)
+      .filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key))
+      .map(([, value]) => value!)
+      .filter((value) => value.length >= 6);
+    const journalMessage = String(redactSecrets(message, secrets));
+    const activity = (status: string, extra: Record<string, string> = {}) =>
+      this.journal.append({
+        runId: input.runId,
+        type: "harness.activity",
+        payload: {
+          attemptId: attempt.id,
+          event: { type: "log", at: new Date().toISOString(), data: { status, ...extra } },
+        },
+        actor: input.actor,
+        subjectId: attempt.id,
+      });
+    activity("Sending steering message", { message: journalMessage });
+    try {
+      await adapter.steer({ invocationId: input.invocationId, message });
+      activity("Steering message sent", { message: journalMessage });
+    } catch (cause) {
+      activity("Steering message rejected", {
+        detail: cause instanceof Error ? cause.message : String(cause),
+      });
+      throw cause;
+    }
+    return { revision: this.journal.getView(input.runId)?.revision ?? view.revision };
+  }
+
+  private recordHarnessActivity(
+    runId: string,
+    invocationId: string,
+    attemptId: string,
+    event: import("@kouro/core").HarnessEvent,
+  ): void {
+    const secrets = Object.entries(process.env)
+      .filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key))
+      .map(([, value]) => value!)
+      .filter((value) => value.length >= 6);
+    const safe = redactSecrets(event, secrets) as import("@kouro/core").JsonValue;
+    const recorded = this.activityEvents.get(attemptId) ?? [];
+    recorded.push(safe);
+    if (recorded.length > 4000) recorded.splice(0, recorded.length - 4000);
+    this.activityEvents.set(attemptId, recorded);
+    this.journal.append({
+      runId,
+      type: "harness.activity",
+      payload: { attemptId, event: safe },
+      actor: "harness",
+      subjectId: attemptId,
+      causationId: invocationId,
+    });
   }
 
   private controlOnce(input: Omit<Parameters<Coordinator["control"]>[0], "idempotencyKey">): {
@@ -1684,7 +1769,7 @@ export class Coordinator {
           return;
         }
         const codex = (this.codex ??= new CodexHarnessAdapter(
-          new CodexSdkHarness(this.codexDescriptor),
+          new CodexAppServerHarness(this.codexDescriptor),
         ));
         selected = codex;
         resolvedHarness = toHarness(codex.id);
@@ -1832,8 +1917,14 @@ export class Coordinator {
       const runAborters = this.aborters.get(runId) ?? new Map<string, AbortController>();
       runAborters.set(invocationId, aborter);
       this.aborters.set(runId, runAborters);
+      const trackingAdapter = new TrackingHarnessDecorator(selected, (event) =>
+        this.recordHarnessActivity(runId, invocationId, attemptId, event),
+      );
+      const activeAdapters = this.activeAdapters.get(runId) ?? new Map<string, HarnessAdapter>();
+      activeAdapters.set(invocationId, trackingAdapter);
+      this.activeAdapters.set(runId, activeAdapters);
       try {
-        harnessResult = await selected.run({
+        harnessResult = await trackingAdapter.run({
           runId,
           invocationId,
           role: node.role,
@@ -1882,6 +1973,9 @@ export class Coordinator {
           events: [],
           usage: unavailableUsage() as unknown as import("@kouro/core").JsonValue,
         };
+      } finally {
+        this.activeAdapters.get(runId)?.delete(invocationId);
+        if (this.activeAdapters.get(runId)?.size === 0) this.activeAdapters.delete(runId);
       }
       if (collaborationGateway && collaborationBatch)
         collaborationGateway.releaseDelivery(collaborationBatch.batchId);
@@ -2014,8 +2108,10 @@ export class Coordinator {
       const nativeConfigDigest = nativeConfig
         ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}`
         : undefined;
+      const allEvents = [...harnessResult.events, ...(this.activityEvents.get(attemptId) ?? [])];
+      const uniqueEvents = [...new Map(allEvents.map((event) => [json(event), event])).values()];
       const durableEvents = redactSecrets(
-        harnessResult.events,
+        uniqueEvents,
         secretValues,
       ) as readonly import("@kouro/core").JsonValue[];
       if (status === "succeeded" && registeredWorkspace && this.workspaceAdapter)
@@ -2054,6 +2150,7 @@ export class Coordinator {
         },
         ...(retry ? { retry } : {}),
       });
+      this.activityEvents.delete(attemptId);
       return;
     }
     if (node.kind !== "command") {
@@ -2276,7 +2373,7 @@ export class Coordinator {
           throw new Error(`subagent Codex unavailable: ${this.codexDescriptor.detail}`);
         childAdapter =
           this.codex ??
-          (this.codex = new CodexHarnessAdapter(new CodexSdkHarness(this.codexDescriptor)));
+          (this.codex = new CodexHarnessAdapter(new CodexAppServerHarness(this.codexDescriptor)));
       } else if (childAgent.harness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available")
@@ -2330,8 +2427,27 @@ export class Coordinator {
           childAgent.timeoutMs === undefined ? undefined : Math.min(childAgent.timeoutMs, 60_000);
         const timeout =
           timeoutMs === undefined ? undefined : setTimeout(() => childAborter.abort(), timeoutMs);
+        let scoutReplyStarted = false;
+        const trackedChild = new TrackingHarnessDecorator(childAdapter, (event) => {
+          const data =
+            event.data && typeof event.data === "object" && !Array.isArray(event.data)
+              ? event.data
+              : { detail: event.data };
+          this.recordHarnessActivity(input.runId, input.parentInvocationId, input.parentAttemptId, {
+            ...event,
+            data:
+              event.type === "text"
+                ? {
+                    scoutId: input.scoutId,
+                    label: !scoutReplyStarted,
+                    text: event.data,
+                  }
+                : { ...data, scoutId: input.scoutId },
+          });
+          if (event.type === "text") scoutReplyStarted = true;
+        });
         try {
-          const result = await childAdapter.run({
+          const result = await trackedChild.run({
             runId: input.runId,
             invocationId: childInvocationId,
             role: childAgent.role,

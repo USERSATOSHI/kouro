@@ -152,6 +152,41 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     try {
       for await (const message of query({ prompt, options })) {
         messages.push(message);
+        const event = message.type === "stream_event" ? message.event : undefined;
+        if (event && typeof event === "object" && "type" in event) {
+          const item = event as {
+            type: string;
+            delta?: { type?: string; text?: string };
+            content_block?: { type?: string; name?: string; id?: string };
+          };
+          const at = new Date().toISOString();
+          if (
+            item.type === "content_block_delta" &&
+            item.delta?.type === "text_delta" &&
+            typeof item.delta.text === "string"
+          ) {
+            input.onEvent?.({ type: "text", at, data: item.delta.text });
+          } else if (
+            item.type === "content_block_start" &&
+            item.content_block?.type === "tool_use"
+          ) {
+            input.onEvent?.({
+              type: "tool",
+              at,
+              data: {
+                id: item.content_block.id ?? "tool",
+                name: item.content_block.name ?? "Tool",
+                status: "started",
+              },
+            });
+          }
+        } else if (message.type === "assistant") {
+          input.onEvent?.({
+            type: "log",
+            at: new Date().toISOString(),
+            data: { status: "Thinking" },
+          });
+        }
         if (message.type === "result") resultMessage = message;
       }
     } catch (cause) {
@@ -231,7 +266,47 @@ function parseJson(text: string): JsonValue | undefined {
 
 function eventsFrom(messages: readonly SDKMessage[]): HarnessEvent[] {
   const at = new Date().toISOString();
-  return messages.map((message) => ({ type: "log", at, data: JSON.stringify(message) }));
+  const events: HarnessEvent[] = [];
+  for (const message of messages) {
+    if (message.type === "stream_event") {
+      const event = message.event as unknown as Record<string, unknown>;
+      const delta = event.delta as Record<string, unknown> | undefined;
+      const block = event.content_block as Record<string, unknown> | undefined;
+      if (
+        event.type === "content_block_delta" &&
+        delta?.type === "text_delta" &&
+        typeof delta.text === "string"
+      )
+        events.push({ type: "text", at, data: delta.text });
+      else if (event.type === "content_block_start" && block?.type === "tool_use")
+        events.push({
+          type: "tool",
+          at,
+          data: { name: String(block.name ?? "Tool"), status: "started" },
+        });
+      continue;
+    }
+    if (message.type === "assistant") {
+      const content = (message as unknown as { message?: { content?: unknown[] } }).message
+        ?.content;
+      for (const part of content ?? []) {
+        if (
+          part &&
+          typeof part === "object" &&
+          "type" in part &&
+          part.type === "text" &&
+          "text" in part &&
+          typeof part.text === "string"
+        )
+          events.push({ type: "text", at, data: part.text });
+        else if (part && typeof part === "object" && "type" in part && part.type === "tool_use")
+          events.push({ type: "tool", at, data: { name: "Tool", status: "started" } });
+      }
+    } else if (message.type === "result") {
+      events.push({ type: "log", at, data: { status: "Turn completed" } });
+    }
+  }
+  return events;
 }
 
 function usageFrom(message?: SDKResultMessage) {

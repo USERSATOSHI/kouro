@@ -67,6 +67,8 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
     eventCursor: event.sequence,
   };
   switch (event.type) {
+    case "harness.activity":
+      return next;
     case "run.started":
       return runStarted(next, event);
     case "scope.created":

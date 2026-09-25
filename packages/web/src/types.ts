@@ -252,6 +252,7 @@ export interface UiRunView {
   usage: UsageView[];
   diagnostics: DiagnosticView[];
   capabilities: RunCapabilities;
+  liveActivity?: Array<{ attemptId: string; event: Record<string, unknown> }>;
 }
 export const asArray = <T>(value: Readonly<Record<string, T>> | undefined): T[] =>
   Object.values(value ?? {});

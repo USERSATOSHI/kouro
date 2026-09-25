@@ -13,6 +13,7 @@ export class RunSyncStore {
   private _lastMessageAt = 0;
   private _error?: string;
   private ui: UiRunView | null = null;
+  private liveActivity: Array<{ attemptId: string; event: Record<string, unknown> }> = [];
   getSnapshot = () => this.ui;
   get status() {
     return this._status;
@@ -42,7 +43,8 @@ export class RunSyncStore {
   }
   replace(view: CoreRunView) {
     this.core = view;
-    this.ui = viewFromCore(view);
+    this.liveActivity = persistedActivities(view);
+    this.ui = { ...viewFromCore(view), liveActivity: this.liveActivity };
     this._lastMessageAt = Date.now();
     this._status = "live";
     this._error = undefined;
@@ -67,8 +69,20 @@ export class RunSyncStore {
       serverClock: current.serverClock,
       state: frame.state,
     };
+    const activeActivity = this.liveActivity.filter(
+      (item) => next.state.attempts[item.attemptId]?.status === "running",
+    );
+    this.liveActivity = [...persistedActivities(next), ...activeActivity];
     this.core = next;
-    this.ui = viewFromCore(next);
+    if (frame.activity && next.state.attempts[frame.activity.attemptId]?.status === "running") {
+      this.liveActivity.push({
+        attemptId: frame.activity.attemptId,
+        event: frame.activity.event as Record<string, unknown>,
+      });
+      if (this.liveActivity.length > 1500)
+        this.liveActivity.splice(0, this.liveActivity.length - 1500);
+    }
+    this.ui = { ...viewFromCore(next), liveActivity: this.liveActivity };
     this._lastMessageAt = Date.now();
     this._status = "live";
     this._error = undefined;
@@ -83,4 +97,14 @@ export class RunSyncStore {
     this.notify();
     return "reset";
   }
+}
+
+function persistedActivities(view: CoreRunView) {
+  return Object.values(view.state.attempts).flatMap((attempt) =>
+    (attempt.harnessEvents ?? []).flatMap((event) =>
+      event && typeof event === "object" && !Array.isArray(event)
+        ? [{ attemptId: attempt.id, event: event as Record<string, unknown> }]
+        : [],
+    ),
+  );
 }

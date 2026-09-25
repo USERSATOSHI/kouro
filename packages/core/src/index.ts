@@ -36,6 +36,7 @@ export function createLifecycleEvent<T extends LifecycleEventType, P>(
 export function createProjectionFrame(
   previous: ExecutionState,
   next: ExecutionState,
+  activity?: ProjectionFrame["activity"],
 ): ProjectionFrame {
   if (previous.runId !== next.runId)
     throw new Error("Projection frame states must belong to one run");
@@ -46,6 +47,7 @@ export function createProjectionFrame(
     revision: next.revision,
     eventCursor: next.eventCursor,
     state: next,
+    ...(activity ? { activity } : {}),
   };
 }
 

@@ -115,8 +115,18 @@ export function resolvePiSelection(
 
 export class PiSdkHarness {
   readonly descriptor: HarnessDescriptor;
+  private activeSessions = new Map<
+    string,
+    Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]
+  >();
   constructor(descriptor: HarnessDescriptor) {
     this.descriptor = descriptor;
+  }
+
+  async steer(attemptId: string, message: string): Promise<void> {
+    const session = this.activeSessions.get(attemptId);
+    if (!session) throw new Error("steer-unavailable: Pi session is not active");
+    await session.steer(message);
   }
 
   async startTurn(request: StartTurnRequest): Promise<TurnHandle> {
@@ -234,6 +244,7 @@ export class PiSdkHarness {
         customTools,
       });
       session = created.session;
+      this.activeSessions.set(input.attemptId, session);
       if (input.signal?.aborted || timeout) await session.abort();
       if (input.signal?.aborted)
         return {
@@ -305,6 +316,7 @@ export class PiSdkHarness {
       if (timer) clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       session?.dispose();
+      this.activeSessions.delete(input.attemptId);
     }
   }
 }
@@ -359,10 +371,19 @@ function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void): void 
   const update = event.assistantMessageEvent;
   if (event.type === "message_update" && isRecord(update) && update.type === "text_delta") {
     if (typeof update.delta === "string") emit({ type: "text", at, data: update.delta });
+  } else if (
+    event.type === "message_update" &&
+    isRecord(update) &&
+    update.type === "thinking_delta"
+  ) {
+    emit({ type: "log", at, data: { status: "Thinking" } });
   } else if (event.type.includes("tool")) {
-    emit({ type: "tool", at, data: event as JsonValue });
+    const safe = Object.fromEntries(
+      Object.entries(event).filter(([key]) => !/thinking|reasoning/i.test(key)),
+    );
+    emit({ type: "tool", at, data: safe as JsonValue });
   } else {
-    emit({ type: "log", at, data: event as JsonValue });
+    emit({ type: "log", at, data: { status: "Thinking" } });
   }
 }
 
@@ -448,11 +469,15 @@ export class PiHarnessAdapter implements HarnessAdapter {
       signal: input.signal,
       context: input.context,
       collaboration: input.collaboration,
+      onEvent: input.onEvent,
     });
     return {
       ...result,
       usage: result.usage as unknown as JsonValue,
       events: result.events as unknown as JsonValue[],
     };
+  }
+  steer(input: { invocationId: string; message: string }) {
+    return this.harness.steer(input.invocationId, input.message);
   }
 }

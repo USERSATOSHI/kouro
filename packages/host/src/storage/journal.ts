@@ -1068,7 +1068,13 @@ export class Journal {
     this.db
       .query("UPDATE run_projections SET revision = ?1, view_json = ?2 WHERE run_id = ?3")
       .run(state.revision, json(view), input.runId);
-    const frame = createProjectionFrame(prior.state, state);
+    const frame = createProjectionFrame(
+      prior.state,
+      state,
+      event.type === "harness.activity"
+        ? { attemptId: event.payload.attemptId, event: event.payload.event }
+        : undefined,
+    );
     this.db
       .query("INSERT INTO projection_frames(run_id, revision, frame_json) VALUES (?1, ?2, ?3)")
       .run(input.runId, state.revision, json(frame));

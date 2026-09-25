@@ -697,7 +697,7 @@ export function App() {
     setSurface("new-run");
   };
 
-  const controlRun = async (action: string, invocationId?: string) => {
+  const controlRun = async (action: string, invocationId?: string, message?: string) => {
     if (!selectedRunId || pendingAction) return;
     setPendingAction(action);
     setActionNotice(undefined);
@@ -708,6 +708,7 @@ export function App() {
         body: JSON.stringify({
           action,
           invocationId,
+          message,
           expectedRevision: snapshot?.revision,
           idempotencyKey: crypto.randomUUID(),
         }),
@@ -1193,7 +1194,7 @@ function Topbar({
   launching: boolean;
   pendingAction?: string;
   actionNotice?: string;
-  onControl: (action: string, invocationId?: string) => void;
+  onControl: (action: string, invocationId?: string, message?: string) => void;
   workflows: WorkflowSummary[];
   workflowId: string;
   setWorkflowId: (id: string) => void;
@@ -1544,7 +1545,7 @@ function Workbench({
   view: UiRunView;
   selectedInvocationId?: string;
   setSelectedInvocationId: (id: string) => void;
-  onControl: (action: string, invocationId?: string) => void;
+  onControl: (action: string, invocationId?: string, message?: string) => void;
   pendingAction?: string;
   onInspectorResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
@@ -2086,7 +2087,7 @@ function Inspector({
   view: UiRunView;
   graph?: WorkflowGraph;
   selectedId?: string;
-  onControl: (action: string, invocationId?: string) => void;
+  onControl: (action: string, invocationId?: string, message?: string) => void;
   pendingAction?: string;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
@@ -2118,8 +2119,46 @@ function Inspector({
     item.invocationId === selectedId ||
     Boolean(item.attemptId && attempts.some((attempt) => attempt.attemptId === item.attemptId));
   const context = view.context.filter(belongs);
-  const tools = view.tools.filter(belongs);
-  const logs = view.logs.filter(belongs);
+  const liveAttemptIds = new Set(
+    attempts.filter((attempt) => attempt.state === "running").map((attempt) => attempt.attemptId),
+  );
+  const liveEvents = (view.liveActivity ?? []).filter((item) => liveAttemptIds.has(item.attemptId));
+  const liveTools = liveEvents.flatMap((item, index) => {
+    const event = item.event as { type?: string; at?: string; data?: unknown };
+    if (event.type !== "tool") return [];
+    const data =
+      event.data && typeof event.data === "object" ? (event.data as Record<string, unknown>) : {};
+    return [
+      {
+        id: String(data.id ?? `${item.attemptId}:live-tool:${index}`),
+        name: `${data.scoutId ? `${String(data.scoutId)} · ` : ""}${String(data.name ?? "Tool")}`,
+        status: String(data.status ?? "running"),
+        input: data.input,
+        output: data.output,
+        invocationId: selectedId,
+        attemptId: item.attemptId,
+        startedAt: event.at,
+      },
+    ];
+  });
+  const liveLogs = liveEvents.flatMap((item, index) => {
+    const event = item.event as { type?: string; at?: string; data?: unknown };
+    if (event.type !== "log") return [];
+    const data =
+      event.data && typeof event.data === "object" ? (event.data as Record<string, unknown>) : {};
+    return [
+      {
+        id: `${item.attemptId}:live-log:${index}`,
+        level: "info",
+        message: `${data.scoutId ? `${String(data.scoutId)} · ` : ""}${String(data.status ?? data.message ?? "Working")}`,
+        timestamp: event.at,
+        invocationId: selectedId,
+        attemptId: item.attemptId,
+      },
+    ];
+  });
+  const tools = [...view.tools.filter(belongs), ...liveTools];
+  const logs = [...view.logs.filter(belongs), ...liveLogs];
   const usage = view.usage.filter(belongs);
   const diagnostics = view.diagnostics.filter(belongs);
   const tabs = [
@@ -2181,7 +2220,16 @@ function Inspector({
             ))}
           </div>
           <div className="inspector-content">
-            {tab === "output" && <OutputPanel attempt={latest} invocation={invocation} />}
+            {tab === "output" && (
+              <OutputPanel
+                attempt={latest}
+                invocation={invocation}
+                liveActivity={(view.liveActivity ?? []).filter(
+                  (item) => item.attemptId === latest?.attemptId,
+                )}
+                onSteer={(message) => onControl("steer", invocation.invocationId, message)}
+              />
+            )}
             {tab === "context" && <ContextPanel items={context} />}
             {tab === "tools" && <ToolPanel items={tools} />}
             {tab === "logs" && <LogPanel items={logs} />}
@@ -2371,7 +2419,7 @@ function ApprovalPanel({
   nodeKind?: string;
   view: UiRunView;
   pendingAction?: string;
-  onControl: (action: string, invocationId?: string) => void;
+  onControl: (action: string, invocationId?: string, message?: string) => void;
 }) {
   const isApproval = nodeKind === "approval" || invocation.approval !== undefined;
   if (!isApproval) return null;
@@ -2657,11 +2705,93 @@ function DiffPanel({ runId, revision }: { runId: string; revision: number }) {
   );
 }
 
-function OutputPanel({ attempt, invocation }: { attempt?: UiAttempt; invocation: UiInvocation }) {
+function OutputPanel({
+  attempt,
+  invocation,
+  liveActivity = [],
+  onSteer,
+}: {
+  attempt?: UiAttempt;
+  invocation: UiInvocation;
+  liveActivity?: Array<{ attemptId: string; event: unknown }>;
+  onSteer: (message: string) => void;
+}) {
   const output = attempt?.output;
   const captured = Array.isArray(output) ? output.length > 0 : output !== undefined;
+  const liveText = liveActivity
+    .filter((item) => (item.event as { type?: string })?.type === "text")
+    .map((item) => {
+      const data = (item.event as { data?: unknown }).data;
+      if (data && typeof data === "object" && "text" in data) {
+        const text = String((data as { text: unknown }).text ?? "");
+        const label = (data as { label?: unknown }).label === true;
+        return `${label ? `[${String((data as { scoutId?: unknown }).scoutId ?? "scout")}]: ` : ""}${text}`;
+      }
+      return String(data ?? "");
+    })
+    .join("");
+  const activityLabels = liveActivity
+    .filter((item) => (item.event as { type?: string })?.type !== "text")
+    .map((item) => {
+      const event = item.event as { type?: string; data?: unknown };
+      const data =
+        event.data && typeof event.data === "object" ? (event.data as Record<string, unknown>) : {};
+      if (event.type === "usage") return "Usage updated";
+      if (event.type === "tool")
+        return `${data.scoutId ? `${String(data.scoutId)} · ` : ""}${String(data.name ?? "Tool")} · ${String(data.status ?? "running")}`;
+      return `${data.scoutId ? `${String(data.scoutId)} · ` : ""}${String(data.status ?? event.type ?? "Working")}`;
+    });
+  const execution =
+    attempt?.resolvedExecution && typeof attempt.resolvedExecution === "object"
+      ? (attempt.resolvedExecution as Record<string, unknown>)
+      : {};
+  const canSteer =
+    invocation.state === "running" && (execution.harness === "pi" || execution.harness === "codex");
+  const [steeringText, setSteeringText] = useState("");
   return (
     <div className="output-panel">
+      {(invocation.state === "running" || liveActivity.length > 0) && (
+        <section className="live-agent-activity" aria-live="polite">
+          <div className="section-label">
+            AGENT ACTIVITY <span>{invocation.state === "running" ? "live" : "captured"}</span>
+          </div>
+          <p>{activityLabels.at(-1) ?? "Thinking"}</p>
+          {activityLabels.length > 1 && (
+            <ul>
+              {activityLabels.slice(-8).map((label, index) => (
+                <li key={`${index}:${label}`}>{label}</li>
+              ))}
+            </ul>
+          )}
+          {liveText && <pre className="live-agent-reply">{liveText}</pre>}
+          {canSteer ? (
+            <form
+              className="steer-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const message = steeringText.trim();
+                if (message) {
+                  onSteer(message);
+                  setSteeringText("");
+                }
+              }}
+            >
+              <textarea
+                aria-label="Steer active agent"
+                placeholder="Send an instruction to the active agent"
+                value={steeringText}
+                onChange={(event) => setSteeringText(event.target.value)}
+                maxLength={4000}
+              />
+              <button type="submit" disabled={!steeringText.trim()}>
+                Steer agent
+              </button>
+            </form>
+          ) : (
+            <small>This harness accepts input after its current turn.</small>
+          )}
+        </section>
+      )}
       <div className="section-label">
         STRUCTURED OUTPUT <span>{captured ? "captured" : "none"}</span>
       </div>

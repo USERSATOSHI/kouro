@@ -508,9 +508,12 @@ export interface ProjectionFrame {
   readonly revision: number;
   readonly eventCursor: number;
   readonly state: ExecutionState;
+  /** Incremental user-visible provider activity, present only on activity frames. */
+  readonly activity?: { readonly attemptId: string; readonly event: JsonValue };
 }
 
 export type LifecycleEventType =
+  | "harness.activity"
   | "run.started"
   | "scope.created"
   | "fork.created"
@@ -594,6 +597,10 @@ export interface AttemptReservedPayload {
 export interface AttemptStartedPayload {
   readonly attemptId: string;
 }
+export interface HarnessActivityPayload {
+  readonly attemptId: string;
+  readonly event: JsonValue;
+}
 
 export interface AttemptCompletedPayload {
   readonly attemptId: string;
@@ -668,6 +675,7 @@ export interface RunRetryPayload {
 }
 
 export type LifecycleEvent =
+  | EventEnvelope<"harness.activity", HarnessActivityPayload>
   | EventEnvelope<"run.started", RunStartedPayload>
   | EventEnvelope<"scope.created", ScopeCreatedPayload>
   | EventEnvelope<"fork.created", ForkCreatedPayload>

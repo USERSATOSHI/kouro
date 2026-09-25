@@ -459,6 +459,18 @@ export function createHostServer(
       return { error: "unsupported-or-invalid-action" };
     }
     try {
+      if (
+        input.action === "steer" &&
+        typeof input.invocationId === "string" &&
+        typeof input.message === "string"
+      )
+        return service.steer({
+          runId: params.id,
+          invocationId: input.invocationId,
+          message: input.message,
+          expectedRevision: Number(input.expectedRevision),
+          actor: "local-operator",
+        });
       if (["pause", "resume", "cancel", "interrupt", "detach"].includes(input.action))
         return service.control({
           runId: params.id,

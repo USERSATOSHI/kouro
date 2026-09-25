@@ -161,6 +161,7 @@ export interface HarnessAdapter {
     /** Host-owned, optional collaboration tools. The harness never supplies sender identity. */
     collaboration?: CollaborationTools;
     signal?: AbortSignal;
+    onEvent?: (event: import("@kouro/core").HarnessEvent) => void;
   }): Promise<{
     output?: import("@kouro/core").JsonValue;
     rawOutput?: string;
@@ -170,6 +171,7 @@ export interface HarnessAdapter {
     events: readonly import("@kouro/core").JsonValue[];
     usage: import("@kouro/core").JsonValue;
   }>;
+  steer?(input: { invocationId: string; message: string }): Promise<void>;
 }
 
 export interface CollaborationTools {

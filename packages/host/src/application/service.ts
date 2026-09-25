@@ -109,6 +109,10 @@ export class ApplicationService {
     this.experiments = new ExperimentService(this);
   }
 
+  steer(input: Parameters<Coordinator["steer"]>[0]) {
+    return this.coordinator.steer(input);
+  }
+
   async start(): Promise<void> {
     await this.tiny();
     await this.feature();

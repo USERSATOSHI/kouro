@@ -10,7 +10,11 @@ type BaseCapability =
   | "tools"
   | "usage"
   | "cost-cap";
-export type Capability = BaseCapability | "awaited-subagent-tool" | "child-read-only-envelope";
+export type Capability =
+  | BaseCapability
+  | "awaited-subagent-tool"
+  | "child-read-only-envelope"
+  | "steer";
 export type Availability = "available" | "unavailable";
 export interface CapabilityState {
   readonly state: "supported" | "unsupported" | "conditional";
