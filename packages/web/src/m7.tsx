@@ -386,12 +386,11 @@ export const M7_ENDPOINTS = {
 export type M7WorkbenchProps = {
   runId: string;
   revision?: number;
-  availableProfiles?: Array<{ id: string; name: string }>;
   fetchView: (runId: string) => Promise<unknown>;
   createCheckpoint?: (runId: string) => Promise<unknown>;
   forkCheckpoint?: (
     checkpointId: string,
-    input: { name: string; profile?: string; promptVariants?: Record<string, string> },
+    input: { name: string; promptVariants?: Record<string, string> },
   ) => Promise<unknown>;
 };
 const metric = (value: number | undefined, unit: string) =>
@@ -405,12 +404,10 @@ export function M7Workbench({
   fetchView,
   createCheckpoint,
   forkCheckpoint,
-  availableProfiles = [],
 }: M7WorkbenchProps) {
   const [view, setView] = useState<M7View>();
   const [error, setError] = useState<string>();
   const [name, setName] = useState("");
-  const [profile, setProfile] = useState("");
   const [promptNodeId, setPromptNodeId] = useState("");
   const [promptText, setPromptText] = useState("");
   const [notice, setNotice] = useState<string>();
@@ -474,7 +471,6 @@ export function M7Workbench({
     try {
       const raw = await forkCheckpoint(checkpoint.id, {
         name: name.trim(),
-        ...(profile ? { profile } : {}),
         ...(promptNodeId.trim() ? { promptVariants: { [promptNodeId.trim()]: promptText } } : {}),
       });
       setView(normalizeM7View(raw, runId));
@@ -554,21 +550,6 @@ export function M7Workbench({
                 placeholder="e.g. approach-b"
                 disabled={!eligible || !checkpoint || busy}
               />
-            </label>
-            <label>
-              Execution profile for new work
-              <select
-                value={profile}
-                onChange={(event) => setProfile(event.target.value)}
-                disabled={!eligible || !checkpoint || busy}
-              >
-                <option value="">Inherit source profile</option>
-                {availableProfiles.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.name}
-                  </option>
-                ))}
-              </select>
             </label>
             <details className="m7-prompt-variant">
               <summary>Change an unexecuted agent prompt</summary>

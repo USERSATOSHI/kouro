@@ -127,30 +127,10 @@ export function createHostServer(
       const input = bodyObject(body);
       if (typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim())
         throw new Error("idempotencyKey is required");
-      if (
-        input.executionProfile !== undefined &&
-        ![
-          "scripted",
-          "codex-readonly",
-          "codex-workspace-write",
-          "claude-readonly",
-          "claude-workspace-write",
-          "pi-readonly",
-        ].includes(String(input.executionProfile))
-      )
-        throw new Error("unsupported execution profile");
       return toWebRun(
         await service.runPromptFixture({
           fixture: input.fixture as never,
           idempotencyKey: input.idempotencyKey,
-          executionProfile: input.executionProfile as
-            | "scripted"
-            | "codex-readonly"
-            | "codex-workspace-write"
-            | "claude-readonly"
-            | "claude-workspace-write"
-            | "pi-readonly"
-            | undefined,
         }),
       );
     } catch (cause) {
@@ -402,17 +382,12 @@ export function createHostServer(
       set.status = 400;
       return { error: "invalid-run-request" };
     }
-    if (
-      input.executionProfile !== undefined &&
-      input.executionProfile !== "scripted" &&
-      input.executionProfile !== "codex-readonly" &&
-      input.executionProfile !== "pi-readonly" &&
-      input.executionProfile !== "codex-workspace-write" &&
-      input.executionProfile !== "claude-readonly" &&
-      input.executionProfile !== "claude-workspace-write"
-    ) {
+    if (input.executionProfile !== undefined || input.allowUnrestrictedCommands !== undefined) {
       set.status = 400;
-      return { error: "invalid-execution-profile" };
+      return {
+        error: "obsolete-run-settings",
+        message: "Set harnesses and capabilities on workflow nodes before launching.",
+      };
     }
     try {
       return toWebRun(
@@ -423,15 +398,13 @@ export function createHostServer(
             typeof input.input === "object" && input.input !== null
               ? (input.input as Record<string, unknown>)
               : undefined,
-          executionProfile: input.executionProfile as
-            | "scripted"
-            | "codex-readonly"
-            | "codex-workspace-write"
-            | "claude-readonly"
-            | "claude-workspace-write"
-            | "pi-readonly"
-            | undefined,
-          allowUnrestrictedCommands: input.allowUnrestrictedCommands === true,
+          nodeSettings:
+            input.nodeSettings && typeof input.nodeSettings === "object"
+              ? (input.nodeSettings as Record<
+                  string,
+                  { harness?: string; modelId?: string; capabilities?: string[] }
+                >)
+              : undefined,
           workspace:
             typeof input.workspace === "object" &&
             input.workspace !== null &&

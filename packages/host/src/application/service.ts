@@ -5,6 +5,8 @@ import {
   canonicalize,
   sha256Hex,
   renderPromptFixture,
+  isHarness,
+  CAPABILITY,
 } from "@kouro/core";
 import type { Bundle, WorkflowDefinitionSource } from "@kouro/core";
 import type { PromptFixture } from "@kouro/core";
@@ -399,7 +401,9 @@ export class ApplicationService {
         available: codexAvailable,
         harness: "codex",
         capabilities: codexCapabilities,
-        unavailableReason: codexAvailable ? undefined : "Codex SDK runtime is not available on this host",
+        unavailableReason: codexAvailable
+          ? undefined
+          : "Codex SDK runtime is not available on this host",
       },
       {
         id: "codex-workspace-write",
@@ -408,7 +412,9 @@ export class ApplicationService {
         available: codexAvailable,
         harness: "codex",
         capabilities: codexCapabilities,
-        unavailableReason: codexAvailable ? undefined : "Codex SDK runtime is not available on this host",
+        unavailableReason: codexAvailable
+          ? undefined
+          : "Codex SDK runtime is not available on this host",
       },
       {
         id: "claude-readonly",
@@ -478,13 +484,17 @@ export class ApplicationService {
     idempotencyKey: string;
     actor?: string;
     input?: Record<string, unknown>;
+    nodeSettings?: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>;
+    /** Legacy callers may still send this; new run settings belong to workflow nodes. */
     executionProfile?: ExecutionProfileId;
-    workspace?: { repositoryPath: string; workspaceId?: string };
     allowUnrestrictedCommands?: boolean;
+    workspace?: { repositoryPath: string; workspaceId?: string };
   }): Promise<RunSummary> {
-    const bundle = this.bundles.get(input.workflowId);
-    if (!bundle) throw new Error(`Unknown workflow ${input.workflowId}`);
-    return (await this.coordinator.createRun({ ...input, bundle })).run;
+    const source = this.bundles.get(input.workflowId);
+    if (!source) throw new Error(`Unknown workflow ${input.workflowId}`);
+    const bundle = input.nodeSettings ? await configureBundle(source, input.nodeSettings) : source;
+    const { nodeSettings: _nodeSettings, ...runInput } = input;
+    return (await this.coordinator.createRun({ ...runInput, bundle })).run;
   }
   /** A playground execution is an ordinary journaled run of a tiny compiled workflow. */
   async runPromptFixture(input: {
@@ -507,7 +517,6 @@ export class ApplicationService {
         workflowId,
         bundle,
         idempotencyKey: input.idempotencyKey,
-        executionProfile: input.executionProfile ?? "scripted",
         input: {
           __kouroPromptFixture: {
             id: input.fixture.id,
@@ -946,6 +955,77 @@ export class ApplicationService {
       entries,
     };
   }
+}
+
+async function configureBundle(
+  source: Bundle,
+  settings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>,
+): Promise<Bundle> {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings))
+    throw new Error("nodeSettings must be an object keyed by workflow node ID");
+  const definitions = Object.fromEntries(
+    Object.entries(source.definitions).map(([definitionId, definition]) => [
+      definitionId,
+      {
+        ...definition,
+        nodes: definition.nodes.map((node) => {
+          const setting = settings[node.id];
+          if (!setting) return node;
+          if (typeof setting !== "object" || Array.isArray(setting))
+            throw new Error(`Invalid settings for node ${node.id}`);
+          if (node.kind !== "agent" && node.kind !== "command")
+            throw new Error(`Node ${node.id} cannot have runtime settings`);
+          if (
+            setting.harness !== undefined &&
+            (node.kind !== "agent" || !isHarness(setting.harness))
+          )
+            throw new Error(`Invalid harness for node ${node.id}`);
+          if (
+            setting.modelId !== undefined &&
+            (typeof setting.modelId !== "string" || setting.modelId.length > 200)
+          )
+            throw new Error(`Invalid model for node ${node.id}`);
+          const allowed = Object.values(CAPABILITY) as string[];
+          if (
+            setting.capabilities !== undefined &&
+            (!Array.isArray(setting.capabilities) ||
+              setting.capabilities.some(
+                (capability) => typeof capability !== "string" || !allowed.includes(capability),
+              ))
+          )
+            throw new Error(`Invalid capability for node ${node.id}`);
+          return {
+            ...node,
+            ...(setting.harness === undefined ? {} : { harness: setting.harness }),
+            ...(setting.modelId === undefined ? {} : { modelId: setting.modelId }),
+            ...(setting.capabilities === undefined
+              ? {}
+              : { capabilities: [...new Set(setting.capabilities)].sort() }),
+          };
+        }),
+      },
+    ]),
+  );
+  for (const nodeId of Object.keys(settings))
+    if (
+      !Object.values(source.definitions).some((definition) =>
+        definition.nodes.some((node) => node.id === nodeId),
+      )
+    )
+      throw new Error(`Unknown workflow node ${nodeId}`);
+  const executable = {
+    formatVersion: source.formatVersion,
+    semanticVersions: source.semanticVersions,
+    rootDefinitionId: source.rootDefinitionId,
+    definitions,
+    schemas: source.schemas,
+    limits: source.limits,
+    sourceMap: source.sourceMap,
+    boundSummary: source.boundSummary,
+  };
+  const canonicalJson = canonicalize(executable);
+  const digest = `sha256:${await sha256Hex(canonicalJson)}`;
+  return Object.freeze({ ...JSON.parse(canonicalJson), digest, canonicalJson }) as Bundle;
 }
 
 const AgentSummary = artifactType<{ summary: string }>("kouro.agent-summary.v1", {

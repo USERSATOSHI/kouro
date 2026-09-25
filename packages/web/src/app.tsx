@@ -39,7 +39,6 @@ import {
   bundleGraph,
   type ContextSegment,
   type DiagnosticView,
-  type ExecutionProfile,
   type LogEntryView,
   type ToolCallView,
   type UsageView,
@@ -125,7 +124,6 @@ const normalizeRun = (raw: unknown): RunSummary | null => {
     startedAt: typeof item.startedAt === "string" ? item.startedAt : undefined,
     endedAt: typeof item.endedAt === "string" ? item.endedAt : undefined,
     revision: typeof item.revision === "number" ? item.revision : undefined,
-    executionProfile: typeof item.executionProfile === "string" ? item.executionProfile : undefined,
     task: typeof item.task === "string" ? item.task : undefined,
     workItem: item.workItem,
   };
@@ -269,9 +267,9 @@ export function App() {
   const [workflowId, setWorkflowId] = useState("tiny");
   const [task, setTask] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
-  const [profiles, setProfiles] = useState<ExecutionProfile[]>([]);
-  const [profileId, setProfileId] = useState<ExecutionProfile["id"]>("scripted");
-  const [allowUnrestrictedCommands, setAllowUnrestrictedCommands] = useState(false);
+  const [nodeSettings, setNodeSettings] = useState<
+    Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>
+  >({});
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(
     () => new URLSearchParams(window.location.search).get("run") ?? undefined,
   );
@@ -336,10 +334,9 @@ export function App() {
 
   const loadCatalog = useCallback(async () => {
     try {
-      const [workflowPayload, runsPayload, profilePayload, experimentPayload] = await Promise.all([
+      const [workflowPayload, runsPayload, experimentPayload] = await Promise.all([
         api<unknown[] | { workflows?: unknown[]; items?: unknown[] }>("/api/workflows"),
         api<unknown[] | { runs?: unknown[]; items?: unknown[] }>("/api/runs"),
-        api<unknown[] | { profiles?: unknown[]; items?: unknown[] }>("/api/execution-profiles"),
         api<unknown[] | { experiments?: unknown[]; items?: unknown[] }>("/api/experiments"),
       ]);
       const nextWorkflows = unwrapArray(workflowPayload, "workflows")
@@ -348,16 +345,12 @@ export function App() {
       const nextRuns = unwrapArray(runsPayload, "runs")
         .map(normalizeRun)
         .filter((item): item is RunSummary => Boolean(item));
-      const nextProfiles = unwrapArray(profilePayload, "profiles").filter(
-        (item): item is ExecutionProfile => Boolean(item && typeof item === "object"),
-      );
       setWorkflows(nextWorkflows);
       setRuns((current) => [
         ...nextRuns,
         ...current.filter((run) => !nextRuns.some((fresh) => fresh.id === run.id)),
       ]);
       if (nextRuns.length < 100) setHasMoreRuns(false);
-      setProfiles(nextProfiles);
       const nextExperiments = (
         Array.isArray(experimentPayload)
           ? experimentPayload
@@ -370,10 +363,6 @@ export function App() {
       setExperiments(nextExperiments);
       if (!selectedExperimentId && nextExperiments[0])
         setSelectedExperimentId(nextExperiments[0].id);
-      if (!nextProfiles.some((item) => item.id === profileId && item.available)) {
-        const firstAvailable = nextProfiles.find((item) => item.available);
-        if (firstAvailable) setProfileId(firstAvailable.id);
-      }
       if (!workflowId && nextWorkflows[0]) setWorkflowId(nextWorkflows[0].id);
       if (!selectedRunId && nextRuns[0]) setSelectedRunId(nextRuns[0].id);
       setError(undefined);
@@ -382,7 +371,7 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }, [profileId, selectedRunId, workflowId, selectedExperimentId]);
+  }, [selectedRunId, workflowId, selectedExperimentId]);
 
   const showOlderRuns = async () => {
     if (shownRunCount < runs.length) {
@@ -685,8 +674,7 @@ export function App() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           workflowId,
-          executionProfile: profileId,
-          allowUnrestrictedCommands,
+          nodeSettings,
           idempotencyKey: crypto.randomUUID(),
           ...(task.trim() ? { input: { task: task.trim() } } : {}),
           ...(workspacePath.trim() ? { workspace: { repositoryPath: workspacePath.trim() } } : {}),
@@ -759,7 +747,7 @@ export function App() {
   const forkCheckpoint = useCallback(
     async (
       checkpointId: string,
-      input: { name: string; profile?: string; promptVariants?: Record<string, string> },
+      input: { name: string; promptVariants?: Record<string, string> },
     ) => {
       const result = await api<{ checkpointId: string }>(M7_ENDPOINTS.fork(checkpointId), {
         method: "POST",
@@ -768,7 +756,6 @@ export function App() {
           count: 2,
           requestKey: `fork:${checkpointId}:${input.name}:${crypto.randomUUID()}`,
           name: input.name,
-          ...(input.profile ? { executionProfile: input.profile } : {}),
           ...(input.promptVariants ? { promptVariants: input.promptVariants } : {}),
         }),
       });
@@ -812,6 +799,7 @@ export function App() {
         selectedRunId={selectedRunId}
         setWorkflowId={(id) => {
           setWorkflowId(id);
+          setNodeSettings({});
           openNewRun();
         }}
         setSelectedRunId={(id) => {
@@ -831,11 +819,6 @@ export function App() {
           onLaunch={launch}
           onNewRun={openNewRun}
           launching={launching}
-          profiles={profiles}
-          profileId={profileId}
-          setProfileId={setProfileId}
-          allowUnrestrictedCommands={allowUnrestrictedCommands}
-          setAllowUnrestrictedCommands={setAllowUnrestrictedCommands}
           pendingAction={pendingAction}
           actionNotice={actionNotice}
           onControl={controlRun}
@@ -843,6 +826,7 @@ export function App() {
           workflowId={workflowId}
           setWorkflowId={(id) => {
             setWorkflowId(id);
+            setNodeSettings({});
             openNewRun();
           }}
           surface={surface}
@@ -869,9 +853,6 @@ export function App() {
             fetchView={fetchCheckpointView}
             createCheckpoint={captureCheckpoint}
             forkCheckpoint={forkCheckpoint}
-            availableProfiles={profiles
-              .filter((profile) => profile.available)
-              .map((profile) => ({ id: profile.id, name: profile.name }))}
           />
         ) : surface === "development" ? (
           <DevelopmentWorkbench
@@ -920,6 +901,8 @@ export function App() {
         ) : (
           <Preview
             workflow={workflow}
+            nodeSettings={nodeSettings}
+            setNodeSettings={setNodeSettings}
             task={task}
             setTask={setTask}
             workspacePath={workspacePath}
@@ -981,7 +964,6 @@ function DevelopmentWorkbench({ onOpenRun }: { onOpenRun: (runId: string) => voi
             variables: JSON.parse(value),
           },
           idempotencyKey: crypto.randomUUID(),
-          executionProfile: "scripted",
         }),
       });
       setPromptRunId(response.id);
@@ -1194,11 +1176,6 @@ function Topbar({
   onLaunch,
   onNewRun,
   launching,
-  profiles,
-  profileId,
-  setProfileId,
-  allowUnrestrictedCommands,
-  setAllowUnrestrictedCommands,
   pendingAction,
   actionNotice,
   onControl,
@@ -1214,11 +1191,6 @@ function Topbar({
   onLaunch: () => void;
   onNewRun: () => void;
   launching: boolean;
-  profiles: ExecutionProfile[];
-  profileId: ExecutionProfile["id"];
-  setProfileId: (id: ExecutionProfile["id"]) => void;
-  allowUnrestrictedCommands: boolean;
-  setAllowUnrestrictedCommands: (enabled: boolean) => void;
   pendingAction?: string;
   actionNotice?: string;
   onControl: (action: string, invocationId?: string) => void;
@@ -1292,42 +1264,6 @@ function Topbar({
               </option>
             ))}
           </select>
-        </label>
-        <label className="profile-picker">
-          <span>PROFILE</span>
-          <select
-            aria-label="Execution profile"
-            value={profileId}
-            onChange={(event) => setProfileId(event.target.value as ExecutionProfile["id"])}
-          >
-            {(profiles.length
-              ? profiles
-              : [
-                  {
-                    id: "scripted",
-                    name: "Scripted fixture",
-                    description: "",
-                    available: true,
-                    harness: "scripted",
-                    capabilities: {},
-                  },
-                ]
-            ).map((profile) => (
-              <option key={profile.id} value={profile.id} disabled={!profile.available}>
-                {profile.name}
-                {profile.available ? "" : " · unavailable"}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="profile-picker">
-          <input
-            type="checkbox"
-            aria-label="Allow legacy unrestricted commands"
-            checked={allowUnrestrictedCommands}
-            onChange={(event) => setAllowUnrestrictedCommands(event.target.checked)}
-          />
-          <span>ALLOW LEGACY COMMANDS</span>
         </label>
         <span className={`stream-state ${store.status}`}>
           <i />
@@ -1412,6 +1348,8 @@ function RunControlBar({
 
 function Preview({
   workflow,
+  nodeSettings,
+  setNodeSettings,
   task,
   setTask,
   workspacePath,
@@ -1420,6 +1358,10 @@ function Preview({
   launching,
 }: {
   workflow?: WorkflowSummary;
+  nodeSettings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>;
+  setNodeSettings: (
+    settings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>,
+  ) => void;
   task: string;
   setTask: (task: string) => void;
   workspacePath: string;
@@ -1430,11 +1372,109 @@ function Preview({
   const root = workflow?.bundle?.definitions[workflow.bundle.rootDefinitionId];
   const taskInput = root?.inputPorts?.find((port) => port.name === "task");
   const taskRequired = taskInput?.required === true;
+  const editableNodes =
+    workflow?.bundle?.definitions[workflow.bundle.rootDefinitionId]?.nodes.filter(
+      (node) => node.kind === "agent" || node.kind === "command",
+    ) ?? [];
+  const updateNode = (
+    nodeId: string,
+    update: { harness?: string; modelId?: string; capabilities?: string[] },
+  ) => setNodeSettings({ ...nodeSettings, [nodeId]: { ...nodeSettings[nodeId], ...update } });
   return (
     <section className="preview">
       <div className="preview-kicker">
         WORKFLOW PREVIEW <span>UNEXECUTED</span>
       </div>
+      {editableNodes.length > 0 && (
+        <section className="node-settings">
+          <h2>Node settings</h2>
+          <p>Choose the harness and access each node can use for this run.</p>
+          {editableNodes.map((node) => {
+            const settings = nodeSettings[node.id] ?? {};
+            const capabilities = settings.capabilities ?? node.capabilities ?? [];
+            return (
+              <fieldset key={node.id} className="node-setting">
+                <legend>
+                  {node.id} · {node.kind}
+                </legend>
+                {node.kind === "agent" && (
+                  <>
+                    <label>
+                      Harness
+                      <select
+                        value={settings.harness ?? node.harness ?? ""}
+                        onChange={(event) =>
+                          updateNode(node.id, { harness: event.target.value || undefined })
+                        }
+                      >
+                        <option value="">Host default</option>
+                        <option value="codex">Codex</option>
+                        <option value="pi">Pi</option>
+                        <option value="claude">Claude</option>
+                        <option value="opencode">OpenCode</option>
+                      </select>
+                    </label>
+                    <label>
+                      Model
+                      <input
+                        value={settings.modelId ?? node.modelId ?? ""}
+                        placeholder="Harness default"
+                        onChange={(event) =>
+                          updateNode(node.id, { modelId: event.target.value || undefined })
+                        }
+                      />
+                    </label>
+                  </>
+                )}
+                <label className="node-capability">
+                  <input
+                    type="checkbox"
+                    checked={capabilities.includes("repository.read")}
+                    onChange={(event) =>
+                      updateNode(node.id, {
+                        capabilities: event.target.checked
+                          ? [...capabilities, "repository.read"]
+                          : capabilities.filter((item) => item !== "repository.read"),
+                      })
+                    }
+                  />
+                  Repository read
+                </label>
+                <label className="node-capability">
+                  <input
+                    type="checkbox"
+                    checked={capabilities.includes("repository.write")}
+                    onChange={(event) =>
+                      updateNode(node.id, {
+                        capabilities: event.target.checked
+                          ? [...capabilities, "repository.write"]
+                          : capabilities.filter((item) => item !== "repository.write"),
+                      })
+                    }
+                  />
+                  Repository write
+                </label>
+                {node.kind === "command" && (
+                  <label className="node-capability">
+                    <input
+                      type="checkbox"
+                      checked={capabilities.includes("terminal.execute")}
+                      onChange={(event) =>
+                        updateNode(node.id, {
+                          capabilities: event.target.checked
+                            ? [...capabilities, "terminal.execute"]
+                            : capabilities.filter((item) => item !== "terminal.execute"),
+                        })
+                      }
+                    />
+                    Run command outside the sandbox
+                  </label>
+                )}
+              </fieldset>
+            );
+          })}
+        </section>
+      )}
       <h1>{workflow?.name ?? workflow?.id ?? "Select a workflow"}</h1>
       <p className="preview-desc">
         Review the compiled execution path before admitting a local run.

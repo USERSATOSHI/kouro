@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { main } from "../src/cli.ts";
 import { ApplicationService } from "../src/application/service.ts";
@@ -16,9 +16,9 @@ describe("workflow template catalog", () => {
   test("exposes sequential and fusion templates as runnable compiled bundles", async () => {
     const dataDir = mkdtempSync(join("/tmp", "kouro-template-"));
     directories.push(dataDir);
-    const templateRoot = resolve(process.cwd(), ".kouro");
-    const featurePath = resolve(templateRoot, "catalog-feature");
-    const fusionPath = resolve(templateRoot, "catalog-fusion");
+    const authoringRoot = resolve(process.cwd(), ".kouro");
+    const featurePath = resolve(authoringRoot, "catalog-feature");
+    const fusionPath = resolve(authoringRoot, "catalog-fusion");
     rmSync(featurePath, { recursive: true, force: true });
     rmSync(fusionPath, { recursive: true, force: true });
     expect(await main(["create", "template", "catalog-feature", "--template", "feature"])).toBe(0);
@@ -26,6 +26,11 @@ describe("workflow template catalog", () => {
       await main(["create", "template", "catalog-fusion", "--template", "feature-fusion"]),
     ).toBe(0);
     directories.push(featurePath, fusionPath);
+    const templateRoot = join(authoringRoot, `.test-${dataDir.split("/").at(-1)}`);
+    mkdirSync(templateRoot, { recursive: true });
+    directories.push(templateRoot);
+    cpSync(featurePath, join(templateRoot, "catalog-feature"), { recursive: true });
+    cpSync(fusionPath, join(templateRoot, "catalog-fusion"), { recursive: true });
     const service = new ApplicationService({
       dataDir,
       templateRoot,

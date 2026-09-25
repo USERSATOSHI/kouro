@@ -207,6 +207,7 @@ export class Coordinator {
     input?: Record<string, unknown>;
     idempotencyKey: string;
     actor?: string;
+    /** Accepted for durable compatibility; run-wide profiles and opt-ins are ignored. */
     executionProfile?:
       | "scripted"
       | "codex-readonly"
@@ -214,8 +215,8 @@ export class Coordinator {
       | "claude-readonly"
       | "claude-workspace-write"
       | "pi-readonly";
-    workspace?: { repositoryPath: string; workspaceId?: string };
     allowUnrestrictedCommands?: boolean;
+    workspace?: { repositoryPath: string; workspaceId?: string };
   }): Promise<{ run: RunSummary; created: boolean }> {
     const normalizedInput = normalizeAdmissionInput(input.bundle, input.input);
     if (input.workspace && !this.workspaceAdapter)
@@ -224,10 +225,9 @@ export class Coordinator {
       ...input,
       input: {
         ...normalizedInput,
-        __kouroExecutionProfile: input.executionProfile ?? this.defaultProfile,
-        ...(input.allowUnrestrictedCommands ? { __kouroAllowUnrestrictedCommands: true } : {}),
+        ...(input.executionProfile ? { __kouroExecutionProfile: input.executionProfile } : {}),
       },
-      executionProfile: input.executionProfile ?? this.defaultProfile,
+      ...(input.executionProfile ? { executionProfile: input.executionProfile } : {}),
       workspace: input.workspace,
     });
     if (result.created && input.workspace) {
@@ -1335,12 +1335,9 @@ export class Coordinator {
   ): void {
     validateCommandNode(node);
     if (node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE)) return;
-    if (node.executionMode !== "trusted-unrestricted") return;
-    const row = this.journal.getRunRow(runId);
-    const input = row ? parseJson<Record<string, unknown>>(row.input_json) : {};
-    if (input.__kouroAllowUnrestrictedCommands !== true)
+    if (node.executionMode === "trusted-unrestricted")
       throw new Error(
-        "Command requires explicit launch opt-in: enable trusted unrestricted commands",
+        `Command node ${node.id} uses removed unrestricted mode; add terminal.execute to that node`,
       );
   }
 
@@ -1693,13 +1690,13 @@ export class Coordinator {
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = {
-          sandbox:
-            (node.capabilities
+          sandbox: (
+            node.capabilities
               ? node.capabilities.includes(CAPABILITY.REPOSITORY_WRITE)
-              : profile === "codex-workspace-write" &&
-                node.workspaceAccess === "workspace-write")
-              ? "workspace-write"
-              : "read-only",
+              : profile === "codex-workspace-write" && node.workspaceAccess === "workspace-write"
+          )
+            ? "workspace-write"
+            : "read-only",
         };
       } else if (requestedHarness === "pi") {
         this.piDescriptor ??= await inspectPi();
@@ -1743,13 +1740,13 @@ export class Coordinator {
           selected = claude;
           nativeConfig = {
             ...(node.modelId ? { model: node.modelId } : {}),
-            permissionMode:
-              (node.capabilities
+            permissionMode: (
+              node.capabilities
                 ? node.capabilities.includes(CAPABILITY.REPOSITORY_WRITE)
-                : profile === "claude-workspace-write" &&
-                  node.workspaceAccess === "workspace-write")
-                ? "acceptEdits"
-                : "dontAsk",
+                : profile === "claude-workspace-write" && node.workspaceAccess === "workspace-write"
+            )
+              ? "acceptEdits"
+              : "dontAsk",
           };
         } else {
           this.opencodeDescriptor ??= await inspectExternalCli("opencode");

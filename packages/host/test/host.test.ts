@@ -7,7 +7,7 @@ import { FakeProcessAdapter } from "../src/adapters/process/bwrap.ts";
 import { createHostServer } from "../src/http/server.ts";
 import type { ProcessAdapter } from "../src/types.ts";
 import type { HarnessAdapter } from "../src/types.ts";
-import { WorkflowBuilder, compileWorkflow } from "@kouro/core";
+import { CAPABILITY, WorkflowBuilder, compileWorkflow } from "@kouro/core";
 
 const directories: string[] = [];
 const temporaryDirectory = () => {
@@ -56,7 +56,7 @@ async function git(cwd: string, args: string[]): Promise<void> {
 }
 
 describe("Kouro M1 host", () => {
-  test("runs declared git argv only after unrestricted launch opt-in and records stderr on failure", async () => {
+  test("runs commands only when the node declares terminal.execute", async () => {
     const dataDir = temporaryDirectory();
     const repository = await fixtureRepository();
     const builder = new WorkflowBuilder({ id: "git-command-e2e", version: "1" });
@@ -83,11 +83,19 @@ describe("Kouro M1 host", () => {
       Object.values(deniedView.state.attempts).some((attempt) => attempt.commandEvidence),
     ).toBe(false);
 
+    const configured = new WorkflowBuilder({ id: "git-command-e2e", version: "1" });
+    const authorizedCommand = configured.command("git-status", {
+      executable: "git",
+      args: ["status", "--short"],
+      capabilities: [CAPABILITY.TERMINAL_EXECUTE],
+    });
+    const authorizedDone = configured.complete("done");
+    configured.startAt(authorizedCommand);
+    configured.sequence(authorizedCommand, authorizedDone);
     const accepted = await service.coordinator.createRun({
       workflowId: "git-command-e2e",
-      bundle,
+      bundle: await compileWorkflow(configured.build()),
       idempotencyKey: "git-command-accepted",
-      allowUnrestrictedCommands: true,
       workspace: { repositoryPath: repository },
     });
     const acceptedView = await waitForTerminal(service, accepted.run.runId);
