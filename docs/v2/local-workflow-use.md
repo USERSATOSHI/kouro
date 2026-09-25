@@ -30,3 +30,13 @@ uses an in-process MCP server from the Claude Agent SDK. Real provider use still
 requires the corresponding harness to be installed and authenticated. The local
 test suite exercises the MCP and extension bridges; it does not make a live
 provider call.
+
+## Opening the workbench over SSH
+
+`kouro serve` listens on the remote machine's loopback interface. When the
+server starts inside an SSH session, it prints a forwarding command. Run that
+command in a terminal on your own computer, replacing `<same-SSH-target>` with
+the host or SSH config alias you used to connect. Keep it running, then open
+the printed `http://127.0.0.1:...` workbench URL in your local browser. The
+browser connects through the tunnel while Kouro stays bound to loopback on the
+remote machine.

@@ -85,6 +85,7 @@ export interface AgentOptions<T = unknown> {
   readonly capabilities?: readonly WorkflowCapability[];
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly produces?: ArtifactType<T>;
+  /** Maximum attempt duration; omit it to run until completion or cancellation. */
   readonly timeoutMs?: number;
   readonly uses?: readonly ScoutHandle[];
   readonly scoutPolicy?: Partial<ScoutPolicy>;
@@ -103,6 +104,7 @@ export interface SubagentOptions<T = unknown> {
   readonly input?: Readonly<Record<string, SchemaInput>>;
   /** The single typed report returned by the subagent. */
   readonly produces: ArtifactType<T>;
+  /** Maximum child attempt duration; omit it to run until completion or cancellation. */
   readonly timeoutMs?: number;
   readonly scripted?: ScriptedAgentProfile;
   readonly resources?: Readonly<Record<string, number>>;
@@ -317,7 +319,9 @@ function directSubagentSource<T>(
       source: { kind: "input" as const, sourceId: input.name, port: input.name },
       missing: "error" as const,
     })),
-    timeoutMs: finitePositive(options.timeoutMs, 5_000),
+    ...(options.timeoutMs === undefined
+      ? {}
+      : { timeoutMs: finitePositive(options.timeoutMs, 5_000) }),
     ...(options.scripted === undefined ? {} : { scripted: options.scripted }),
     ...(options.resources === undefined ? {} : { resources: options.resources }),
   };
@@ -502,7 +506,9 @@ export class WorkflowBuilder {
       ),
       outputPorts: output === undefined ? [] : [output],
       bindings: bindings(options.input, this),
-      timeoutMs: finitePositive(options.timeoutMs, 5_000),
+      ...(options.timeoutMs === undefined
+        ? {}
+        : { timeoutMs: finitePositive(options.timeoutMs, 5_000) }),
       ...(options.uses === undefined
         ? {}
         : {
@@ -1051,7 +1057,7 @@ function stripInternal(node: InternalNode): Node {
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
       ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
       ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),
-      timeoutMs: node.timeoutMs,
+      ...(node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs }),
       ...(node.uses === undefined ? {} : { uses: node.uses }),
       ...(node.scoutPolicy === undefined ? {} : { scoutPolicy: node.scoutPolicy }),
       ...(node.scripted === undefined ? {} : { scripted: node.scripted }),

@@ -118,7 +118,8 @@ export interface AgentNode {
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];
   readonly bindings: readonly Binding[];
-  readonly timeoutMs: number;
+  /** Maximum attempt duration; omitted means run until completion or cancellation. */
+  readonly timeoutMs?: number;
   /** Optional per-agent allowlist of declared subagents. */
   readonly uses?: readonly string[];
   readonly scoutPolicy?: ScoutPolicy;

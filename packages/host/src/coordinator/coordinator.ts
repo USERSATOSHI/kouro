@@ -1725,11 +1725,14 @@ export class Coordinator {
         resolvedVersion = pi.adapterVersion;
         const piSelection = resolvePiSelection(
           { harness: "pi", model: { id: node.modelId ?? "" } },
-          { timeoutMs: node.timeoutMs, ...(node.modelId ? { model: node.modelId } : {}) },
+          {
+            ...(node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs }),
+            ...(node.modelId ? { model: node.modelId } : {}),
+          },
         );
         resolvedModelId = piSelection.model;
         nativeConfig = {
-          timeoutMs: node.timeoutMs,
+          ...(node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs }),
           ...(piSelection.provider ? { provider: piSelection.provider } : {}),
           ...(piSelection.model ? { model: piSelection.model } : {}),
         };
@@ -2323,10 +2326,10 @@ export class Coordinator {
         const childAborter = new AbortController();
         const abort = () => childAborter.abort();
         signal?.addEventListener("abort", abort, { once: true });
-        const timeout = setTimeout(
-          () => childAborter.abort(),
-          Math.min(childAgent.timeoutMs, 60_000),
-        );
+        const timeoutMs =
+          childAgent.timeoutMs === undefined ? undefined : Math.min(childAgent.timeoutMs, 60_000);
+        const timeout =
+          timeoutMs === undefined ? undefined : setTimeout(() => childAborter.abort(), timeoutMs);
         try {
           const result = await childAdapter.run({
             runId: input.runId,
@@ -2335,7 +2338,7 @@ export class Coordinator {
             prompt: childAgent.prompt,
             ...(outputSchema ? { outputSchema } : {}),
             delayMs: this.scriptedDelayMs,
-            timeoutMs: Math.min(childAgent.timeoutMs, 60_000),
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
             cwd: input.cwd,
             ...(childAgent.modelId
               ? { modelId: childAgent.modelId }
@@ -2355,7 +2358,7 @@ export class Coordinator {
             throw new Error(result.error ?? `scout harness ${result.status}`);
           return result.output;
         } finally {
-          clearTimeout(timeout);
+          if (timeout) clearTimeout(timeout);
           signal?.removeEventListener("abort", abort);
         }
       },

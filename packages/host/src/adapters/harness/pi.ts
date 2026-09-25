@@ -76,7 +76,13 @@ export interface PiRunInput {
 }
 
 export function piNativeConfig(config: JsonObject = {}): JsonObject & { checksum: string } {
-  const safe = redactSecrets(config, ["apiKey", "api_key", "token", "password", "secret"]) as JsonObject;
+  const safe = redactSecrets(config, [
+    "apiKey",
+    "api_key",
+    "token",
+    "password",
+    "secret",
+  ]) as JsonObject;
   return { ...safe, checksum: `sha256:${simpleHash(canonicalize(safe))}` };
 }
 
@@ -184,18 +190,22 @@ export class PiSdkHarness {
       input.onEvent?.(event);
     };
     let timeout = false;
-    const timeoutMs = typeof config.timeoutMs === "number" ? config.timeoutMs : 120_000;
-    const timer = setTimeout(() => {
-      timeout = true;
-      void session?.abort();
-    }, timeoutMs);
+    const timeoutMs = typeof config.timeoutMs === "number" ? config.timeoutMs : undefined;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timeout = true;
+            void session?.abort();
+          }, timeoutMs);
     const abort = () => void session?.abort();
     input.signal?.addEventListener("abort", abort, { once: true });
     try {
       const resolved = resolvePiSelection(input.selection, config);
-      const requestedModel = resolved.provider && resolved.model
-        ? `${resolved.provider}/${resolved.model}`
-        : resolved.model;
+      const requestedModel =
+        resolved.provider && resolved.model
+          ? `${resolved.provider}/${resolved.model}`
+          : resolved.model;
       const agentDir = getAgentDir();
       const services = await createAgentSessionServices({
         cwd: input.cwd,
@@ -208,7 +218,9 @@ export class PiSdkHarness {
           extensionFactories: await loadPiBuiltInExtensions(),
         },
       });
-      const model = requestedModel ? await modelFor(services.modelRuntime, requestedModel) : undefined;
+      const model = requestedModel
+        ? await modelFor(services.modelRuntime, requestedModel)
+        : undefined;
       if (requestedModel && !model) throw new Error(`Pi model is unavailable: ${requestedModel}`);
       const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
       const subagent = input.collaboration?.subagent;
@@ -224,7 +236,12 @@ export class PiSdkHarness {
       session = created.session;
       if (input.signal?.aborted || timeout) await session.abort();
       if (input.signal?.aborted)
-        return { status: "cancelled", error: "cancelled", usage: piUsage(session.getSessionStats()), events };
+        return {
+          status: "cancelled",
+          error: "cancelled",
+          usage: piUsage(session.getSessionStats()),
+          events,
+        };
       if (timeout)
         return {
           status: "failed",
@@ -241,13 +258,16 @@ export class PiSdkHarness {
         : handoff;
       await session.prompt(prompt);
       unsubscribe();
-      const lastMessage = [...session.messages].reverse().find((candidate) => candidate.role === "assistant");
-      const message = lastMessage ? assistantText(lastMessage as unknown as Record<string, unknown>) : undefined;
+      const lastMessage = [...session.messages]
+        .reverse()
+        .find((candidate) => candidate.role === "assistant");
+      const message = lastMessage
+        ? assistantText(lastMessage as unknown as Record<string, unknown>)
+        : undefined;
       let output: JsonValue | undefined = message;
       if (typeof output === "string") output = parseJsonOutput(output);
       const usage = piUsage(session.getSessionStats());
-      if (input.signal?.aborted)
-        return { status: "cancelled", error: "cancelled", usage, events };
+      if (input.signal?.aborted) return { status: "cancelled", error: "cancelled", usage, events };
       if (timeout)
         return { status: "failed", error: `pi timed out after ${timeoutMs}ms`, usage, events };
       if (lastMessage && (lastMessage as unknown as Record<string, unknown>).stopReason === "error")
@@ -261,7 +281,13 @@ export class PiSdkHarness {
       if (input.role.outputSchema) {
         const check = validateJsonSchema(output, input.role.outputSchema);
         if (!check.valid)
-          return { status: "failed", error: `invalid-output: ${check.error}`, rawOutput: message, usage, events };
+          return {
+            status: "failed",
+            error: `invalid-output: ${check.error}`,
+            rawOutput: message,
+            usage,
+            events,
+          };
       }
       return { status: "succeeded", output, rawOutput: message, usage, events };
     } catch (cause) {
@@ -276,7 +302,7 @@ export class PiSdkHarness {
         events,
       };
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       session?.dispose();
     }
@@ -286,7 +312,8 @@ export class PiSdkHarness {
 async function modelFor(runtime: ModelRuntime, requested?: string) {
   if (!requested) return undefined;
   const separator = requested.indexOf("/");
-  if (separator >= 1) return runtime.getModel(requested.slice(0, separator), requested.slice(separator + 1));
+  if (separator >= 1)
+    return runtime.getModel(requested.slice(0, separator), requested.slice(separator + 1));
   return (await runtime.getAvailable()).find(({ id }) => id === requested);
 }
 
@@ -318,7 +345,10 @@ function createSubagentTool(
       const check = validateJsonSchema(args, manifestTool.inputSchema);
       if (!check.valid) throw new Error(`Invalid subagent request: ${check.error}`);
       const result = await invoke(args);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: undefined };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+        details: undefined,
+      };
     },
   });
 }
@@ -347,7 +377,13 @@ function assistantText(message: Record<string, unknown>): string | undefined {
   return text || undefined;
 }
 
-function piUsage(stats: ReturnType<NonNullable<Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]["getSessionStats"]>>) {
+function piUsage(
+  stats: ReturnType<
+    NonNullable<
+      Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]["getSessionStats"]
+    >
+  >,
+) {
   const tokens = stats.tokens;
   return {
     inputTokens: { value: tokens.input, quality: "observed" as const, source: "pi" },
@@ -381,8 +417,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isInlineExtension(value: unknown): value is InlineExtension {
-  return typeof value === "function" ||
-    (isRecord(value) && typeof value.name === "string" && typeof value.factory === "function");
+  return (
+    typeof value === "function" ||
+    (isRecord(value) && typeof value.name === "string" && typeof value.factory === "function")
+  );
 }
 
 export class PiHarnessAdapter implements HarnessAdapter {
@@ -391,7 +429,10 @@ export class PiHarnessAdapter implements HarnessAdapter {
   constructor(private readonly harness: PiSdkHarness) {}
   capabilities() {
     return Object.fromEntries(
-      Object.entries(this.harness.descriptor.capabilities).map(([key, value]) => [key, value.state]),
+      Object.entries(this.harness.descriptor.capabilities).map(([key, value]) => [
+        key,
+        value.state,
+      ]),
     );
   }
   async run(input: Parameters<HarnessAdapter["run"]>[0]) {

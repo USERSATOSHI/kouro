@@ -159,18 +159,21 @@ export class ExternalCliHarnessAdapter implements HarnessAdapter {
     }
     const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
     const stderrPromise = new Response(proc.stderr).text().catch(() => "");
-    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : 120_000;
+    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => {
-        proc.kill("SIGTERM");
-        resolve("timeout");
-      }, timeoutMs);
-    });
+    const timeout =
+      timeoutMs === undefined
+        ? undefined
+        : new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => {
+              proc.kill("SIGTERM");
+              resolve("timeout");
+            }, timeoutMs);
+          });
     const completed = Promise.all([stdoutPromise, stderrPromise, proc.exited]).then(
       ([stdout, stderr, code]) => ({ stdout, stderr, code }),
     );
-    const result = await Promise.race([completed, timeout]);
+    const result = timeout ? await Promise.race([completed, timeout]) : await completed;
     if (timer) clearTimeout(timer);
     if (result === "timeout")
       return {

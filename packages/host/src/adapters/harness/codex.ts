@@ -133,7 +133,7 @@ export class CodexSdkHarness implements HarnessPort {
     const codexConfig: NonNullable<CodexOptions["config"]> = {};
     if (bridge) {
       const sourceEntrypoint = new URL("../../cli.ts", import.meta.url);
-      const entrypoint = await Bun.file(sourceEntrypoint).exists()
+      const entrypoint = (await Bun.file(sourceEntrypoint).exists())
         ? sourceEntrypoint.pathname
         : new URL("kouro.js", import.meta.url).pathname;
       codexConfig.mcp_servers = {
@@ -168,15 +168,18 @@ export class CodexSdkHarness implements HarnessPort {
     const timeoutMs =
       typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
         ? input.timeoutMs
-        : 120_000;
+        : undefined;
     const abortController = new AbortController();
     const abort = () => abortController.abort(input.signal?.reason);
     if (input.signal?.aborted) abort();
     else input.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(
-      () => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    );
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(
+            () => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
     const prompt = input.context
       ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
       : input.role.prompt;
@@ -202,7 +205,11 @@ export class CodexSdkHarness implements HarnessPort {
       for await (const event of stream) {
         raw.push(JSON.stringify(event));
         events.push({ type: "log", at: new Date().toISOString(), data: JSON.stringify(event) });
-        consumeCodexEvent(event, (text) => (response = text), (usage) => (usageRecord = usage));
+        consumeCodexEvent(
+          event,
+          (text) => (response = text),
+          (usage) => (usageRecord = usage),
+        );
         if (event.type === "turn.failed" || event.type === "error") {
           streamError = event.type === "turn.failed" ? event.error.message : event.message;
         }
@@ -210,13 +217,14 @@ export class CodexSdkHarness implements HarnessPort {
     } catch (cause) {
       streamError = cause instanceof Error ? cause.message : String(cause);
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       await closeBridge();
     }
 
     const rawOutput = raw.join("\n");
-    const timedOut = abortController.signal.aborted && !input.signal?.aborted;
+    const timedOut =
+      timeoutMs !== undefined && abortController.signal.aborted && !input.signal?.aborted;
     if (input.signal?.aborted || timedOut) {
       const message = timedOut ? `Codex timed out after ${timeoutMs}ms` : "cancelled";
       return {
@@ -270,7 +278,11 @@ export class CodexSdkHarness implements HarnessPort {
 function consumeCodexEvent(
   event: ThreadEvent,
   onResponse: (text: string) => void,
-  onUsage: (usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number }) => void,
+  onUsage: (usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cached_input_tokens?: number;
+  }) => void,
 ): void {
   if (event.type === "item.completed" && event.item.type === "agent_message") {
     onResponse(event.item.text);

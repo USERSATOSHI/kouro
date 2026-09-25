@@ -56,11 +56,14 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     const abort = () => abortController.abort(input.signal?.reason);
     if (input.signal?.aborted) abort();
     else input.signal?.addEventListener("abort", abort, { once: true });
-    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : 120_000;
-    const timer = setTimeout(
-      () => abortController.abort(new Error(`Claude SDK timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    );
+    const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : undefined;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(
+            () => abortController.abort(new Error(`Claude SDK timed out after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
     let stderr = "";
     const messages: SDKMessage[] = [];
     const context = input.context
@@ -115,7 +118,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
                   },
                 ),
               ],
-              timeout: timeoutMs,
+              ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
             }),
           }
         : undefined;
@@ -152,7 +155,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         if (message.type === "result") resultMessage = message;
       }
     } catch (cause) {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       const cancelled = input.signal?.aborted === true;
       return {
@@ -164,12 +167,14 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         events: eventsFrom(messages),
       };
     }
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     input.signal?.removeEventListener("abort", abort);
     if (abortController.signal.aborted) {
       return {
         status: input.signal?.aborted ? "cancelled" : "failed",
-        error: input.signal?.aborted ? "cancelled" : `Claude SDK timed out after ${timeoutMs}ms`,
+        error: input.signal?.aborted
+          ? "cancelled"
+          : `Claude SDK timed out after ${timeoutMs ?? "configured"}ms`,
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,

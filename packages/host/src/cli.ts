@@ -22,7 +22,7 @@ Usage:
 
 Environment:
   KOURO_DATA_DIR  Durable local state directory (default: .kouro-data)
-  KOURO_PORT      Loopback port (default: 43127)
+  KOURO_PORT      Loopback port (default: 43127; forward it over SSH for remote hosts)
   KOURO_TOKEN     Optional fixed one-time browser pairing token
 `;
 
@@ -235,6 +235,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   host.start();
   const url = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
   process.stdout.write(`Kouro workbench: ${url}\nData: ${dataDir}\n`);
+  if (process.env.SSH_CONNECTION) {
+    process.stdout.write(
+      `SSH browser access: on your computer run:\n  ssh -N -L ${host.port}:127.0.0.1:${host.port} <same-SSH-target>\nThen open the workbench URL above in your local browser. Keep the tunnel running.\n`,
+    );
+  }
 
   let closing = false;
   const close = async () => {

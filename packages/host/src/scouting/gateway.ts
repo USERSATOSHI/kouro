@@ -118,8 +118,13 @@ export class ScoutGateway {
       const workspace = runInput.__kouroWorkspace as { workspaceId?: unknown } | undefined;
       const workspaceId =
         workspace && typeof workspace.workspaceId === "string" ? workspace.workspaceId : undefined;
-      const timeoutMs = Math.min(parentNode.timeoutMs, childAgent.timeoutMs, 60_000);
-      const deadlineAt = new Date(Date.now() + timeoutMs).toISOString();
+      const configuredTimeouts = [parentNode.timeoutMs, childAgent.timeoutMs].filter(
+        (value): value is number => typeof value === "number",
+      );
+      const timeoutMs =
+        configuredTimeouts.length === 0 ? undefined : Math.min(...configuredTimeouts, 60_000);
+      const deadlineAt =
+        timeoutMs === undefined ? null : new Date(Date.now() + timeoutMs).toISOString();
       const spent = this.journal.db
         .query(
           "SELECT COUNT(*) as count FROM scout_requests WHERE run_id=?1 AND parent_attempt_id=?2 AND scout_id=?3",
