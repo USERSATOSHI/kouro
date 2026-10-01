@@ -1,6 +1,6 @@
 import type { CoreProjectionFrame, CoreRunView, StoreStatus, UiRunView } from "../types";
-import { viewFromCore } from "../types";
-import { projectSession, type SessionObservation } from "../session";
+import { usageViewFrom, viewFromCore } from "../types";
+import { isEmptyThinkingStatus, projectSession, type SessionObservation } from "../session";
 
 type Listener = () => void;
 type ResetListener = (reason: string) => void;
@@ -139,6 +139,24 @@ export class RunSyncStore {
     }
     const tools = new Map(ui.tools.map((tool) => [tool.id, tool]));
     for (const [attemptId, observations] of byAttempt) {
+      const observedUsage = [...observations].reverse().find((item) => {
+        const data = item.event.data;
+        return (
+          item.event.type === "usage" &&
+          data &&
+          typeof data === "object" &&
+          !("scoutId" in data) &&
+          usageViewFrom(data).completeness !== "unavailable"
+        );
+      });
+      if (observedUsage) {
+        ui.usage = ui.usage.filter((item) => item.attemptId !== attemptId);
+        ui.usage.push({
+          ...usageViewFrom(observedUsage.event.data),
+          attemptId,
+          invocationId: view.state.attempts[attemptId]?.invocationId,
+        });
+      }
       for (const entry of projectSession(observations))
         if (entry.kind === "tool") {
           tools.set(entry.id, {
@@ -148,7 +166,9 @@ export class RunSyncStore {
             invocationId: view.state.attempts[attemptId]?.invocationId,
           });
         }
-      const logs = observations.filter((item) => item.event.type === "log");
+      const logs = observations.filter(
+        (item) => item.event.type === "log" && !isEmptyThinkingStatus(item.event),
+      );
       if (logs.length) {
         ui.logs = ui.logs.filter((log) => log.attemptId !== attemptId);
         ui.logs.push(

@@ -23,6 +23,7 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import { RunSyncStore } from "./data/syncStore";
+import { projectSession } from "./session";
 import { makeTimeScale, spanBounds } from "./data/timeScale";
 import { virtualRows } from "./data/virtualRows";
 import { shouldReconnectOnVisibility } from "./data/reconnect";
@@ -4139,16 +4140,19 @@ function OutputPanel({
       return String(data ?? "");
     })
     .join("");
-  const activityLabels = liveActivity
-    .filter((item) => (item.event as { type?: string })?.type !== "text")
-    .map((item) => {
-      const event = item.event as { type?: string; data?: unknown };
-      const data =
-        event.data && typeof event.data === "object" ? (event.data as Record<string, unknown>) : {};
-      if (event.type === "usage") return "Usage updated";
-      if (event.type === "tool")
-        return `${data.scoutId ? `${String(data.scoutId)} · ` : ""}${String(data.name ?? "Tool")} · ${String(data.status ?? "running")}`;
-      return `${data.scoutId ? `${String(data.scoutId)} · ` : ""}${String(data.status ?? event.type ?? "Working")}`;
+  const activityLabels = projectSession(
+    liveActivity.flatMap((item) =>
+      item.event && typeof item.event === "object" && !Array.isArray(item.event)
+        ? [{ ...item, event: item.event as Record<string, unknown> }]
+        : [],
+    ),
+  )
+    .filter((entry) => entry.kind !== "message" || entry.channel === "thinking")
+    .map((entry) => {
+      const speaker = entry.scoutId ? `${entry.scoutId} · ` : "";
+      if (entry.kind === "tool") return `${speaker}${entry.name} · ${entry.status}`;
+      if (entry.kind === "status") return `${speaker}${entry.message}`;
+      return `${speaker}${entry.text.slice(0, 160)}`;
     });
   const [steeringText, setSteeringText] = useState("");
   return (

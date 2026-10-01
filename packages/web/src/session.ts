@@ -29,6 +29,16 @@ export type SessionEntry =
     }
   | { kind: "status"; id: string; message: string; scoutId?: string; requestId?: string };
 
+/** Older Pi adapters persisted bookkeeping as empty Thinking logs. */
+export function isEmptyThinkingStatus(event: Record<string, unknown>): boolean {
+  const data = record(event.data);
+  return (
+    event.type === "log" &&
+    data?.status === "Thinking" &&
+    Object.keys(data).every((key) => ["status", "scoutId", "requestId", "channel"].includes(key))
+  );
+}
+
 /** Group streamed deltas and tool lifecycle updates into stable readable entries. */
 export function projectSession(observations: readonly SessionObservation[]): SessionEntry[] {
   const entries: SessionEntry[] = [];
@@ -47,6 +57,7 @@ export function projectSession(observations: readonly SessionObservation[]): Ses
   let messageRequest: string | undefined;
   const instructions = new Map<string, number>();
   for (const { observation, index } of ordered) {
+    if (isEmptyThinkingStatus(observation.event)) continue;
     const fingerprint = `${observation.attemptId}:${JSON.stringify(observation.event)}`;
     if (observation.cursor !== undefined) {
       const key = `${observation.attemptId}:${observation.cursor}`;

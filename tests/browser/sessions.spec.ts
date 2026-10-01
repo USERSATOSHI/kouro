@@ -79,6 +79,8 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("Parent session marker");
   await expect(dialog).toContainText("Child session marker");
+  await expect(dialog).toContainText("Reviewing the fixture");
+  await expect(dialog.locator(".session-status").filter({ hasText: /^Thinking$/ })).toHaveCount(0);
   await expect(dialog.locator(".session-tool")).toHaveCount(2);
   await expect(dialog).toContainText("Parent tool result");
   await expect(dialog.getByTestId("session-split")).toBeVisible();
@@ -88,6 +90,7 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
   await expect(dialog.getByRole("region", { name: "Subagent model session" })).toContainText(
     "Child tool result",
   );
+  await page.screenshot({ path: "test-results/session-split-thinking.png", fullPage: true });
   await dialog.getByRole("button", { name: "Combined view" }).click();
   await dialog.getByLabel("Session speaker").selectOption("reviewer");
   await expect(dialog).toContainText("Child session marker");
@@ -110,7 +113,9 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
     page.locator(".inspector .activity-text").filter({ hasText: "Parent tool result" }),
   ).toHaveText("Parent tool result");
   await page.getByRole("button", { name: "logs", exact: true }).click();
-  await expect(page.locator(".log-results")).toContainText("Reviewing the fixture");
+  await expect(page.locator(".log-results")).toContainText("Reviewing");
+  await expect(page.locator(".log-results")).toContainText("the fixture");
+  await expect(page.locator(".log-results .activity-text").filter({ hasText: /^Thinking$/ })).toHaveCount(0);
 
   // Reload must preserve the selected run and journal-backed activity.
   await page.reload();
@@ -118,6 +123,7 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
   expect(new URL(page.url()).searchParams.get("run")).toBe(runId);
   await page.getByRole("button", { name: "Agent session", exact: true }).click();
   await expect(dialog).toContainText("Instruction received: web-steer-marker");
+  await expect(dialog.locator(".session-status").filter({ hasText: /^Thinking$/ })).toHaveCount(0);
   await expect(dialog.locator(".session-tool")).toHaveCount(2);
   await dialog.getByLabel("Steer active agent").fill("spawn-live-subagent");
   await dialog.getByRole("button", { name: "Send instruction" }).click();

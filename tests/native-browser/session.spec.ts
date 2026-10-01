@@ -21,8 +21,15 @@ test(`native ${harness} parent and child are visible live and retain the consume
   await expect(dialog.getByRole("region", { name: "Subagent model session" })).toContainText(marker, { timeout: 90000 });
   await expect(dialog.getByRole("region", { name: "Main model session" })).toContainText(marker, { timeout: 90000 });
   await expect(page.getByTestId("run-status")).toHaveText("succeeded", { timeout: 90000 });
+  await dialog.getByLabel("Close agent session").click();
+  await page.getByRole("button", { name: "usage", exact: true }).click();
+  await expect(page.locator(".inspector .evidence-card strong")).toHaveText(/^[1-9]\d* tokens$/);
+  await expect(page.locator(".inspector .evidence-card")).toContainText("complete");
   await page.reload(); await page.getByRole("button", { name: "Agent session", exact: true }).click();
   await expect(dialog.getByRole("region", { name: "Subagent model session" })).toContainText(marker);
+  await dialog.getByLabel("Close agent session").click();
+  await page.getByRole("button", { name: "usage", exact: true }).click();
+  await expect(page.locator(".inspector .evidence-card strong")).toHaveText(/^[1-9]\d* tokens$/);
 });
 
 test(`native ${harness} consumes steering sent from the rendered session`, async ({ page }) => {

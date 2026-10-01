@@ -16525,6 +16525,7 @@ class CodexAppServerHarness {
   async run(input) {
     const transport = new CodexAppServerTransport(input.cwd);
     const events = [];
+    let usage = unavailableUsage();
     const emit = (event) => {
       events.push(event);
       input.onEvent?.(event);
@@ -16570,6 +16571,7 @@ class CodexAppServerHarness {
 ${JSON.stringify(input.context)}
 [KOURO_CONTEXT_END]` : input.role.prompt;
       let streamed = "";
+      let activeTurnId;
       const thinkingItems = new Set;
       let completed;
       const done = new Promise((resolve) => {
@@ -16577,7 +16579,19 @@ ${JSON.stringify(input.context)}
       });
       const unsubscribe = transport.subscribe((message) => {
         const params = asObject(message.params);
-        if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
+        if (message.method === "thread/tokenUsage/updated") {
+          if (params.threadId !== threadId || activeTurnId && params.turnId !== activeTurnId)
+            return;
+          const observed = codexAppServerUsage(params.tokenUsage);
+          if (observed) {
+            usage = observed;
+            emit({
+              type: "usage",
+              at: new Date().toISOString(),
+              data: observed
+            });
+          }
+        } else if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
           streamed += params.delta;
           emit({ type: "text", at: new Date().toISOString(), data: params.delta });
         } else if (message.method === "item/reasoning/summaryTextDelta" && typeof params.delta === "string") {
@@ -16692,6 +16706,7 @@ ${JSON.stringify(input.context)}
       const turnId = stringAt(started.value, "turn", "id") ?? stringAt(started.value, "id");
       if (!turnId)
         throw new Error("Codex App Server returned no turn ID");
+      activeTurnId = turnId;
       this.active.set(input.attemptId, { transport, threadId, turnId });
       emit({
         type: "log",
@@ -16719,7 +16734,7 @@ ${JSON.stringify(input.context)}
         return {
           status: input.signal?.aborted ? "cancelled" : "failed",
           error: result.error,
-          usage: unavailableUsage(),
+          usage,
           events
         };
       const turn = asObject(result.value);
@@ -16728,7 +16743,7 @@ ${JSON.stringify(input.context)}
         return {
           status: "failed",
           error: "Codex turn has no final agent message",
-          usage: unavailableUsage(),
+          usage,
           events
         };
       const output = parseStructuredOutput(final);
@@ -16739,21 +16754,10 @@ ${JSON.stringify(input.context)}
             status: "failed",
             error: `invalid-output: ${validation.error}`,
             rawOutput: final,
-            usage: unavailableUsage(),
+            usage,
             events
           };
       }
-      const tokens = asObject(turn.tokens);
-      const usage = typeof tokens.input === "number" && typeof tokens.output === "number" ? {
-        inputTokens: { value: tokens.input, quality: "observed", source: "codex" },
-        outputTokens: { value: tokens.output, quality: "observed", source: "codex" },
-        totalTokens: {
-          value: tokens.input + tokens.output,
-          quality: "observed",
-          source: "codex"
-        },
-        cost: { value: null, quality: "unavailable" }
-      } : unavailableUsage();
       if (!streamed)
         emit({ type: "text", at: new Date().toISOString(), data: final });
       else if (final.startsWith(streamed) && final.length > streamed.length)
@@ -16763,7 +16767,7 @@ ${JSON.stringify(input.context)}
       return {
         status: input.signal?.aborted ? "cancelled" : "failed",
         error: input.signal?.aborted ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
-        usage: unavailableUsage(),
+        usage,
         events
       };
     } finally {
@@ -16846,6 +16850,18 @@ function stringAt(value, ...keys) {
 function finalCodexText(turn) {
   const items = Array.isArray(turn.items) ? turn.items : [];
   return items.filter((item) => asObject(item).type === "agentMessage" || asObject(item).type === "agent_message").map((item) => asObject(item).text).filter((text) => typeof text === "string").at(-1);
+}
+function codexAppServerUsage(tokenUsage) {
+  const total = asObject(asObject(tokenUsage).total);
+  const values = [total.inputTokens, total.outputTokens, total.totalTokens];
+  if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0))
+    return;
+  return {
+    inputTokens: { value: total.inputTokens, quality: "observed", source: "codex" },
+    outputTokens: { value: total.outputTokens, quality: "observed", source: "codex" },
+    totalTokens: { value: total.totalTokens, quality: "observed", source: "codex" },
+    cost: { value: null, quality: "unavailable" }
+  };
 }
 class CodexHarnessAdapter {
   harness;
@@ -37278,15 +37294,18 @@ function emitPiEvent(event, emit) {
   const at = new Date().toISOString();
   const update = event.assistantMessageEvent;
   if (event.type === "message_update" && isRecord3(update) && update.type === "text_delta") {
-    if (typeof update.delta === "string")
+    if (typeof update.delta === "string" && update.delta)
       emit({ type: "text", at, data: update.delta });
   } else if (event.type === "message_update" && isRecord3(update) && update.type === "thinking_delta") {
+    if (typeof update.delta !== "string" || !update.delta)
+      return;
     emit({
       type: "log",
       at,
       data: {
         status: "Thinking",
-        ...typeof update.delta === "string" ? { text: update.delta, channel: "thinking" } : {}
+        text: update.delta,
+        channel: "thinking"
       }
     });
   } else if (event.type.includes("tool")) {
@@ -37309,7 +37328,26 @@ function emitPiEvent(event, emit) {
       }
     });
   } else {
-    emit({ type: "log", at, data: { status: "Thinking" } });
+    const statuses = {
+      agent_start: "Working",
+      compaction_start: "Compacting context",
+      compaction_end: "Context compaction finished",
+      auto_retry_start: "Retrying model request",
+      auto_retry_end: "Model request retry finished"
+    };
+    const status = statuses[event.type];
+    if (!status)
+      return;
+    const detail = event.errorMessage ?? event.finalError;
+    emit({
+      type: "log",
+      at,
+      data: {
+        status,
+        ...typeof detail === "string" && detail ? { detail } : {},
+        ...typeof event.attempt === "number" ? { attempt: event.attempt } : {}
+      }
+    });
   }
 }
 function assistantText(message) {

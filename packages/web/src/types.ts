@@ -1,4 +1,5 @@
 import { approvalRepairsRemaining } from "@kouro/core";
+import { isEmptyThinkingStatus } from "./session";
 import type {
   ArtifactRef,
   Bundle,
@@ -196,6 +197,33 @@ export interface UsageView {
   detail?: string;
   invocationId?: string;
   attemptId?: string;
+}
+export function usageViewFrom(value: unknown): UsageView {
+  const u = record(value) ?? {};
+  const usageValue = (value: unknown) => number(record(value)?.value ?? value);
+  const qualities = [u.inputTokens, u.outputTokens, u.totalTokens]
+    .map((value) => text(record(value)?.quality))
+    .filter(Boolean);
+  const observed = qualities.filter((value) => value === "observed").length;
+  return {
+    inputTokens: usageValue(u.inputTokens),
+    outputTokens: usageValue(u.outputTokens),
+    totalTokens: usageValue(u.totalTokens),
+    estimated: qualities.includes("estimated") || u.estimated === true,
+    cost: usageValue(u.cost),
+    currency: text(u.currency),
+    completeness:
+      u.completeness === "complete" ||
+      u.completeness === "partial" ||
+      u.completeness === "unavailable"
+        ? u.completeness
+        : observed === 3
+          ? "complete"
+          : observed > 0
+            ? "partial"
+            : "unavailable",
+    detail: text(u.detail),
+  };
 }
 export interface RunCapabilities {
   cancel?: boolean;
@@ -400,6 +428,7 @@ export function viewFromCore(view: CoreRunView): UiRunView {
     for (const event of events) {
       const kind = text(event.type ?? event.kind) ?? "log";
       const data = record(event.data) ?? event;
+      if (isEmptyThinkingStatus({ type: kind, data })) continue;
       if (kind === "tool" || kind === "tool_call" || kind === "tool_result") {
         const id = `${attempt.id}:${text(data.scoutId) ?? "parent"}:${text(data.requestId) ? `${text(data.requestId)}:` : ""}${text(data.id) ?? `tool:${tools.length}`}`;
         const previous = tools.find((tool) => tool.id === id);
@@ -440,30 +469,8 @@ export function viewFromCore(view: CoreRunView): UiRunView {
     }
     if (a.usage !== undefined) {
       declaredAttemptUsage = true;
-      const u = record(a.usage) ?? {};
-      const usageValue = (value: unknown) => number(record(value)?.value ?? value);
-      const qualities = [u.inputTokens, u.outputTokens, u.totalTokens]
-        .map((value) => text(record(value)?.quality))
-        .filter(Boolean);
-      const observed = qualities.filter((value) => value === "observed").length;
       usage.push({
-        inputTokens: usageValue(u.inputTokens),
-        outputTokens: usageValue(u.outputTokens),
-        totalTokens: usageValue(u.totalTokens),
-        estimated: qualities.includes("estimated") || u.estimated === true,
-        cost: usageValue(u.cost),
-        currency: text(u.currency),
-        completeness:
-          u.completeness === "complete" ||
-          u.completeness === "partial" ||
-          u.completeness === "unavailable"
-            ? u.completeness
-            : observed === 3
-              ? "complete"
-              : observed > 0
-                ? "partial"
-                : "unavailable",
-        detail: text(u.detail),
+        ...usageViewFrom(a.usage),
         invocationId: attempt.invocationId,
         attemptId: attempt.id,
       });

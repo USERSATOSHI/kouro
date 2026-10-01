@@ -46,6 +46,53 @@ const view = (revision = 0): RunView => ({
 });
 
 describe("run projection sync", () => {
+  test("projects parent usage live and after reconnect without replacing it with child counters", () => {
+    const store = new RunSyncStore();
+    const initial = view();
+    store.replace(initial);
+    const counters = {
+      inputTokens: { value: 400, quality: "observed" },
+      outputTokens: { value: 60, quality: "observed" },
+      totalTokens: { value: 460, quality: "observed" },
+      cost: { value: null, quality: "unavailable" },
+    };
+    const activity: JsonValue[] = [
+      { type: "usage", data: counters },
+      {
+        type: "usage",
+        data: { ...counters, scoutId: "child", totalTokens: { value: 9999, quality: "observed" } },
+      },
+      { type: "usage", data: { quality: "unavailable" } },
+    ];
+    activity.forEach((event, index) =>
+      store.apply({
+        projectionVersion: 1,
+        runId: initial.runId,
+        baseRevision: index,
+        revision: index + 1,
+        eventCursor: index + 1,
+        state: view(index + 1).state,
+        activity: { attemptId: "a", event },
+      }),
+    );
+    expect(store.getSnapshot()?.usage).toEqual([
+      expect.objectContaining({
+        inputTokens: 400,
+        outputTokens: 60,
+        totalTokens: 460,
+        completeness: "complete",
+        cost: undefined,
+        attemptId: "a",
+      }),
+    ]);
+    store.replace({
+      ...view(3),
+      m2: {
+        activity: activity.map((event, index) => ({ attemptId: "a", cursor: index + 1, event })),
+      },
+    } as RunView);
+    expect(store.getSnapshot()?.usage[0]?.totalTokens).toBe(460);
+  });
   test("applies a contiguous frame and ignores duplicates", () => {
     const store = new RunSyncStore();
     store.replace(view());

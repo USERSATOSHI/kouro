@@ -109,6 +109,16 @@ if (live) {
       rawOutput: result.rawOutput?.slice(-2000),
       toolsCalled: called,
     }).toMatchObject({ status: "succeeded" });
+    if (live === "codex") {
+      expect(
+        (result.usage as { totalTokens: { value: number } }).totalTokens.value,
+      ).toBeGreaterThan(0);
+      expect(result.usage).toMatchObject({
+        inputTokens: { value: expect.any(Number), quality: "observed" },
+        outputTokens: { value: expect.any(Number), quality: "observed" },
+        totalTokens: { value: expect.any(Number), quality: "observed" },
+      });
+    }
     expect(requestIds).toEqual(["live-1"]);
     expect({ called, stderr: result.stderr, output: result.output }).toEqual({
       called: ["riskReviewer"],
@@ -210,6 +220,11 @@ if (live === "codex" || live === "pi") {
         (item) => item.status === "succeeded",
       )!;
       const ref = attempt.output[0]!;
+      if (live === "codex") {
+        const persistedUsage = attempt.usage as { totalTokens: { value: number; quality: string } };
+        expect(persistedUsage.totalTokens.value).toBeGreaterThan(0);
+        expect(persistedUsage.totalTokens.quality).toBe("observed");
+      }
       expect(
         JSON.parse(new TextDecoder().decode(service.coordinator.journal.blobs.read(ref))),
       ).toEqual({ summary: marker });

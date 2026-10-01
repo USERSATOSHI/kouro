@@ -111,7 +111,10 @@ export class BrowserSessionHarness implements HarnessAdapter {
       };
     }
     if (input.role === "web-session-reviewer") {
-      emit("log", { status: "Thinking", channel: "thinking", text: "Reviewing the fixture" });
+      for (let index = 0; index < 30; index++) emit("log", { status: "Thinking" });
+      emit("log", { status: "Thinking", channel: "thinking", text: "Reviewing" });
+      for (let index = 0; index < 30; index++) emit("log", { status: "Thinking" });
+      emit("log", { status: "Thinking", channel: "thinking", text: " the fixture" });
       emit("tool", { id: "shared-tool", name: "Read", status: "started", input: "child.ts" });
       emit("text", "Child session marker\n");
       const task =

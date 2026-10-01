@@ -2,6 +2,85 @@ import { describe, expect, test } from "bun:test";
 import { projectSession } from "./session";
 
 describe("agent session projection", () => {
+  test("old empty Thinking logs do not split real child thinking, replies, or hide tool results", () => {
+    const entries = projectSession([
+      ...Array.from({ length: 100 }, (_, index) => ({
+        attemptId: "a",
+        cursor: index,
+        event: {
+          type: "log",
+          data: { status: "Thinking", scoutId: "repositoryScout", requestId: "repo-1" },
+        },
+      })),
+      {
+        attemptId: "a",
+        cursor: 101,
+        event: {
+          type: "log",
+          data: {
+            channel: "thinking",
+            text: "Inspect",
+            scoutId: "repositoryScout",
+            requestId: "repo-1",
+          },
+        },
+      },
+      {
+        attemptId: "a",
+        cursor: 102,
+        event: {
+          type: "log",
+          data: { status: "Thinking", scoutId: "repositoryScout", requestId: "repo-1" },
+        },
+      },
+      {
+        attemptId: "a",
+        cursor: 103,
+        event: {
+          type: "log",
+          data: {
+            channel: "thinking",
+            text: " README",
+            scoutId: "repositoryScout",
+            requestId: "repo-1",
+          },
+        },
+      },
+      {
+        attemptId: "a",
+        cursor: 104,
+        event: {
+          type: "tool",
+          data: {
+            id: "read",
+            name: "read",
+            scoutId: "repositoryScout",
+            requestId: "repo-1",
+            status: "completed",
+            output: "file contents",
+          },
+        },
+      },
+      {
+        attemptId: "a",
+        cursor: 105,
+        event: { type: "log", data: { status: "Thinking", detail: "Model is reconnecting" } },
+      },
+    ]);
+    expect(entries).toHaveLength(3);
+    expect(entries[0]).toMatchObject({
+      channel: "thinking",
+      text: "Inspect README",
+      scoutId: "repositoryScout",
+      requestId: "repo-1",
+    });
+    expect(entries[1]).toMatchObject({
+      kind: "tool",
+      output: "file contents",
+      status: "completed",
+    });
+    expect(entries[2]).toMatchObject({ kind: "status", message: "Thinking" });
+  });
   test("groups streamed text and ignores the same observation when replayed", () => {
     const entries = projectSession([
       { attemptId: "attempt-a", cursor: 4, event: { type: "text", data: "Hello " } },

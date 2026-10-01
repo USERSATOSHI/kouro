@@ -386,6 +386,7 @@ export class CodexAppServerHarness {
   async run(input: CodexRunInput): Promise<HarnessResult> {
     const transport = new CodexAppServerTransport(input.cwd);
     const events: HarnessEvent[] = [];
+    let usage = unavailableUsage();
     const emit = (event: HarnessEvent) => {
       events.push(event);
       input.onEvent?.(event);
@@ -435,6 +436,7 @@ export class CodexAppServerHarness {
         ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
         : input.role.prompt;
       let streamed = "";
+      let activeTurnId: string | undefined;
       const thinkingItems = new Set<string>();
       let completed:
         | ((result: { ok: boolean; value?: unknown; error?: string }) => void)
@@ -444,7 +446,22 @@ export class CodexAppServerHarness {
       });
       const unsubscribe = transport.subscribe((message) => {
         const params = asObject(message.params);
-        if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
+        if (message.method === "thread/tokenUsage/updated") {
+          if (params.threadId !== threadId || (activeTurnId && params.turnId !== activeTurnId))
+            return;
+          const observed = codexAppServerUsage(params.tokenUsage);
+          if (observed) {
+            usage = observed;
+            emit({
+              type: "usage",
+              at: new Date().toISOString(),
+              data: observed as unknown as JsonValue,
+            });
+          }
+        } else if (
+          message.method === "item/agentMessage/delta" &&
+          typeof params.delta === "string"
+        ) {
           streamed += params.delta;
           emit({ type: "text", at: new Date().toISOString(), data: params.delta });
         } else if (
@@ -601,6 +618,7 @@ export class CodexAppServerHarness {
       if (!started.ok) throw new Error(started.error);
       const turnId = stringAt(started.value, "turn", "id") ?? stringAt(started.value, "id");
       if (!turnId) throw new Error("Codex App Server returned no turn ID");
+      activeTurnId = turnId;
       this.active.set(input.attemptId, { transport, threadId, turnId });
       emit({
         type: "log",
@@ -630,7 +648,7 @@ export class CodexAppServerHarness {
         return {
           status: input.signal?.aborted ? "cancelled" : "failed",
           error: result.error,
-          usage: unavailableUsage(),
+          usage,
           events,
         };
       const turn = asObject(result.value);
@@ -639,7 +657,7 @@ export class CodexAppServerHarness {
         return {
           status: "failed",
           error: "Codex turn has no final agent message",
-          usage: unavailableUsage(),
+          usage,
           events,
         };
       const output: JsonValue = parseStructuredOutput(final);
@@ -650,25 +668,10 @@ export class CodexAppServerHarness {
             status: "failed",
             error: `invalid-output: ${validation.error}`,
             rawOutput: final,
-            usage: unavailableUsage(),
+            usage,
             events,
           };
       }
-      const tokens = asObject(turn.tokens);
-      const usage = (
-        typeof tokens.input === "number" && typeof tokens.output === "number"
-          ? {
-              inputTokens: { value: tokens.input, quality: "observed", source: "codex" },
-              outputTokens: { value: tokens.output, quality: "observed", source: "codex" },
-              totalTokens: {
-                value: tokens.input + tokens.output,
-                quality: "observed",
-                source: "codex",
-              },
-              cost: { value: null, quality: "unavailable" },
-            }
-          : unavailableUsage()
-      ) as HarnessResult["usage"];
       if (!streamed) emit({ type: "text", at: new Date().toISOString(), data: final });
       else if (final.startsWith(streamed) && final.length > streamed.length)
         emit({ type: "text", at: new Date().toISOString(), data: final.slice(streamed.length) });
@@ -681,7 +684,7 @@ export class CodexAppServerHarness {
           : cause instanceof Error
             ? cause.message
             : String(cause),
-        usage: unavailableUsage(),
+        usage,
         events,
       };
     } finally {
@@ -797,6 +800,23 @@ function consumeCodexEvent(
   } else if (event.type === "turn.completed") {
     onUsage(event.usage);
   }
+}
+
+/** App Server reports thread counters separately from the completed Turn payload.
+ * Each Kouro invocation starts a fresh thread, so total includes all its model
+ * calls (including tool continuations), whereas last covers only the last call.
+ */
+export function codexAppServerUsage(tokenUsage: unknown): HarnessResult["usage"] | undefined {
+  const total = asObject(asObject(tokenUsage).total);
+  const values = [total.inputTokens, total.outputTokens, total.totalTokens];
+  if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0))
+    return undefined;
+  return {
+    inputTokens: { value: total.inputTokens as number, quality: "observed", source: "codex" },
+    outputTokens: { value: total.outputTokens as number, quality: "observed", source: "codex" },
+    totalTokens: { value: total.totalTokens as number, quality: "observed", source: "codex" },
+    cost: { value: null, quality: "unavailable" },
+  };
 }
 
 function codexUsage(

@@ -444,23 +444,26 @@ function createSubagentTool(
   });
 }
 
-function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void): void {
+export function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void): void {
   if (!isRecord(event) || typeof event.type !== "string") return;
   const at = new Date().toISOString();
   const update = event.assistantMessageEvent;
   if (event.type === "message_update" && isRecord(update) && update.type === "text_delta") {
-    if (typeof update.delta === "string") emit({ type: "text", at, data: update.delta });
+    if (typeof update.delta === "string" && update.delta)
+      emit({ type: "text", at, data: update.delta });
   } else if (
     event.type === "message_update" &&
     isRecord(update) &&
     update.type === "thinking_delta"
   ) {
+    if (typeof update.delta !== "string" || !update.delta) return;
     emit({
       type: "log",
       at,
       data: {
         status: "Thinking",
-        ...(typeof update.delta === "string" ? { text: update.delta, channel: "thinking" } : {}),
+        text: update.delta,
+        channel: "thinking",
       },
     });
   } else if (event.type.includes("tool")) {
@@ -502,7 +505,27 @@ function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void): void 
       } as unknown as JsonValue,
     });
   } else {
-    emit({ type: "log", at, data: { status: "Thinking" } });
+    // Message/tool-argument start, delta and end notifications are bookkeeping,
+    // not thinking content. Only publish meaningful lifecycle observations.
+    const statuses: Record<string, string> = {
+      agent_start: "Working",
+      compaction_start: "Compacting context",
+      compaction_end: "Context compaction finished",
+      auto_retry_start: "Retrying model request",
+      auto_retry_end: "Model request retry finished",
+    };
+    const status = statuses[event.type];
+    if (!status) return;
+    const detail = event.errorMessage ?? event.finalError;
+    emit({
+      type: "log",
+      at,
+      data: {
+        status,
+        ...(typeof detail === "string" && detail ? { detail } : {}),
+        ...(typeof event.attempt === "number" ? { attempt: event.attempt } : {}),
+      },
+    });
   }
 }
 

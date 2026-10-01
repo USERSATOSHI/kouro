@@ -97,6 +97,44 @@ the corresponding portable source and distribution updates are tracked. A
 running host caches its template catalog and must restart to load these edits;
 already-created runs retain their pinned bundles.
 
+## Activity and usage regression follow-up — 2026-10-02
+
+A real Chore session exposed repeated empty `Thinking` rows and missing Codex
+token counts despite completed parent/child execution. Pi's event normalizer
+was turning SDK bookkeeping and tool-argument notifications into generic thinking
+logs. It now publishes actual thinking text and meaningful lifecycle events only.
+The session, output and log projections also filter old empty thinking records
+without removing recorded thinking content or error details.
+
+The Codex App Server adapter read a nonexistent `turn.tokens` field. It now captures
+the installed protocol's `thread/tokenUsage/updated` counters, scoped to the active
+thread/turn, and retains observed usage on success or failure. Thread totals include
+tool continuations. The browser projects usage while the attempt is running and
+does not substitute attributed child usage for the parent's counters. Cost remains
+unavailable when the provider does not report it. Counts never recorded by an older
+host cannot be backfilled from these changes.
+
+Verification for this follow-up:
+
+- `bun test packages scripts`: **198 passing tests**, zero failures. Includes Pi
+  bookkeeping filtering, retained-history thinking content, reported Codex totals,
+  and live/reconnected parent usage isolation. Two localhost fixtures initially
+  failed under the restricted sandbox; the complete rerun with localhost access passed.
+- `KOURO_TEST_PORT=43284 bun run test:browser tests/browser/sessions.spec.ts`:
+  **9 passing browser tests**, including empty-row filtering, meaningful thinking,
+  readable tools, split panes, scoped interruption/retry and durable reload.
+- `KOURO_LIVE_SUBAGENT_HARNESS=codex KOURO_LIVE_SUBAGENT_MODEL=gpt-6-luna bun test packages/host/test/live-subagent.test.ts`:
+  **2 passing native tests**, including observed positive token counters in the
+  returned result and durable coordinator attempt.
+- `KOURO_TEST_PORT=43285 KOURO_LIVE_BROWSER_MODEL=gpt-6-luna bun run test:browser:native --grep 'parent and child are visible'`:
+  **1 passing native browser test**. Actual parent/child results and observed token
+  counts are rendered, and counts remain visible after reload.
+- Typecheck, lint, formatting, `git diff --check` and the CLI build pass. The rebuilt
+  distribution contains these fixes. The existing web chunk-size warning remains.
+
+These checks cover the reported regressions, not a new complete v1 parity or
+production sign-off. The active operator host was not restarted.
+
 ## Remaining release gates and v1 gaps
 
 1. **Provider configuration:** this machine's configured Codex default `gpt-6.1-sol` was rejected by its ChatGPT account. Explicit `gpt-6-luna` parent/child settings completed native tests. Parent and child model controls are now exposed separately. For Pi on the user's local server, select `llama.cpp/qwen36-35b-a3b-256k-vision-mtp` on each intended node while that model is loaded; the saved Pi default names an unloaded model. Claude needs login. No account/configuration file was changed and no silent model fallback was added. A client model catalog alone does not prove successful inference.
