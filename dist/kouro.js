@@ -356,6 +356,7 @@ class WorkflowBuilder {
       executable: options.executable,
       ...options.executionMode ? { executionMode: options.executionMode } : {},
       ...options.capabilities === undefined ? {} : { capabilities: [...new Set(options.capabilities)].sort() },
+      ...options.workspaceAccess === undefined ? {} : { workspaceAccess: options.workspaceAccess },
       args: [...options.args ?? []],
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), true)),
       outputPorts: [output],
@@ -392,16 +393,25 @@ class WorkflowBuilder {
     return this.handle(id, undefined);
   }
   approval(id, options = {}) {
+    const output = defaultOutput(id, undefined, {
+      type: "object",
+      required: ["decision", "feedback"],
+      additionalProperties: false,
+      properties: {
+        decision: { type: "string", enum: ["approved", "rejected", "changes-requested"] },
+        feedback: { type: "string" }
+      }
+    });
     const node = {
       id,
       kind: "approval",
       action: options.action ?? id,
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), false)),
-      outputPorts: [],
+      outputPorts: [output],
       bindings: bindings(options.input, this)
     };
     this.addNode(node);
-    return this.handle(id, undefined);
+    return this.handle(id, output);
   }
   call(id, child, options = {}) {
     const childSource = child.build();
@@ -670,6 +680,14 @@ class WorkflowBuilder {
       throw new Error(`Unknown source node ${sourceNodeId}`);
     if (!this.nodeMap.has(target.id))
       throw new Error(`Unknown target node ${target.id}`);
+    for (const [name, value] of Object.entries(options.feedbackBindings ?? {})) {
+      const targetNode = this.nodeMap.get(target.id);
+      if (!targetNode.inputPorts.some((input) => input.name === name))
+        this.nodeMap.set(target.id, {
+          ...targetNode,
+          inputPorts: [...targetNode.inputPorts, port(name, this.schemaOf(value), false)]
+        });
+    }
     const edge = {
       id: options.id ?? `${sourceNodeId}:${outcome}:${target.id}:${this.edgeList.length}`,
       sourceNodeId,
@@ -788,6 +806,7 @@ function stripInternal(node) {
       executable: node.executable,
       ...node.executionMode === undefined ? {} : { executionMode: node.executionMode },
       ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
+      ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
       args: node.args,
       timeoutMs: node.timeoutMs,
       acceptedExitCodes: node.acceptedExitCodes
@@ -836,6 +855,7 @@ var init_builder = __esm(() => {
     type: "object",
     properties: {
       exitCode: { type: ["integer", "null"] },
+      stdout: { type: "string" },
       executionMode: { enum: ["enforced", "trusted-unrestricted"] },
       signal: { type: ["string", "null"] },
       timeout: { type: ["boolean", "null"] },
@@ -846,6 +866,7 @@ var init_builder = __esm(() => {
     },
     required: [
       "exitCode",
+      "stdout",
       "signal",
       "timeout",
       "spawnError",
@@ -1074,7 +1095,7 @@ async function compileWorkflowDetailed(source) {
       diagnostics.push(error("INVALID_GUARD", "Guard is not a supported deterministic expression", edge.id));
       diagnostics.push(error("UNSUPPORTED_EDGE_FEATURE", "This guard is not supported by the current compiler", edge.id));
     }
-    const allowedOutcomes = sourceNode?.kind === "approval" ? ["approved", "rejected"] : ["success", "failure"];
+    const allowedOutcomes = sourceNode?.kind === "approval" ? ["approved", "rejected", "changes-requested"] : ["success", "failure"];
     if (sourceNode?.kind && !allowedOutcomes.includes(edge.outcome)) {
       diagnostics.push(error("UNSUPPORTED_OUTCOME", `Outcome ${edge.outcome} is not supported in M1`, edge.id));
     }
@@ -1575,7 +1596,7 @@ function reduceEvent(state, event) {
   if (!Number.isSafeInteger(event.sequence) || event.sequence !== state.revision + 1) {
     throw new Error(`Event sequence ${event.sequence} must equal revision + 1 (${state.revision + 1})`);
   }
-  if (["succeeded", "failed", "cancelled", "interrupted"].includes(state.status)) {
+  if (["succeeded", "failed", "cancelled", "interrupted"].includes(state.status) && !(["failed", "interrupted"].includes(state.status) && event.type === "run.retried")) {
     throw new Error(`Cannot apply ${event.type} after terminal run status ${state.status}`);
   }
   const next = {
@@ -1584,6 +1605,8 @@ function reduceEvent(state, event) {
     eventCursor: event.sequence
   };
   switch (event.type) {
+    case "harness.activity":
+      return next;
     case "run.started":
       return runStarted(next, event);
     case "scope.created":
@@ -1653,6 +1676,8 @@ function reduceEvent(state, event) {
       return attemptReserved(next, event);
     case "attempt.started":
       return attemptStarted(next, event);
+    case "attempt.cancelled":
+      return attemptCancelled(next, event);
     case "attempt.completed":
       return attemptCompleted(next, event);
     case "invocation.completed":
@@ -1686,22 +1711,63 @@ function reduceEvent(state, event) {
     case "run.detached":
       return next;
     case "run.retried": {
+      if (next.status === "interrupted" && next.control !== "interrupt-requested")
+        throw new Error("Interrupted recovery requires a recorded interrupt request");
+      if (!["running", "failed", "interrupted"].includes(next.status) || (next.control ?? "none") !== "none" && !(next.status === "interrupted" && next.control === "interrupt-requested"))
+        throw new Error("Only a failed run without a pending control can be retried");
       const invocation = next.invocations[event.payload.invocationId];
       if (!invocation || invocation.status !== "failed")
         throw new Error("Only a failed terminal invocation can be retried");
       const source = next.attempts[event.payload.sourceAttemptId];
-      if (!source || source.invocationId !== invocation.id || source.status !== "failed")
+      if (!source || source.invocationId !== invocation.id || !["failed", "cancelled"].includes(source.status))
         throw new Error("Retry source attempt is not failed");
       if (next.attempts[event.payload.attemptId])
         throw new Error("Retry attempt already exists");
       return {
         ...next,
-        invocations: { ...next.invocations, [invocation.id]: { ...invocation, status: "running" } }
+        status: "running",
+        control: "none",
+        finishedAt: null,
+        scopes: {
+          ...next.scopes,
+          [next.rootScopeId]: { ...next.scopes[next.rootScopeId], status: "running" }
+        },
+        invocations: {
+          ...next.invocations,
+          [invocation.id]: {
+            ...invocation,
+            status: "running",
+            completedAt: null,
+            outcome: null,
+            error: undefined,
+            output: [],
+            evidence: [],
+            artifacts: []
+          }
+        }
       };
     }
     default:
       return assertNever(event);
   }
+}
+function approvalRepairsRemaining(bundle, state, invocationId) {
+  const invocation = state.invocations[invocationId];
+  const definition = invocation && bundle.definitions[state.scopes[invocation.scopeId]?.definitionId ?? ""];
+  if (!invocation || !definition || invocation.status !== "pending" || !definition.nodes.some((node) => node.id === invocation.nodeId && node.kind === "approval"))
+    return 0;
+  const routes = definition.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === "changes-requested");
+  if (!routes.some((edge) => edge.default))
+    return 0;
+  const bounded = routes.filter((edge) => {
+    const guard = edge.guard;
+    return guard?.kind === "counter-below-limit" && guard.counterId === edge.counterIncrement && edge.feedbackBindings?.some((binding) => binding.source.kind === "producer" && binding.source.sourceId === invocation.nodeId);
+  });
+  if (bounded.length !== 1)
+    return 0;
+  const route = bounded[0];
+  const max = definition.counters.find((counter) => counter.id === route.counterIncrement)?.max ?? 0;
+  return Math.max(0, max - (state.counters[`${invocation.scopeId}:${route.counterIncrement}`] ?? 0));
 }
 function approvalRequested(state, event) {
   const p = event.payload;
@@ -1744,7 +1810,8 @@ function approvalDecided(state, event) {
         ...approval,
         status: p.decision,
         actor: event.actor,
-        decidedAt: event.recordedAt
+        decidedAt: event.recordedAt,
+        ...p.feedback ? { feedback: p.feedback } : {}
       }
     },
     invocations: {
@@ -1753,7 +1820,8 @@ function approvalDecided(state, event) {
         ...invocation,
         status,
         completedAt: event.recordedAt,
-        outcome: p.decision
+        outcome: p.decision,
+        output: p.output ?? []
       }
     }
   };
@@ -1821,7 +1889,7 @@ function attemptReserved(state, event) {
     throw new Error(`Attempt ${payload.attemptId} already exists`);
   const priorAttempts = Object.values(state.attempts).filter((item) => item.invocationId === invocation.id);
   const latest = [...priorAttempts].sort((left, right) => right.ordinal - left.ordinal)[0];
-  const retrying = invocation.status === "running" && latest?.status === "failed";
+  const retrying = invocation.status === "running" && latest !== undefined && ["failed", "cancelled"].includes(latest.status);
   if (invocation.status !== "pending" && !retrying)
     throw new Error(`Invocation ${invocation.id} is not reservable from ${invocation.status}`);
   const attempt = {
@@ -1862,6 +1930,20 @@ function attemptStarted(state, event) {
       [invocation.id]: { ...invocation, status: "running", startedAt: event.recordedAt }
     }
   };
+}
+function attemptCancelled(state, event) {
+  const attempt = state.attempts[event.payload.attemptId];
+  if (!attempt)
+    throw new Error(`Cannot cancel unknown attempt ${event.payload.attemptId}`);
+  if (attempt.status !== "reserved")
+    throw new Error(`Attempt ${attempt.id} is not cancellable from ${attempt.status}`);
+  const cancelled = {
+    ...attempt,
+    status: "cancelled",
+    finishedAt: event.recordedAt,
+    error: event.payload.reason
+  };
+  return { ...state, attempts: { ...state.attempts, [attempt.id]: cancelled } };
 }
 function attemptCompleted(state, event) {
   const payload = event.payload;
@@ -1911,7 +1993,7 @@ function invocationCompleted(state, event) {
     throw new Error(`Invocation ${invocation.id} cannot complete while its attempts are active`);
   }
   const latest = [...attempts].sort((left, right) => right.ordinal - left.ordinal)[0];
-  if (latest && latest.status !== payload.status) {
+  if (latest && latest.status !== payload.status && !(payload.outcome === "cancelled" && latest.status === "cancelled" && payload.status === "failed")) {
     throw new Error(`Invocation ${invocation.id} status ${payload.status} does not match latest attempt ${latest.status}`);
   }
   if (invocation.startedAt && compareTime(event.recordedAt, invocation.startedAt) < 0) {
@@ -1937,8 +2019,8 @@ function runCompleted(state, event) {
   if (invocations.length === 0 || invocations.some((invocation) => !["succeeded", "failed", "recovery-required"].includes(invocation.status))) {
     throw new Error("Run cannot complete while invocations are absent or active");
   }
-  if (event.payload.status === "succeeded" && invocations.some((invocation) => invocation.status !== "succeeded")) {
-    throw new Error("Run cannot succeed with a non-succeeded invocation");
+  if (event.payload.status === "succeeded" && invocations.some((invocation) => invocation.status !== "succeeded" && !(invocation.status === "failed" && invocations.some((next) => next.sourceInvocationId === invocation.id && next.sourceEdgeId)))) {
+    throw new Error("Run cannot succeed with an unhandled failed invocation");
   }
   if (state.startedAt && compareTime(event.recordedAt, state.startedAt) < 0)
     throw new Error("Run completed before it started");
@@ -2192,6 +2274,8 @@ function decide(bundle, state) {
         continue;
       }
       const outgoing = scopeDefinition.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === (invocation.outcome ?? "success"));
+      if (Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && outgoing.some((edge) => edge.id === candidate.sourceEdgeId)))
+        continue;
       for (const edge of selectEdges(outgoing, state, invocation.scopeId, bundle)) {
         const targetNode = scopeDefinition.nodes.find((candidate) => candidate.id === edge.targetNodeId);
         if (targetNode?.kind === "join")
@@ -2217,7 +2301,9 @@ function decide(bundle, state) {
       continue;
     }
     if (invocation.status === "failed") {
-      const outgoing = scopeDefinition.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === "failure");
+      const outgoing = scopeDefinition.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === (invocation.outcome ?? "failure"));
+      if (Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && outgoing.some((edge) => edge.id === candidate.sourceEdgeId)))
+        continue;
       const owningFork = scopeDefinition.nodes.find((candidate) => candidate.kind === "fork" && candidate.branchIds.includes(invocation.nodeId));
       if (outgoing.length === 0) {
         if (owningFork)
@@ -2338,7 +2424,8 @@ function guardAllows(guard, state, scopeId, bundle) {
     return false;
   const definition = value.counterId;
   const current = state.counters[`${scopeId}:${definition}`] ?? 0;
-  const max = bundle.definitions[bundle.rootDefinitionId]?.counters.find((counter) => counter.id === definition)?.max;
+  const scopeDefinitionId = state.scopes[scopeId]?.definitionId ?? bundle.rootDefinitionId;
+  const max = (bundle.definitions[scopeDefinitionId] ?? bundle.definitions[bundle.rootDefinitionId])?.counters.find((counter) => counter.id === definition)?.max;
   return max === undefined ? false : current < max;
 }
 function selectEdges(edges, state, scopeId, bundle) {
@@ -10111,6 +10198,7 @@ __export(exports_src, {
   assertNoEscalation: () => assertNoEscalation,
   assertMessageTarget: () => assertMessageTarget,
   artifactType: () => artifactType,
+  approvalRepairsRemaining: () => approvalRepairsRemaining,
   WorkflowBuilder: () => WorkflowBuilder,
   PROJECTION_VERSION: () => PROJECTION_VERSION,
   NodeHandle: () => NodeHandle,
@@ -10125,7 +10213,7 @@ __export(exports_src, {
 function createLifecycleEvent(type, values, payload) {
   return { ...values, schemaVersion: 1, type, payload };
 }
-function createProjectionFrame(previous, next) {
+function createProjectionFrame(previous, next, activity) {
   if (previous.runId !== next.runId)
     throw new Error("Projection frame states must belong to one run");
   return {
@@ -10134,7 +10222,8 @@ function createProjectionFrame(previous, next) {
     baseRevision: previous.revision,
     revision: next.revision,
     eventCursor: next.eventCursor,
-    state: next
+    state: next,
+    ...activity ? { activity } : {}
   };
 }
 function createRunView(bundle, state, serverClock) {
@@ -15913,7 +16002,8 @@ init_src();
 
 // packages/host/src/coordinator/coordinator.ts
 init_src();
-import { mkdirSync as mkdirSync5 } from "fs";
+import { mkdirSync as mkdirSync6 } from "fs";
+import { createHash as createHash4 } from "crypto";
 import { join as join4 } from "path";
 
 // packages/host/src/id.ts
@@ -16113,54 +16203,243 @@ function wait(delayMs, signal) {
   });
 }
 
+// packages/host/src/adapters/harness/tracking.ts
+class TrackingHarnessDecorator {
+  inner;
+  track;
+  normalize;
+  id;
+  adapterVersion;
+  steer;
+  canSteer;
+  probe;
+  reconnect;
+  terminate;
+  constructor(inner, track, normalize) {
+    this.inner = inner;
+    this.track = track;
+    this.normalize = normalize;
+    this.id = inner.id;
+    this.adapterVersion = inner.adapterVersion;
+    if (inner.steer)
+      this.steer = (input) => inner.steer(input);
+    if (inner.canSteer)
+      this.canSteer = (input) => inner.canSteer(input);
+    if (inner.probe)
+      this.probe = (input) => inner.probe(input);
+    if (inner.reconnect)
+      this.reconnect = (input) => inner.reconnect(input);
+    if (inner.terminate)
+      this.terminate = (input) => inner.terminate(input);
+  }
+  capabilities() {
+    return this.inner.capabilities();
+  }
+  async run(input) {
+    const startedAt = performance.now();
+    const trackedEvents = [];
+    let streamedAny = false;
+    let pendingText = "";
+    let textTimer;
+    const emit = (event) => {
+      event = this.normalize?.(event) ?? event;
+      trackedEvents.push(event);
+      if (trackedEvents.length > 4000)
+        trackedEvents.splice(0, trackedEvents.length - 4000);
+      input.onEvent?.(event);
+      this.track(event);
+    };
+    const flushText = () => {
+      if (textTimer)
+        clearTimeout(textTimer);
+      textTimer = undefined;
+      if (!pendingText)
+        return;
+      const data = pendingText;
+      pendingText = "";
+      emit({ type: "text", at: new Date().toISOString(), data });
+    };
+    emit({ type: "log", at: new Date().toISOString(), data: { status: "Starting" } });
+    try {
+      const result = await this.inner.run({
+        ...input,
+        onEvent: (event) => {
+          streamedAny = true;
+          if (event.type === "text" && typeof event.data === "string") {
+            pendingText += String(event.data);
+            if (!textTimer)
+              textTimer = setTimeout(flushText, 100);
+          } else {
+            flushText();
+            emit(event);
+          }
+        }
+      });
+      flushText();
+      if (!streamedAny)
+        for (const value of result.events) {
+          const event = harnessEvent(value);
+          if (event)
+            emit(event);
+        }
+      emit({
+        type: "usage",
+        at: new Date().toISOString(),
+        data: result.usage
+      });
+      emit({
+        type: "log",
+        at: new Date().toISOString(),
+        data: {
+          status: result.status === "succeeded" ? "Turn completed" : "Turn ended",
+          durationMs: Math.round(performance.now() - startedAt),
+          ...result.error ? { detail: result.error } : {}
+        }
+      });
+      return { ...result, events: trackedEvents };
+    } catch (cause) {
+      flushText();
+      emit({
+        type: "log",
+        at: new Date().toISOString(),
+        data: {
+          status: "Turn failed",
+          durationMs: Math.round(performance.now() - startedAt),
+          detail: cause instanceof Error ? cause.message : String(cause)
+        }
+      });
+      throw cause;
+    } finally {
+      if (textTimer)
+        clearTimeout(textTimer);
+    }
+  }
+}
+function harnessEvent(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return;
+  const event = value;
+  if (event.type !== "text" && event.type !== "log" && event.type !== "tool" && event.type !== "usage" || typeof event.at !== "string" || event.data === undefined)
+    return;
+  return event;
+}
+
+// packages/host/src/adapters/harness/activity-preview.ts
+function activityPreview(value) {
+  let remaining = 32000;
+  const visit = (item, depth) => {
+    if (remaining <= 0 || depth > 5)
+      return "\u2026 full output available in the artifact";
+    if (typeof item === "string") {
+      const limit = Math.min(remaining, 20000);
+      remaining -= Math.min(item.length, limit);
+      return item.length > limit ? `${item.slice(0, limit)}
+\u2026 preview truncated` : item;
+    }
+    if (item === null || typeof item !== "object") {
+      remaining -= 16;
+      return item;
+    }
+    if (Array.isArray(item)) {
+      const result2 = [];
+      for (const child of item.slice(0, 50)) {
+        if (remaining <= 0)
+          break;
+        result2.push(visit(child, depth + 1));
+      }
+      if (result2.length < item.length)
+        result2.push("\u2026 additional items in the full output");
+      return result2;
+    }
+    const result = {};
+    for (const [key, child] of Object.entries(item).slice(0, 40)) {
+      if (remaining <= 0)
+        break;
+      const label = key.length > 512 ? `${key.slice(0, 512)}\u2026` : key;
+      remaining -= label.length;
+      result[label] = visit(child, depth + 1);
+    }
+    return result;
+  };
+  return visit(value, 0);
+}
+
 // packages/host/src/adapters/harness/codex.ts
 init_src();
 import { Codex } from "@openai/codex-sdk";
+import { spawn } from "child_process";
+import { createInterface } from "readline";
+import { fileURLToPath } from "url";
 
-// packages/host/src/adapters/harness/scout-bridge.ts
-import { randomBytes, timingSafeEqual } from "crypto";
-import { createServer } from "http";
-async function startScoutBridge(subagent) {
-  const token = randomBytes(32).toString("hex");
-  const server = createServer(async (request, response) => {
-    const supplied = request.headers.authorization?.replace(/^Bearer /, "") ?? "";
-    const valid = supplied.length === token.length && timingSafeEqual(Buffer.from(supplied), Buffer.from(token));
-    if (!valid || request.method !== "POST" || request.url !== "/subagent") {
-      response.writeHead(404).end();
-      return;
-    }
-    try {
-      let body = "";
-      for await (const chunk of request) {
-        body += chunk.toString();
-        if (Buffer.byteLength(body) > 64 * 1024)
-          throw new Error("subagent request too large");
-      }
-      const parsed = JSON.parse(body);
-      if (typeof parsed.requestId !== "string" || typeof parsed.subagentId !== "string" || !parsed.input || typeof parsed.input !== "object" || Array.isArray(parsed.input))
-        throw new Error("invalid subagent request");
-      const result = await subagent({
-        requestId: parsed.requestId,
-        subagentId: parsed.subagentId,
-        input: parsed.input
-      });
-      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
-    } catch (cause) {
-      response.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) }));
-    }
-  });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string")
-    throw new Error("scout bridge address unavailable");
+// packages/host/src/adapters/harness/codex-activity.ts
+function codexToolEvent(item, started, at) {
+  const failed = item.status === "failed" || item.success === false || Boolean(item.error) || typeof item.exitCode === "number" && item.exitCode !== 0;
+  const output = item.aggregatedOutput ?? item.result ?? item.contentItems ?? item.output ?? item.changes;
+  const input = item.arguments ?? item.command ?? item.query;
+  const error2 = item.error ? typeof item.error === "string" ? item.error : JSON.stringify(item.error) : failed && typeof item.exitCode === "number" ? `Command exited with status ${item.exitCode}` : undefined;
   return {
-    endpoint: `http://127.0.0.1:${address.port}/subagent`,
-    token,
-    close: () => new Promise((resolve) => server.close(() => resolve()))
+    type: "tool",
+    at,
+    data: JSON.parse(JSON.stringify({
+      id: item.id,
+      name: item.tool ?? item.name ?? item.type,
+      status: failed ? "failed" : item.status === "interrupted" ? "cancelled" : started ? "started" : "completed",
+      ...input === undefined ? {} : { input },
+      ...output === undefined ? {} : { output },
+      ...error2 === undefined ? {} : { error: error2 }
+    }))
   };
+}
+
+// packages/host/src/adapters/harness/structured-output.ts
+function parseStructuredOutput(text) {
+  const trimmed = text.trim();
+  const candidates = [
+    trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1]?.trim(),
+    trimmed,
+    firstJsonObject(trimmed)
+  ].filter((value) => Boolean(value));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === "string") {
+        try {
+          return JSON.parse(parsed);
+        } catch {
+          return parsed;
+        }
+      }
+      return parsed;
+    } catch {}
+  }
+  return text;
+}
+function firstJsonObject(value) {
+  const start = value.indexOf("{");
+  if (start < 0)
+    return;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start;index < value.length; index++) {
+    const char = value[index];
+    if (quoted) {
+      if (escaped)
+        escaped = false;
+      else if (char === "\\")
+        escaped = true;
+      else if (char === '"')
+        quoted = false;
+      continue;
+    }
+    if (char === '"')
+      quoted = true;
+    else if (char === "{")
+      depth++;
+    else if (char === "}" && --depth === 0)
+      return value.slice(start, index + 1);
+  }
+  return;
 }
 
 // packages/host/src/adapters/harness/codex.ts
@@ -16175,13 +16454,14 @@ async function inspectCodex() {
   const supported = { state: available ? "supported" : "unsupported" };
   return {
     id: "codex",
-    adapterVersion: "sdk",
+    adapterVersion: "app-server",
     version: "OpenAI Codex TypeScript SDK",
     availability: available ? "available" : "unavailable",
     detail: available ? undefined : `Codex SDK runtime unavailable (${detail})`,
     capabilities: {
       "structured-output": supported,
       cancel: supported,
+      steer: supported,
       resume: { state: "unsupported" },
       reattach: { state: "unsupported" },
       tools: {
@@ -16207,212 +16487,356 @@ async function inspectCodex() {
     }
   };
 }
-
-class CodexSdkHarness {
+class CodexAppServerHarness {
   descriptor;
+  active = new Map;
   constructor(descriptor) {
     this.descriptor = descriptor;
   }
-  async startTurn(request) {
-    const controller = new AbortController;
-    const result = this.run({
-      attemptId: request.attemptId,
-      role: request.role,
-      selection: request.selection,
-      cwd: request.cwd ?? ".",
-      context: request.context,
-      signal: controller.signal
+  canSteer(invocationId) {
+    return this.active.has(invocationId);
+  }
+  async steer(invocationId, message) {
+    const active = this.active.get(invocationId);
+    if (!active)
+      throw new Error("steer-unavailable: Codex turn is not active");
+    const result = await active.transport.request("turn/steer", {
+      threadId: active.threadId,
+      expectedTurnId: active.turnId,
+      input: [{ type: "text", text: message }]
     });
-    return {
-      observations: async function* () {
-        for (const event of (await result).events)
-          yield event;
-      }(),
-      cancel: async (reason) => {
-        controller.abort();
-        await result;
-      },
-      close: async () => {
-        await result;
-      }
-    };
+    if (!result.ok)
+      throw new Error(`Codex rejected steering message: ${result.error}`);
   }
   async run(input) {
-    if (this.descriptor.availability !== "available") {
-      return {
-        status: "unavailable",
-        error: this.descriptor.detail,
-        usage: unavailableUsage(),
-        events: []
-      };
-    }
-    const config = input.selection.nativeConfig ?? {};
-    const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
-    const bridge = scoutTool && input.collaboration?.subagent ? await startScoutBridge(input.collaboration.subagent) : undefined;
-    const env = {
-      PATH: process.env.PATH ?? "/usr/bin:/bin",
-      HOME: process.env.HOME ?? "/tmp"
+    const transport = new CodexAppServerTransport(input.cwd);
+    const events = [];
+    const emit = (event) => {
+      events.push(event);
+      input.onEvent?.(event);
     };
-    if (process.env.CODEX_HOME)
-      env.CODEX_HOME = process.env.CODEX_HOME;
-    if (bridge && scoutTool) {
-      env.KOURO_SCOUT_ENDPOINT = bridge.endpoint;
-      env.KOURO_SCOUT_TOKEN = bridge.token;
-      env.KOURO_SCOUT_SCHEMA = JSON.stringify(scoutTool.inputSchema);
-    }
-    const codexConfig = {};
-    if (bridge) {
-      const sourceEntrypoint = new URL("../../cli.ts", import.meta.url);
-      const entrypoint = await Bun.file(sourceEntrypoint).exists() ? sourceEntrypoint.pathname : new URL("kouro.js", import.meta.url).pathname;
-      codexConfig.mcp_servers = {
-        kouro_scout: {
-          command: process.execPath,
-          args: [entrypoint, "__scout_mcp"],
-          env_vars: ["KOURO_SCOUT_ENDPOINT", "KOURO_SCOUT_TOKEN", "KOURO_SCOUT_SCHEMA"]
-        }
-      };
-    }
-    const sdkOptions = {
-      env,
-      ...Object.keys(codexConfig).length > 0 ? { config: codexConfig } : {}
-    };
-    let thread;
     try {
-      thread = new Codex(sdkOptions).startThread({
-        ...typeof config.model === "string" ? { model: config.model } : {},
-        workingDirectory: input.cwd,
-        skipGitRepoCheck: true,
-        sandboxMode: config.sandbox === "workspace-write" ? "workspace-write" : "read-only"
+      const scout = input.context?.tools.find((item) => item.name === "subagent");
+      const dynamicTools = scout && input.collaboration?.subagent ? [
+        {
+          type: "function",
+          name: "subagent",
+          description: scout.description,
+          inputSchema: scout.inputSchema
+        }
+      ] : undefined;
+      const initialized = await transport.request("initialize", {
+        clientInfo: { name: "kouro", title: "Kouro", version: "2" },
+        capabilities: dynamicTools ? { experimentalApi: true, requestAttestation: false } : null
       });
-    } catch (cause) {
-      await bridge?.close();
-      return {
-        status: "unavailable",
-        error: cause instanceof Error ? cause.message : String(cause),
-        usage: unavailableUsage(),
-        events: []
-      };
-    }
-    const timeoutMs = typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0 ? input.timeoutMs : undefined;
-    const abortController = new AbortController;
-    const abort = () => abortController.abort(input.signal?.reason);
-    if (input.signal?.aborted)
-      abort();
-    else
-      input.signal?.addEventListener("abort", abort, { once: true });
-    const timer = timeoutMs === undefined ? undefined : setTimeout(() => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)), timeoutMs);
-    const prompt = input.context ? `${input.role.prompt}
+      if (!initialized.ok)
+        throw new Error(initialized.error);
+      transport.notify("initialized", {});
+      const threadResult = await transport.request("thread/start", {
+        cwd: input.cwd,
+        ...input.selection.model.id && input.selection.model.id !== "default" ? { model: input.selection.model.id } : {},
+        approvalPolicy: "on-request",
+        ...dynamicTools ? { dynamicTools } : {}
+      });
+      if (!threadResult.ok)
+        throw new Error(threadResult.error);
+      const threadId = stringAt(threadResult.value, "thread", "id") ?? stringAt(threadResult.value, "id");
+      if (!threadId)
+        throw new Error("Codex App Server returned no thread ID");
+      const policy = input.nativeConfig?.sandbox === "workspace-write" ? {
+        type: "workspaceWrite",
+        writableRoots: [input.cwd],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false
+      } : { type: "readOnly", networkAccess: false };
+      const prompt = input.context ? `${input.role.prompt}
 
 [KOURO_CONTEXT_BEGIN]
 ${JSON.stringify(input.context)}
 [KOURO_CONTEXT_END]` : input.role.prompt;
-    const events = [];
-    const raw = [];
-    let response;
-    let usageRecord;
-    let streamError;
-    let bridgeClosed = false;
-    const closeBridge = async () => {
-      if (!bridgeClosed) {
-        bridgeClosed = true;
-        await bridge?.close();
-      }
-    };
-    try {
-      const { events: stream } = await thread.runStreamed(prompt, {
-        ...input.role.outputSchema ? { outputSchema: input.role.outputSchema } : {},
-        signal: abortController.signal
+      let streamed = "";
+      const thinkingItems = new Set;
+      let completed;
+      const done = new Promise((resolve) => {
+        completed = resolve;
       });
-      for await (const event of stream) {
-        raw.push(JSON.stringify(event));
-        events.push({ type: "log", at: new Date().toISOString(), data: JSON.stringify(event) });
-        consumeCodexEvent(event, (text) => response = text, (usage) => usageRecord = usage);
-        if (event.type === "turn.failed" || event.type === "error") {
-          streamError = event.type === "turn.failed" ? event.error.message : event.message;
-        }
-      }
-    } catch (cause) {
-      streamError = cause instanceof Error ? cause.message : String(cause);
-    } finally {
-      if (timer)
-        clearTimeout(timer);
-      input.signal?.removeEventListener("abort", abort);
-      await closeBridge();
-    }
-    const rawOutput = raw.join(`
-`);
-    const timedOut = timeoutMs !== undefined && abortController.signal.aborted && !input.signal?.aborted;
-    if (input.signal?.aborted || timedOut) {
-      const message = timedOut ? `Codex timed out after ${timeoutMs}ms` : "cancelled";
-      return {
-        status: input.signal?.aborted ? "cancelled" : "failed",
-        error: message,
-        rawOutput,
-        usage: codexUsage(usageRecord),
-        events: [...events, { type: "log", at: new Date().toISOString(), data: message }]
+      const unsubscribe = transport.subscribe((message) => {
+        const params = asObject(message.params);
+        if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
+          streamed += params.delta;
+          emit({ type: "text", at: new Date().toISOString(), data: params.delta });
+        } else if (message.method === "item/reasoning/summaryTextDelta" && typeof params.delta === "string") {
+          thinkingItems.add(String(params.itemId));
+          emit({
+            type: "log",
+            at: new Date().toISOString(),
+            data: {
+              status: "Thinking",
+              text: params.delta,
+              channel: "thinking",
+              id: `${String(params.itemId)}:${String(params.summaryIndex ?? 0)}`
+            }
+          });
+        } else if (message.method === "item/commandExecution/outputDelta" && typeof params.delta === "string") {
+          emit({
+            type: "tool",
+            at: new Date().toISOString(),
+            data: {
+              id: String(params.itemId),
+              name: "commandExecution",
+              status: "running",
+              outputDelta: params.delta
+            }
+          });
+        } else if (message.id !== undefined && message.method === "item/commandExecution/requestApproval") {
+          transport.respond(message.id, {
+            decision: input.nativeConfig?.sandbox === "workspace-write" ? "accept" : "decline"
+          });
+        } else if (message.id !== undefined && message.method === "item/fileChange/requestApproval") {
+          transport.respond(message.id, {
+            decision: input.nativeConfig?.sandbox === "workspace-write" ? "accept" : "decline"
+          });
+        } else if (message.method === "item/started" || message.method === "item/completed") {
+          const item = asObject(params.item);
+          if (item.type === "reasoning") {
+            const summary = Array.isArray(item.summary) ? item.summary.filter((part) => typeof part === "string").join(`
+`) : "";
+            emit({
+              type: "log",
+              at: new Date().toISOString(),
+              data: {
+                status: "Thinking",
+                ...summary && !thinkingItems.has(String(item.id)) ? { text: summary, channel: "thinking" } : {}
+              }
+            });
+          } else if (item.type === "userMessage") {} else if (item.type === "plan" && message.method === "item/completed" && typeof item.text === "string")
+            emit({
+              type: "log",
+              at: new Date().toISOString(),
+              data: { status: "Planning", channel: "thinking", text: item.text }
+            });
+          else if (item.type === "agentMessage") {
+            if (message.method === "item/started")
+              emit({
+                type: "log",
+                at: new Date().toISOString(),
+                data: { status: "Writing reply" }
+              });
+          } else if (typeof item.type === "string")
+            emit(codexToolEvent(item, message.method === "item/started", new Date().toISOString()));
+        } else if (message.id !== undefined && message.method === "item/tool/call" && params.tool === "subagent" && scout && input.collaboration?.subagent) {
+          input.collaboration.subagent({
+            requestId: typeof asObject(params.arguments).requestId === "string" ? String(asObject(params.arguments).requestId) : String(params.callId ?? params.id ?? message.id),
+            subagentId: String(asObject(params.arguments).subagentId ?? ""),
+            input: asObject(asObject(params.arguments).input)
+          }).then((result2) => transport.respond(message.id, {
+            contentItems: [{ type: "inputText", text: JSON.stringify(result2) }],
+            success: result2.state === "succeeded"
+          }), (cause) => transport.respond(message.id, {
+            contentItems: [{ type: "inputText", text: String(cause) }],
+            success: false
+          }));
+        } else if (message.id !== undefined && message.method === "item/tool/call") {
+          transport.respond(message.id, {
+            contentItems: [
+              { type: "inputText", text: "Tool is not authorized for this invocation." }
+            ],
+            success: false
+          });
+        } else if (message.id !== undefined && message.method === "item/permissions/requestApproval") {
+          transport.respond(message.id, { permissions: {}, scope: "turn" });
+        } else if (message.id !== undefined && message.method === "item/tool/requestUserInput") {
+          transport.respond(message.id, { answers: {} });
+        } else if (message.method === "turn/completed") {
+          const turn2 = asObject(params.turn);
+          if (turn2.status === "failed" || turn2.status === "interrupted")
+            completed?.({
+              ok: false,
+              error: turn2.status === "interrupted" ? "Codex turn was interrupted" : String(asObject(turn2.error).message ?? "Codex turn failed")
+            });
+          else
+            completed?.({ ok: true, value: turn2 });
+        } else if (message.method === "turn/failed")
+          completed?.({
+            ok: false,
+            error: String(asObject(params.error).message ?? "Codex turn failed")
+          });
+      });
+      const started = await transport.request("turn/start", {
+        threadId,
+        input: [{ type: "text", text: prompt }],
+        cwd: input.cwd,
+        approvalPolicy: "on-request",
+        sandboxPolicy: policy,
+        summary: "auto",
+        ...input.selection.model.id && input.selection.model.id !== "default" ? { model: input.selection.model.id } : {},
+        ...input.outputSchema ? { outputSchema: input.outputSchema } : {}
+      });
+      if (!started.ok)
+        throw new Error(started.error);
+      const turnId = stringAt(started.value, "turn", "id") ?? stringAt(started.value, "id");
+      if (!turnId)
+        throw new Error("Codex App Server returned no turn ID");
+      this.active.set(input.attemptId, { transport, threadId, turnId });
+      emit({
+        type: "log",
+        at: new Date().toISOString(),
+        data: { status: "Working", readyForSteering: true }
+      });
+      const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : undefined;
+      let timeout;
+      const cancel = () => {
+        transport.request("turn/interrupt", { threadId, turnId });
       };
-    }
-    if (streamError) {
-      return {
-        status: "failed",
-        error: streamError,
-        rawOutput,
-        usage: codexUsage(usageRecord),
-        events
-      };
-    }
-    let parsed = response;
-    if (typeof parsed === "string") {
-      try {
-        parsed = JSON.parse(parsed);
-      } catch {}
-    }
-    if (input.role.outputSchema) {
-      const check = validateJsonSchema(parsed, input.role.outputSchema);
-      if (!check.valid) {
+      input.signal?.addEventListener("abort", cancel, { once: true });
+      const timed = timeoutMs === undefined ? undefined : new Promise((resolve) => {
+        timeout = setTimeout(() => {
+          cancel();
+          resolve({ ok: false, error: `Codex timed out after ${timeoutMs}ms` });
+        }, timeoutMs);
+      });
+      const result = await (timed ? Promise.race([done, timed]) : done);
+      if (timeout)
+        clearTimeout(timeout);
+      input.signal?.removeEventListener("abort", cancel);
+      unsubscribe();
+      if (!result.ok)
         return {
-          status: "failed",
-          rawOutput,
-          error: `invalid-output: ${check.error}`,
-          usage: codexUsage(usageRecord),
+          status: input.signal?.aborted ? "cancelled" : "failed",
+          error: result.error,
+          usage: unavailableUsage(),
           events
         };
+      const turn = asObject(result.value);
+      const final = finalCodexText(turn) ?? streamed;
+      if (!final)
+        return {
+          status: "failed",
+          error: "Codex turn has no final agent message",
+          usage: unavailableUsage(),
+          events
+        };
+      const output = parseStructuredOutput(final);
+      if (input.outputSchema) {
+        const validation = validateJsonSchema(output, input.outputSchema);
+        if (!validation.valid)
+          return {
+            status: "failed",
+            error: `invalid-output: ${validation.error}`,
+            rawOutput: final,
+            usage: unavailableUsage(),
+            events
+          };
       }
+      const tokens = asObject(turn.tokens);
+      const usage = typeof tokens.input === "number" && typeof tokens.output === "number" ? {
+        inputTokens: { value: tokens.input, quality: "observed", source: "codex" },
+        outputTokens: { value: tokens.output, quality: "observed", source: "codex" },
+        totalTokens: {
+          value: tokens.input + tokens.output,
+          quality: "observed",
+          source: "codex"
+        },
+        cost: { value: null, quality: "unavailable" }
+      } : unavailableUsage();
+      if (!streamed)
+        emit({ type: "text", at: new Date().toISOString(), data: final });
+      else if (final.startsWith(streamed) && final.length > streamed.length)
+        emit({ type: "text", at: new Date().toISOString(), data: final.slice(streamed.length) });
+      return { status: "succeeded", output, rawOutput: final, usage, events };
+    } catch (cause) {
+      return {
+        status: input.signal?.aborted ? "cancelled" : "failed",
+        error: input.signal?.aborted ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        usage: unavailableUsage(),
+        events
+      };
+    } finally {
+      this.active.delete(input.attemptId);
+      await transport.dispose();
     }
-    return {
-      status: "succeeded",
-      output: parsed,
-      rawOutput,
-      usage: codexUsage(usageRecord),
-      events
-    };
   }
-}
-function consumeCodexEvent(event, onResponse, onUsage) {
-  if (event.type === "item.completed" && event.item.type === "agent_message") {
-    onResponse(event.item.text);
-  } else if (event.type === "turn.completed") {
-    onUsage(event.usage);
-  }
-}
-function codexUsage(usage) {
-  if (!usage)
-    return unavailableUsage();
-  const inputTokens = usage.input_tokens;
-  const outputTokens = usage.output_tokens;
-  const totalTokens = inputTokens + outputTokens;
-  return {
-    inputTokens: { value: inputTokens, quality: "observed", source: "codex" },
-    outputTokens: { value: outputTokens, quality: "observed", source: "codex" },
-    totalTokens: { value: totalTokens, quality: "observed", source: "codex" },
-    cost: { value: null, quality: "unavailable" }
-  };
 }
 
+class CodexAppServerTransport {
+  child;
+  pending = new Map;
+  listeners = new Set;
+  sequence = 0;
+  lines;
+  constructor(cwd) {
+    const entry = fileURLToPath(import.meta.resolve("@openai/codex/bin/codex.js"));
+    this.child = spawn(process.execPath, [entry, "app-server"], {
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    this.lines = createInterface({ input: this.child.stdout });
+    this.lines.on("line", (line) => {
+      try {
+        const message = JSON.parse(line);
+        if (message.id !== undefined && !message.method) {
+          const resolve = this.pending.get(message.id);
+          if (resolve) {
+            this.pending.delete(message.id);
+            resolve(message.error ? { ok: false, error: JSON.stringify(message.error) } : { ok: true, value: message.result });
+          }
+        } else
+          for (const listener of this.listeners)
+            listener(message);
+      } catch {}
+    });
+    this.child.once("exit", (code) => {
+      for (const resolve of this.pending.values())
+        resolve({ ok: false, error: `Codex App Server exited (${code ?? "unknown"})` });
+      this.pending.clear();
+    });
+  }
+  request(method, params) {
+    const id2 = ++this.sequence;
+    return new Promise((resolve) => {
+      this.pending.set(id2, resolve);
+      this.child.stdin.write(`${JSON.stringify({ id: id2, method, params })}
+`);
+    });
+  }
+  notify(method, params) {
+    this.child.stdin.write(`${JSON.stringify({ method, params })}
+`);
+  }
+  respond(id2, result) {
+    this.child.stdin.write(`${JSON.stringify({ id: id2, result })}
+`);
+  }
+  subscribe(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  async dispose() {
+    this.lines.close();
+    if (this.child.exitCode === null) {
+      this.child.kill("SIGTERM");
+      await new Promise((resolve) => this.child.once("exit", () => resolve()));
+    }
+  }
+}
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function stringAt(value, ...keys) {
+  let current = value;
+  for (const key of keys)
+    current = asObject(current)[key];
+  return typeof current === "string" ? current : undefined;
+}
+function finalCodexText(turn) {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  return items.filter((item) => asObject(item).type === "agentMessage" || asObject(item).type === "agent_message").map((item) => asObject(item).text).filter((text) => typeof text === "string").at(-1);
+}
 class CodexHarnessAdapter {
   harness;
   id = "codex";
-  adapterVersion = "sdk";
+  adapterVersion = "app-server";
   constructor(harness2) {
     this.harness = harness2;
   }
@@ -16430,6 +16854,8 @@ class CodexHarnessAdapter {
         prompt: input.prompt,
         ...input.outputSchema ? { outputSchema: input.outputSchema } : {}
       },
+      nativeConfig: input.nativeConfig,
+      outputSchema: input.outputSchema,
       selection: {
         harness: this.id,
         model: { id: input.modelId ?? "default" },
@@ -16438,6 +16864,7 @@ class CodexHarnessAdapter {
       cwd: input.cwd ?? ".",
       context: input.context,
       collaboration: input.collaboration,
+      onEvent: input.onEvent,
       timeoutMs: input.timeoutMs,
       signal: input.signal
     });
@@ -16446,6 +16873,14 @@ class CodexHarnessAdapter {
       events: result.events.map((event) => JSON.parse(JSON.stringify(event))),
       usage: JSON.parse(JSON.stringify(result.usage))
     };
+  }
+  steer(input) {
+    if (!(this.harness instanceof CodexAppServerHarness))
+      return Promise.reject(new Error("steer-unavailable: Codex SDK does not expose turn steering"));
+    return this.harness.steer(input.invocationId, input.message);
+  }
+  canSteer(input) {
+    return this.harness instanceof CodexAppServerHarness && this.harness.canSteer(input.invocationId);
   }
 }
 
@@ -16532,12 +16967,75 @@ function parseOutput(stdout) {
   }
   return stdout.trim() || undefined;
 }
+function normalizeCliLine(line, channel) {
+  const value = line.trim();
+  if (!value)
+    return;
+  const at = new Date().toISOString();
+  if (channel === "stderr")
+    return { type: "log", at, data: { status: "CLI stderr", detail: value } };
+  let parsed;
+  try {
+    const candidate = JSON.parse(value);
+    if (typeof candidate === "object" && candidate !== null && !Array.isArray(candidate))
+      parsed = candidate;
+  } catch {
+    return { type: "text", at, data: value };
+  }
+  if (!parsed)
+    return { type: "text", at, data: value };
+  const part = typeof parsed.part === "object" && parsed.part !== null ? parsed.part : {};
+  const type = String(parsed.type ?? part.type ?? "").toLowerCase();
+  const content = typeof part.text === "string" ? part.text : typeof parsed.text === "string" ? parsed.text : typeof parsed.content === "string" ? parsed.content : undefined;
+  if (content !== undefined && /text|message|content/.test(type))
+    return { type: "text", at, data: content };
+  if (/tool/.test(type) || typeof part.tool === "string" || typeof parsed.tool === "string") {
+    const state = typeof part.state === "object" && part.state !== null ? part.state : {};
+    const status = String(state.status ?? parsed.status ?? (/result|complete|finish|error/.test(type) ? "completed" : "running")).toLowerCase();
+    const name = String(part.tool ?? parsed.tool ?? parsed.name ?? "tool");
+    const id2 = String(part.callID ?? part.id ?? parsed.callID ?? parsed.id ?? name);
+    return { type: "tool", at, data: { id: id2, name, status } };
+  }
+  return {
+    type: "log",
+    at,
+    data: { status: type ? `CLI ${type}` : "CLI event", detail: value.slice(0, 2000) }
+  };
+}
+async function readActivity(stream, channel, onEvent) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  let captured = "";
+  let pending = "";
+  const emitLine = (line) => {
+    const event = normalizeCliLine(line, channel);
+    if (event)
+      onEvent(event);
+  };
+  for (;; ) {
+    const { done, value } = await reader.read();
+    const text = decoder.decode(value, { stream: !done });
+    captured += text;
+    pending += text;
+    let newline;
+    while ((newline = pending.indexOf(`
+`)) >= 0) {
+      emitLine(pending.slice(0, newline).replace(/\r$/, ""));
+      pending = pending.slice(newline + 1);
+    }
+    if (done)
+      break;
+  }
+  emitLine(pending);
+  return captured;
+}
 
 class ExternalCliHarnessAdapter {
   kind;
   descriptor;
   id;
   adapterVersion = "1";
+  activeProcesses = new Map;
   constructor(kind, descriptor) {
     this.kind = kind;
     this.descriptor = descriptor;
@@ -16545,6 +17043,20 @@ class ExternalCliHarnessAdapter {
   }
   capabilities() {
     return Object.fromEntries(Object.entries(this.descriptor.capabilities).map(([key, value]) => [key, value.state]));
+  }
+  async terminate(input) {
+    const proc = this.activeProcesses.get(input.attemptId);
+    if (!proc)
+      return true;
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      return false;
+    }
+    return Promise.race([
+      proc.exited.then(() => true, () => false),
+      new Promise((resolve) => setTimeout(() => resolve(false), 3000))
+    ]);
   }
   async run(input) {
     const unavailable = () => JSON.parse(JSON.stringify(unavailableUsage()));
@@ -16581,8 +17093,20 @@ ${input.prompt}` : input.prompt;
         events: []
       };
     }
-    const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
-    const stderrPromise = new Response(proc.stderr).text().catch(() => "");
+    const attemptId = input.attemptId ?? input.invocationId;
+    this.activeProcesses.set(attemptId, proc);
+    const cleanup = () => {
+      if (this.activeProcesses.get(attemptId) === proc)
+        this.activeProcesses.delete(attemptId);
+    };
+    proc.exited.then(cleanup, cleanup);
+    const events = [];
+    const emit = (event) => {
+      events.push(event);
+      input.onEvent?.(event);
+    };
+    const stdoutPromise = readActivity(proc.stdout, "stdout", emit).catch(() => "");
+    const stderrPromise = readActivity(proc.stderr, "stderr", emit).catch(() => "");
     const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : undefined;
     let timer;
     const timeout = timeoutMs === undefined ? undefined : new Promise((resolve) => {
@@ -16605,8 +17129,6 @@ ${input.prompt}` : input.prompt;
     if (input.signal?.aborted)
       return { status: "cancelled", error: "cancelled", usage: unavailable(), events: [] };
     const output = parseOutput(result.stdout);
-    const events = result.stdout.split(`
-`).filter(Boolean).map((line) => ({ type: "log", at: new Date().toISOString(), data: line }));
     if (result.code !== 0)
       return {
         status: "failed",
@@ -36109,9 +36631,81 @@ ${JSON.stringify(input2.context)}
       } : {}
     };
     let resultMessage;
+    let thinkingStreamed = false;
     try {
       for await (const message of query({ prompt, options })) {
         messages.push(message);
+        const event = message.type === "stream_event" ? message.event : undefined;
+        if (event && typeof event === "object" && "type" in event) {
+          const item = event;
+          const at = new Date().toISOString();
+          if (item.type === "message_start")
+            thinkingStreamed = false;
+          if (item.type === "content_block_delta" && item.delta?.type === "thinking_delta" && typeof item.delta.thinking === "string") {
+            thinkingStreamed = true;
+            input2.onEvent?.({
+              type: "log",
+              at,
+              data: { channel: "thinking", text: item.delta.thinking, status: "Thinking" }
+            });
+          } else if (item.type === "content_block_delta" && item.delta?.type === "text_delta" && typeof item.delta.text === "string") {
+            input2.onEvent?.({ type: "text", at, data: item.delta.text });
+          } else if (item.type === "content_block_start" && item.content_block?.type === "tool_use") {
+            input2.onEvent?.({
+              type: "tool",
+              at,
+              data: {
+                id: item.content_block.id ?? "tool",
+                name: item.content_block.name ?? "Tool",
+                status: "started",
+                ...item.content_block.input === undefined ? {} : { input: item.content_block.input }
+              }
+            });
+          }
+        } else if (message.type === "assistant") {
+          const content = message.message?.content;
+          for (const part of content ?? []) {
+            if (isRecord2(part) && part.type === "thinking" && typeof part.thinking === "string" && !thinkingStreamed)
+              input2.onEvent?.({
+                type: "log",
+                at: new Date().toISOString(),
+                data: { channel: "thinking", text: part.thinking, status: "Thinking" }
+              });
+            if (!isRecord2(part) || part.type !== "tool_use" || typeof part.id !== "string")
+              continue;
+            input2.onEvent?.({
+              type: "tool",
+              at: new Date().toISOString(),
+              data: {
+                id: part.id,
+                name: typeof part.name === "string" ? part.name : "Tool",
+                status: "running",
+                ...part.input === undefined ? {} : { input: part.input }
+              }
+            });
+          }
+          input2.onEvent?.({
+            type: "log",
+            at: new Date().toISOString(),
+            data: { status: "Thinking" }
+          });
+        } else if (message.type === "user") {
+          const content = message.message?.content;
+          for (const part of content ?? []) {
+            if (!isRecord2(part) || part.type !== "tool_result" || typeof part.tool_use_id !== "string")
+              continue;
+            const isError = part.is_error === true;
+            input2.onEvent?.({
+              type: "tool",
+              at: new Date().toISOString(),
+              data: {
+                id: part.tool_use_id,
+                status: isError ? "failed" : "completed",
+                ...isError ? { error: displayToolResult(part.content) } : { output: part.content }
+              }
+            });
+          }
+        }
         if (message.type === "result")
           resultMessage = message;
       }
@@ -36179,15 +36773,104 @@ ${JSON.stringify(input2.context)}
   }
 }
 function parseJson2(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
+  return parseStructuredOutput(text);
 }
 function eventsFrom(messages) {
   const at = new Date().toISOString();
-  return messages.map((message) => ({ type: "log", at, data: JSON.stringify(message) }));
+  const events = [];
+  let streamedText = "";
+  let thinkingStreamed = false;
+  for (const message of messages) {
+    if (message.type === "stream_event") {
+      const event = message.event;
+      const delta = event.delta;
+      const block = event.content_block;
+      if (event.type === "message_start") {
+        streamedText = "";
+        thinkingStreamed = false;
+      }
+      if (event.type === "content_block_delta" && delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
+        thinkingStreamed = true;
+        events.push({
+          type: "log",
+          at,
+          data: { channel: "thinking", status: "Thinking", text: delta.thinking }
+        });
+      }
+      if (event.type === "content_block_delta" && delta?.type === "text_delta" && typeof delta.text === "string") {
+        streamedText += delta.text;
+        events.push({ type: "text", at, data: delta.text });
+      } else if (event.type === "content_block_start" && block?.type === "tool_use")
+        events.push({
+          type: "tool",
+          at,
+          data: {
+            id: typeof block.id === "string" ? block.id : "tool",
+            name: String(block.name ?? "Tool"),
+            status: "started"
+          }
+        });
+      continue;
+    }
+    if (message.type === "assistant") {
+      const content = message.message?.content;
+      for (const part of content ?? []) {
+        if (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string") {
+          if (!streamedText)
+            events.push({ type: "text", at, data: part.text });
+          else if (part.text.startsWith(streamedText) && part.text.length > streamedText.length)
+            events.push({ type: "text", at, data: part.text.slice(streamedText.length) });
+        } else if (isRecord2(part) && part.type === "thinking" && typeof part.thinking === "string" && !thinkingStreamed)
+          events.push({
+            type: "log",
+            at,
+            data: { channel: "thinking", status: "Thinking", text: part.thinking }
+          });
+        else if (isRecord2(part) && part.type === "tool_use" && typeof part.id === "string")
+          events.push({
+            type: "tool",
+            at,
+            data: {
+              id: part.id,
+              name: typeof part.name === "string" ? part.name : "Tool",
+              status: "running",
+              ...part.input === undefined ? {} : { input: part.input }
+            }
+          });
+      }
+    } else if (message.type === "user") {
+      const content = message.message?.content;
+      for (const part of content ?? []) {
+        if (!isRecord2(part) || part.type !== "tool_result" || typeof part.tool_use_id !== "string")
+          continue;
+        const isError = part.is_error === true;
+        events.push({
+          type: "tool",
+          at,
+          data: {
+            id: part.tool_use_id,
+            status: isError ? "failed" : "completed",
+            ...isError ? { error: displayToolResult(part.content) } : { output: part.content }
+          }
+        });
+      }
+    } else if (message.type === "result") {
+      events.push({ type: "log", at, data: { status: "Turn completed" } });
+    }
+  }
+  return events;
+}
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function displayToolResult(value) {
+  if (typeof value === "string")
+    return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 function usageFrom(message) {
   if (!message)
@@ -36228,7 +36911,7 @@ import {
   VERSION as PI_SDK_VERSION
 } from "@earendil-works/pi-coding-agent";
 import { dirname, resolve } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath as fileURLToPath2 } from "url";
 import { Type } from "typebox";
 var nativeConfigSchema = {
   type: "object",
@@ -36277,10 +36960,10 @@ function piNativeConfig(config2 = {}) {
 function resolvePiSelection(selection, config2 = {}, env = Bun.env) {
   const configuredProvider = typeof config2.provider === "string" && config2.provider.trim() ? config2.provider : undefined;
   const configuredModel = typeof config2.model === "string" && config2.model.trim() ? config2.model : undefined;
-  const selectedModel = configuredModel || env.KOURO_PI_MODEL?.trim() || selection.model.id;
-  let provider = configuredProvider || env.KOURO_PI_PROVIDER?.trim() || selection.model.provider;
+  const selectedModel = configuredModel || selection.model.id || env.KOURO_PI_MODEL?.trim();
+  let provider = configuredProvider || selection.model.provider || env.KOURO_PI_PROVIDER?.trim();
   let model = selectedModel || undefined;
-  if (!provider && model && !/^https?:\/\//i.test(model)) {
+  if (!configuredProvider && !selection.model.provider && model && !/^https?:\/\//i.test(model) && (!provider || Boolean(configuredModel || selection.model.id))) {
     const slash = model.indexOf("/");
     if (slash > 0) {
       provider = model.slice(0, slash);
@@ -36292,8 +36975,15 @@ function resolvePiSelection(selection, config2 = {}, env = Bun.env) {
 
 class PiSdkHarness {
   descriptor;
+  activeSessions = new Map;
   constructor(descriptor) {
     this.descriptor = descriptor;
+  }
+  async steer(attemptId, message) {
+    const session = this.activeSessions.get(attemptId);
+    if (!session)
+      throw new Error("steer-unavailable: Pi session is not active");
+    await session.steer(message);
   }
   async startTurn(request) {
     const controller = new AbortController;
@@ -36365,16 +37055,22 @@ class PiSdkHarness {
       input2.onEvent?.(event);
     };
     let timeout = false;
+    const discoveryController = new AbortController;
     const timeoutMs = typeof config2.timeoutMs === "number" ? config2.timeoutMs : undefined;
     const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
       timeout = true;
+      discoveryController.abort();
       session?.abort();
     }, timeoutMs);
-    const abort = () => void session?.abort();
+    const abort = () => {
+      discoveryController.abort();
+      session?.abort();
+    };
     input2.signal?.addEventListener("abort", abort, { once: true });
+    if (input2.signal?.aborted)
+      abort();
     try {
       const resolved = resolvePiSelection(input2.selection, config2);
-      const requestedModel = resolved.provider && resolved.model ? `${resolved.provider}/${resolved.model}` : resolved.model;
       const agentDir = getAgentDir();
       const services = await createAgentSessionServices({
         cwd: input2.cwd,
@@ -36387,9 +37083,7 @@ class PiSdkHarness {
           extensionFactories: await loadPiBuiltInExtensions()
         }
       });
-      const model = requestedModel ? await modelFor(services.modelRuntime, requestedModel) : undefined;
-      if (requestedModel && !model)
-        throw new Error(`Pi model is unavailable: ${requestedModel}`);
+      const model = await resolvePiModel(services.modelRuntime, resolved, services.settingsManager, discoveryController.signal);
       const scoutTool = input2.context?.tools.find((item) => item.name === "subagent");
       const subagent = input2.collaboration?.subagent;
       const customTools = scoutTool && subagent ? [createSubagentTool(scoutTool, subagent)] : [];
@@ -36398,10 +37092,21 @@ class PiSdkHarness {
         sessionManager: SessionManager.inMemory(input2.cwd),
         ...model ? { model } : {},
         ...typeof config2.thinking === "string" ? { thinkingLevel: config2.thinking } : {},
-        tools: ["read", "grep", "find", "ls"],
+        tools: ["read", "grep", "find", "ls", ...customTools.map((tool2) => tool2.name)],
         customTools
       });
       session = created.session;
+      this.activeSessions.set(input2.attemptId, session);
+      if (session.model)
+        emit({
+          type: "log",
+          at: new Date().toISOString(),
+          data: {
+            status: "Model selected",
+            provider: session.model.provider,
+            modelId: session.model.id
+          }
+        });
       if (input2.signal?.aborted || timeout)
         await session.abort();
       if (input2.signal?.aborted)
@@ -36443,7 +37148,7 @@ ${JSON.stringify(input2.role.outputSchema)}` : handoff3;
       if (lastMessage && lastMessage.stopReason === "error")
         return {
           status: "failed",
-          error: message ?? "Pi SDK turn failed",
+          error: typeof lastMessage.errorMessage === "string" && lastMessage.errorMessage ? lastMessage.errorMessage : message ?? "Pi SDK turn failed",
           rawOutput: message,
           usage,
           events
@@ -36463,7 +37168,7 @@ ${JSON.stringify(input2.role.outputSchema)}` : handoff3;
     } catch (cause) {
       return {
         status: input2.signal?.aborted ? "cancelled" : "failed",
-        error: input2.signal?.aborted ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        error: input2.signal?.aborted ? "cancelled" : timeout ? `pi timed out after ${timeoutMs}ms` : cause instanceof Error ? cause.message : String(cause),
         usage: session ? piUsage(session.getSessionStats()) : unavailableUsage(),
         events
       };
@@ -36472,21 +37177,58 @@ ${JSON.stringify(input2.role.outputSchema)}` : handoff3;
         clearTimeout(timer);
       input2.signal?.removeEventListener("abort", abort);
       session?.dispose();
+      this.activeSessions.delete(input2.attemptId);
     }
   }
 }
-async function modelFor(runtime, requested) {
-  if (!requested)
+async function resolvePiModel(runtime, selection, settings, signal) {
+  const provider = selection.provider ?? settings.getDefaultProvider();
+  const requested = selection.model ?? settings.getDefaultModel();
+  if (provider === "llama.cpp") {
+    const local = runtime.getProvider(provider);
+    const auth = await runtime.getAuth(provider);
+    if (!local?.refreshModels || !auth)
+      throw new Error("Pi local model discovery failed: llama.cpp is not configured");
+    const discoverySignal = AbortSignal.any([
+      AbortSignal.timeout(15000),
+      ...signal ? [signal] : []
+    ]);
+    try {
+      await local.refreshModels({
+        credential: { type: "api_key", key: auth.auth.apiKey, env: auth.env },
+        store: { read: async () => {
+          return;
+        }, write: async () => {}, delete: async () => {} },
+        allowNetwork: true,
+        force: true,
+        signal: discoverySignal
+      });
+    } catch (cause) {
+      if (signal?.aborted)
+        throw new Error("Pi model discovery cancelled");
+      if (discoverySignal.aborted)
+        throw new Error("Pi local model discovery timed out");
+      throw new Error(`Pi local model discovery failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+    if (signal?.aborted)
+      throw new Error("Pi model discovery cancelled");
+    if (discoverySignal.aborted)
+      throw new Error("Pi local model discovery timed out");
+  }
+  if (!requested && !provider)
     return;
-  const separator = requested.indexOf("/");
-  if (separator >= 1)
-    return runtime.getModel(requested.slice(0, separator), requested.slice(separator + 1));
-  return (await runtime.getAvailable()).find(({ id: id2 }) => id2 === requested);
+  const available = provider ? runtime.getModels(provider) : await runtime.getAvailable();
+  const model = requested ? provider ? runtime.getModel(provider, requested) : available.find(({ id: id2 }) => id2 === requested) : available[0];
+  if (!model) {
+    const choices = available.map((item) => `${item.provider}/${item.id}`).slice(0, 10).join(", ");
+    throw new Error(`Pi model is unavailable: ${provider ? `${provider}/` : ""}${requested ?? "(none)"}.${choices ? ` Available models: ${choices}.` : " No models are available for this provider."}`);
+  }
+  return model;
 }
 async function loadPiBuiltInExtensions() {
-  const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const entry = fileURLToPath2(import.meta.resolve("@earendil-works/pi-coding-agent"));
   const loaded = await import(resolve(dirname(entry), "extensions/index.js"));
-  if (!isRecord2(loaded) || !Array.isArray(loaded.builtInExtensions))
+  if (!isRecord3(loaded) || !Array.isArray(loaded.builtInExtensions))
     throw new Error("Pi built-in extensions are unavailable in the installed SDK");
   return loaded.builtInExtensions.filter(isInlineExtension);
 }
@@ -36517,17 +37259,43 @@ function createSubagentTool(manifestTool, invoke) {
   });
 }
 function emitPiEvent(event, emit) {
-  if (!isRecord2(event) || typeof event.type !== "string")
+  if (!isRecord3(event) || typeof event.type !== "string")
     return;
   const at = new Date().toISOString();
   const update = event.assistantMessageEvent;
-  if (event.type === "message_update" && isRecord2(update) && update.type === "text_delta") {
+  if (event.type === "message_update" && isRecord3(update) && update.type === "text_delta") {
     if (typeof update.delta === "string")
       emit({ type: "text", at, data: update.delta });
+  } else if (event.type === "message_update" && isRecord3(update) && update.type === "thinking_delta") {
+    emit({
+      type: "log",
+      at,
+      data: {
+        status: "Thinking",
+        ...typeof update.delta === "string" ? { text: update.delta, channel: "thinking" } : {}
+      }
+    });
   } else if (event.type.includes("tool")) {
-    emit({ type: "tool", at, data: event });
+    const result = isRecord3(event.result) ? event.result : undefined;
+    const isError = event.isError === true || result?.isError === true || event.error !== undefined;
+    const lifecycle = event.type.toLowerCase();
+    emit({
+      type: "tool",
+      at,
+      data: {
+        id: String(event.toolCallId ?? (isRecord3(event.toolCall) ? event.toolCall.id : undefined) ?? event.id ?? `${event.type}:${at}`),
+        name: String(event.toolName ?? event.name ?? "Tool"),
+        status: lifecycle.endsWith("_start") ? "running" : lifecycle.endsWith("_end") ? isError ? "failed" : "completed" : lifecycle.includes("update") ? "running" : isError ? "failed" : "completed",
+        ...event.args !== undefined ? { input: event.args } : {},
+        ...event.input !== undefined ? { input: event.input } : {},
+        ...event.result !== undefined ? { output: event.result } : {},
+        ...isError ? {
+          error: String(event.error ?? result?.error ?? result?.content ?? "Tool execution failed")
+        } : {}
+      }
+    });
   } else {
-    emit({ type: "log", at, data: event });
+    emit({ type: "log", at, data: { status: "Thinking" } });
   }
 }
 function assistantText(message) {
@@ -36535,7 +37303,7 @@ function assistantText(message) {
     return message.text;
   if (!Array.isArray(message.content))
     return;
-  const text = message.content.filter(isRecord2).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => String(part.text)).join("");
+  const text = message.content.filter(isRecord3).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => String(part.text)).join("");
   return text || undefined;
 }
 function piUsage(stats) {
@@ -36548,13 +37316,7 @@ function piUsage(stats) {
   };
 }
 function parseJsonOutput(value) {
-  const trimmed = value.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
-  try {
-    return JSON.parse(fenced ?? trimmed);
-  } catch {
-    return value;
-  }
+  return parseStructuredOutput(value);
 }
 function simpleHash(value) {
   let hash2 = 2166136261;
@@ -36564,11 +37326,11 @@ function simpleHash(value) {
   }
   return (hash2 >>> 0).toString(16).padStart(8, "0");
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function isInlineExtension(value) {
-  return typeof value === "function" || isRecord2(value) && typeof value.name === "string" && typeof value.factory === "function";
+  return typeof value === "function" || isRecord3(value) && typeof value.name === "string" && typeof value.factory === "function";
 }
 
 class PiHarnessAdapter {
@@ -36591,12 +37353,16 @@ class PiHarnessAdapter {
       selection: {
         harness: this.id,
         model: { id: input2.modelId ?? "" },
-        nativeConfig: input2.nativeConfig
+        nativeConfig: {
+          ...input2.nativeConfig,
+          ...input2.timeoutMs === undefined ? {} : { timeoutMs: input2.timeoutMs }
+        }
       },
       cwd: input2.cwd ?? ".",
       signal: input2.signal,
       context: input2.context,
-      collaboration: input2.collaboration
+      collaboration: input2.collaboration,
+      onEvent: input2.onEvent
     });
     return {
       ...result,
@@ -36604,17 +37370,21 @@ class PiHarnessAdapter {
       events: result.events
     };
   }
+  steer(input2) {
+    return this.harness.steer(input2.invocationId, input2.message);
+  }
 }
 
 // packages/host/src/adapters/process/darwin.ts
-import { mkdirSync } from "fs";
+import { mkdirSync as mkdirSync2 } from "fs";
 
 // packages/host/src/adapters/process/common.ts
-import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 async function runEnforcedProcess(input2) {
   const operationKey = input2.operationKey ?? "probe";
+  mkdirSync(input2.cwd, { recursive: true, mode: 448 });
   const capture2 = capturePaths();
   let child;
   try {
@@ -36691,6 +37461,7 @@ async function runEnforcedProcess(input2) {
   }
 }
 async function runTrustedCommand(input2) {
+  mkdirSync(input2.cwd, { recursive: true, mode: 448 });
   const capture2 = capturePaths();
   let child;
   try {
@@ -36801,12 +37572,12 @@ function readCaptured(capture2) {
   };
   return [read(capture2.stdout), read(capture2.stderr)];
 }
-async function probeEnforcedProcess(spawn, name) {
+async function probeEnforcedProcess(spawn2, name) {
   const workspace = await Bun.$`mktemp -d /tmp/kouro-${name}-probe.XXXXXX`.text().catch(() => "").then((value) => value.trim());
   if (!workspace)
     return { available: false, detail: "cannot allocate probe workspace" };
   try {
-    const result = await spawn(workspace, ["/usr/bin/printf", "kouro-bwrap-probe\\n"], 5000);
+    const result = await spawn2(workspace, ["/usr/bin/printf", "kouro-bwrap-probe\\n"], 5000);
     const stdout = new TextDecoder().decode(result.evidence.stdout);
     const stderr = new TextDecoder().decode(result.evidence.stderr);
     return result.evidence.exitCode === 0 && stdout === `kouro-bwrap-probe
@@ -36839,7 +37610,7 @@ class DarwinSandboxProcessAdapter {
     const probe = await this.probe();
     if (!probe.available)
       throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
-    mkdirSync(input2.workspaceDir, { recursive: true, mode: 448 });
+    mkdirSync2(input2.workspaceDir, { recursive: true, mode: 448 });
     return this.spawn(input2.workspaceDir, ["/usr/bin/printf", `Kouro M1 command
 `], input2.timeoutMs, input2.operationKey);
   }
@@ -36917,7 +37688,7 @@ function escapeSandboxPath(path) {
 }
 
 // packages/host/src/adapters/process/bwrap.ts
-import { mkdirSync as mkdirSync2 } from "fs";
+import { mkdirSync as mkdirSync3 } from "fs";
 class BubblewrapProcessAdapter {
   enforcementMode = "enforced";
   probeResult;
@@ -36935,7 +37706,7 @@ class BubblewrapProcessAdapter {
     const probe = await this.probe();
     if (!probe.available)
       throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
-    mkdirSync2(input2.workspaceDir, { recursive: true, mode: 448 });
+    mkdirSync3(input2.workspaceDir, { recursive: true, mode: 448 });
     return this.spawn(input2.workspaceDir, ["/usr/bin/printf", "Kouro M1 command\\n"], input2.timeoutMs, input2.operationKey);
   }
   async executeCommand(input2) {
@@ -37029,7 +37800,7 @@ init_src();
 init_src();
 import { Database } from "bun:sqlite";
 import { createHash as createHash2 } from "crypto";
-import { mkdirSync as mkdirSync4 } from "fs";
+import { mkdirSync as mkdirSync5 } from "fs";
 import { join as join3 } from "path";
 
 // packages/host/src/storage/schema.ts
@@ -37126,6 +37897,16 @@ function migrate(db) {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS unconfirmed_harness_shutdowns (
+      shutdown_id TEXT PRIMARY KEY NOT NULL,
+      attempt_id TEXT NOT NULL REFERENCES attempts(id),
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      detail TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS unconfirmed_harness_shutdowns_run_idx
+      ON unconfirmed_harness_shutdowns(run_id);
 
     CREATE TABLE IF NOT EXISTS outbox (
       effect_id TEXT PRIMARY KEY REFERENCES effects(id),
@@ -37363,7 +38144,41 @@ function migrate(db) {
       record_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS run_deletions (
+      run_id TEXT PRIMARY KEY NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      request_digest TEXT NOT NULL,
+      expected_revision INTEGER NOT NULL,
+      actor TEXT NOT NULL,
+      status TEXT NOT NULL,
+      preview_json TEXT NOT NULL,
+      blobs_json TEXT NOT NULL DEFAULT '[]',
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
+  const shutdownColumns = db.query("PRAGMA table_info(unconfirmed_harness_shutdowns)").all();
+  if (!shutdownColumns.some((column) => column.name === "shutdown_id")) {
+    db.exec(`
+      DROP INDEX IF EXISTS unconfirmed_harness_shutdowns_run_idx;
+      ALTER TABLE unconfirmed_harness_shutdowns RENAME TO unconfirmed_harness_shutdowns_legacy;
+      CREATE TABLE unconfirmed_harness_shutdowns (
+        shutdown_id TEXT PRIMARY KEY NOT NULL,
+        attempt_id TEXT NOT NULL REFERENCES attempts(id),
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        detail TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO unconfirmed_harness_shutdowns(shutdown_id, attempt_id, run_id, detail, created_at)
+        SELECT 'legacy:' || attempt_id, attempt_id, run_id, detail, created_at
+        FROM unconfirmed_harness_shutdowns_legacy;
+      DROP TABLE unconfirmed_harness_shutdowns_legacy;
+      CREATE INDEX unconfirmed_harness_shutdowns_run_idx
+        ON unconfirmed_harness_shutdowns(run_id);
+    `);
+  }
   try {
     db.exec("ALTER TABLE collaboration_batches ADD COLUMN context_manifest_ids_json TEXT NOT NULL DEFAULT '[]'");
   } catch {}
@@ -37453,9 +38268,10 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
-  mkdirSync as mkdirSync3,
+  mkdirSync as mkdirSync4,
   openSync,
   readFileSync as readFileSync2,
+  rmSync as rmSync2,
   renameSync,
   writeFileSync
 } from "fs";
@@ -37464,13 +38280,13 @@ class BlobStore {
   root;
   constructor(root) {
     this.root = root;
-    mkdirSync3(join2(root, "blobs"), { recursive: true, mode: 448 });
-    mkdirSync3(join2(root, "tmp"), { recursive: true, mode: 448 });
+    mkdirSync4(join2(root, "blobs"), { recursive: true, mode: 448 });
+    mkdirSync4(join2(root, "tmp"), { recursive: true, mode: 448 });
   }
   put(runId, bytes, mediaType = "application/octet-stream") {
     const digest = createHash("sha256").update(bytes).digest("hex");
     const destination = join2(this.root, "blobs", digest.slice(0, 2), digest);
-    mkdirSync3(dirname2(destination), { recursive: true, mode: 448 });
+    mkdirSync4(dirname2(destination), { recursive: true, mode: 448 });
     if (!existsSync(destination)) {
       const temporary = join2(this.root, "tmp", `${id("blob")}.partial`);
       writeFileSync(temporary, bytes, { mode: 384 });
@@ -37511,6 +38327,10 @@ class BlobStore {
     if (actual !== ref.digest)
       throw new Error("Artifact checksum mismatch");
     return bytes;
+  }
+  removeDigests(digests) {
+    for (const digest of digests)
+      rmSync2(this.pathForDigest(digest), { force: true });
   }
 }
 
@@ -37565,6 +38385,19 @@ class OwnerLock {
 }
 
 // packages/host/src/storage/journal.ts
+function toRunDeletion(row) {
+  return {
+    runId: row.run_id,
+    idempotencyKey: row.idempotency_key,
+    requestDigest: row.request_digest,
+    expectedRevision: row.expected_revision,
+    actor: row.actor,
+    status: row.status,
+    preview: parseJson(row.preview_json),
+    blobDigests: parseJson(row.blobs_json),
+    ...row.error === null ? {} : { error: row.error }
+  };
+}
 function toDeliveryAction(row) {
   return {
     id: row.id,
@@ -37598,7 +38431,7 @@ class Journal {
   frameBatch = null;
   constructor(options) {
     this.dataDir = options.dataDir;
-    mkdirSync4(options.dataDir, { recursive: true, mode: 448 });
+    mkdirSync5(options.dataDir, { recursive: true, mode: 448 });
     this.owner = new OwnerLock(join3(options.dataDir, "owner.lock"));
     if (options.requireOwner !== false)
       this.owner.acquire();
@@ -37715,6 +38548,7 @@ class Journal {
   }
   associateExperimentCell(experimentId, cellKey, token, runId, status = "running") {
     this.tx(() => {
+      this.assertRunAvailable(runId);
       const result = this.db.query("UPDATE experiment_cells SET status = ?1, run_id = COALESCE(run_id, ?2), updated_at = ?3 WHERE experiment_id = ?4 AND cell_key = ?5 AND (reservation_token = ?6 OR run_id = ?2)").run(status, runId, now(), experimentId, cellKey, token);
       if (result.changes === 0)
         throw new Error("experiment cell reservation is not owned by this worker");
@@ -37746,6 +38580,8 @@ class Journal {
     }
     const createdAt = now();
     const persisted = this.tx(() => {
+      for (const run of input2.runs)
+        this.assertRunAvailable(run.runId);
       const prior = this.db.query("SELECT id, runs_json, anchors_json, evidence_revision, created_at FROM run_comparisons WHERE id = ?1").get(input2.id);
       if (prior) {
         const existing = {
@@ -38136,6 +38972,7 @@ class Journal {
     const row = this.getRunRow(input2.runId);
     if (!row)
       throw new Error(`Run not found: ${input2.runId}`);
+    this.assertRunAvailable(input2.runId);
     const prior = parseJson(this.projectionJson(input2.runId));
     const event = {
       eventId: id("evt"),
@@ -38155,7 +38992,7 @@ class Journal {
     this.updateEntityTables(event, prior.bundle);
     this.db.query("UPDATE runs SET status = ?1, revision = ?2, updated_at = ?3 WHERE id = ?4").run(state.status, state.revision, event.recordedAt, input2.runId);
     this.db.query("UPDATE run_projections SET revision = ?1, view_json = ?2 WHERE run_id = ?3").run(state.revision, json(view), input2.runId);
-    const frame = createProjectionFrame(prior.state, state);
+    const frame = createProjectionFrame(prior.state, state, event.type === "harness.activity" ? { attemptId: event.payload.attemptId, event: event.payload.event } : undefined);
     this.db.query("INSERT INTO projection_frames(run_id, revision, frame_json) VALUES (?1, ?2, ?3)").run(input2.runId, state.revision, json(frame));
     this.frameBatch?.push(frame);
     return event;
@@ -38213,7 +39050,7 @@ class Journal {
         digest,
         mediaType
       }));
-      const changed = this.db.query("UPDATE effects SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'claimed'").run(input2.status === "succeeded" ? "succeeded" : "failed", now(), input2.effectId).changes;
+      const changed = this.db.query("UPDATE effects SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'claimed'").run(input2.status, now(), input2.effectId).changes;
       if (changed !== 1)
         throw new Error(`Effect ${input2.effectId} is not claimed`);
       this.db.query("UPDATE outbox SET state = 'completed' WHERE effect_id = ?1").run(input2.effectId);
@@ -38250,7 +39087,8 @@ class Journal {
           type: "invocation.completed",
           payload: {
             invocationId: String(effect.payload.invocationId ?? ""),
-            status: input2.status,
+            status: input2.status === "cancelled" ? "failed" : input2.status,
+            ...input2.status === "cancelled" ? { outcome: "cancelled" } : {},
             output: input2.output,
             evidence: input2.evidence,
             artifacts: input2.artifacts,
@@ -38261,23 +39099,58 @@ class Journal {
       }
     });
   }
-  markRecoveryRequired(effectId, reason) {
+  cancelReservedEffect(attemptId, reason) {
+    const effect = this.db.query("SELECT id, run_id as runId FROM effects WHERE attempt_id = ?1 AND state = 'reserved'").get(attemptId);
+    if (!effect)
+      return;
+    this.tx(() => {
+      const changed = this.db.query("UPDATE effects SET state = 'cancelled', updated_at = ?1 WHERE id = ?2 AND state = 'reserved'").run(now(), effect.id).changes;
+      if (changed !== 1)
+        return;
+      this.db.query("UPDATE outbox SET state = 'completed' WHERE effect_id = ?1").run(effect.id);
+      this.db.query("UPDATE attempts SET state = 'cancelled', ended_at = ?1, error = ?2 WHERE id = ?3").run(now(), reason, attemptId);
+      this.appendInTransaction({
+        runId: effect.runId,
+        type: "attempt.cancelled",
+        payload: { attemptId, reason },
+        actor: "system"
+      });
+    });
+  }
+  markRecoveryRequired(effectId, reason, shutdownId = id("shutdown")) {
     const effect = this.getEffect(effectId);
     if (!effect)
       return;
     this.tx(() => {
       const changed = this.db.query("UPDATE effects SET state = 'unknown', updated_at = ?1 WHERE id = ?2 AND state = 'claimed'").run(now(), effectId).changes;
-      if (changed !== 1)
-        return;
-      this.db.query("UPDATE outbox SET state = 'unknown' WHERE effect_id = ?1").run(effectId);
-      this.appendInTransaction({
-        runId: effect.runId,
-        type: "recovery.required",
-        payload: { code: "effect-ambiguous", subjectId: effectId, detail: reason },
-        actor: "system",
-        subjectId: effectId
-      });
+      if (changed === 1) {
+        this.db.query("UPDATE outbox SET state = 'unknown' WHERE effect_id = ?1").run(effectId);
+        this.db.query("UPDATE attempts SET state = 'recovery-required', ended_at = ?1, error = ?2 WHERE id = ?3").run(now(), reason, effect.attemptId);
+      }
+      this.db.query("INSERT OR IGNORE INTO unconfirmed_harness_shutdowns(shutdown_id, attempt_id, run_id, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)").run(shutdownId, effect.attemptId, effect.runId, reason, now());
+      if (changed === 1) {
+        this.appendInTransaction({
+          runId: effect.runId,
+          type: "attempt.completed",
+          payload: {
+            attemptId: effect.attemptId,
+            status: "recovery-required",
+            error: reason
+          },
+          actor: "system"
+        });
+        this.appendInTransaction({
+          runId: effect.runId,
+          type: "recovery.required",
+          payload: { code: "effect-ambiguous", subjectId: effectId, detail: reason },
+          actor: "system",
+          subjectId: effectId
+        });
+      }
     });
+  }
+  confirmHarnessShutdown(shutdownId) {
+    this.db.query("DELETE FROM unconfirmed_harness_shutdowns WHERE shutdown_id = ?1").run(shutdownId);
   }
   insertArtifact(ref) {
     this.db.query("INSERT OR IGNORE INTO artifacts(id, run_id, digest, media_type, byte_length, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").run(ref.id, ref.runId, ref.digest ?? "", ref.mediaType ?? "application/octet-stream", ref.byteLength, ref.createdAt);
@@ -38285,6 +39158,149 @@ class Journal {
   getRunSummary(runId) {
     const row = this.db.query("SELECT id as runId, workflow_id as workflowId, status, revision, input_json, created_at as createdAt, updated_at as updatedAt FROM runs WHERE id = ?1").get(runId);
     return row ? this.runSummary(row) : null;
+  }
+  getRunDeletion(runId) {
+    const row = this.db.query("SELECT * FROM run_deletions WHERE run_id = ?1").get(runId);
+    return row ? toRunDeletion(row) : undefined;
+  }
+  listIncompleteRunDeletions() {
+    const rows = this.db.query("SELECT * FROM run_deletions WHERE status <> 'completed' ORDER BY updated_at").all();
+    return rows.map(toRunDeletion);
+  }
+  runDeletionBlockers(runId) {
+    const blockers = [];
+    const unconfirmedShutdowns = this.db.query("SELECT shutdown_id, attempt_id, detail FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 ORDER BY created_at").all(runId);
+    blockers.push(...unconfirmedShutdowns.map((row) => ({
+      kind: "unconfirmed-harness-shutdown",
+      id: row.shutdown_id,
+      message: `Harness shutdown ${row.shutdown_id} for attempt ${row.attempt_id} is unconfirmed: ${row.detail}`
+    })));
+    const checkpoints = this.db.query("SELECT id FROM checkpoints WHERE source_run_id = ?1").all(runId);
+    blockers.push(...checkpoints.map((row) => ({
+      kind: "checkpoint",
+      id: row.id,
+      message: `Checkpoint ${row.id} retains this run as its source.`
+    })));
+    const cells = this.db.query("SELECT experiment_id, cell_key FROM experiment_cells WHERE run_id = ?1").all(runId);
+    blockers.push(...cells.map((row) => ({
+      kind: "experiment-cell",
+      id: `${row.experiment_id}/${row.cell_key}`,
+      message: `Experiment cell ${row.experiment_id}/${row.cell_key} retains this run.`
+    })));
+    const comparisons = this.db.query("SELECT id, runs_json FROM run_comparisons").all();
+    blockers.push(...comparisons.filter((row) => parseJson(row.runs_json).some((run) => run.runId === runId)).map((row) => ({
+      kind: "comparison",
+      id: row.id,
+      message: `Comparison ${row.id} retains a pinned revision of this run.`
+    })));
+    const records = this.db.query("SELECT id, record_json FROM checkpoint_records").all();
+    blockers.push(...records.filter((row) => payloadReferencesRun(parseJson(row.record_json), runId)).map((row) => ({
+      kind: "checkpoint-record",
+      id: row.id,
+      message: `Checkpoint record ${row.id} retains this run.`
+    })));
+    const evidence = this.db.query("SELECT evidence_id, payload_json FROM evaluation_evidence WHERE run_id <> ?1").all(runId);
+    blockers.push(...evidence.filter((row) => payloadReferencesRun(parseJson(row.payload_json), runId)).map((row) => ({
+      kind: "evaluation-evidence",
+      id: row.evidence_id,
+      message: `Evaluation evidence ${row.evidence_id} cites this run.`
+    })));
+    const artifacts = this.db.query("SELECT id FROM artifacts WHERE run_id = ?1").all(runId);
+    if (artifacts.length) {
+      const ids = new Set(artifacts.map(({ id: artifactId }) => artifactId));
+      const scoutRefs = this.db.query("SELECT run_id, request_id, result_artifact_id FROM scout_requests WHERE run_id <> ?1 AND result_artifact_id IS NOT NULL").all(runId);
+      blockers.push(...scoutRefs.filter((row) => ids.has(row.result_artifact_id)).map((row) => ({
+        kind: "scout-result",
+        id: `${row.run_id}/${row.request_id}`,
+        message: `A delegated result in ${row.run_id} retains one of this run's artifacts.`
+      })));
+    }
+    return blockers;
+  }
+  beginRunDeletion(input2) {
+    if (!input2.idempotencyKey.trim())
+      throw new Error("idempotency key is required");
+    if (!input2.actor.trim())
+      throw new Error("deletion actor is required");
+    const requestDigest = createHash2("sha256").update(canonicalize({
+      runId: input2.runId,
+      expectedRevision: input2.expectedRevision,
+      actor: input2.actor
+    })).digest("hex");
+    return this.tx(() => {
+      const prior = this.db.query("SELECT * FROM run_deletions WHERE run_id = ?1").get(input2.runId);
+      if (prior) {
+        if (prior.status === "completed")
+          return toRunDeletion(prior);
+        if (prior.idempotency_key !== input2.idempotencyKey || prior.request_digest !== requestDigest)
+          throw new Error("run deletion is already in progress with a different request");
+        return toRunDeletion(prior);
+      }
+      const run = this.getRunRow(input2.runId);
+      if (!run)
+        throw new Error(`Run not found: ${input2.runId}`);
+      if (run.revision !== input2.expectedRevision)
+        throw new Error("stale-action: run revision changed");
+      if (!["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(run.status))
+        throw new Error("run deletion requires a terminal run");
+      const activeAttempts = this.db.query("SELECT id FROM attempts WHERE run_id = ?1 AND state IN ('reserved', 'running')").all(input2.runId);
+      if (activeAttempts.length)
+        throw new Error("run deletion is blocked by active attempts");
+      const blockers = this.runDeletionBlockers(input2.runId);
+      if (blockers.length)
+        throw new Error(`run deletion blocked: ${blockers.map((item) => item.message).join(" ")}`);
+      const timestamp = now();
+      this.db.query("INSERT INTO run_deletions(run_id, idempotency_key, request_digest, expected_revision, actor, status, preview_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?7, ?7)").run(input2.runId, input2.idempotencyKey, requestDigest, input2.expectedRevision, input2.actor, json(input2.preview), timestamp);
+      return this.getRunDeletion(input2.runId);
+    });
+  }
+  advanceRunDeletion(runId, status, input2 = {}) {
+    this.db.query("UPDATE run_deletions SET status = ?1, error = ?2, blobs_json = COALESCE(?3, blobs_json), updated_at = ?4 WHERE run_id = ?5").run(status, input2.error ?? null, input2.blobDigests ? json(input2.blobDigests) : null, now(), runId);
+    const record2 = this.getRunDeletion(runId);
+    if (!record2)
+      throw new Error(`Run deletion is not registered: ${runId}`);
+    return record2;
+  }
+  purgeRunData(runId) {
+    return this.tx(() => {
+      const deletion = this.getRunDeletion(runId);
+      if (!deletion)
+        throw new Error(`Run deletion is not registered: ${runId}`);
+      if (deletion.status === "database-purged" || deletion.status === "blob-cleanup-failed")
+        return deletion.blobDigests;
+      if (deletion.status === "completed")
+        return [];
+      if (deletion.status !== "workspace-cleaned" && deletion.status !== "purge-failed")
+        throw new Error(`workspace cleanup must complete before run purge (${deletion.status})`);
+      const blockers = this.runDeletionBlockers(runId);
+      if (blockers.length)
+        throw new Error(`run deletion blocked: ${blockers.map((item) => item.message).join(" ")}`);
+      const digests = this.db.query("SELECT DISTINCT a.digest FROM artifacts a WHERE a.run_id = ?1 AND a.digest <> '' AND NOT EXISTS (SELECT 1 FROM artifacts other WHERE other.digest = a.digest AND other.run_id <> ?1)").all(runId).map(({ digest }) => digest);
+      this.db.query("DELETE FROM collaboration_message_reservations WHERE message_id IN (SELECT id FROM collaboration_messages WHERE run_id = ?1)").run(runId);
+      this.db.query("DELETE FROM collaboration_batches WHERE wait_id IN (SELECT id FROM collaboration_waits WHERE run_id = ?1)").run(runId);
+      this.db.query("DELETE FROM collaboration_waits WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_messages WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_channels WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_participants WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_usage WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_grants WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM scout_deliveries WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM scout_requests WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM outbox WHERE effect_id IN (SELECT id FROM effects WHERE run_id = ?1)").run(runId);
+      this.db.query("DELETE FROM effects WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM attempts WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM invocations WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM artifacts WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM evaluation_evidence WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM delivery_actions WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM command_receipts WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM run_events WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM projection_frames WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM run_projections WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM runs WHERE id = ?1").run(runId);
+      this.db.query("UPDATE run_deletions SET status = 'database-purged', blobs_json = ?1, error = NULL, updated_at = ?2 WHERE run_id = ?3").run(json(digests), now(), runId);
+      return digests;
+    });
   }
   listRuns() {
     const rows = this.db.query("SELECT id as runId, workflow_id as workflowId, status, revision, input_json, created_at as createdAt, updated_at as updatedAt FROM runs ORDER BY created_at DESC").all();
@@ -38313,6 +39329,31 @@ class Journal {
     const value = this.db.query("SELECT view_json FROM run_projections WHERE run_id = ?1").get(runId);
     return value ? parseJson(value.view_json) : null;
   }
+  getViewAtRevision(runId, revision) {
+    const row = this.getRunRow(runId);
+    if (!row)
+      return null;
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision > row.revision)
+      throw new Error(`invalid pinned revision ${revision} for run ${runId}`);
+    let state = createInitialState(runId);
+    let recordedAt;
+    let cursor = 0;
+    while (cursor < revision) {
+      const events = this.getEvents(runId, cursor, Math.min(500, revision - cursor));
+      if (!events.length)
+        break;
+      for (const event of events) {
+        if (event.sequence > revision)
+          break;
+        state = reduceEvent(state, event);
+        recordedAt = event.recordedAt;
+        cursor = event.sequence;
+      }
+    }
+    if (state.revision !== revision)
+      throw new Error(`pinned revision ${revision} is not fully retained for run ${runId}`);
+    return createRunView(parseJson(row.bundle_json), state, recordedAt ?? row.createdAt);
+  }
   getRunRow(runId) {
     return this.db.query("SELECT id as runId, workflow_id as workflowId, status, revision, bundle_json, input_json, created_at as createdAt, updated_at as updatedAt FROM runs WHERE id = ?1").get(runId);
   }
@@ -38325,6 +39366,7 @@ class Journal {
     if (!run)
       throw new Error(`Run not found: ${certificate.sourceRunId}`);
     return this.tx(() => {
+      this.assertRunAvailable(certificate.sourceRunId);
       const prior = this.db.query("SELECT certificate_json, certificate_digest FROM checkpoints WHERE id = ?1").get(certificate.checkpointId);
       if (prior) {
         if (prior.certificate_digest !== certificate.certificateDigest || canonicalize(parseJson(prior.certificate_json)) !== canonicalize(certificate))
@@ -38397,6 +39439,32 @@ class Journal {
       payload: parseJson(String(row.payload_json))
     }));
   }
+  getHarnessActivity(runId, after = 0, limit = 200, attemptId, tail = false) {
+    const rows = this.db.query(`SELECT sequence, payload_json FROM run_events WHERE run_id = ?1 AND type = 'harness.activity' AND sequence > ?2 ${attemptId ? "AND json_extract(payload_json, '$.attemptId') = ?4" : ""} ORDER BY sequence ${tail ? "DESC" : "ASC"} LIMIT ?3`).all(runId, after, Math.max(1, Math.min(500, limit)), ...attemptId ? [attemptId] : []);
+    return (tail ? rows.reverse() : rows).flatMap((row) => {
+      const payload = parseJson(row.payload_json);
+      if (typeof payload.attemptId !== "string")
+        return [];
+      return [
+        {
+          cursor: row.sequence,
+          attemptId: payload.attemptId,
+          event: payload.event
+        }
+      ];
+    });
+  }
+  getSteeringCommand(runId, idempotencyKey) {
+    const row = this.db.query("SELECT json_extract(payload_json, '$.event.data.requestDigest') AS request_digest, json_extract(payload_json, '$.event.data.outcome') AS status, json_extract(payload_json, '$.event.data.revision') AS revision, json_extract(payload_json, '$.event.data.detail') AS detail FROM run_events WHERE run_id = ?1 AND type = 'harness.activity' AND json_extract(payload_json, '$.event.data.idempotencyKey') = ?2 ORDER BY sequence DESC LIMIT 1").get(runId, idempotencyKey);
+    if (!row?.request_digest || !row.status)
+      return null;
+    return {
+      requestDigest: row.request_digest,
+      status: row.status,
+      ...typeof row.revision === "number" ? { revision: row.revision } : {},
+      ...typeof row.detail === "string" ? { detail: row.detail } : {}
+    };
+  }
   getFrames(runId, after = 0, limit = 500) {
     const rows = this.db.query("SELECT frame_json FROM projection_frames WHERE run_id = ?1 AND revision > ?2 ORDER BY revision LIMIT ?3").all(runId, after, limit);
     return rows.map((row) => parseJson(row.frame_json));
@@ -38406,6 +39474,14 @@ class Journal {
   }
   hasArtifactDigest(digest) {
     return Boolean(this.db.query("SELECT 1 FROM artifacts WHERE digest = ?1 LIMIT 1").get(digest));
+  }
+  runArtifactDigests(runId) {
+    return this.db.query("SELECT DISTINCT a.digest FROM artifacts a WHERE a.run_id = ?1 AND a.digest <> '' AND NOT EXISTS (SELECT 1 FROM artifacts other WHERE other.digest = a.digest AND other.run_id <> ?1)").all(runId).map(({ digest }) => digest);
+  }
+  assertRunAvailable(runId) {
+    const deletion = this.db.query("SELECT status FROM run_deletions WHERE run_id = ?1").get(runId);
+    if (deletion && deletion.status !== "completed")
+      throw new Error(`run is being deleted: ${runId}`);
   }
   recordEvaluationEvidence(evidence, association) {
     const run = this.getRunRow(evidence.target.runId);
@@ -38421,6 +39497,11 @@ class Journal {
       return parseJson(prior.payload_json);
     }
     this.tx(() => {
+      this.assertRunAvailable(evidence.target.runId);
+      for (const source of evidence.provenance ?? []) {
+        if (source.kind === "run")
+          this.assertRunAvailable(source.id);
+      }
       this.db.query("INSERT INTO evaluation_evidence(evidence_id, run_id, revision, tree_digest, evaluator_id, evaluator_version, evidence_class, status, experiment_id, cell_key, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)").run(evidence.id, evidence.target.runId, evidence.target.revision, evidence.target.treeDigest ?? null, evidence.evaluatorId, evidence.evaluatorVersion, evidence.evidenceClass, evidence.status, association?.experimentId ?? null, association?.cellKey ?? null, payload, evidence.recordedAt);
     });
     return evidence;
@@ -38521,6 +39602,10 @@ class Journal {
     }
   }
   updateEntityTables(event, bundle) {
+    if (event.type === "run.retried") {
+      this.db.query("UPDATE invocations SET state = 'running', ended_at = NULL, error = NULL, output_artifact_ids_json = '[]' WHERE id = ?1 AND run_id = ?2").run(event.payload.invocationId, event.runId);
+      return;
+    }
     if (event.type === "invocation.created") {
       const definition = bundle.definitions[bundle.rootDefinitionId];
       const kind = definition?.nodes.find((node2) => node2.id === event.payload.nodeId)?.kind ?? "unknown";
@@ -38534,8 +39619,16 @@ class Journal {
         this.db.query("UPDATE invocations SET state = 'running', started_at = COALESCE(started_at, ?1) WHERE id = ?2").run(event.recordedAt, row.invocationId);
       return;
     }
+    if (event.type === "attempt.cancelled") {
+      this.db.query("UPDATE attempts SET state = 'cancelled', ended_at = ?1, error = ?2 WHERE id = ?3").run(event.recordedAt, event.payload.reason, event.payload.attemptId);
+      return;
+    }
     if (event.type === "attempt.completed") {
       this.db.query("UPDATE attempts SET state = ?1, ended_at = ?2, error = ?3 WHERE id = ?4").run(event.payload.status, event.recordedAt, event.payload.error ?? null, event.payload.attemptId);
+      return;
+    }
+    if (event.type === "invocation.cancelled") {
+      this.db.query("UPDATE invocations SET state = 'failed', ended_at = ?1, error = ?2 WHERE id = ?3").run(event.recordedAt, event.payload.reason, event.payload.invocationId);
       return;
     }
     if (event.type === "invocation.completed") {
@@ -38548,6 +39641,20 @@ class Journal {
       throw new Error(`Run not found: ${runId}`);
     return row.view_json;
   }
+}
+function payloadReferencesRun(value, runId) {
+  if (Array.isArray(value))
+    return value.some((item) => payloadReferencesRun(item, runId));
+  if (!value || typeof value !== "object")
+    return false;
+  const record2 = value;
+  if ((record2.kind === "run" || record2.type === "run") && record2.id === runId)
+    return true;
+  for (const key of ["runId", "sourceRunId", "candidateRunId", "parentRunId", "childRunId"]) {
+    if (record2[key] === runId)
+      return true;
+  }
+  return Object.values(record2).some((item) => payloadReferencesRun(item, runId));
 }
 
 // packages/host/src/scheduler/scheduler.ts
@@ -39127,7 +40234,7 @@ function normalizeWorkItemInput(input2) {
     throw new Error("task input must be nonblank");
   let workItem;
   if (rawWorkItem !== undefined) {
-    if (!isRecord3(rawWorkItem))
+    if (!isRecord4(rawWorkItem))
       throw new Error("workItem input must be an object");
     if (rawWorkItem.version !== 1)
       throw new Error("workItem.version must be 1");
@@ -39138,9 +40245,9 @@ function normalizeWorkItemInput(input2) {
       throw new Error("task and workItem.task conflict");
     const rawTicket = rawWorkItem.ticket;
     if (rawTicket !== undefined) {
-      if (!isRecord3(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
+      if (!isRecord4(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
         throw new Error("workItem.ticket.reference must be nonblank");
-      if (!isRecord3(rawTicket.snapshot))
+      if (!isRecord4(rawTicket.snapshot))
         throw new Error("ticket-only admission is unsupported without an immutable snapshot");
       validateTicketSnapshot(rawTicket.snapshot);
     }
@@ -39217,7 +40324,7 @@ function optionalString(value, field) {
     throw new Error(`${field} must be a string`);
   return { [field.slice(field.indexOf(".") + 1)]: value };
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -39523,7 +40630,9 @@ function toRequest(row) {
     ...row.deadline_at === null ? {} : { deadlineAt: row.deadline_at },
     ...row.dispatch_id === null ? {} : { dispatchId: row.dispatch_id },
     usage: parseJson(row.usage_json),
-    ...row.error === null ? {} : { error: row.error }
+    ...row.error === null ? {} : { error: row.error },
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 function digest(value) {
@@ -39578,7 +40687,7 @@ function validateScoutOutput(schemas3, ports, result) {
   if (ports.length === 0)
     return;
   for (const port2 of ports) {
-    const value = ports.length === 1 ? result : isRecord4(result) ? result[port2.name] : undefined;
+    const value = ports.length === 1 ? result : isRecord5(result) ? result[port2.name] : undefined;
     const schema = schemas3[port2.schemaDigest];
     if (!schema)
       throw new Error(`missing scout output schema ${port2.schemaDigest}`);
@@ -39587,7 +40696,7 @@ function validateScoutOutput(schemas3, ports, result) {
       throw new Error(`invalid scout output ${port2.name}: ${check2.error}`);
   }
 }
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -39606,6 +40715,10 @@ class Coordinator {
   dataDir;
   scriptedDelayMs;
   commandTimeoutMs;
+  agentIdleTimeoutMs;
+  agentObservationGraceMs;
+  operationTimeoutMs;
+  cancelGraceMs;
   defaultProfile;
   workspaceAdapter;
   workspaces = new Map;
@@ -39621,7 +40734,11 @@ class Coordinator {
   opencodeDescriptor;
   active = new Map;
   reschedule = new Set;
+  activeSchedulers = new Map;
+  runBudgetTimers = new Map;
   aborters = new Map;
+  activeAdapters = new Map;
+  activityEvents = new Map;
   closed = false;
   constructor(options) {
     this.dataDir = options.dataDir;
@@ -39632,6 +40749,10 @@ class Coordinator {
     this.process = options.process ?? createDefaultProcessAdapter();
     this.scriptedDelayMs = Math.max(0, options.scriptedDelayMs ?? 5000);
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30000;
+    this.agentIdleTimeoutMs = options.agentIdleTimeoutMs ?? 120000;
+    this.agentObservationGraceMs = options.agentObservationGraceMs ?? 120000;
+    this.operationTimeoutMs = options.operationTimeoutMs ?? 15 * 60000;
+    this.cancelGraceMs = options.cancelGraceMs ?? 5000;
     this.defaultProfile = options.executionProfile ?? "scripted";
     this.workspaceAdapter = options.workspaceAdapter;
     const row = this.journal.db.query("SELECT value FROM schema_meta WHERE key = 'owner_epoch'").get();
@@ -39689,6 +40810,9 @@ class Coordinator {
     if (this.closed)
       return;
     this.closed = true;
+    for (const timer of this.runBudgetTimers.values())
+      clearTimeout(timer);
+    this.runBudgetTimers.clear();
     await Promise.allSettled(this.active.values());
     this.journal.close();
   }
@@ -39807,6 +40931,10 @@ class Coordinator {
     if (!ref || !this.workspaceAdapter)
       throw new Error("run has no repository workspace");
     const snapshot = await this.workspaceAdapter.snapshot(ref);
+    if (input2.expectedTree !== undefined && snapshot.resultTree !== input2.expectedTree)
+      throw new Error("stale-review: workspace tree changed after the diff was reviewed");
+    if (input2.expectedPatchDigest !== undefined && snapshot.patchDigest !== input2.expectedPatchDigest)
+      throw new Error("stale-review: workspace diff changed after review");
     return this.journal.createDeliveryAction({
       requestKey: input2.requestKey,
       runId: input2.runId,
@@ -39849,6 +40977,40 @@ class Coordinator {
     this.workspaces.delete(runId);
     this.snapshots.delete(runId);
   }
+  assertRunDrained(runId) {
+    if (this.active.has(runId))
+      throw new Error("run deletion is blocked while its coordinator is active");
+    if ((this.aborters.get(runId)?.size ?? 0) > 0)
+      throw new Error("run deletion is blocked by active invocation controllers");
+    const unconfirmedShutdowns = this.journal.db.query("SELECT attempt_id FROM unconfirmed_harness_shutdowns WHERE run_id = ?1").all(runId);
+    if (unconfirmedShutdowns.length)
+      throw new Error("run deletion is blocked by unconfirmed harness shutdown");
+    const activeAttempts = this.journal.db.query("SELECT id FROM attempts WHERE run_id = ?1 AND state IN ('reserved', 'running')").all(runId);
+    if (activeAttempts.length)
+      throw new Error("run deletion is blocked by active attempts");
+  }
+  async cleanupRunWorkspaces(runId) {
+    this.assertRunDrained(runId);
+    const claims = await this.workspaceClaims(runId);
+    for (const claim3 of claims ?? [])
+      await this.workspaceAdapter.cleanup(claim3);
+    this.workspaces.delete(runId);
+    this.snapshots.delete(runId);
+    for (const [key, claim3] of this.branchWorkspaces) {
+      if (claim3.runId === runId)
+        this.branchWorkspaces.delete(key);
+    }
+    this.activeAdapters.delete(runId);
+    const view = this.journal.getView(runId);
+    for (const attemptId of Object.keys(view?.state.attempts ?? {}))
+      this.activityEvents.delete(attemptId);
+  }
+  async workspaceClaims(runId) {
+    return this.workspaceAdapter?.listClaims(runId) ?? [];
+  }
+  hasWorkspaceAdapter() {
+    return Boolean(this.workspaceAdapter);
+  }
   decideApproval(input2) {
     if (!input2.actor.trim())
       throw new Error("approval actor is required");
@@ -39858,6 +41020,7 @@ class Coordinator {
       requestDigest: JSON.stringify({
         invocationId: input2.invocationId,
         decision: input2.decision,
+        feedback: input2.feedback?.trim() ?? "",
         bindingDigest: input2.bindingDigest ?? null,
         subjectRevision: input2.subjectRevision ?? null
       }),
@@ -39868,15 +41031,32 @@ class Coordinator {
     const view = this.journal.getView(input2.runId);
     if (!view)
       throw new Error(`Run not found: ${input2.runId}`);
+    if (view.state.control !== "none")
+      throw new Error("approval is unavailable while the run is stopping");
     if (view.revision !== input2.expectedRevision)
       throw new Error(`stale-action: expected revision ${input2.expectedRevision}, current revision ${view.revision}`);
     const approval = Object.values(view.state.approvals).find((candidate) => candidate.invocationId === input2.invocationId && candidate.status === "pending");
     if (!approval)
       throw new Error("approval is not pending");
+    const feedback = input2.feedback?.trim() ?? "";
+    if (feedback.length > 20000)
+      throw new Error("approval feedback exceeds 20000 characters");
+    if (input2.decision === "changes-requested") {
+      if (!feedback)
+        throw new Error("request changes requires feedback");
+      if (approvalRepairsRemaining(view.bundle, view.state, input2.invocationId) === 0)
+        throw new Error("request changes is unavailable: no bounded feedback route or repair budget remains");
+    }
     if (input2.bindingDigest !== undefined && input2.bindingDigest !== approval.bindingDigest)
       throw new Error("stale-action: approval binding changed");
     if (input2.subjectRevision !== undefined && input2.subjectRevision !== approval.subjectRevision)
       throw new Error("stale-action: approval subject changed");
+    const invocation = view.state.invocations[input2.invocationId];
+    const definition = view.bundle.definitions[view.state.scopes[invocation.scopeId].definitionId];
+    const port2 = definition.nodes.find((node2) => node2.id === invocation.nodeId)?.outputPorts[0];
+    const stored = port2 ? this.journal.blobs.put(input2.runId, new TextEncoder().encode(json({ decision: input2.decision, feedback })), "application/json") : undefined;
+    if (stored)
+      this.journal.insertArtifact(stored);
     this.journal.append({
       runId: input2.runId,
       type: "approval.decided",
@@ -39884,7 +41064,18 @@ class Coordinator {
         approvalId: approval.id,
         decision: input2.decision,
         bindingDigest: approval.bindingDigest,
-        subjectRevision: approval.subjectRevision
+        subjectRevision: approval.subjectRevision,
+        ...feedback ? { feedback } : {},
+        ...stored && port2 ? {
+          output: [
+            {
+              id: stored.id,
+              digest: stored.digest,
+              mediaType: stored.mediaType,
+              schemaDigest: port2.schemaDigest
+            }
+          ]
+        } : {}
       },
       actor: input2.actor,
       subjectId: approval.id
@@ -39896,11 +41087,390 @@ class Coordinator {
   control(input2) {
     if (!input2.actor.trim())
       throw new Error("action actor is required");
-    return this.journal.command({
+    const result = this.journal.command({
       idempotencyKey: input2.idempotencyKey,
       runId: input2.runId,
       execute: () => this.controlOnce(input2)
     }).result;
+    if ((input2.action === "cancel" || input2.action === "interrupt") && !this.active.has(input2.runId))
+      this.schedule(input2.runId);
+    return result;
+  }
+  async steer(input2) {
+    const view = this.journal.getView(input2.runId);
+    if (!view)
+      throw new Error(`Run not found: ${input2.runId}`);
+    const message = input2.message.trim();
+    if (!message || message.length > 4000)
+      throw new Error("steer message must be 1 to 4000 characters");
+    if (!input2.idempotencyKey.trim())
+      throw new Error("idempotency key is required");
+    const requestDigest = createHash4("sha256").update(canonicalize({ invocationId: input2.invocationId, attemptId: input2.attemptId, message })).digest("hex");
+    const prior = this.journal.getSteeringCommand(input2.runId, input2.idempotencyKey);
+    if (prior) {
+      if (prior.requestDigest !== requestDigest)
+        throw new Error("idempotency key payload conflict");
+      if (prior.status === "accepted")
+        return {
+          revision: prior.revision ?? this.journal.getView(input2.runId)?.revision ?? view.revision,
+          duplicate: true
+        };
+      if (prior.status === "rejected")
+        throw new Error(`steer-rejected: ${prior.detail ?? "The harness rejected this instruction"}`);
+      throw new Error("steer-outcome-unknown: this instruction may have reached the harness; it was not resent");
+    }
+    const invocation = view.state.invocations[input2.invocationId];
+    if (!invocation || invocation.status !== "running")
+      throw new Error("steer-unavailable: invocation is not running");
+    const adapter = this.activeAdapters.get(input2.runId)?.get(input2.invocationId);
+    if (!adapter?.steer)
+      throw new Error("steer-unavailable: active harness does not support mid-turn steering");
+    const attempt = Object.values(view.state.attempts).find((item) => item.id === input2.attemptId && item.invocationId === invocation.id && item.status === "running");
+    if (!attempt)
+      throw new Error("steer-unavailable: active attempt is missing");
+    const secrets = Object.entries(process.env).filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key)).map(([, value]) => value).filter((value) => value.length >= 6);
+    const journalMessage = String(redactSecrets(message, secrets));
+    const activity = (status, extra = {}) => this.journal.append({
+      runId: input2.runId,
+      type: "harness.activity",
+      payload: {
+        attemptId: attempt.id,
+        event: {
+          type: "log",
+          at: new Date().toISOString(),
+          data: {
+            status,
+            idempotencyKey: input2.idempotencyKey,
+            requestDigest,
+            invocationId: input2.invocationId,
+            ...extra
+          }
+        }
+      },
+      actor: input2.actor,
+      subjectId: attempt.id
+    });
+    const requested = activity("Steering instruction requested", {
+      instruction: journalMessage,
+      outcome: "requested"
+    });
+    try {
+      await adapter.steer({ invocationId: input2.invocationId, message });
+    } catch (cause) {
+      const detail = String(redactSecrets(cause instanceof Error ? cause.message : String(cause), secrets));
+      activity("Steering instruction rejected", {
+        detail,
+        instruction: journalMessage,
+        outcome: "rejected"
+      });
+      throw new Error(`steer-rejected: ${detail}`);
+    }
+    const current = this.journal.getView(input2.runId);
+    if (!current || ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(current.state.status))
+      return { revision: requested.sequence };
+    const accepted = activity("Steering instruction accepted", {
+      instruction: journalMessage,
+      outcome: "accepted"
+    });
+    return { revision: accepted.sequence };
+  }
+  canSteer(runId, invocationId) {
+    const adapter = this.activeAdapters.get(runId)?.get(invocationId);
+    return Boolean(adapter?.steer && (adapter.canSteer?.({ invocationId }) ?? true));
+  }
+  canInterrupt(runId, invocationId) {
+    return Boolean(this.aborters.get(runId)?.has(invocationId));
+  }
+  interruptAttempt(input2) {
+    if (!input2.actor.trim())
+      throw new Error("action actor is required");
+    return this.journal.command({
+      runId: input2.runId,
+      idempotencyKey: input2.idempotencyKey,
+      requestDigest: JSON.stringify({
+        action: "interrupt-attempt",
+        invocationId: input2.invocationId,
+        attemptId: input2.attemptId
+      }),
+      execute: () => {
+        const view = this.journal.getView(input2.runId);
+        if (!view || view.revision !== input2.expectedRevision)
+          throw new Error("stale-action: run revision changed");
+        const attempt = view.state.attempts[input2.attemptId];
+        const aborter = this.aborters.get(input2.runId)?.get(input2.invocationId);
+        if (!attempt || attempt.invocationId !== input2.invocationId || attempt.status !== "running" || !aborter || !["running", "paused"].includes(view.state.status) || (view.state.control ?? "none") !== "none")
+          throw new Error("interrupt is unavailable: the selected agent attempt is no longer live");
+        const event = this.journal.append({
+          runId: input2.runId,
+          type: "harness.activity",
+          actor: input2.actor,
+          payload: {
+            attemptId: input2.attemptId,
+            event: {
+              type: "log",
+              at: now(),
+              data: {
+                status: "Agent interrupt requested",
+                outcome: "requested",
+                idempotencyKey: input2.idempotencyKey
+              }
+            }
+          }
+        });
+        aborter.abort("operator interrupted this agent");
+        return { revision: event.sequence, status: view.state.status };
+      }
+    }).result;
+  }
+  canRetry(runId, invocationId) {
+    const view = this.journal.getView(runId);
+    if (!view || !["failed", "interrupted"].includes(view.state.status) || (view.state.control ?? "none") !== "none" && !(view.state.status === "interrupted" && view.state.control === "interrupt-requested"))
+      return false;
+    if (view.state.status === "interrupted" && view.state.control !== "interrupt-requested")
+      return false;
+    const invocation = view.state.invocations[invocationId];
+    const node2 = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find((item) => item.id === invocation?.nodeId);
+    if (!invocation || invocation.status !== "failed" || invocation.scopeId !== view.state.rootScopeId || !node2 || !["agent", "command"].includes(node2.kind) || Object.values(view.state.invocations).some((item) => item.sourceInvocationId === invocationId) || view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.some((item) => item.kind === "fork" && item.branchIds.includes(invocation.nodeId)))
+      return false;
+    const latest = Object.values(view.state.attempts).filter((item) => item.invocationId === invocationId).sort((a, b) => b.ordinal - a.ordinal)[0];
+    if (!latest || !["failed", "cancelled"].includes(latest.status) || Object.keys(view.state.attempts).length >= view.bundle.limits.maxAttempts)
+      return false;
+    return !this.journal.db.query("SELECT 1 FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 LIMIT 1").get(runId);
+  }
+  normalizeActivity(runId, event) {
+    if (event.type !== "tool" || !event.data || typeof event.data !== "object" || Array.isArray(event.data) || event.data.output === undefined)
+      return event;
+    const output2 = redactSecrets(event.data.output, Object.entries(process.env).filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key)).map(([, value]) => value).filter((value) => value.length >= 6));
+    const bytes = new TextEncoder().encode(json(output2));
+    if (bytes.byteLength <= 65536)
+      return event;
+    const artifact = this.journal.blobs.put(runId, bytes, "application/json");
+    this.journal.insertArtifact(artifact);
+    return {
+      ...event,
+      data: {
+        ...event.data,
+        output: activityPreview(output2),
+        outputArtifactId: artifact.id,
+        outputBytes: bytes.byteLength
+      }
+    };
+  }
+  recordHarnessActivity(runId, invocationId, attemptId, event) {
+    const secrets = Object.entries(process.env).filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key)).map(([, value]) => value).filter((value) => value.length >= 6);
+    const safe = redactSecrets(event, secrets);
+    const recorded = this.activityEvents.get(attemptId) ?? [];
+    recorded.push(safe);
+    if (recorded.length > 4000)
+      recorded.splice(0, recorded.length - 4000);
+    this.activityEvents.set(attemptId, recorded);
+    this.journal.append({
+      runId,
+      type: "harness.activity",
+      payload: { attemptId, event: safe },
+      actor: "harness",
+      subjectId: attemptId,
+      causationId: invocationId
+    });
+  }
+  async superviseHarness(adapter, input2, controller, timeoutMs, runDeadlineAt, recoveryAttemptId = input2.attemptId ?? input2.invocationId, recordSupervisionEvent) {
+    const startedAt = Date.now();
+    const supervisionId = id("supervision");
+    let lastProgressAt = startedAt;
+    let observationUntil;
+    let reconnectAttempts = 0;
+    const runningTools = new Map;
+    let stopReason;
+    const signal = input2.signal;
+    const attemptId = input2.attemptId ?? input2.invocationId;
+    const record2 = input2.onEvent;
+    const log = (status, detail) => {
+      const event = {
+        type: "log",
+        at: new Date().toISOString(),
+        data: { status, detail }
+      };
+      record2?.(event);
+      recordSupervisionEvent?.(event);
+    };
+    const operation = adapter.run({
+      ...input2,
+      timeoutMs: undefined,
+      onEvent: (event) => {
+        record2?.(event);
+        if (event.type === "text") {
+          lastProgressAt = Date.now();
+          observationUntil = undefined;
+        }
+        if (event.type !== "tool" || !event.data || typeof event.data !== "object")
+          return;
+        const tool2 = event.data;
+        const id2 = String(tool2.id ?? tool2.name ?? "tool");
+        const status = String(tool2.status ?? "").toLowerCase();
+        const terminal = /complete|finish|end|fail|error|result|cancel/.test(status);
+        if (terminal)
+          runningTools.delete(id2);
+        else if (/start|running|update/.test(status)) {
+          runningTools.set(id2, runningTools.get(id2) ?? Date.now() + this.operationTimeoutMs);
+        }
+        lastProgressAt = Date.now();
+        observationUntil = undefined;
+      }
+    });
+    const settled = operation.then((result) => ({ ok: true, result }), (error63) => ({ ok: false, error: error63 }));
+    const sleep = (ms) => Bun.sleep(Math.max(1, ms));
+    const settleAfterStop = async (reason) => {
+      stopReason = reason;
+      if (!signal?.aborted)
+        controller.abort(reason);
+      log("Cancellation requested", reason);
+      const final = await Promise.race([settled, sleep(this.cancelGraceMs).then(() => null)]);
+      if (final === null) {
+        let terminated = false;
+        if (adapter.terminate) {
+          try {
+            terminated = await Promise.race([
+              adapter.terminate({ attemptId, reason }),
+              sleep(5000).then(() => false)
+            ]);
+          } catch {
+            terminated = false;
+          }
+        }
+        if (terminated) {
+          log("Owned process termination confirmed", reason);
+          if (reason === "cancelled")
+            return {
+              status: "cancelled",
+              error: "cancelled",
+              events: [],
+              usage: unavailableUsage()
+            };
+          return {
+            status: "failed",
+            error: reason,
+            events: [],
+            usage: unavailableUsage()
+          };
+        }
+        const detail = `provider did not confirm termination within ${this.cancelGraceMs}ms after ${reason}`;
+        log("Cancellation unconfirmed; recovery required", detail);
+        const effect = this.journal.db.query("SELECT id FROM effects WHERE attempt_id = ?1").get(recoveryAttemptId);
+        if (effect) {
+          this.journal.markRecoveryRequired(effect.id, detail, supervisionId);
+          settled.then(() => this.journal.confirmHarnessShutdown(supervisionId)).catch(() => {
+            return;
+          });
+        }
+        return;
+      }
+      if (!final.ok) {
+        if (reason === "cancelled")
+          return {
+            status: "cancelled",
+            error: "cancelled",
+            events: [],
+            usage: unavailableUsage()
+          };
+        return {
+          status: "failed",
+          error: `${reason}: ${final.error instanceof Error ? final.error.message : String(final.error)}`,
+          events: [],
+          usage: unavailableUsage()
+        };
+      }
+      if (reason === "cancelled") {
+        if (final.result.status === "succeeded")
+          return final.result;
+        return { ...final.result, status: "cancelled", error: "cancelled" };
+      }
+      return { ...final.result, status: "failed", error: reason };
+    };
+    for (;; ) {
+      const now2 = Date.now();
+      const first = await Promise.race([settled, sleep(250).then(() => null)]);
+      if (first !== null) {
+        if (!first.ok) {
+          if (signal?.aborted) {
+            const reason = signal.reason === "budget-exhausted" || signal.reason === "run-budget-exhausted" ? signal.reason : "cancelled";
+            return settleAfterStop(reason);
+          }
+          return {
+            status: "failed",
+            error: `transport: ${first.error instanceof Error ? first.error.message : String(first.error)}`,
+            events: [],
+            usage: unavailableUsage()
+          };
+        }
+        return first.result;
+      }
+      if (signal?.aborted) {
+        const reason = signal.reason === "budget-exhausted" || signal.reason === "run-budget-exhausted" ? signal.reason : "cancelled";
+        return settleAfterStop(reason);
+      }
+      if (timeoutMs !== undefined && now2 - startedAt >= timeoutMs) {
+        log("Attempt budget exhausted", `maximum attempt duration ${timeoutMs}ms reached`);
+        return settleAfterStop("budget-exhausted");
+      }
+      if (runDeadlineAt !== undefined && now2 >= runDeadlineAt) {
+        log("Run budget exhausted", "maximum run duration reached");
+        return settleAfterStop("run-budget-exhausted");
+      }
+      const expiredTool = [...runningTools].find(([, deadline]) => deadline <= now2)?.[0];
+      if (expiredTool) {
+        log("Tool operation timed out", `${expiredTool} exceeded ${this.operationTimeoutMs}ms`);
+        return settleAfterStop("operation-timeout");
+      }
+      const view = this.journal.getView(input2.runId);
+      const suspended = view?.state.status === "paused" || Object.values(view?.state.approvals ?? {}).some((approval) => approval.status === "pending");
+      if (suspended || runningTools.size > 0) {
+        lastProgressAt = now2;
+        observationUntil = undefined;
+        continue;
+      }
+      if (now2 - lastProgressAt < this.agentIdleTimeoutMs)
+        continue;
+      if (observationUntil === undefined || now2 >= observationUntil) {
+        let probe = "unknown";
+        if (adapter.probe) {
+          try {
+            probe = await Promise.race([
+              adapter.probe({ attemptId }),
+              sleep(Math.min(5000, this.agentObservationGraceMs)).then(() => "unknown")
+            ]);
+          } catch {
+            probe = "unknown";
+          }
+        }
+        if (probe === "disconnected" && adapter.reconnect && reconnectAttempts < 1) {
+          reconnectAttempts += 1;
+          let reconnected = false;
+          try {
+            reconnected = await Promise.race([
+              adapter.reconnect({ attemptId }),
+              sleep(Math.min(5000, this.agentObservationGraceMs)).then(() => false)
+            ]);
+          } catch {
+            reconnected = false;
+          }
+          log(reconnected ? "Provider reconnected; observing" : "Provider reconnection failed", `status probe reported disconnected for attempt ${attemptId}`);
+          observationUntil = Date.now() + this.agentObservationGraceMs;
+          continue;
+        }
+        if (probe === "working") {
+          log("Provider reports working; observing", `no progress for attempt ${attemptId}`);
+          observationUntil = Date.now() + this.agentObservationGraceMs;
+          continue;
+        }
+        if (observationUntil === undefined) {
+          log("Possibly stalled; provider status unknown", `no text or tool progress for ${this.agentIdleTimeoutMs}ms; observing for ${this.agentObservationGraceMs}ms`);
+          observationUntil = Date.now() + this.agentObservationGraceMs;
+          continue;
+        }
+        log("Agent remained silent after observation grace", `attempt ${attemptId}`);
+        return settleAfterStop("possibly-stalled");
+      }
+    }
   }
   controlOnce(input2) {
     const view = this.journal.getView(input2.runId);
@@ -39914,17 +41484,14 @@ class Coordinator {
       throw new Error(`${input2.action} is unavailable without an active run`);
     if (input2.action === "interrupt" && !active)
       throw new Error("interrupt is unavailable without an active attempt");
-    if ((input2.action === "cancel" || input2.action === "interrupt") && active) {
-      const profile = this.profileFor(input2.runId);
-      const capabilities = profile === "codex-readonly" || profile === "codex-workspace-write" ? this.codexDescriptor?.availability === "available" ? { cancel: "supported" } : { cancel: "unsupported" } : this.harness.capabilities();
-      if (capabilities.cancel !== "supported")
-        throw new Error("cancellation-unsupported: adapter cannot cancel active attempt");
-    }
     const type = input2.action === "pause" ? "run.paused" : input2.action === "resume" ? "run.resumed" : input2.action === "cancel" ? "run.cancel.requested" : input2.action === "interrupt" ? "run.interrupt.requested" : "run.detached";
     this.journal.append({ runId: input2.runId, type, payload: {}, actor: input2.actor });
-    if (input2.action === "cancel" || input2.action === "interrupt")
+    if (input2.action === "cancel" || input2.action === "interrupt") {
+      this.activeSchedulers.get(input2.runId)?.cancel(input2.action);
+      this.cancelUnstartedWork(input2.runId, input2.action);
       for (const aborter of this.aborters.get(input2.runId)?.values() ?? [])
         aborter.abort(input2.action);
+    }
     if (input2.action === "resume") {
       if (this.active.has(input2.runId))
         this.reschedule.add(input2.runId);
@@ -39947,12 +41514,14 @@ class Coordinator {
     const view = this.journal.getView(input2.runId);
     if (!view)
       throw new Error(`Run not found: ${input2.runId}`);
+    if (!this.canRetry(input2.runId, input2.invocationId))
+      throw new Error("retry is unavailable: the failed effect must be drained, unconsumed, and within the attempt budget");
     if (view.revision !== input2.expectedRevision)
       throw new Error(`stale-action: expected revision ${input2.expectedRevision}, current revision ${view.revision}`);
     const invocation = view.state.invocations[input2.invocationId];
     const attempts = Object.values(view.state.attempts).filter((attempt) => attempt.invocationId === input2.invocationId).sort((a, b) => b.ordinal - a.ordinal);
     const source = attempts[0];
-    if (!invocation || invocation.status !== "failed" || !source || source.status !== "failed")
+    if (!invocation || invocation.status !== "failed" || !source || !["failed", "cancelled"].includes(source.status))
       throw new Error("retry is only available for a failed terminal invocation");
     const attemptId = id("attempt");
     this.journal.transaction(() => {
@@ -39969,11 +41538,6 @@ class Coordinator {
     const next = this.journal.getView(input2.runId);
     return { revision: next.revision, status: next.state.status };
   }
-  profileFor(runId) {
-    const row = this.journal.getRunRow(runId);
-    const input2 = row ? parseJson(row.input_json) : {};
-    return input2.__kouroExecutionProfile === "codex-readonly" || input2.__kouroExecutionProfile === "codex-workspace-write" || input2.__kouroExecutionProfile === "claude-readonly" || input2.__kouroExecutionProfile === "claude-workspace-write" || input2.__kouroExecutionProfile === "pi-readonly" ? input2.__kouroExecutionProfile : "scripted";
-  }
   schedule(runId) {
     if (this.closed)
       return;
@@ -39982,27 +41546,115 @@ class Coordinator {
       return;
     }
     const work = this.drive(runId).catch((cause) => {
-      const run = this.journal.getRunSummary(runId);
-      if (run && (run.status === "pending" || run.status === "running"))
-        this.journal.append({
-          runId,
-          type: "run.completed",
-          payload: { status: "failed" },
-          actor: "system"
-        });
-      throw cause;
+      const view = this.journal.getView(runId);
+      if (view && (view.state.status === "pending" || view.state.status === "running")) {
+        const invocations = Object.values(view.state.invocations);
+        const allSettled = invocations.length > 0 && invocations.every((invocation) => ["succeeded", "failed", "recovery-required"].includes(invocation.status));
+        if (allSettled) {
+          this.journal.append({
+            runId,
+            type: "run.completed",
+            payload: {
+              status: view.state.control === "cancel-requested" ? "cancelled" : view.state.control === "interrupt-requested" ? "interrupted" : "failed"
+            },
+            actor: "system"
+          });
+        } else {
+          this.journal.append({
+            runId,
+            type: "recovery.required",
+            payload: {
+              code: "coordinator-drive-failed",
+              detail: cause instanceof Error ? cause.message : String(cause)
+            },
+            actor: "system"
+          });
+        }
+      }
     }).finally(() => {
       this.active.delete(runId);
+      const view = this.journal.getView(runId);
+      if (!view || ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(view.state.status)) {
+        const timer = this.runBudgetTimers.get(runId);
+        if (timer)
+          clearTimeout(timer);
+        this.runBudgetTimers.delete(runId);
+      }
       if (!this.closed && this.reschedule.delete(runId))
         this.schedule(runId);
     });
     this.active.set(runId, work);
+  }
+  cancelUnstartedWork(runId, reason) {
+    const view = this.journal.getView(runId);
+    if (!view)
+      return;
+    for (const invocation of Object.values(view.state.invocations)) {
+      const attempts = Object.values(view.state.attempts).filter((attempt) => attempt.invocationId === invocation.id);
+      const reserved = attempts.filter((attempt) => attempt.status === "reserved").sort((a, b) => b.ordinal - a.ordinal)[0];
+      const hasRunningAttempt = attempts.some((attempt) => attempt.status === "running");
+      if (!["pending", "reserved"].includes(invocation.status) && !(invocation.status === "running" && !hasRunningAttempt))
+        continue;
+      if (reserved)
+        this.journal.cancelReservedEffect(reserved.id, reason);
+      this.journal.append({
+        runId,
+        type: "invocation.cancelled",
+        payload: { invocationId: invocation.id, reason },
+        actor: "system",
+        subjectId: invocation.id
+      });
+    }
+  }
+  armRunBudget(runId, view) {
+    if (this.runBudgetTimers.has(runId))
+      return;
+    const startedAt = view.state.startedAt ? Date.parse(view.state.startedAt) : Date.now();
+    const deadline = startedAt + view.bundle.limits.maxRunDurationMs;
+    const timer = setTimeout(() => this.expireRunBudget(runId), Math.max(1, deadline - Date.now()));
+    this.runBudgetTimers.set(runId, timer);
+  }
+  expireRunBudget(runId) {
+    this.runBudgetTimers.delete(runId);
+    const view = this.journal.getView(runId);
+    if (!view || !["running", "paused"].includes(view.state.status))
+      return;
+    const attemptId = Object.values(view.state.attempts).find((attempt) => attempt.status === "running")?.id;
+    this.journal.append({
+      runId,
+      type: "harness.activity",
+      payload: {
+        attemptId: attemptId ?? `${runId}:budget`,
+        event: {
+          type: "log",
+          at: new Date().toISOString(),
+          data: { status: "Run budget exhausted", detail: "maximum run duration reached" }
+        }
+      },
+      actor: "system",
+      ...attemptId ? { subjectId: attemptId } : {}
+    });
+    if (view.state.control === "none")
+      this.journal.append({
+        runId,
+        type: "run.cancel.requested",
+        payload: {},
+        actor: "system"
+      });
+    this.activeSchedulers.get(runId)?.cancel("run-budget-exhausted");
+    this.cancelUnstartedWork(runId, "run budget exhausted");
+    for (const aborter of this.aborters.get(runId)?.values() ?? [])
+      aborter.abort("run-budget-exhausted");
+    if (!this.active.has(runId))
+      this.schedule(runId);
   }
   async drive(runId) {
     for (;; ) {
       const view = this.journal.getView(runId);
       if (!view || view.state.status === "succeeded" || view.state.status === "failed" || view.state.status === "recovery-required")
         return;
+      if (view.state.status === "running")
+        this.armRunBudget(runId, view);
       if (view.state.control !== "none") {
         const active = Object.values(view.state.invocations).some((item) => ["pending", "reserved", "running"].includes(item.status));
         if (!active && (view.state.control === "cancel-requested" || view.state.control === "interrupt-requested")) {
@@ -40232,46 +41884,52 @@ class Coordinator {
           }))),
           resourceCaps: view.bundle.limits.resourceCaps
         });
-        await scheduler.run(executions.map((intent2) => ({
-          id: intent2.attemptId,
-          branchId: intent2.invocationId,
-          ordinal: view.state.invocations[intent2.invocationId]?.activationOrdinal ?? 0,
-          scope: {
-            scopeId: view.state.invocations[intent2.invocationId]?.scopeId ?? view.state.rootScopeId,
-            parentScopeId: null,
-            definitionId: view.bundle.rootDefinitionId,
-            activationOrdinal: view.state.invocations[intent2.invocationId]?.activationOrdinal ?? 0,
-            controlLineage: []
-          },
-          resources: (() => {
-            const invocation = view.state.invocations[intent2.invocationId];
-            const scope = invocation ? view.state.scopes[invocation.scopeId] : undefined;
-            const node2 = scope ? view.bundle.definitions[scope.definitionId]?.nodes.find((candidate) => candidate.id === invocation?.nodeId) : undefined;
-            return node2 && (node2.kind === "agent" || node2.kind === "command") ? node2.resources : undefined;
-          })(),
-          run: async () => {
-            await this.execute(runId, view.bundle, this.journal.getView(runId).state, intent2.invocationId, intent2.attemptId);
-            const current = this.journal.getView(runId)?.state.invocations[intent2.invocationId];
-            if (current?.status === "failed") {
-              const currentView = this.journal.getView(runId);
-              const owningGroup = groups.find((group) => group.expectedBranchIds.includes(intent2.invocationId));
-              if (owningGroup?.mode === "fail-fast") {
-                for (const sibling of Object.values(currentView?.state.invocations ?? {}).filter((candidate) => candidate.id !== intent2.invocationId && owningGroup.expectedBranchIds.includes(candidate.id) && ["pending", "reserved", "running"].includes(candidate.status)))
-                  this.journal.append({
-                    runId,
-                    type: "invocation.cancelled",
-                    payload: { invocationId: sibling.id, reason: "fail-fast branch failure" },
-                    actor: "system",
-                    subjectId: sibling.id
-                  });
-                for (const aborter of this.aborters.get(runId)?.values() ?? [])
-                  aborter.abort("fail-fast branch failure");
+        this.activeSchedulers.set(runId, scheduler);
+        try {
+          await scheduler.run(executions.map((intent2) => ({
+            id: intent2.attemptId,
+            branchId: intent2.invocationId,
+            ordinal: view.state.invocations[intent2.invocationId]?.activationOrdinal ?? 0,
+            scope: {
+              scopeId: view.state.invocations[intent2.invocationId]?.scopeId ?? view.state.rootScopeId,
+              parentScopeId: null,
+              definitionId: view.bundle.rootDefinitionId,
+              activationOrdinal: view.state.invocations[intent2.invocationId]?.activationOrdinal ?? 0,
+              controlLineage: []
+            },
+            resources: (() => {
+              const invocation = view.state.invocations[intent2.invocationId];
+              const scope = invocation ? view.state.scopes[invocation.scopeId] : undefined;
+              const node2 = scope ? view.bundle.definitions[scope.definitionId]?.nodes.find((candidate) => candidate.id === invocation?.nodeId) : undefined;
+              return node2 && (node2.kind === "agent" || node2.kind === "command") ? node2.resources : undefined;
+            })(),
+            run: async () => {
+              await this.execute(runId, view.bundle, this.journal.getView(runId).state, intent2.invocationId, intent2.attemptId);
+              const current = this.journal.getView(runId)?.state.invocations[intent2.invocationId];
+              if (current?.status === "failed") {
+                const currentView = this.journal.getView(runId);
+                const owningGroup = groups.find((group) => group.expectedBranchIds.includes(intent2.invocationId));
+                if (owningGroup?.mode === "fail-fast") {
+                  for (const sibling of Object.values(currentView?.state.invocations ?? {}).filter((candidate) => candidate.id !== intent2.invocationId && owningGroup.expectedBranchIds.includes(candidate.id) && ["pending", "reserved", "running"].includes(candidate.status)))
+                    this.journal.append({
+                      runId,
+                      type: "invocation.cancelled",
+                      payload: { invocationId: sibling.id, reason: "fail-fast branch failure" },
+                      actor: "system",
+                      subjectId: sibling.id
+                    });
+                  for (const aborter of this.aborters.get(runId)?.values() ?? [])
+                    aborter.abort("fail-fast branch failure");
+                }
+                if (owningGroup)
+                  throw new Error(current.outcome === "cancelled" || currentView?.state.control === "cancel-requested" || currentView?.state.control === "interrupt-requested" ? "cancelled" : current.error ?? "branch failed");
               }
-              if (owningGroup)
-                throw new Error(current.outcome === "cancelled" ? "cancelled" : current.error ?? "branch failed");
             }
-          }
-        })), groups);
+          })), groups);
+        } finally {
+          if (this.activeSchedulers.get(runId) === scheduler)
+            this.activeSchedulers.delete(runId);
+        }
         continue;
       }
       const intent = intents[0];
@@ -40572,7 +42230,12 @@ class Coordinator {
         this.branchWorkspaces.set(key, invocationWorkspace);
       }
     }
-    const invocationWorkspaceDir = invocationWorkspace?.path ?? workspaceDir;
+    let invocationWorkspaceDir = invocationWorkspace?.path ?? workspaceDir;
+    if (node2.kind === "command" && node2.workspaceAccess === "source-repository") {
+      if (!registeredWorkspace)
+        throw new Error(`Command ${node2.id} requires a repository workspace`);
+      invocationWorkspaceDir = registeredWorkspace.repositoryPath;
+    }
     if (node2.kind === "agent") {
       const config2 = collaborationConfig;
       const definition = bundle.definitions[scope?.definitionId ?? bundle.rootDefinitionId];
@@ -40795,7 +42458,7 @@ class Coordinator {
           });
           return;
         }
-        const codex = this.codex ??= new CodexHarnessAdapter(new CodexSdkHarness(this.codexDescriptor));
+        const codex = this.codex ??= new CodexHarnessAdapter(new CodexAppServerHarness(this.codexDescriptor));
         selected = codex;
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
@@ -40827,13 +42490,9 @@ class Coordinator {
         selected = pi;
         resolvedHarness = toHarness(pi.id);
         resolvedVersion = pi.adapterVersion;
-        const piSelection = resolvePiSelection({ harness: "pi", model: { id: node2.modelId ?? "" } }, {
-          ...node2.timeoutMs === undefined ? {} : { timeoutMs: node2.timeoutMs },
-          ...node2.modelId ? { model: node2.modelId } : {}
-        });
+        const piSelection = resolvePiSelection({ harness: "pi", model: { id: node2.modelId ?? "" } }, node2.modelId ? { model: node2.modelId } : {});
         resolvedModelId = piSelection.model;
         nativeConfig = {
-          ...node2.timeoutMs === undefined ? {} : { timeoutMs: node2.timeoutMs },
           ...piSelection.provider ? { provider: piSelection.provider } : {},
           ...piSelection.model ? { model: piSelection.model } : {}
         };
@@ -40916,19 +42575,48 @@ class Coordinator {
           return;
         }
       }
-      mkdirSync5(invocationWorkspaceDir, { recursive: true, mode: 448 });
+      const currentControl = this.journal.getView(runId)?.state.control;
+      if (currentControl === "cancel-requested" || currentControl === "interrupt-requested") {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [],
+          artifacts: [],
+          evidence: [],
+          output: [],
+          status: "cancelled",
+          error: currentControl === "cancel-requested" ? "cancelled" : "interrupted",
+          resolvedExecution: {
+            role: node2.role,
+            harness: resolvedHarness,
+            adapterVersion: resolvedVersion,
+            ...resolvedModelId ? { modelId: resolvedModelId } : {}
+          },
+          contextManifest: JSON.parse(JSON.stringify(contextManifest))
+        });
+        return;
+      }
+      mkdirSync6(invocationWorkspaceDir, { recursive: true, mode: 448 });
       let harnessResult;
       const aborter = new AbortController;
       const runAborters = this.aborters.get(runId) ?? new Map;
       runAborters.set(invocationId, aborter);
       this.aborters.set(runId, runAborters);
+      const trackingAdapter = new TrackingHarnessDecorator(selected, (event) => this.recordHarnessActivity(runId, invocationId, attemptId, event), (event) => this.normalizeActivity(runId, event));
+      const activeAdapters = this.activeAdapters.get(runId) ?? new Map;
+      activeAdapters.set(invocationId, trackingAdapter);
+      this.activeAdapters.set(runId, activeAdapters);
+      const attemptStartedAtText = this.journal.getView(runId)?.state.attempts[attemptId]?.startedAt ?? attempt.startedAt;
+      const attemptStartedAt = attemptStartedAtText ? Date.parse(attemptStartedAtText) : Date.now();
+      const attemptBudgetRemaining = node2.timeoutMs === undefined ? undefined : Math.max(1, node2.timeoutMs - Math.max(0, Date.now() - attemptStartedAt));
+      const runStartedAt = this.journal.getView(runId)?.state.startedAt;
+      const runDeadlineAt = runStartedAt && Number.isFinite(Date.parse(runStartedAt)) ? Date.parse(runStartedAt) + bundle.limits.maxRunDurationMs : Date.now() + bundle.limits.maxRunDurationMs;
       try {
-        harnessResult = await selected.run({
+        harnessResult = await this.superviseHarness(trackingAdapter, {
+          attemptId,
           runId,
           invocationId,
           role: node2.role,
           prompt: node2.prompt,
-          timeoutMs: node2.timeoutMs,
           ...node2.modelId ? { modelId: node2.modelId } : {},
           outputSchema,
           delayMs: this.scriptedDelayMs,
@@ -40953,7 +42641,7 @@ class Coordinator {
             }
           } : {},
           signal: aborter.signal
-        });
+        }, aborter, attemptBudgetRemaining, runDeadlineAt, undefined, (event) => this.recordHarnessActivity(runId, invocationId, attemptId, event));
       } catch (cause) {
         harnessResult = {
           status: "failed",
@@ -40961,6 +42649,10 @@ class Coordinator {
           events: [],
           usage: unavailableUsage()
         };
+      } finally {
+        this.activeAdapters.get(runId)?.delete(invocationId);
+        if (this.activeAdapters.get(runId)?.size === 0)
+          this.activeAdapters.delete(runId);
       }
       if (collaborationGateway && collaborationBatch)
         collaborationGateway.releaseDelivery(collaborationBatch.batchId);
@@ -40968,6 +42660,14 @@ class Coordinator {
         const outstanding = this.journal.db.query("SELECT b.id FROM collaboration_batches b JOIN collaboration_waits w ON w.id=b.wait_id WHERE w.run_id=?1 AND w.attempt_id=?2 AND b.state='reserved'").all(runId, attemptId);
         for (const batch of outstanding)
           collaborationGateway.releaseDelivery(batch.id);
+      }
+      if (!harnessResult) {
+        const aborters = this.aborters.get(runId);
+        aborters?.delete(invocationId);
+        if (aborters?.size === 0)
+          this.aborters.delete(runId);
+        this.activityEvents.delete(attemptId);
+        return;
       }
       const collaborationSent = Boolean(harnessResult.output && typeof harnessResult.output === "object" && !Array.isArray(harnessResult.output) && "collaboration" in harnessResult.output && typeof harnessResult.output.collaboration === "object" && harnessResult.output.collaboration !== null && "sent" in harnessResult.output.collaboration);
       if (collaborationGateway && collaborationConfig && collaborationConfig.respondLoop && collaborationBatch?.visible.length === 0 && (!collaborationSent || node2.role.toLowerCase().includes("receiver")))
@@ -40977,7 +42677,7 @@ class Coordinator {
       if (runAbortersAfter?.size === 0)
         this.aborters.delete(runId);
       if (harnessResult.status !== "succeeded") {
-        status = "failed";
+        status = harnessResult.status === "cancelled" ? "cancelled" : "failed";
         error63 = harnessResult.error ?? harnessResult.status;
       }
       if (status === "succeeded" && outputSchema) {
@@ -41014,7 +42714,7 @@ class Coordinator {
           ...node2.outputPorts[0] ? { schemaDigest: node2.outputPorts[0].schemaDigest } : {}
         });
       }
-      if (harnessResult.rawOutput !== undefined || status === "failed") {
+      if (harnessResult.rawOutput !== undefined || status === "failed" || status === "cancelled") {
         const raw = harnessResult.rawOutput ?? json(harnessResult.output ?? { error: error63 });
         const redacted = String(redactSecrets(raw, secretValues));
         const evidenceArtifact = this.journal.blobs.put(runId, new TextEncoder().encode(redacted), "text/plain; charset=utf-8");
@@ -41035,7 +42735,7 @@ class Coordinator {
           mediaType: stderrArtifact.mediaType
         });
       }
-      const retryable = status === "failed" && (harnessResult.status === "unavailable" || error63?.startsWith("invalid-output:") || error63?.startsWith("transport:"));
+      const retryable = status === "failed" && this.journal.getView(runId)?.state.control === "none" && (harnessResult.status === "unavailable" || error63?.startsWith("invalid-output:") || error63?.startsWith("transport:"));
       const ordinal = attempt.ordinal + 1;
       const retry = retryable && ordinal < 2 ? {
         attemptId: id("attempt"),
@@ -41050,7 +42750,9 @@ class Coordinator {
         }
       } : undefined;
       const nativeConfigDigest = nativeConfig ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}` : undefined;
-      const durableEvents = redactSecrets(harnessResult.events, secretValues);
+      const allEvents = [...harnessResult.events, ...this.activityEvents.get(attemptId) ?? []];
+      const uniqueEvents = [...new Map(allEvents.map((event) => [json(event), event])).values()];
+      const durableEvents = redactSecrets(uniqueEvents, secretValues);
       if (status === "succeeded" && registeredWorkspace && this.workspaceAdapter)
         this.snapshots.set(runId, await this.workspaceAdapter.snapshot(registeredWorkspace));
       this.journal.completeEffect({
@@ -41083,6 +42785,7 @@ class Coordinator {
         },
         ...retry ? { retry } : {}
       });
+      this.activityEvents.delete(attemptId);
       return;
     }
     if (node2.kind !== "command") {
@@ -41092,15 +42795,37 @@ class Coordinator {
       this.validateCommandForRun(runId, node2);
       const startedAt = now();
       try {
-        result = await this.process.executeCommand({
-          runId,
-          operationKey: detail.operationKey,
-          workspaceDir: invocationWorkspaceDir,
-          executable: node2.executable,
-          args: node2.args,
-          timeoutMs: node2.timeoutMs || this.commandTimeoutMs,
-          executionMode: node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE) ? "trusted-unrestricted" : node2.executionMode
-        });
+        if (node2.workspaceAccess === "source-repository") {
+          if (!registeredWorkspace || !this.workspaceAdapter)
+            throw new Error(`Command ${node2.id} requires a repository workspace`);
+          if (node2.executable !== "git" || node2.args.length !== 4 || node2.args[0] !== "diff" || node2.args[1] !== "--no-ext-diff" || node2.args[2] !== "--no-textconv")
+            throw new Error("source-repository commands must be the declared read-only git diff");
+          const stdout = await this.workspaceAdapter.diffRepository(registeredWorkspace.repositoryPath, node2.args[3]);
+          result = {
+            operationKey: detail.operationKey,
+            evidence: {
+              argv: [node2.executable, ...node2.args],
+              cwd: registeredWorkspace.repositoryPath,
+              exitCode: 0,
+              signal: null,
+              timedOut: false,
+              spawnError: null,
+              stdout: new TextEncoder().encode(stdout),
+              stderr: new Uint8Array,
+              enforcementMode: "trusted-unrestricted"
+            }
+          };
+        } else {
+          result = await this.process.executeCommand({
+            runId,
+            operationKey: detail.operationKey,
+            workspaceDir: invocationWorkspaceDir,
+            executable: node2.executable,
+            args: node2.args,
+            timeoutMs: node2.timeoutMs || this.commandTimeoutMs,
+            executionMode: node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE) ? "trusted-unrestricted" : node2.executionMode
+          });
+        }
       } catch (cause) {
         status = "failed";
         error63 = cause instanceof Error ? cause.message : String(cause);
@@ -41167,6 +42892,7 @@ class Coordinator {
     if (commandEvidence) {
       const resultArtifact = this.journal.blobs.put(runId, new TextEncoder().encode(json({
         exitCode: commandEvidence.exitCode,
+        stdout: new TextDecoder().decode(result?.evidence.stdout ?? new Uint8Array),
         executionMode: commandEvidence.executionMode,
         signal: commandEvidence.signal,
         timeout: commandEvidence.timeout,
@@ -41215,7 +42941,7 @@ class Coordinator {
       if (value !== undefined && binding?.path?.length)
         value = selectJsonPath(value, binding.path);
       if (value === undefined) {
-        const missing = binding?.missing ?? (port2.defaultValue === undefined ? "error" : "default");
+        const missing = binding?.missing ?? (port2.defaultValue !== undefined ? "default" : port2.required ? "error" : "omit");
         if (missing === "default" && port2.defaultValue !== undefined)
           value = port2.defaultValue;
         else if (missing === "omit" && !port2.required)
@@ -41253,7 +42979,7 @@ class Coordinator {
         this.codexDescriptor ??= await inspectCodex();
         if (this.codexDescriptor.availability !== "available")
           throw new Error(`subagent Codex unavailable: ${this.codexDescriptor.detail}`);
-        childAdapter = this.codex ?? (this.codex = new CodexHarnessAdapter(new CodexSdkHarness(this.codexDescriptor)));
+        childAdapter = this.codex ?? (this.codex = new CodexHarnessAdapter(new CodexAppServerHarness(this.codexDescriptor)));
       } else if (childAgent.harness === "pi") {
         this.piDescriptor ??= await inspectPi();
         if (this.piDescriptor.availability !== "available")
@@ -41302,28 +43028,52 @@ class Coordinator {
         const abort = () => childAborter.abort();
         signal?.addEventListener("abort", abort, { once: true });
         const timeoutMs = childAgent.timeoutMs === undefined ? undefined : Math.min(childAgent.timeoutMs, 60000);
-        const timeout = timeoutMs === undefined ? undefined : setTimeout(() => childAborter.abort(), timeoutMs);
+        let scoutReplyStarted = false;
+        const trackedChild = new TrackingHarnessDecorator(childAdapter, (event) => {
+          const data = event.data && typeof event.data === "object" && !Array.isArray(event.data) ? event.data : { detail: event.data };
+          this.recordHarnessActivity(input2.runId, input2.parentInvocationId, input2.parentAttemptId, {
+            ...event,
+            data: event.type === "text" ? {
+              scoutId: input2.scoutId,
+              requestId: input2.requestId,
+              label: !scoutReplyStarted,
+              text: event.data
+            } : { ...data, scoutId: input2.scoutId, requestId: input2.requestId }
+          });
+          if (event.type === "text")
+            scoutReplyStarted = true;
+        }, (event) => this.normalizeActivity(input2.runId, event));
         try {
-          const result = await childAdapter.run({
+          const childRunDeadline = view.state.startedAt && Number.isFinite(Date.parse(view.state.startedAt)) ? Date.parse(view.state.startedAt) + view.bundle.limits.maxRunDurationMs : Date.now() + view.bundle.limits.maxRunDurationMs;
+          const result = await this.superviseHarness(trackedChild, {
+            attemptId: childInvocationId,
             runId: input2.runId,
             invocationId: childInvocationId,
             role: childAgent.role,
             prompt: childAgent.prompt,
             ...outputSchema ? { outputSchema } : {},
             delayMs: this.scriptedDelayMs,
-            ...timeoutMs === undefined ? {} : { timeoutMs },
             cwd: input2.cwd,
             ...childAgent.modelId ? { modelId: childAgent.modelId } : childAdapter.id === input2.adapter.id && input2.parentModelId ? { modelId: input2.parentModelId } : {},
             nativeConfig: childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : childAdapter.id === "codex" ? { sandbox: "read-only" } : {},
             context,
-            signal: childAborter.signal
+            signal: childAborter.signal,
+            onEvent: () => {
+              return;
+            }
+          }, childAborter, timeoutMs, childRunDeadline, input2.parentAttemptId, (event) => {
+            const data = event.data && typeof event.data === "object" && !Array.isArray(event.data) ? event.data : { detail: event.data };
+            this.recordHarnessActivity(input2.runId, input2.parentInvocationId, input2.parentAttemptId, {
+              ...event,
+              data: { ...data, scoutId: input2.scoutId, requestId: input2.requestId }
+            });
           });
+          if (!result)
+            throw new Error("subagent cancellation was not confirmed; parent requires recovery");
           if (result.status !== "succeeded" || result.output === undefined)
             throw new Error(result.error ?? `scout harness ${result.status}`);
           return result.output;
         } finally {
-          if (timeout)
-            clearTimeout(timeout);
           signal?.removeEventListener("abort", abort);
         }
       }
@@ -41464,9 +43214,9 @@ function validateCommandNode(node2) {
 
 // packages/host/src/adapters/workspace/git.ts
 import {
-  mkdirSync as mkdirSync6,
+  mkdirSync as mkdirSync7,
   readFileSync as readFileSync3,
-  rmSync as rmSync2,
+  rmSync as rmSync3,
   writeFileSync as writeFileSync2,
   existsSync as existsSync2,
   cpSync,
@@ -41482,9 +43232,9 @@ class GitWorkspaceAdapter {
   constructor(options) {
     this.root = resolve2(options.worktreeRoot);
     this.executable = options.gitExecutable ?? "git";
-    mkdirSync6(this.root, { recursive: true, mode: 448 });
-    mkdirSync6(join5(this.root, "claims"), { recursive: true, mode: 448 });
-    mkdirSync6(join5(this.root, "indexes"), { recursive: true, mode: 448 });
+    mkdirSync7(this.root, { recursive: true, mode: 448 });
+    mkdirSync7(join5(this.root, "claims"), { recursive: true, mode: 448 });
+    mkdirSync7(join5(this.root, "indexes"), { recursive: true, mode: 448 });
   }
   async create(input2) {
     const repositoryPath = await this.repositoryRoot(input2.repositoryPath);
@@ -41496,7 +43246,7 @@ class GitWorkspaceAdapter {
     const path = join5(this.root, safePart(input2.runId), safePart(input2.workspaceId));
     if (existsSync2(path))
       throw new Error(`workspace path already exists: ${path}`);
-    mkdirSync6(join5(this.root, safePart(input2.runId)), { recursive: true, mode: 448 });
+    mkdirSync7(join5(this.root, safePart(input2.runId)), { recursive: true, mode: 448 });
     await this.git(repositoryPath, ["worktree", "add", "--detach", path, baseCommit]);
     const claim3 = {
       repositoryPath,
@@ -41516,8 +43266,8 @@ class GitWorkspaceAdapter {
       try {
         await this.git(repositoryPath, ["worktree", "remove", "--force", path]);
       } catch {}
-      rmSync2(path, { recursive: true, force: true });
-      rmSync2(this.claimPath(claim3), { force: true });
+      rmSync3(path, { recursive: true, force: true });
+      rmSync3(this.claimPath(claim3), { force: true });
       throw cause;
     }
   }
@@ -41598,8 +43348,12 @@ class GitWorkspaceAdapter {
         changedPaths
       };
     } finally {
-      rmSync2(temp, { force: true });
+      rmSync3(temp, { force: true });
     }
+  }
+  async diffRepository(repositoryPath, baseRef) {
+    const repository = await this.repositoryRoot(repositoryPath);
+    return this.git(repository, ["--no-pager", "diff", "--no-ext-diff", "--no-textconv", baseRef]);
   }
   async integrate(input2) {
     const target = await this.snapshot(input2.target);
@@ -41620,7 +43374,7 @@ class GitWorkspaceAdapter {
     if (conflicts.length)
       return { target, sources, conflicts };
     const backup = join5(this.root, "integration-backups", randomUUID3());
-    mkdirSync6(backup, { recursive: true, mode: 448 });
+    mkdirSync7(backup, { recursive: true, mode: 448 });
     try {
       for (const entry of readdirSync(input2.target.path)) {
         if (entry === ".git")
@@ -41637,12 +43391,12 @@ class GitWorkspaceAdapter {
           const sourcePath = join5(sourceRef.path, change.path);
           const targetPath = join5(input2.target.path, change.path);
           if (change.oldPath && change.status.startsWith("R"))
-            rmSync2(join5(input2.target.path, change.oldPath), { recursive: true, force: true });
+            rmSync3(join5(input2.target.path, change.oldPath), { recursive: true, force: true });
           if (change.status.startsWith("D"))
-            rmSync2(targetPath, { recursive: true, force: true });
+            rmSync3(targetPath, { recursive: true, force: true });
           else if (existsSync2(sourcePath)) {
-            mkdirSync6(join5(targetPath, ".."), { recursive: true });
-            rmSync2(targetPath, { recursive: true, force: true });
+            mkdirSync7(join5(targetPath, ".."), { recursive: true });
+            rmSync3(targetPath, { recursive: true, force: true });
             cpSync(sourcePath, targetPath, { recursive: true, force: true });
             if (change.mode && !change.mode.endsWith("000"))
               chmodSync(targetPath, Number.parseInt(change.mode, 8) & 511);
@@ -41654,7 +43408,7 @@ class GitWorkspaceAdapter {
       try {
         for (const entry of readdirSync(input2.target.path)) {
           if (entry !== ".git")
-            rmSync2(join5(input2.target.path, entry), { recursive: true, force: true });
+            rmSync3(join5(input2.target.path, entry), { recursive: true, force: true });
         }
         for (const entry of readdirSync(backup))
           cpSync(join5(backup, entry), join5(input2.target.path, entry), {
@@ -41664,7 +43418,7 @@ class GitWorkspaceAdapter {
       } catch {}
       throw cause;
     } finally {
-      rmSync2(backup, { recursive: true, force: true });
+      rmSync3(backup, { recursive: true, force: true });
     }
   }
   async prepareCommit(input2) {
@@ -41734,9 +43488,9 @@ class GitWorkspaceAdapter {
     if (!registered)
       throw new Error("refusing cleanup of unregistered workspace");
     await this.git(claim3.repositoryPath, ["worktree", "remove", "--force", claim3.path]);
-    rmSync2(claim3.path, { recursive: true, force: true });
-    rmSync2(this.claimPath(claim3), { force: true });
-    rmSync2(this.preparedPath(claim3), { force: true });
+    rmSync3(claim3.path, { recursive: true, force: true });
+    rmSync3(this.claimPath(claim3), { force: true });
+    rmSync3(this.preparedPath(claim3), { force: true });
   }
   async verifyCommit(claim3, input2) {
     const head = await this.git(claim3.path, ["rev-parse", "HEAD"]);
@@ -41846,8 +43600,8 @@ init_src();
 
 // packages/host/src/evaluation/verifier.ts
 init_src();
-import { createHash as createHash4 } from "crypto";
-import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync7, mkdtempSync as mkdtempSync2, rmSync as rmSync3, writeFileSync as writeFileSync3 } from "fs";
+import { createHash as createHash5 } from "crypto";
+import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync8, mkdtempSync as mkdtempSync2, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
 import { join as join6, resolve as resolve3 } from "path";
 
 class BunVerifierProcess {
@@ -41904,7 +43658,7 @@ class BunVerifierProcess {
   }
 }
 function digest2(bytes) {
-  return createHash4("sha256").update(bytes).digest("hex");
+  return createHash5("sha256").update(bytes).digest("hex");
 }
 async function runDeterministicCommandEvaluator(input2) {
   const candidate = resolve3(input2.candidateWorkspace);
@@ -41917,7 +43671,7 @@ async function runDeterministicCommandEvaluator(input2) {
   const observedTreeDigest = await input2.resolveCandidateTreeDigest();
   if (observedTreeDigest !== input2.candidateTreeDigest)
     throw new Error(`candidate tree digest mismatch: expected ${input2.candidateTreeDigest}, observed ${observedTreeDigest}`);
-  mkdirSync7(verifier, { recursive: true, mode: 448 });
+  mkdirSync8(verifier, { recursive: true, mode: 448 });
   const runVerifier = mkdtempSync2(join6(verifier, "run-"));
   const acceptance = join6(runVerifier, "acceptance-source");
   const isolatedCandidate = join6(runVerifier, "candidate");
@@ -41964,7 +43718,7 @@ async function runDeterministicCommandEvaluator(input2) {
       })
     };
   } finally {
-    rmSync3(runVerifier, { recursive: true, force: true });
+    rmSync4(runVerifier, { recursive: true, force: true });
   }
   const stdoutRef = input2.artifactSink?.put(input2.target.runId, result.stdout, "text/plain");
   const stderrRef = input2.artifactSink?.put(input2.target.runId, result.stderr, "text/plain");
@@ -42010,6 +43764,7 @@ async function runDeterministicCommandEvaluator(input2) {
 // packages/host/src/evaluations.ts
 class ExperimentService {
   app;
+  activeCells = new Map;
   constructor(app) {
     this.app = app;
   }
@@ -42112,22 +43867,44 @@ class ExperimentService {
     const experiment = this.get(experimentId);
     if (!experiment)
       throw new Error(`Experiment not found: ${experimentId}`);
+    if (experiment.status === "cancelled")
+      return;
     this.app.coordinator.journal.setExperimentStatus(experimentId, "running");
     const maxConcurrent = Math.max(1, options.maxConcurrent ?? experiment.maxConcurrent);
-    const pending = experiment.cells.filter((cell) => cell.status === "pending" || cell.status === "reserved");
+    const pending = experiment.cells.filter((cell) => ["pending", "reserved", "running"].includes(cell.status));
     let cursor = 0;
     const worker = async () => {
       for (;; ) {
         const cell = pending[cursor++];
         if (!cell)
           return;
-        await this.launchCell(experimentId, cell, experiment, options.actor);
+        const key = `${experimentId}/${cell.key}`;
+        const active = this.activeCells.get(key);
+        if (active) {
+          await active;
+          continue;
+        }
+        const work = this.launchCell(experimentId, cell, experiment, options.actor);
+        this.activeCells.set(key, work);
+        try {
+          await work;
+        } finally {
+          if (this.activeCells.get(key) === work)
+            this.activeCells.delete(key);
+        }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(maxConcurrent, pending.length) }, worker));
-    const after = this.get(experimentId);
-    if (after?.status === "running" && after.cells.every((cell) => ["succeeded", "failed", "cancelled"].includes(cell.status)))
-      this.app.coordinator.journal.setExperimentStatus(experimentId, "completed");
+    const allWorkers = Promise.all(Array.from({ length: Math.min(maxConcurrent, pending.length) }, worker));
+    const finished = allWorkers.then(() => {
+      const after = this.get(experimentId);
+      if (after?.status === "running" && after.cells.every((cell) => ["succeeded", "failed", "cancelled"].includes(cell.status)))
+        this.app.coordinator.journal.setExperimentStatus(experimentId, "completed");
+    });
+    finished.catch(() => {
+      return;
+    });
+    const waitMs = Math.max(0, options.observerWaitMs ?? 30000);
+    await Promise.race([finished, Bun.sleep(waitMs)]);
   }
   cancel(experimentId) {
     const experiment = this.get(experimentId);
@@ -42137,20 +43914,22 @@ class ExperimentService {
     for (const cell of experiment.cells) {
       if (["pending", "reserved"].includes(cell.status)) {
         this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, "cancelled");
-      } else if (cell.status === "running" && cell.runId) {
-        const view = this.app.getView(cell.runId);
-        if (view && ["pending", "running"].includes(view.state.status)) {
-          try {
-            this.app.control({
-              runId: cell.runId,
-              action: "cancel",
-              expectedRevision: view.revision,
-              actor: "experiment",
-              idempotencyKey: `experiment-cancel:${experimentId}:${cell.key}`
-            });
-            this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, "cancelled", "cancelled by experiment operator");
-          } catch {}
+      } else if (cell.status === "running") {
+        if (cell.runId) {
+          const view = this.app.getView(cell.runId);
+          if (view && ["pending", "running"].includes(view.state.status)) {
+            try {
+              this.app.control({
+                runId: cell.runId,
+                action: "cancel",
+                expectedRevision: view.revision,
+                actor: "experiment",
+                idempotencyKey: `experiment-cancel:${experimentId}:${cell.key}`
+              });
+            } catch {}
+          }
         }
+        this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, "cancelled", "cancelled by experiment operator");
       }
     }
   }
@@ -42210,12 +43989,34 @@ class ExperimentService {
       },
       workspace: experiment.repositoryPath ? { repositoryPath: experiment.repositoryPath } : undefined
     });
-    this.app.coordinator.journal.associateExperimentCell(experimentId, cell.key, token, run.runId, "running");
-    for (let attempt = 0;attempt < 2000; attempt += 1) {
-      if (this.get(experimentId)?.cells.find((candidate) => candidate.key === cell.key)?.status === "cancelled")
-        return;
+    const latestExperiment = this.get(experimentId);
+    const latestCell = latestExperiment?.cells.find((candidate) => candidate.key === cell.key);
+    if (latestCell?.status === "cancelled" || latestExperiment?.status === "cancelled") {
       const view = this.app.getView(run.runId);
-      if (view && !["pending", "running"].includes(view.state.status)) {
+      if (view && ["pending", "running"].includes(view.state.status)) {
+        try {
+          this.app.control({
+            runId: run.runId,
+            action: "cancel",
+            expectedRevision: view.revision,
+            actor: "experiment",
+            idempotencyKey: `experiment-cancel:${experimentId}:${cell.key}`
+          });
+        } catch {}
+      }
+      this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, "cancelled", "cancelled by experiment operator");
+      return;
+    }
+    this.app.coordinator.journal.associateExperimentCell(experimentId, cell.key, token, run.runId, "running");
+    for (;; ) {
+      const cellState = this.get(experimentId)?.cells.find((candidate) => candidate.key === cell.key);
+      if (cellState?.status === "cancelled" || this.get(experimentId)?.status === "cancelled") {
+        if (cellState?.status !== "cancelled")
+          this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, "cancelled", "cancelled by experiment operator");
+        return;
+      }
+      const view = this.app.getView(run.runId);
+      if (view && ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(view.state.status)) {
         const target = {
           runId: run.runId,
           revision: view.revision,
@@ -42308,12 +44109,11 @@ class ExperimentService {
             cellKey: cell.key
           });
         }
-        this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, view.state.status === "succeeded" ? "succeeded" : view.state.status === "cancelled" ? "cancelled" : "failed", view.state.status === "succeeded" ? undefined : `run ended ${view.state.status}`);
+        this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, this.get(experimentId)?.status === "cancelled" || this.get(experimentId)?.cells.find((candidate) => candidate.key === cell.key)?.status === "cancelled" ? "cancelled" : view.state.status === "succeeded" ? "succeeded" : view.state.status === "cancelled" ? "cancelled" : "failed", view.state.status === "succeeded" ? undefined : `run ended ${view.state.status}`);
         return;
       }
-      await Bun.sleep(5);
+      await Bun.sleep(250);
     }
-    throw new Error(`experiment cell run did not finish: ${cell.key}`);
   }
   caseInput(experimentId, caseId) {
     const experiment = this.get(experimentId);
@@ -42324,7 +44124,7 @@ class ExperimentService {
 
 // packages/host/src/checkpoints/materializer.ts
 init_src();
-import { createHash as createHash5 } from "crypto";
+import { createHash as createHash6 } from "crypto";
 class CheckpointMaterializer {
   options;
   constructor(options) {
@@ -42413,7 +44213,7 @@ class CheckpointMaterializer {
     if (canonicalize(withoutProfile(childInput)) !== canonicalize(withoutProfile(sourceInput)))
       throw new Error("fork variant may change only execution profile");
     const childProfile = typeof childInput.__kouroExecutionProfile === "string" ? childInput.__kouroExecutionProfile : "scripted";
-    const childConfigDependencyDigest = `sha256:${createHash5("sha256").update(canonicalize({
+    const childConfigDependencyDigest = `sha256:${createHash6("sha256").update(canonicalize({
       input: childInput,
       profile: childProfile,
       promptVariants: input2.promptVariants ?? {},
@@ -42491,7 +44291,7 @@ class CheckpointMaterializer {
   }
 }
 function stableCheckpointId(requestKey) {
-  return `cp_${createHash5("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
+  return `cp_${createHash6("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
 }
 async function materializePromptVariant(source, replacements, sourceView, inheritedInvocationIds) {
   const entries = Object.entries(replacements);
@@ -42561,14 +44361,14 @@ function structuralIdentity(bundle) {
   });
 }
 // packages/host/src/checkpoints/retention.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync8, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
+import { existsSync as existsSync3, mkdirSync as mkdirSync9, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
 import { join as join7 } from "path";
 
 class CheckpointRetention {
   path;
   marks;
   constructor(dataDir) {
-    mkdirSync8(dataDir, { recursive: true, mode: 448 });
+    mkdirSync9(dataDir, { recursive: true, mode: 448 });
     this.path = join7(dataDir, "checkpoint-retention.json");
     this.marks = existsSync3(this.path) ? JSON.parse(readFileSync4(this.path, "utf8")) : {};
   }
@@ -42628,7 +44428,7 @@ class CheckpointRetention {
 }
 // packages/host/src/application/service.ts
 init_src();
-import { randomBytes as randomBytes2, randomUUID as randomUUID4 } from "crypto";
+import { randomBytes, randomUUID as randomUUID4 } from "crypto";
 import { readdir, readFile } from "fs/promises";
 import { resolve as resolve4 } from "path";
 import { pathToFileURL } from "url";
@@ -42662,6 +44462,37 @@ class ApplicationService {
       workspace: workspaceAdapter
     }) : undefined;
     this.experiments = new ExperimentService(this);
+  }
+  steer(input2) {
+    return this.coordinator.steer(input2);
+  }
+  canSteer(runId, invocationId) {
+    return this.coordinator.canSteer(runId, invocationId);
+  }
+  interruptAttempt(input2) {
+    return this.coordinator.interruptAttempt(input2);
+  }
+  operatorState(runId) {
+    const view = this.getView(runId);
+    if (!view)
+      return;
+    const invocations = Object.values(view.state.invocations);
+    const retryableInvocationIds = ["failed", "interrupted"].includes(view.state.status) ? invocations.filter((item) => item.status === "failed" && this.coordinator.canRetry(runId, item.id)).map((item) => item.id) : [];
+    const steerableInvocationIds = invocations.filter((item) => item.status === "running" && this.canSteer(runId, item.id)).map((item) => item.id);
+    const interruptibleInvocationIds = invocations.filter((item) => item.status === "running" && this.coordinator.canInterrupt(runId, item.id)).map((item) => item.id);
+    return {
+      capabilities: {
+        pause: view.state.status === "running",
+        resume: view.state.status === "paused",
+        cancel: view.state.status === "running" || view.state.status === "paused",
+        detach: view.state.status === "running" || view.state.status === "paused",
+        steer: steerableInvocationIds.length > 0,
+        retry: retryableInvocationIds.length > 0
+      },
+      retryableInvocationIds,
+      steerableInvocationIds,
+      interruptibleInvocationIds
+    };
   }
   async start() {
     await this.tiny();
@@ -42717,7 +44548,7 @@ class ApplicationService {
       throw new Error("comparison not found");
     const spans = [];
     for (const run of comparison2.runs) {
-      const view = this.getView(run.runId);
+      const view = this.coordinator.journal.getViewAtRevision(run.runId, run.revision);
       if (!view)
         throw new Error(`comparison run not found: ${run.runId}`);
       for (const invocation of Object.values(view.state.invocations)) {
@@ -42747,7 +44578,7 @@ class ApplicationService {
     return buildComparisonTimeline(comparison2, spans);
   }
   blindedEvidence(run) {
-    const view = this.getView(run.runId);
+    const view = this.coordinator.journal.getViewAtRevision(run.runId, run.revision);
     if (!view)
       throw new Error(`comparison run not found: ${run.runId}`);
     const evidence = Object.values(view.state.invocations).map((invocation) => ({
@@ -42770,14 +44601,16 @@ class ApplicationService {
     const [first, second] = comparison2.runs;
     if (!first || !second)
       throw new Error("pairwise runs missing");
-    const flip = randomBytes2(1)[0] % 2 === 1;
+    const flip = randomBytes(1)[0] % 2 === 1;
     const sanitizedA = this.blindedEvidence(first);
     const sanitizedB = this.blindedEvidence(second);
+    const runA = flip ? second : first;
+    const runB = flip ? first : second;
     const assignment = this.coordinator.journal.createPairwiseAssignment({
       id: `pair_${randomUUID4().replaceAll("-", "")}`,
       comparisonId: input2.comparisonId,
-      runA: first,
-      runB: second,
+      runA,
+      runB,
       sideA: flip ? "side-redacted-1" : "side-redacted-2",
       sideB: flip ? "side-redacted-2" : "side-redacted-1",
       rubric: input2.rubric,
@@ -42856,18 +44689,36 @@ class ApplicationService {
             scopeId: childDefinition.id === bundle.rootDefinitionId ? undefined : childDefinition.id,
             position: { x: 60 + (ranks.get(node2.id) ?? 0) * 250, y: 80 }
           }))),
-          edges: Object.values(bundle.definitions).flatMap((childDefinition) => childDefinition.controlEdges.map((edge) => ({
-            id: `${childDefinition.id}:${edge.id}`,
-            source: edge.sourceNodeId,
-            target: edge.targetNodeId,
-            definitionId: childDefinition.id,
-            outcome: edge.outcome,
-            label: edge.id.endsWith(":repair") ? `${edge.outcome} \xB7 repair` : edge.id.endsWith(":repair-exhausted") ? `${edge.outcome} \xB7 exhausted` : edge.outcome
-          }))),
+          edges: [
+            ...Object.values(bundle.definitions).flatMap((childDefinition) => childDefinition.controlEdges.map((edge) => ({
+              id: `${childDefinition.id}:${edge.id}`,
+              source: edge.sourceNodeId,
+              target: edge.targetNodeId,
+              definitionId: childDefinition.id,
+              outcome: edge.outcome,
+              label: edge.id.endsWith(":repair") ? `${edge.outcome} \xB7 repair` : edge.id.endsWith(":repair-exhausted") ? `${edge.outcome} \xB7 exhausted` : edge.outcome
+            }))),
+            ...Object.values(bundle.definitions).flatMap((definition2) => (definition2.scouts ?? []).flatMap((scout) => {
+              const child = bundle.definitions[scout.definitionId];
+              const childAgent = child?.nodes.find((node2) => node2.kind === "agent");
+              if (!child || !childAgent)
+                return [];
+              return definition2.nodes.filter((node2) => node2.kind === "agent" && (node2.uses === undefined || node2.uses.includes(scout.id))).map((parent) => ({
+                id: `${definition2.id}:subagent:${parent.id}:${scout.id}`,
+                source: parent.id,
+                target: childAgent.id,
+                definitionId: definition2.id,
+                targetDefinitionId: child.id,
+                relation: "subagent",
+                label: scout.id
+              }));
+            }))
+          ],
           groups: Object.values(bundle.definitions).map((childDefinition) => ({
             id: childDefinition.id,
             label: childDefinition.id,
-            definitionId: childDefinition.id
+            definitionId: childDefinition.id,
+            ...childDefinition.id === bundle.rootDefinitionId ? {} : { parentId: bundle.rootDefinitionId }
           }))
         },
         bundle,
@@ -42980,7 +44831,13 @@ class ApplicationService {
       throw new Error(`Unknown workflow ${input2.workflowId}`);
     const bundle = input2.nodeSettings ? await configureBundle(source, input2.nodeSettings) : source;
     const { nodeSettings: _nodeSettings, ...runInput } = input2;
-    return (await this.coordinator.createRun({ ...runInput, bundle })).run;
+    const needsSourceRepository = Object.values(bundle.definitions).some((definition) => definition.nodes.some((node2) => node2.kind === "command" && node2.workspaceAccess === "source-repository"));
+    const workspace = input2.workspace ?? (needsSourceRepository ? { repositoryPath: resolve4(process.cwd()), workspaceId: "source" } : undefined);
+    return (await this.coordinator.createRun({
+      ...runInput,
+      ...workspace ? { workspace } : {},
+      bundle
+    })).run;
   }
   async runPromptFixture(input2) {
     const rendered = await renderPromptFixture(input2.fixture);
@@ -43033,6 +44890,25 @@ class ApplicationService {
   listRunsPage(limit = 100, offset = 0) {
     return this.coordinator.journal.listRunsPage(limit, offset);
   }
+  pendingApprovals() {
+    return this.coordinator.journal.listRuns().flatMap((run) => {
+      const view = this.getView(run.runId);
+      if (!view)
+        return [];
+      return Object.values(view.state.approvals).filter((approval) => approval.status === "pending").map((approval) => ({
+        runId: run.runId,
+        workflowId: run.workflowId,
+        task: run.task,
+        revision: view.revision,
+        invocationId: approval.invocationId,
+        approvalId: approval.id,
+        action: approval.action,
+        bindingDigest: approval.bindingDigest,
+        subjectRevision: approval.subjectRevision,
+        requestedAt: view.state.invocations[approval.invocationId]?.startedAt
+      }));
+    });
+  }
   collaboration(runId) {
     return new CollaborationGateway(this.coordinator.journal).snapshot(runId);
   }
@@ -43042,8 +44918,11 @@ class ApplicationService {
   getView(runId) {
     return this.coordinator.journal.getView(runId);
   }
-  getEvents(runId, after) {
-    return this.coordinator.journal.getEvents(runId, after);
+  getEvents(runId, after, limit) {
+    return this.coordinator.journal.getEvents(runId, after, limit);
+  }
+  getHarnessActivity(runId, after, limit, attemptId, tail = false) {
+    return this.coordinator.journal.getHarnessActivity(runId, after, limit, attemptId, tail);
   }
   recordEvaluationEvidence(evidence, association) {
     return this.coordinator.journal.recordEvaluationEvidence(evidence, association);
@@ -43098,6 +44977,135 @@ class ApplicationService {
     });
     this.checkpointRetention.assertCleanupAllowed(roots);
     await this.coordinator.cleanupWorkspace(runId);
+  }
+  async previewRunDeletion(runId) {
+    const journal = this.coordinator.journal;
+    const run = journal.getRunRow(runId);
+    if (!run) {
+      const deletion2 = journal.getRunDeletion(runId);
+      if (!deletion2)
+        throw new Error(`Run not found: ${runId}`);
+      return {
+        ...deletion2.preview,
+        runId,
+        revision: deletion2.expectedRevision,
+        deletionStatus: deletion2.status,
+        deletionError: deletion2.error,
+        deletionRequestKey: deletion2.idempotencyKey,
+        canDelete: false
+      };
+    }
+    const view = journal.getView(runId);
+    const input2 = journal.getRunInput(runId) ?? {};
+    const repository = input2.__kouroWorkspace;
+    const claims = await this.coordinator.workspaceClaims(runId);
+    const blockers = journal.runDeletionBlockers(runId);
+    const status = journal.getRunDeletion(runId)?.status;
+    const deletion = journal.getRunDeletion(runId);
+    const attemptCount = this.countRows("attempts", runId);
+    const artifactCount = this.countRows("artifacts", runId);
+    const eventCount = this.countRows("run_events", runId);
+    const checkpointCount = this.countRows("checkpoints", runId, "source_run_id");
+    const active = (() => {
+      try {
+        this.coordinator.assertRunDrained(runId);
+        return false;
+      } catch {
+        return true;
+      }
+    })();
+    const workspaceAdapterMissing = Boolean(repository?.repositoryPath) && !this.coordinator.hasWorkspaceAdapter() && !["workspace-cleaned", "purge-failed"].includes(deletion?.status ?? "");
+    const preview = {
+      runId,
+      workflowId: run.workflowId,
+      status: run.status,
+      revision: run.revision,
+      task: typeof input2.task === "string" ? input2.task : "",
+      repositoryPath: typeof repository?.repositoryPath === "string" ? repository.repositoryPath : undefined,
+      terminal: ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(run.status),
+      drained: !active,
+      workspaceAdapterMissing,
+      workspaces: claims.map((claim3) => ({ workspaceId: claim3.workspaceId, path: claim3.path })),
+      removes: {
+        historyEvents: eventCount,
+        attempts: attemptCount,
+        artifacts: artifactCount,
+        workspaces: claims.length
+      },
+      retained: { checkpoints: checkpointCount, blockers },
+      blockers,
+      deletionStatus: status,
+      deletionError: deletion?.error,
+      deletionRequestKey: deletion?.idempotencyKey,
+      canDelete: !active && !workspaceAdapterMissing && blockers.length === 0 && ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(run.status)
+    };
+    return { ...preview, viewStatus: view?.state.status };
+  }
+  incompleteRunDeletions() {
+    return this.coordinator.journal.listIncompleteRunDeletions().map((deletion) => ({
+      runId: deletion.runId,
+      status: deletion.status,
+      task: deletion.preview.task,
+      workflowId: deletion.preview.workflowId,
+      error: deletion.error
+    }));
+  }
+  async deleteRun(input2) {
+    const journal = this.coordinator.journal;
+    let deletion = journal.getRunDeletion(input2.runId);
+    if (deletion?.status === "completed")
+      return deletion;
+    if (deletion && ["database-purged", "blob-cleanup-failed"].includes(deletion.status)) {
+      try {
+        this.coordinator.journal.blobs.removeDigests(deletion.blobDigests);
+      } catch (cause) {
+        return journal.advanceRunDeletion(input2.runId, "blob-cleanup-failed", {
+          error: cause instanceof Error ? cause.message : String(cause)
+        });
+      }
+      return journal.advanceRunDeletion(input2.runId, "completed");
+    }
+    this.coordinator.assertRunDrained(input2.runId);
+    const preview = await this.previewRunDeletion(input2.runId);
+    if (!preview.canDelete)
+      throw new Error(preview.workspaceAdapterMissing ? "run deletion is blocked because its workspace adapter is unavailable" : preview.blockers?.length ? `run deletion blocked: ${preview.blockers.map((item) => item.message).join(" ")}` : "run deletion requires a terminal, drained run");
+    if (preview.revision !== input2.expectedRevision)
+      throw new Error("stale-action: run revision changed");
+    deletion = journal.beginRunDeletion({ ...input2, preview });
+    if (deletion.status === "requested" || deletion.status === "workspace-cleanup-failed") {
+      try {
+        await this.coordinator.cleanupRunWorkspaces(input2.runId);
+        deletion = journal.advanceRunDeletion(input2.runId, "workspace-cleaned");
+      } catch (cause) {
+        return journal.advanceRunDeletion(input2.runId, "workspace-cleanup-failed", {
+          error: cause instanceof Error ? cause.message : String(cause)
+        });
+      }
+    }
+    if (deletion.status === "workspace-cleaned" || deletion.status === "purge-failed") {
+      try {
+        const exclusive = journal.runArtifactDigests(input2.runId);
+        this.checkpointRetention.assertCleanupAllowed(exclusive);
+        journal.purgeRunData(input2.runId);
+      } catch (cause) {
+        return journal.advanceRunDeletion(input2.runId, "purge-failed", {
+          error: cause instanceof Error ? cause.message : String(cause)
+        });
+      }
+      deletion = journal.getRunDeletion(input2.runId);
+    }
+    try {
+      this.coordinator.journal.blobs.removeDigests(deletion.blobDigests);
+    } catch (cause) {
+      return journal.advanceRunDeletion(input2.runId, "blob-cleanup-failed", {
+        error: cause instanceof Error ? cause.message : String(cause)
+      });
+    }
+    return journal.advanceRunDeletion(input2.runId, "completed");
+  }
+  countRows(table, runId, key = "run_id") {
+    const row = this.coordinator.journal.db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${key} = ?1`).get(runId);
+    return row.count;
   }
   async checkpointInput(runId) {
     const view = this.getView(runId);
@@ -43316,15 +45324,28 @@ class ApplicationService {
 async function configureBundle(source, settings) {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("nodeSettings must be an object keyed by workflow node ID");
+  const targets = Object.entries(source.definitions).flatMap(([definitionId, definition]) => definition.nodes.map((node2) => ({ definitionId, node: node2, key: `${definitionId}/${node2.id}` })));
+  const resolved = new Map;
+  for (const [key, setting] of Object.entries(settings)) {
+    const matches = targets.filter((target) => target.key === key || target.node.id === key);
+    if (!matches.length)
+      throw new Error(`Unknown workflow node ${key}`);
+    if (matches.length !== 1)
+      throw new Error(`Ambiguous workflow node ${key}; use the definition and node ID`);
+    if (resolved.has(matches[0].node))
+      throw new Error(`Duplicate settings for workflow node ${key}`);
+    resolved.set(matches[0].node, setting);
+  }
+  const childDefinitions = new Set(Object.values(source.definitions).flatMap((definition) => (definition.scouts ?? []).map((scout) => scout.definitionId)));
   const definitions = Object.fromEntries(Object.entries(source.definitions).map(([definitionId, definition]) => [
     definitionId,
     {
       ...definition,
       nodes: definition.nodes.map((node2) => {
-        const setting = settings[node2.id];
-        if (!setting)
+        if (!resolved.has(node2))
           return node2;
-        if (typeof setting !== "object" || Array.isArray(setting))
+        const setting = resolved.get(node2);
+        if (!setting || typeof setting !== "object" || Array.isArray(setting))
           throw new Error(`Invalid settings for node ${node2.id}`);
         if (node2.kind !== "agent" && node2.kind !== "command")
           throw new Error(`Node ${node2.id} cannot have runtime settings`);
@@ -43335,6 +45356,8 @@ async function configureBundle(source, settings) {
         const allowed = Object.values(CAPABILITY);
         if (setting.capabilities !== undefined && (!Array.isArray(setting.capabilities) || setting.capabilities.some((capability) => typeof capability !== "string" || !allowed.includes(capability))))
           throw new Error(`Invalid capability for node ${node2.id}`);
+        if (childDefinitions.has(definitionId) && setting.capabilities?.some((capability) => capability !== CAPABILITY.REPOSITORY_READ))
+          throw new Error(`Subagent ${definitionId} must remain read-only`);
         return {
           ...node2,
           ...setting.harness === undefined ? {} : { harness: setting.harness },
@@ -43344,9 +45367,6 @@ async function configureBundle(source, settings) {
       })
     }
   ]));
-  for (const nodeId of Object.keys(settings))
-    if (!Object.values(source.definitions).some((definition) => definition.nodes.some((node2) => node2.id === nodeId)))
-      throw new Error(`Unknown workflow node ${nodeId}`);
   const executable = {
     formatVersion: source.formatVersion,
     semanticVersions: source.semanticVersions,
@@ -43420,14 +45440,14 @@ async function compileFeature() {
   const builder2 = new WorkflowBuilder({ id: "feature", version: "2" });
   const task = builder2.input("task", taskSchema, { required: false });
   const workItem = builder2.input("workItem", WorkItem, { required: false });
-  builder2.subagent("repositoryScout", {
+  const repositoryScout = builder2.subagent("repositoryScout", {
     role: "repository-scout",
     prompt: "Inspect the read-only repository view and return a structured repository report.",
     input: { task: taskSchema, question: ScoutQuestion },
     produces: ScoutReport,
     scripted: { output: { summary: "Repository scout fixture", findings: [] } }
   });
-  builder2.subagent("testScout", {
+  const testScout = builder2.subagent("testScout", {
     role: "test-scout",
     prompt: "Inspect the read-only repository view and return a structured test/build report.",
     input: { task: taskSchema, question: ScoutQuestion },
@@ -43438,7 +45458,8 @@ async function compileFeature() {
     role: "planner",
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",
     input: { task, workItem },
-    produces: AgentSummary
+    produces: AgentSummary,
+    uses: [repositoryScout, testScout]
   });
   const approval = builder2.approval("approve-plan", {
     action: "accept-plan",
@@ -43459,6 +45480,11 @@ async function compileFeature() {
   plan.on("success").to(approval);
   approval.on("approved").to(implement);
   approval.on("rejected").to(failed);
+  approval.on("changes-requested").repair(plan, {
+    maxRepairs: 3,
+    feedback: approval.output,
+    exhausted: failed
+  });
   implement.on("success").to(validate2);
   validate2.on("success").to(done);
   validate2.on("failure").repair(implement, {
@@ -43533,7 +45559,7 @@ async function loadFileTemplates(root) {
 }
 
 // packages/host/src/http/server.ts
-import { randomBytes as randomBytes3, randomUUID as randomUUID5 } from "crypto";
+import { randomBytes as randomBytes2, randomUUID as randomUUID5 } from "crypto";
 import { join as join8, normalize, relative } from "path";
 
 // node_modules/.bun/memoirist@0.4.0/node_modules/memoirist/dist/bun/index.js
@@ -57960,7 +59986,7 @@ var Elysia = _Elysia;
 // packages/host/src/http/server.ts
 init_src();
 function createHostServer(service, options = {}) {
-  const token = options.token ?? process.env.KOURO_TOKEN ?? randomBytes3(24).toString("base64url");
+  const token = options.token ?? process.env.KOURO_TOKEN ?? randomBytes2(24).toString("base64url");
   const port2 = options.port ?? Number(process.env.KOURO_PORT ?? 43127);
   const sessions = new Map;
   const app = new Elysia;
@@ -58006,7 +60032,7 @@ function createHostServer(service, options = {}) {
       return { error: "invalid-token" };
     }
     const sessionId = randomUUID5();
-    const csrf = randomBytes3(24).toString("base64url");
+    const csrf = randomBytes2(24).toString("base64url");
     sessions.set(sessionId, { csrf, createdAt: Date.now() });
     set2.headers["set-cookie"] = `kouro_session=${sessionId}; HttpOnly; SameSite=Strict; Path=/`;
     return { csrfToken: csrf };
@@ -58121,7 +60147,8 @@ function createHostServer(service, options = {}) {
       }
       service.experiments.resume(params.id, {
         actor: typeof input2.actor === "string" ? input2.actor : undefined,
-        maxConcurrent: Number.isSafeInteger(input2.maxConcurrent) ? Number(input2.maxConcurrent) : undefined
+        maxConcurrent: Number.isSafeInteger(input2.maxConcurrent) ? Number(input2.maxConcurrent) : undefined,
+        observerWaitMs: Number.isSafeInteger(input2.observerWaitMs) ? Math.max(0, Number(input2.observerWaitMs)) : undefined
       }).catch(() => {});
       return service.experiments.get(params.id);
     } catch (cause) {
@@ -58147,6 +60174,44 @@ function createHostServer(service, options = {}) {
     }
   });
   app.get("/api/runs", ({ request, set: set2, query: query2 }) => checked(request, set2) ? service.listRunsPage(Math.min(100, nonnegativeInt(query2.limit) || 100), nonnegativeInt(query2.offset)).map(toWebRun) : denied(set2));
+  app.get("/api/approvals", ({ request, set: set2 }) => checked(request, set2) ? service.pendingApprovals() : denied(set2));
+  app.get("/api/run-deletions", ({ request, set: set2 }) => checked(request, set2) ? service.incompleteRunDeletions() : denied(set2));
+  app.get("/api/runs/:id/deletion-preview", async ({ request, set: set2, params }) => {
+    if (!checked(request, set2))
+      return denied(set2);
+    try {
+      return await service.previewRunDeletion(params.id);
+    } catch (cause) {
+      set2.status = 404;
+      return {
+        error: "run-deletion-preview-failed",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  });
+  app.post("/api/runs/:id/delete", async ({ request, set: set2, params, body }) => {
+    if (!checked(request, set2, true))
+      return denied(set2);
+    try {
+      const input2 = bodyObject(body);
+      if (typeof input2.idempotencyKey !== "string" || !input2.idempotencyKey.trim())
+        throw new Error("idempotencyKey is required");
+      if (!Number.isSafeInteger(input2.expectedRevision))
+        throw new Error("expectedRevision is required");
+      return await service.deleteRun({
+        runId: params.id,
+        expectedRevision: Number(input2.expectedRevision),
+        idempotencyKey: input2.idempotencyKey,
+        actor: typeof input2.actor === "string" && input2.actor.trim() ? input2.actor : "operator"
+      });
+    } catch (cause) {
+      set2.status = 409;
+      return {
+        error: "run-deletion-rejected",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  });
   app.get("/api/runs/:id/checkpoint", async ({ request, set: set2, params }) => {
     if (!checked(request, set2))
       return denied(set2);
@@ -58272,7 +60337,9 @@ function createHostServer(service, options = {}) {
         nodeSettings: input2.nodeSettings && typeof input2.nodeSettings === "object" ? input2.nodeSettings : undefined,
         workspace: typeof input2.workspace === "object" && input2.workspace !== null && typeof input2.workspace.repositoryPath === "string" ? {
           repositoryPath: String(input2.workspace.repositoryPath),
-          workspaceId: typeof input2.workspace.workspaceId === "string" ? String(input2.workspace.workspaceId) : undefined
+          ...typeof input2.workspace.workspaceId === "string" ? {
+            workspaceId: String(input2.workspace.workspaceId)
+          } : {}
         } : undefined
       }));
     } catch (cause) {
@@ -58305,15 +60372,34 @@ function createHostServer(service, options = {}) {
     if (!checked(request, set2, true))
       return denied(set2);
     const input2 = bodyObject(body);
-    if (typeof input2.action !== "string" || !Number.isSafeInteger(input2.expectedRevision) || typeof input2.idempotencyKey !== "string" || !input2.idempotencyKey.trim()) {
+    if (typeof input2.action !== "string" || input2.action !== "steer" && !Number.isSafeInteger(input2.expectedRevision) || typeof input2.idempotencyKey !== "string" || !input2.idempotencyKey.trim()) {
       set2.status = 400;
       return { error: "unsupported-or-invalid-action" };
     }
     try {
+      if (input2.action === "steer" && typeof input2.invocationId === "string" && typeof input2.attemptId === "string" && typeof input2.message === "string") {
+        return service.steer({
+          runId: params.id,
+          invocationId: input2.invocationId,
+          attemptId: input2.attemptId,
+          message: input2.message,
+          actor: "local-operator",
+          idempotencyKey: input2.idempotencyKey
+        });
+      }
       if (["pause", "resume", "cancel", "interrupt", "detach"].includes(input2.action))
         return service.control({
           runId: params.id,
           action: input2.action,
+          expectedRevision: Number(input2.expectedRevision),
+          actor: "local-operator",
+          idempotencyKey: input2.idempotencyKey
+        });
+      if (input2.action === "interrupt-attempt" && typeof input2.invocationId === "string" && typeof input2.attemptId === "string")
+        return service.interruptAttempt({
+          runId: params.id,
+          invocationId: input2.invocationId,
+          attemptId: input2.attemptId,
           expectedRevision: Number(input2.expectedRevision),
           actor: "local-operator",
           idempotencyKey: input2.idempotencyKey
@@ -58326,7 +60412,7 @@ function createHostServer(service, options = {}) {
           actor: "local-operator",
           idempotencyKey: input2.idempotencyKey
         });
-      if (input2.action === "deliver" && (typeof input2.expectedTree === "string" || typeof input2.deliveryActionId === "string"))
+      if (input2.action === "deliver" && typeof input2.expectedTree === "string" && typeof input2.deliveryActionId === "string")
         return service.workspaceCommit({
           runId: params.id,
           expectedTree: typeof input2.expectedTree === "string" ? input2.expectedTree : service.deliveryAction(String(input2.deliveryActionId))?.resultTree ?? "",
@@ -58334,12 +60420,13 @@ function createHostServer(service, options = {}) {
           message: typeof input2.message === "string" && input2.message.trim() ? input2.message : `Deliver ${params.id}`,
           ...typeof input2.deliveryActionId === "string" ? { deliveryActionId: input2.deliveryActionId } : {}
         });
-      if (input2.action !== "approve" && input2.action !== "reject" || typeof input2.invocationId !== "string")
+      if (!["approve", "reject", "request-changes"].includes(input2.action) || typeof input2.invocationId !== "string")
         throw new Error("unsupported-or-invalid-action");
       return service.decideApproval({
         runId: params.id,
         invocationId: input2.invocationId,
-        decision: input2.action === "approve" ? "approved" : "rejected",
+        decision: input2.action === "approve" ? "approved" : input2.action === "request-changes" ? "changes-requested" : "rejected",
+        ...typeof input2.message === "string" ? { feedback: input2.message } : {},
         expectedRevision: Number(input2.expectedRevision),
         actor: typeof input2.actor === "string" && input2.actor.trim() ? input2.actor : "local-operator",
         idempotencyKey: input2.idempotencyKey,
@@ -58367,11 +60454,8 @@ function createHostServer(service, options = {}) {
       ...view,
       servedAt: new Date().toISOString(),
       m2: {
-        capabilities: {
-          pause: view.state.status === "running",
-          resume: view.state.status === "paused",
-          detach: view.state.status === "running" || view.state.status === "paused"
-        }
+        ...service.operatorState(params.id),
+        activity: service.getHarnessActivity(params.id, 0, 500, undefined, true)
       }
     };
   });
@@ -58383,9 +60467,31 @@ function createHostServer(service, options = {}) {
       return { error: "run-not-found" };
     }
     const after = nonnegativeInt(query2.after);
+    const limit = Math.max(1, Math.min(500, nonnegativeInt(query2.limit) || 200));
+    const events = service.getEvents(params.id, after, limit);
+    const lastCursor = events.at(-1)?.sequence ?? after;
+    const head = service.getView(params.id)?.eventCursor ?? after;
     return {
-      events: service.getEvents(params.id, after),
-      nextCursor: service.getView(params.id)?.eventCursor ?? after
+      events,
+      nextCursor: lastCursor,
+      hasMore: lastCursor < head
+    };
+  });
+  app.get("/api/runs/:id/activity", ({ request, set: set2, params, query: query2 }) => {
+    if (!checked(request, set2))
+      return denied(set2);
+    if (!service.getView(params.id)) {
+      set2.status = 404;
+      return { error: "run-not-found" };
+    }
+    const after = nonnegativeInt(query2.after);
+    const limit = Math.min(500, Math.max(1, nonnegativeInt(query2.limit) || 200));
+    const attemptId = typeof query2.attemptId === "string" ? query2.attemptId : undefined;
+    const items = service.getHarnessActivity(params.id, after, limit, attemptId);
+    return {
+      items,
+      nextCursor: items.at(-1)?.cursor ?? after,
+      hasMore: items.length === limit
     };
   });
   app.get("/api/runs/:id/evidence", ({ request, set: set2, params, query: query2 }) => {
@@ -58428,7 +60534,9 @@ function createHostServer(service, options = {}) {
         } : {},
         ...Array.isArray(input2.reviewEvidence) ? {
           reviewEvidence: input2.reviewEvidence.filter((item) => typeof item === "string")
-        } : {}
+        } : {},
+        ...typeof input2.expectedTree === "string" ? { expectedTree: input2.expectedTree } : {},
+        ...typeof input2.expectedPatchDigest === "string" ? { expectedPatchDigest: input2.expectedPatchDigest } : {}
       });
     } catch (cause) {
       set2.status = 409;
@@ -58509,7 +60617,7 @@ function createHostServer(service, options = {}) {
               if (abortController.signal.aborted)
                 break;
               controller.enqueue(encoder2.encode(`id: ${frame.revision}
-data: ${JSON.stringify(frame)}
+data: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}
 
 `));
             }

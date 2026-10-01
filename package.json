@@ -29,10 +29,11 @@
     "release:forgejo": "bun run typecheck && bun test packages/core packages/host && bun run build && bun run scripts/publish-forgejo.ts",
     "test": "bun test packages scripts",
     "test:browser": "playwright test",
+    "test:browser:native": "playwright test --config playwright.native.config.ts",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint --deny-warnings packages scripts && bun run scripts/check-boundaries.ts",
-    "format": "oxfmt --write packages scripts package.json tsconfig.json playwright.config.ts",
-    "format:check": "oxfmt --check packages scripts package.json tsconfig.json playwright.config.ts"
+    "format": "oxfmt --write packages scripts package.json tsconfig.json playwright.config.ts playwright.native.config.ts",
+    "format:check": "oxfmt --check packages scripts package.json tsconfig.json playwright.config.ts playwright.native.config.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.281",

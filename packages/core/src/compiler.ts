@@ -153,7 +153,11 @@ export async function compileWorkflowDetailed(
         new Set(capabilities).size !== capabilities.length
       )
         diagnostics.push(
-          error("INVALID_CAPABILITIES", "Node capabilities contain an unknown or duplicate value", node.id),
+          error(
+            "INVALID_CAPABILITIES",
+            "Node capabilities contain an unknown or duplicate value",
+            node.id,
+          ),
         );
       if (
         node.kind === "command" &&
@@ -161,7 +165,11 @@ export async function compileWorkflowDetailed(
         !capabilities.includes(CAPABILITY.TERMINAL_EXECUTE)
       )
         diagnostics.push(
-          error("MISSING_TERMINAL_CAPABILITY", "Command nodes must declare terminal.execute", node.id),
+          error(
+            "MISSING_TERMINAL_CAPABILITY",
+            "Command nodes must declare terminal.execute",
+            node.id,
+          ),
         );
     }
     validatePorts(node.inputPorts, schemaDigests, diagnostics, node.id);
@@ -315,7 +323,9 @@ export async function compileWorkflowDetailed(
       );
     }
     const allowedOutcomes =
-      sourceNode?.kind === "approval" ? ["approved", "rejected"] : ["success", "failure"];
+      sourceNode?.kind === "approval"
+        ? ["approved", "rejected", "changes-requested"]
+        : ["success", "failure"];
     if (sourceNode?.kind && !allowedOutcomes.includes(edge.outcome)) {
       diagnostics.push(
         error("UNSUPPORTED_OUTCOME", `Outcome ${edge.outcome} is not supported in M1`, edge.id),

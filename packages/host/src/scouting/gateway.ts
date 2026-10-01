@@ -33,6 +33,8 @@ interface ScoutRow {
   result_artifact_id: string | null;
   result_digest: string | null;
   error: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 type ScoutRunner = (request: ScoutRequest, signal?: AbortSignal) => Promise<JsonValue>;
@@ -541,6 +543,8 @@ function toRequest(row: ScoutRow): ScoutRequest {
     ...(row.dispatch_id === null ? {} : { dispatchId: row.dispatch_id }),
     usage: parseJson(row.usage_json),
     ...(row.error === null ? {} : { error: row.error }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 

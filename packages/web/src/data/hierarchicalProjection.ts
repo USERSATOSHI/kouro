@@ -13,7 +13,14 @@ export interface GraphScope {
 
 export interface GraphProjection {
   nodes: Node[];
-  edges: Array<{ id: string; source: string; target: string; label?: string; hidden?: boolean }>;
+  edges: Array<{
+    id: string;
+    source: string;
+    target: string;
+    label?: string;
+    className?: string;
+    hidden?: boolean;
+  }>;
   scopes: GraphScope[];
   breadcrumbs: string[];
   instances: Array<{
@@ -35,6 +42,36 @@ const scopePath = (id: string, scopes: Record<string, GraphScope>): string[] => 
   }
   return result;
 };
+
+/** Selection needs only a scope path, not a rebuild of graph instances and edges. */
+export function graphSelectionBreadcrumbs(
+  graph: WorkflowGraph | undefined,
+  view: UiRunView,
+  selectedId?: string,
+): string[] {
+  const selected = asArray(view.invocations).find((item) => item.invocationId === selectedId);
+  if (!selected) return [];
+  const scopes: Record<string, GraphScope> = {};
+  for (const scope of asArray(view.scopes)) {
+    const definitionLabel = scope.definitionId || scope.id;
+    scopes[scope.id] = {
+      id: scope.id,
+      parentId: scope.parentScopeId ?? undefined,
+      label: definitionLabel === scope.id ? definitionLabel : `${definitionLabel} · ${scope.id}`,
+      depth: 0,
+      collapsed: false,
+    };
+  }
+  for (const group of graph?.groups ?? [])
+    scopes[group.id] ??= {
+      id: group.id,
+      parentId: group.parentId,
+      label: group.label || group.id,
+      depth: 0,
+      collapsed: false,
+    };
+  return scopePath(selected.scopeId, scopes).map((id) => scopes[id]?.label ?? id);
+}
 
 /**
  * Projects a possibly-new M4 graph into a deterministic React Flow model.
@@ -171,6 +208,7 @@ export function projectHierarchicalGraph(
   const edges = (graph?.edges ?? []).flatMap((edge) => {
     const definitionId =
       edge.definitionId ?? graph?.nodes.find((node) => node.id === edge.source)?.definitionId;
+    const targetDefinitionId = edge.targetDefinitionId ?? definitionId;
     const sources = workNodes.filter(
       (node) =>
         (node.data.node as { id: string }).id === edge.source &&
@@ -179,7 +217,8 @@ export function projectHierarchicalGraph(
     const targets = workNodes.filter(
       (node) =>
         (node.data.node as { id: string }).id === edge.target &&
-        (!definitionId || (node.data.node as WorkflowNode).definitionId === definitionId),
+        (!targetDefinitionId ||
+          (node.data.node as WorkflowNode).definitionId === targetDefinitionId),
     );
     if (!sources.length || !targets.length) return [{ ...edge, hidden: true }];
     // Keep branch links scoped where possible; otherwise retain the explicit
@@ -193,6 +232,7 @@ export function projectHierarchicalGraph(
       id: pairs.length === 1 ? edge.id : `${edge.id}::${source.id}::${target.id}::${index}`,
       source: source.id,
       target: target.id,
+      ...(edge.relation === "subagent" ? { className: "subagent-edge" } : {}),
       hidden: false,
     }));
   });

@@ -27,6 +27,7 @@ import {
   type TurnHandle,
 } from "@kouro/core";
 import type { CollaborationTools, HarnessAdapter } from "../../types.ts";
+import { parseStructuredOutput } from "./structured-output.ts";
 
 const nativeConfigSchema: JsonValue = {
   type: "object",
@@ -100,10 +101,16 @@ export function resolvePiSelection(
     typeof config.provider === "string" && config.provider.trim() ? config.provider : undefined;
   const configuredModel =
     typeof config.model === "string" && config.model.trim() ? config.model : undefined;
-  const selectedModel = configuredModel || env.KOURO_PI_MODEL?.trim() || selection.model.id;
-  let provider = configuredProvider || env.KOURO_PI_PROVIDER?.trim() || selection.model.provider;
+  const selectedModel = configuredModel || selection.model.id || env.KOURO_PI_MODEL?.trim();
+  let provider = configuredProvider || selection.model.provider || env.KOURO_PI_PROVIDER?.trim();
   let model = selectedModel || undefined;
-  if (!provider && model && !/^https?:\/\//i.test(model)) {
+  if (
+    !configuredProvider &&
+    !selection.model.provider &&
+    model &&
+    !/^https?:\/\//i.test(model) &&
+    (!provider || Boolean(configuredModel || selection.model.id))
+  ) {
     const slash = model.indexOf("/");
     if (slash > 0) {
       provider = model.slice(0, slash);
@@ -200,22 +207,24 @@ export class PiSdkHarness {
       input.onEvent?.(event);
     };
     let timeout = false;
+    const discoveryController = new AbortController();
     const timeoutMs = typeof config.timeoutMs === "number" ? config.timeoutMs : undefined;
     const timer =
       timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
             timeout = true;
+            discoveryController.abort();
             void session?.abort();
           }, timeoutMs);
-    const abort = () => void session?.abort();
+    const abort = () => {
+      discoveryController.abort();
+      void session?.abort();
+    };
     input.signal?.addEventListener("abort", abort, { once: true });
+    if (input.signal?.aborted) abort();
     try {
       const resolved = resolvePiSelection(input.selection, config);
-      const requestedModel =
-        resolved.provider && resolved.model
-          ? `${resolved.provider}/${resolved.model}`
-          : resolved.model;
       const agentDir = getAgentDir();
       const services = await createAgentSessionServices({
         cwd: input.cwd,
@@ -228,10 +237,12 @@ export class PiSdkHarness {
           extensionFactories: await loadPiBuiltInExtensions(),
         },
       });
-      const model = requestedModel
-        ? await modelFor(services.modelRuntime, requestedModel)
-        : undefined;
-      if (requestedModel && !model) throw new Error(`Pi model is unavailable: ${requestedModel}`);
+      const model = await resolvePiModel(
+        services.modelRuntime,
+        resolved,
+        services.settingsManager,
+        discoveryController.signal,
+      );
       const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
       const subagent = input.collaboration?.subagent;
       const customTools = scoutTool && subagent ? [createSubagentTool(scoutTool, subagent)] : [];
@@ -240,11 +251,21 @@ export class PiSdkHarness {
         sessionManager: SessionManager.inMemory(input.cwd),
         ...(model ? { model } : {}),
         ...(typeof config.thinking === "string" ? { thinkingLevel: config.thinking as never } : {}),
-        tools: ["read", "grep", "find", "ls"],
+        tools: ["read", "grep", "find", "ls", ...customTools.map((tool) => tool.name)],
         customTools,
       });
       session = created.session;
       this.activeSessions.set(input.attemptId, session);
+      if (session.model)
+        emit({
+          type: "log",
+          at: new Date().toISOString(),
+          data: {
+            status: "Model selected",
+            provider: session.model.provider,
+            modelId: session.model.id,
+          },
+        });
       if (input.signal?.aborted || timeout) await session.abort();
       if (input.signal?.aborted)
         return {
@@ -284,7 +305,10 @@ export class PiSdkHarness {
       if (lastMessage && (lastMessage as unknown as Record<string, unknown>).stopReason === "error")
         return {
           status: "failed",
-          error: message ?? "Pi SDK turn failed",
+          error:
+            typeof lastMessage.errorMessage === "string" && lastMessage.errorMessage
+              ? lastMessage.errorMessage
+              : (message ?? "Pi SDK turn failed"),
           rawOutput: message,
           usage,
           events,
@@ -306,9 +330,11 @@ export class PiSdkHarness {
         status: input.signal?.aborted ? "cancelled" : "failed",
         error: input.signal?.aborted
           ? "cancelled"
-          : cause instanceof Error
-            ? cause.message
-            : String(cause),
+          : timeout
+            ? `pi timed out after ${timeoutMs}ms`
+            : cause instanceof Error
+              ? cause.message
+              : String(cause),
         usage: session ? piUsage(session.getSessionStats()) : unavailableUsage(),
         events,
       };
@@ -321,12 +347,65 @@ export class PiSdkHarness {
   }
 }
 
-async function modelFor(runtime: ModelRuntime, requested?: string) {
-  if (!requested) return undefined;
-  const separator = requested.indexOf("/");
-  if (separator >= 1)
-    return runtime.getModel(requested.slice(0, separator), requested.slice(separator + 1));
-  return (await runtime.getAvailable()).find(({ id }) => id === requested);
+export async function resolvePiModel(
+  runtime: Pick<
+    ModelRuntime,
+    "getProvider" | "getAuth" | "getModel" | "getAvailable" | "getModels"
+  >,
+  selection: PiResolvedSelection,
+  settings: { getDefaultProvider(): string | undefined; getDefaultModel(): string | undefined },
+  signal?: AbortSignal,
+) {
+  const provider = selection.provider ?? settings.getDefaultProvider();
+  const requested = selection.model ?? settings.getDefaultModel();
+  if (provider === "llama.cpp") {
+    // SDK service construction restores caches but does not discover the live
+    // router catalog. Refresh after the built-in provider is registered.
+    const local = runtime.getProvider(provider);
+    const auth = await runtime.getAuth(provider);
+    if (!local?.refreshModels || !auth)
+      throw new Error("Pi local model discovery failed: llama.cpp is not configured");
+    const discoverySignal = AbortSignal.any([
+      AbortSignal.timeout(15000),
+      ...(signal ? [signal] : []),
+    ]);
+    try {
+      // Refresh only this provider. ModelRuntime.refresh in SDK 0.82 also
+      // contacts unrelated providers; their failures must not block a local run.
+      await local.refreshModels({
+        credential: { type: "api_key", key: auth.auth.apiKey, env: auth.env },
+        store: { read: async () => undefined, write: async () => {}, delete: async () => {} },
+        allowNetwork: true,
+        force: true,
+        signal: discoverySignal,
+      });
+    } catch (cause) {
+      if (signal?.aborted) throw new Error("Pi model discovery cancelled");
+      if (discoverySignal.aborted) throw new Error("Pi local model discovery timed out");
+      throw new Error(
+        `Pi local model discovery failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+    if (signal?.aborted) throw new Error("Pi model discovery cancelled");
+    if (discoverySignal.aborted) throw new Error("Pi local model discovery timed out");
+  }
+  if (!requested && !provider) return undefined;
+  const available = provider ? runtime.getModels(provider) : await runtime.getAvailable();
+  const model = requested
+    ? provider
+      ? runtime.getModel(provider, requested)
+      : available.find(({ id }) => id === requested)
+    : available[0];
+  if (!model) {
+    const choices = available
+      .map((item) => `${item.provider}/${item.id}`)
+      .slice(0, 10)
+      .join(", ");
+    throw new Error(
+      `Pi model is unavailable: ${provider ? `${provider}/` : ""}${requested ?? "(none)"}.${choices ? ` Available models: ${choices}.` : " No models are available for this provider."}`,
+    );
+  }
+  return model;
 }
 
 async function loadPiBuiltInExtensions(): Promise<InlineExtension[]> {
@@ -376,12 +455,52 @@ function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void): void 
     isRecord(update) &&
     update.type === "thinking_delta"
   ) {
-    emit({ type: "log", at, data: { status: "Thinking" } });
+    emit({
+      type: "log",
+      at,
+      data: {
+        status: "Thinking",
+        ...(typeof update.delta === "string" ? { text: update.delta, channel: "thinking" } : {}),
+      },
+    });
   } else if (event.type.includes("tool")) {
-    const safe = Object.fromEntries(
-      Object.entries(event).filter(([key]) => !/thinking|reasoning/i.test(key)),
-    );
-    emit({ type: "tool", at, data: safe as JsonValue });
+    const result = isRecord(event.result) ? event.result : undefined;
+    const isError = event.isError === true || result?.isError === true || event.error !== undefined;
+    const lifecycle = event.type.toLowerCase();
+    emit({
+      type: "tool",
+      at,
+      data: {
+        id: String(
+          event.toolCallId ??
+            (isRecord(event.toolCall) ? event.toolCall.id : undefined) ??
+            event.id ??
+            `${event.type}:${at}`,
+        ),
+        name: String(event.toolName ?? event.name ?? "Tool"),
+        status: lifecycle.endsWith("_start")
+          ? "running"
+          : lifecycle.endsWith("_end")
+            ? isError
+              ? "failed"
+              : "completed"
+            : lifecycle.includes("update")
+              ? "running"
+              : isError
+                ? "failed"
+                : "completed",
+        ...(event.args !== undefined ? { input: event.args as JsonValue } : {}),
+        ...(event.input !== undefined ? { input: event.input as JsonValue } : {}),
+        ...(event.result !== undefined ? { output: event.result as JsonValue } : {}),
+        ...(isError
+          ? {
+              error: String(
+                event.error ?? result?.error ?? result?.content ?? "Tool execution failed",
+              ),
+            }
+          : {}),
+      } as unknown as JsonValue,
+    });
   } else {
     emit({ type: "log", at, data: { status: "Thinking" } });
   }
@@ -415,13 +534,7 @@ function piUsage(
 }
 
 function parseJsonOutput(value: string): JsonValue {
-  const trimmed = value.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
-  try {
-    return JSON.parse(fenced ?? trimmed) as JsonValue;
-  } catch {
-    return value;
-  }
+  return parseStructuredOutput(value);
 }
 
 function simpleHash(value: string): string {
@@ -463,7 +576,10 @@ export class PiHarnessAdapter implements HarnessAdapter {
       selection: {
         harness: this.id,
         model: { id: input.modelId ?? "" },
-        nativeConfig: input.nativeConfig,
+        nativeConfig: {
+          ...input.nativeConfig,
+          ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+        },
       },
       cwd: input.cwd ?? ".",
       signal: input.signal,

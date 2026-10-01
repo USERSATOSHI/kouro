@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ProcessResult } from "../../types.ts";
@@ -11,6 +11,7 @@ export async function runEnforcedProcess(input: {
   operationKey?: string;
 }): Promise<ProcessResult> {
   const operationKey = input.operationKey ?? "probe";
+  mkdirSync(input.cwd, { recursive: true, mode: 0o700 });
   const capture = capturePaths();
   let child: ReturnType<typeof Bun.spawn>;
   try {
@@ -92,6 +93,7 @@ export async function runTrustedCommand(input: {
   timeoutMs: number;
   operationKey: string;
 }): Promise<ProcessResult> {
+  mkdirSync(input.cwd, { recursive: true, mode: 0o700 });
   const capture = capturePaths();
   let child: ReturnType<typeof Bun.spawn>;
   try {

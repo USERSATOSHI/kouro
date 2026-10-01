@@ -6,10 +6,6 @@ test("real host runs the compiled graph and grows live timeline bars", async ({ 
   page.on("pageerror", (error) => browserErrors.push(error.message));
   await page.goto("/#token=kouro-browser-test-token");
   await expect(page.getByTestId("start-run").first()).toBeEnabled();
-  await expect(page.getByLabel("Execution profile")).toHaveValue("scripted");
-  await expect(
-    page.getByLabel("Execution profile").locator('option[value="codex-readonly"]'),
-  ).toHaveCount(1);
   await page.getByTestId("start-run").first().click();
   await expect(page.getByTestId("workflow-graph")).toBeVisible();
   await expect(page.getByTestId("execution-timeline")).toBeVisible();
@@ -18,7 +14,9 @@ test("real host runs the compiled graph and grows live timeline bars", async ({ 
   const canvas = page.getByTestId("timeline-canvas");
   const fittedWidth = await canvas.evaluate((element) => element.getBoundingClientRect().width);
   await page.getByTestId("timeline-zoom-in").click();
-  await expect.poll(() => canvas.evaluate((element) => element.getBoundingClientRect().width)).toBeGreaterThan(fittedWidth);
+  await expect
+    .poll(() => canvas.evaluate((element) => element.getBoundingClientRect().width))
+    .toBeGreaterThan(fittedWidth);
   await page.getByTestId("timeline-fit").click();
 
   const bar = page.locator('[data-testid="timeline-bar"][data-active="true"]').first();
@@ -27,10 +25,14 @@ test("real host runs the compiled graph and grows live timeline bars", async ({ 
   expect(invocationId).toBeTruthy();
   const initialElapsed = Number(await bar.getAttribute("data-duration-ms"));
   expect(Number.isFinite(initialElapsed)).toBe(true);
-  await expect.poll(async () => Number(await bar.getAttribute("data-duration-ms")), { timeout: 3000 })
+  await expect
+    .poll(async () => Number(await bar.getAttribute("data-duration-ms")), { timeout: 3000 })
     .toBeGreaterThan(initialElapsed + 500);
   await bar.click();
-  await expect(page.getByTestId("node-inspector")).toHaveAttribute("data-invocation-id", invocationId!);
+  await expect(page.getByTestId("node-inspector")).toHaveAttribute(
+    "data-invocation-id",
+    invocationId!,
+  );
   await expect(page.getByTestId("run-status")).toHaveText("succeeded", { timeout: 20_000 });
   await page.screenshot({ path: "test-results/m1-workbench-desktop.png", fullPage: true });
 
@@ -45,7 +47,9 @@ test("small viewport keeps the workbench readable", async ({ page }) => {
   await page.goto("/#token=kouro-browser-test-token");
   await expect(page.getByTestId("start-run").first()).toBeEnabled();
   await page.screenshot({ path: "test-results/m1-workbench-small.png", fullPage: true });
-  const horizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
+  const horizontalOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > innerWidth,
+  );
   expect(horizontalOverflow).toBe(false);
 });
 
@@ -58,8 +62,8 @@ test("quiet SSE stays live and a returning tab refreshes its run snapshot", asyn
   // Bun's idle timeout from disconnecting this long-lived trace subscription.
   await page.waitForTimeout(11_000);
   await expect(page.locator(".stream-state")).toHaveText("LIVE");
-  const refreshed = page.waitForResponse((response) =>
-    response.url().includes("/api/runs/") && response.url().endsWith("/view"),
+  const refreshed = page.waitForResponse(
+    (response) => response.url().includes("/api/runs/") && response.url().endsWith("/view"),
   );
   await page.evaluate(() => {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
@@ -72,7 +76,9 @@ test("quiet SSE stays live and a returning tab refreshes its run snapshot", asyn
   await expect(page.getByTestId("run-status")).toHaveText("succeeded");
 });
 
-test("live timeline uses host time under client skew and honors reduced motion", async ({ page }) => {
+test("live timeline uses host time under client skew and honors reduced motion", async ({
+  page,
+}) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.addInitScript(() => {
     const original = Date.now;
@@ -92,6 +98,7 @@ test("live timeline uses host time under client skew and honors reduced motion",
 });
 
 test("feature workflow durably waits for approval and reaches terminal state", async ({ page }) => {
+  test.setTimeout(60000);
   const browserErrors: string[] = [];
   page.on("pageerror", (error) => browserErrors.push(error.message));
   await page.goto("/#token=kouro-browser-test-token");
@@ -112,10 +119,20 @@ test("feature workflow durably waits for approval and reaches terminal state", a
       id: string;
       graph: { edges: Array<{ label?: string }> };
     }>;
-    return workflows.find((workflow) => workflow.id === "feature")?.graph.edges.map((edge) => edge.label) ?? [];
+    return (
+      workflows
+        .find((workflow) => workflow.id === "feature")
+        ?.graph.edges.map((edge) => edge.label) ?? []
+    );
   });
   expect(featureEdges).toContain("failure · repair");
   expect(featureEdges).toContain("failure · exhausted");
+
+  await page.getByLabel("Requested changes").fill("Add explicit test coverage to the plan");
+  await page.getByRole("button", { name: "Request changes", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("request-changes requested");
+  await expect(page.getByLabel("Requested changes")).toBeVisible({ timeout: 15000 });
+  await expect(page.getByTestId("approval-panel")).toContainText("2 repairs remaining", { timeout: 15000 });
 
   await page.getByTestId("approve-run").click();
   await expect(page.getByRole("status")).toContainText("approve requested", { timeout: 5_000 });
@@ -123,7 +140,7 @@ test("feature workflow durably waits for approval and reaches terminal state", a
   await expect(page.getByTestId("approve-run")).toHaveCount(0);
 
   // A run without a repository must say so explicitly in the diff inspector.
-  await page.getByRole("button", { name: "diff" }).click();
+  await page.getByRole("button", { name: "diff", exact: true }).click();
   await expect(page.getByTestId("diff-no-workspace")).toHaveText(
     "No repository workspace is attached to this run.",
   );
@@ -172,7 +189,6 @@ test("repository workspace diff is rendered from the host snapshot", async ({ pa
       headers: { "content-type": "application/json", "x-csrf-token": session.csrfToken },
       body: JSON.stringify({
         workflowId: "tiny",
-        executionProfile: "scripted",
         workspace: { repositoryPath, workspaceId: "browser-fixture" },
         idempotencyKey: crypto.randomUUID(),
       }),
@@ -180,11 +196,29 @@ test("repository workspace diff is rendered from the host snapshot", async ({ pa
     if (!response.ok) throw new Error(await response.text());
     return ((await response.json()) as { id: string }).id;
   }, cwd());
-  await page.reload();
+  await page.goto(`/?run=${encodeURIComponent(runId)}`);
   await expect(page.getByTestId("run-status")).toHaveText("succeeded", { timeout: 20_000 });
   await page.locator(".work-node").first().click();
-  await page.getByRole("button", { name: "diff" }).click();
-  await expect(page.getByTestId("diff-summary")).toContainText("No changed paths", { timeout: 5_000 });
+  await page.getByRole("button", { name: "diff", exact: true }).click();
+  await expect(page.getByTestId("diff-summary")).toContainText("No changed paths", {
+    timeout: 5_000,
+  });
+  const message = page.getByLabel("Commit message", { exact: true });
+  await message.fill("Review the local delivery\n\nPreserve the operator's message.");
+  const preparedResponse = page.waitForResponse((response) =>
+    response.url().endsWith(`/api/runs/${runId}/delivery`) && response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Prepare delivery", exact: true }).click();
+  const prepared = await preparedResponse;
+  expect(prepared.ok()).toBe(true);
+  const action = await prepared.json();
+  expect(action.message).toBe("Review the local delivery\n\nPreserve the operator's message.");
+  await expect(message).toBeDisabled();
+  const stored = await page.request.get(`/api/runs/${runId}/delivery/${action.id}`);
+  expect((await stored.json()).message).toBe(action.message);
+  await page.getByRole("button", { name: "Refresh reviewed diff", exact: true }).click();
+  await expect(message).toBeEnabled();
+  await expect(message).toHaveValue(action.message);
   expect(runId).toBeTruthy();
 });
 
@@ -200,7 +234,7 @@ test("nested parallel fixture keeps graph, timeline, and scope state linked", as
 
   // Two child scopes are visible while both call branches are executing.
   await expect(page.locator(".scope-node")).toHaveCount(3, { timeout: 10_000 });
-  const childScopes = page.locator('.scope-node').filter({ hasText: "parallel-child" });
+  const childScopes = page.locator(".scope-node").filter({ hasText: "parallel-child" });
   await expect(childScopes).toHaveCount(2);
   const workNodes = page.locator(".work-node");
   await expect(workNodes.filter({ hasText: "work" })).toHaveCount(2);
@@ -209,10 +243,14 @@ test("nested parallel fixture keeps graph, timeline, and scope state linked", as
   const firstScopeId = await childScopes.first().getAttribute("data-testid");
   expect(firstScopeId).toBeTruthy();
   const firstScope = page.getByTestId(firstScopeId!);
-  await firstScope.locator(".scope-toggle").evaluate((element) => (element as HTMLButtonElement).click());
+  await firstScope
+    .locator(".scope-toggle")
+    .evaluate((element) => (element as HTMLButtonElement).click());
   await expect(firstScope.locator(".scope-toggle")).toHaveAttribute("data-collapsed", "true");
   await expect(page.locator(".work-node").filter({ hasText: "work" })).toHaveCount(1);
-  await firstScope.locator(".scope-toggle").evaluate((element) => (element as HTMLButtonElement).click());
+  await firstScope
+    .locator(".scope-toggle")
+    .evaluate((element) => (element as HTMLButtonElement).click());
   await expect(page.locator(".work-node").filter({ hasText: "work" })).toHaveCount(2);
 
   // Select a nested invocation and retain its breadcrumb/identity across the graph.
@@ -225,9 +263,15 @@ test("nested parallel fixture keeps graph, timeline, and scope state linked", as
   // Both branches are concurrent and remain distinct by invocation identity.
   const bars = page.locator('[data-testid="timeline-bar"][data-source-node-id="work"]');
   await expect(bars).toHaveCount(2, { timeout: 10_000 });
-  const ids = await bars.evaluateAll((items) => items.map((item) => item.getAttribute("data-invocation-id")));
+  const ids = await bars.evaluateAll((items) =>
+    items.map((item) => item.getAttribute("data-invocation-id")),
+  );
   expect(new Set(ids).size).toBe(2);
-  expect(await bars.evaluateAll((items) => items.every((item) => Number(item.getAttribute("data-duration-ms")) > 1_000))).toBe(true);
+  expect(
+    await bars.evaluateAll((items) =>
+      items.every((item) => Number(item.getAttribute("data-duration-ms")) > 1_000),
+    ),
+  ).toBe(true);
   const firstBar = bars.first();
   const firstBarId = await firstBar.getAttribute("data-invocation-id");
 
@@ -237,9 +281,9 @@ test("nested parallel fixture keeps graph, timeline, and scope state linked", as
   await expect(page.getByTestId("run-status")).toHaveText("succeeded", { timeout: 20_000 });
 
   // Activation order is durable: completion does not reshuffle timeline rows.
-  const rowIds = await page.locator('[data-testid="timeline-bar"]').evaluateAll((items) =>
-    items.map((item) => item.getAttribute("data-invocation-id")),
-  );
+  const rowIds = await page
+    .locator('[data-testid="timeline-bar"]')
+    .evaluateAll((items) => items.map((item) => item.getAttribute("data-invocation-id")));
   expect(new Set(rowIds).size).toBeGreaterThanOrEqual(2);
   expect(browserErrors).toEqual([]);
   await page.screenshot({ path: "test-results/m4-nested-parallel-desktop.png", fullPage: true });

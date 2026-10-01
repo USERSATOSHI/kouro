@@ -9,7 +9,13 @@ test("M6 collaboration view renders the durable host snapshot", async ({ page })
     const runs = (await (await fetch("/api/runs")).json()) as Array<{ id: string }>;
     for (const run of runs) {
       const response = await fetch(`/api/runs/${encodeURIComponent(run.id)}/collaboration`);
-      if (response.ok && ((await response.json()) as { participants?: unknown[] }).participants?.length) return run.id;
+      if (
+        response.ok &&
+        ((await response.json()) as { participants?: Array<{ id: string }> }).participants?.some(
+          (item) => item.id === "planner",
+        )
+      )
+        return run.id;
     }
     return null;
   });
@@ -23,7 +29,9 @@ test("M6 collaboration view renders the durable host snapshot", async ({ page })
   await expect(page.getByText("Direct message stream")).toBeVisible();
   await expect(page.getByText("The scripted fixture found a durable handoff.")).toBeVisible();
   await expect(page.getByText("Blackboard & artifacts")).toBeVisible();
-  await expect(page.getByText("Review the generated artifact before handoff.").first()).toBeVisible();
+  await expect(
+    page.getByText("Review the generated artifact before handoff.").first(),
+  ).toBeVisible();
   await expect(page.getByText("Participant timeline")).toBeVisible();
   await expect(page.getByText(/sender attempt/).first()).toBeVisible();
   await expect(page.getByText("MESSAGES", { exact: true })).toBeVisible();
@@ -38,15 +46,19 @@ test("M6 collaboration view renders the durable host snapshot", async ({ page })
       const resp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/collaboration`);
       if (resp.ok) {
         const data = await resp.json();
-        if (data.participants?.length > 0) return data;
+        if (data.participants?.some((item: { id: string }) => item.id === "planner")) return data;
       }
     }
     return null;
   });
   expect(snapshot).toMatchObject({
     participants: expect.arrayContaining([expect.objectContaining({ id: "planner" })]),
-    messages: expect.arrayContaining([expect.objectContaining({ senderAttemptId: expect.any(String) })]),
-    blackboard: expect.arrayContaining([expect.objectContaining({ channelId: "blackboard:findings" })]),
+    messages: expect.arrayContaining([
+      expect.objectContaining({ senderAttemptId: expect.any(String) }),
+    ]),
+    blackboard: expect.arrayContaining([
+      expect.objectContaining({ channelId: "blackboard:findings" }),
+    ]),
   });
 });
 
@@ -58,7 +70,13 @@ test("M6 collaboration view remains usable at 768px", async ({ page }) => {
     const runs = (await (await fetch("/api/runs")).json()) as Array<{ id: string }>;
     for (const run of runs) {
       const response = await fetch(`/api/runs/${encodeURIComponent(run.id)}/collaboration`);
-      if (response.ok && ((await response.json()) as { participants?: unknown[] }).participants?.length) return run.id;
+      if (
+        response.ok &&
+        ((await response.json()) as { participants?: Array<{ id: string }> }).participants?.some(
+          (item) => item.id === "planner",
+        )
+      )
+        return run.id;
     }
     return null;
   });

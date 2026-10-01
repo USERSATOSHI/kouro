@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 export type EvalCellStatus =
   | "pending"
@@ -34,6 +34,8 @@ export interface EvalCase {
   id: string;
   label: string;
   description?: string;
+  input?: unknown;
+  acceptance?: unknown;
 }
 export interface EvalVariant {
   id: string;
@@ -54,6 +56,8 @@ export interface EvalExperiment {
 export interface BlindedPairwise {
   id: string;
   evidence?: Array<{ side: string; items?: EvalEvidence[] }>;
+  /** Side ids are ordered as the durable assignment's A and B options. */
+  sides?: string[];
   decision?: { choice: "a" | "b" | "tie" | "abstain"; reason?: string };
   revealed?: boolean;
   /** Populated only from the post-decision server assignment. */
@@ -333,6 +337,24 @@ export function formatEvidenceValue(value: string): string {
   return value;
 }
 
+/** Compare distinct variants for the same case/repetition when available. */
+export function completedComparisonRuns(experiment: EvalExperiment): string[] {
+  const cells = experiment.cells.filter((cell) => cell.status === "succeeded" && cell.runId);
+  const left = cells[0];
+  if (!left) return [];
+  const right =
+    cells.find(
+      (cell) =>
+        cell.runId !== left.runId &&
+        cell.variantId !== left.variantId &&
+        cell.caseId === left.caseId &&
+        cell.repetition === left.repetition,
+    ) ??
+    cells.find((cell) => cell.runId !== left.runId && cell.variantId !== left.variantId) ??
+    cells.find((cell) => cell.runId !== left.runId);
+  return right ? [left.runId!, right.runId!] : [left.runId!];
+}
+
 export function M5Workbench({
   experiment,
   onOpenRun,
@@ -343,6 +365,10 @@ export function M5Workbench({
   onPairwiseChoice,
   comparisonTimeline,
   comparisonTimelineError,
+  onLoadEvidence,
+  experiments,
+  onSelectExperiment,
+  onCompare,
 }: {
   experiment: EvalExperiment;
   onOpenRun?: (runId: string) => void;
@@ -353,12 +379,45 @@ export function M5Workbench({
   onPairwiseChoice?: (choice: "a" | "b" | "tie" | "abstain") => void;
   comparisonTimeline?: ComparisonTimeline;
   comparisonTimelineError?: string;
+  onLoadEvidence?: (cellKey: string) => Promise<EvalEvidence[]>;
+  experiments?: Array<{ id: string; name: string }>;
+  onSelectExperiment?: (id: string) => void;
+  onCompare?: () => void;
 }) {
   const [tab, setTab] = useState<"matrix" | "timeline" | "pairwise">("matrix");
   const [selected, setSelected] = useState<EvalCell>();
   const [reveal, setReveal] = useState(false);
+  const [showDataset, setShowDataset] = useState(false);
+  const [loadedEvidence, setLoadedEvidence] = useState<Record<string, EvalEvidence[]>>({});
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [evidenceError, setEvidenceError] = useState<string>();
   const summary = cellStatusSummary(experiment.cells);
   const evaluation = evaluationSummary(experiment.cells);
+  useEffect(() => {
+    setSelected(undefined);
+    setLoadedEvidence({});
+    setEvidenceError(undefined);
+  }, [experiment.id]);
+  useEffect(() => {
+    if (!selected || !onLoadEvidence || loadedEvidence[selected.id]) return;
+    let cancelled = false;
+    setEvidenceLoading(true);
+    setEvidenceError(undefined);
+    void onLoadEvidence(selected.id)
+      .then((items) => {
+        if (!cancelled) setLoadedEvidence((current) => ({ ...current, [selected.id]: items }));
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled)
+          setEvidenceError(cause instanceof Error ? cause.message : "Unable to load evidence");
+      })
+      .finally(() => {
+        if (!cancelled) setEvidenceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected, onLoadEvidence, loadedEvidence]);
   return (
     <section className="m5-workbench" data-testid="eval-workbench">
       <header className="m5-header">
@@ -369,9 +428,26 @@ export function M5Workbench({
             {experiment.dataset} <span>·</span>{" "}
             {new Date(experiment.createdAt).toLocaleDateString()}
           </p>
+          {experiments && experiments.length > 1 && (
+            <label className="experiment-picker">
+              EXPERIMENT
+              <select
+                value={experiment.id}
+                onChange={(event) => onSelectExperiment?.(event.target.value)}
+              >
+                {experiments.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
         <div className="m5-header-actions">
-          <button className="subtle-button">Dataset</button>
+          <button className="subtle-button" onClick={() => setShowDataset((value) => !value)}>
+            {showDataset ? "Hide dataset" : "Inspect dataset"}
+          </button>
           {experiment.status === "running" && onCancel ? (
             <button className="subtle-button" onClick={onCancel}>
               Cancel
@@ -383,6 +459,13 @@ export function M5Workbench({
           ) : null}
         </div>
       </header>
+      {showDataset && (
+        <section className="dataset-inspector" aria-label="Experiment dataset">
+          <h2>{experiment.dataset}</h2>
+          <p>Cases and declared acceptance checks used by this experiment.</p>
+          <pre>{JSON.stringify(experiment.cases, null, 2)}</pre>
+        </section>
+      )}
       <div className="m5-summary" aria-label="experiment status">
         {Object.entries(summary).map(([status, count]) => (
           <span key={status} className={`m5-stat ${status}`}>
@@ -430,7 +513,24 @@ export function M5Workbench({
         />
       )}
       {tab === "timeline" && (
-        <TimelineCompare timeline={comparisonTimeline} error={comparisonTimelineError} />
+        <>
+          {onCompare && (
+            <button
+              className="subtle-button"
+              disabled={
+                new Set(
+                  experiment.cells
+                    .filter((cell) => cell.status === "succeeded" && cell.runId)
+                    .map((cell) => cell.runId),
+                ).size < 2
+              }
+              onClick={onCompare}
+            >
+              Compare completed cells
+            </button>
+          )}
+          <TimelineCompare timeline={comparisonTimeline} error={comparisonTimelineError} />
+        </>
       )}
       {tab === "pairwise" && (
         <PairwiseReview
@@ -440,12 +540,15 @@ export function M5Workbench({
           pairwise={pairwise}
           onStart={onPairwiseStart}
           onChoice={onPairwiseChoice}
+          onOpenRun={onOpenRun}
         />
       )}
       {selected && (
         <EvidenceDetail
-          cell={selected}
+          cell={{ ...selected, evidence: loadedEvidence[selected.id] ?? selected.evidence }}
           onOpenRun={onOpenRun}
+          loading={evidenceLoading}
+          error={evidenceError}
           onClose={() => setSelected(undefined)}
         />
       )}
@@ -550,10 +653,14 @@ function EvidenceDetail({
   cell,
   onOpenRun,
   onClose,
+  loading,
+  error,
 }: {
   cell: EvalCell;
   onOpenRun?: (runId: string) => void;
   onClose: () => void;
+  loading?: boolean;
+  error?: string;
 }) {
   const grouped = useMemo(
     () =>
@@ -583,6 +690,11 @@ function EvidenceDetail({
         </button>
       </div>
       {cell.error && <div className="m5-error">{cell.error}</div>}
+      {error && (
+        <div className="m5-error" role="alert">
+          {error}
+        </div>
+      )}
       {(["deterministic", "workflow", "efficiency", "judge", "human"] as EvidenceKind[]).map(
         (kind) => (
           <section className={`evidence-group ${kind}`} key={kind}>
@@ -598,7 +710,9 @@ function EvidenceDetail({
                 </div>
               ))
             ) : (
-              <p className="pending-copy">No {kind} evidence recorded.</p>
+              <p className="pending-copy">
+                {loading ? "Loading evidence…" : `No ${kind} evidence recorded.`}
+              </p>
             )}
           </section>
         ),
@@ -621,7 +735,7 @@ function TimelineCompare({ timeline, error }: { timeline?: ComparisonTimeline; e
           <strong>SHARED-SCALE TIMELINE</strong>
           <span>durable aligned stages · {timeline?.runs.length ?? 0} selected runs</span>
         </div>
-        <button className="subtle-button">Fit to runs</button>
+        <span className="timeline-fit-state">Scale fits the selected runs</span>
       </div>
       <div className="compare-axis">
         <span>0s</span>
@@ -666,6 +780,7 @@ function PairwiseReview({
   pairwise,
   onStart,
   onChoice,
+  onOpenRun,
 }: {
   experiment: EvalExperiment;
   reveal: boolean;
@@ -673,6 +788,7 @@ function PairwiseReview({
   pairwise?: BlindedPairwise;
   onStart?: () => void;
   onChoice?: (choice: "a" | "b" | "tie" | "abstain") => void;
+  onOpenRun?: (runId: string) => void;
 }) {
   const options = experiment.variants.slice(0, 2);
   const testCase = experiment.cases[0];
@@ -703,23 +819,31 @@ function PairwiseReview({
       </div>
       <div className="pair-cards">
         {options.map((variant, index) => {
-          const cell = cellFor(experiment, testCase.id, variant.id);
-          const sideId = `side-redacted-${index + 1}`;
+          const sideId = pairwise?.sides?.[index] ?? `side-redacted-${index + 1}`;
+          const assignedVariant = reveal ? pairwise?.revealMap?.[sideId] : undefined;
+          const revealedVariant = experiment.variants.find((item) => item.id === assignedVariant);
+          const cell = assignedVariant
+            ? cellFor(experiment, testCase.id, assignedVariant)
+            : pairwise
+              ? undefined
+              : cellFor(experiment, testCase.id, variant.id);
           const evidence = pairwise?.evidence?.find((item) => item.side === sideId)?.items;
           return (
             <article className="pair-card" key={variant.id}>
               <header>
                 <span>OPTION {index === 0 ? "A" : "B"}</span>
-                {reveal && pairwise?.revealMap?.[sideId] === variant.id && (
+                {revealedVariant && (
                   <small>
-                    {variant.label} · {variant.profile}
+                    {revealedVariant.label} · {revealedVariant.profile}
                   </small>
                 )}
               </header>
               <strong>
-                {cell?.status === "succeeded"
-                  ? `Run ${STATUS_LABEL[cell.status]}`
-                  : STATUS_LABEL[cell?.status ?? "pending"]}
+                {pairwise && !cell
+                  ? "Blinded run"
+                  : cell?.status === "succeeded"
+                    ? `Run ${STATUS_LABEL[cell.status]}`
+                    : STATUS_LABEL[cell?.status ?? "pending"]}
               </strong>
               <p>
                 {evidence
@@ -731,9 +855,15 @@ function PairwiseReview({
                   "No evidence available"}
               </p>
               <small className="pair-acceptance">
-                Acceptance: {acceptanceLabel(cell ? acceptanceStatus(cell) : "missing")}
+                {pairwise && !cell
+                  ? "Pinned evidence snapshot"
+                  : `Acceptance: ${acceptanceLabel(cell ? acceptanceStatus(cell) : "missing")}`}
               </small>
-              <button className="diff-link">Inspect run ↗</button>
+              {cell?.runId && (
+                <button className="diff-link" onClick={() => onOpenRun?.(cell.runId!)}>
+                  Inspect run ↗
+                </button>
+              )}
             </article>
           );
         })}

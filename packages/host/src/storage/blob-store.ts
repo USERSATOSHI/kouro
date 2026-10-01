@@ -6,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  rmSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
@@ -73,6 +74,10 @@ export class BlobStore {
     const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== ref.digest) throw new Error("Artifact checksum mismatch");
     return bytes;
+  }
+
+  removeDigests(digests: readonly string[]): void {
+    for (const digest of digests) rmSync(this.pathForDigest(digest), { force: true });
   }
 }
 

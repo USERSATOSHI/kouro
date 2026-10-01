@@ -343,6 +343,80 @@
     grid-column: 2 / -1;
   }
 }
+
+.invocation-picker {
+  display: grid;
+  gap: 6px;
+  margin: 12px 16px;
+  color: var(--text-muted, #8d9aab);
+  font-size: 12px;
+}
+.invocation-picker select,
+.session-search-row select {
+  min-width: 0;
+  max-width: 100%;
+  padding: 7px;
+  border: 1px solid #304155;
+  border-radius: 5px;
+  color: #d8e1ed;
+  background: #111b29;
+}
+.session-identity {
+  margin: 10px 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  color: #9db0c7;
+}
+.session-search-row {
+  flex-wrap: wrap;
+}
+.session-search-row input {
+  min-width: 120px;
+}
+.artifact-row {
+  display: block;
+}
+.artifact-row summary {
+  display: flex;
+  gap: 8px;
+  cursor: pointer;
+}
+.artifact-row summary strong,
+.artifact-row summary em {
+  display: block;
+}
+.artifact-preview {
+  margin-top: 10px;
+  min-width: 0;
+}
+.artifact-preview pre,
+.scout-activity pre {
+  max-height: 400px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.agent-session-header .session-copy-link {
+  display: block;
+  margin-top: 8px;
+  padding: 0;
+  font-size: 12px;
+  text-decoration: underline;
+}
+.session-status {
+  margin: 0;
+  padding: 2px 0;
+}
+.session-message.operator-message {
+  align-self: flex-end;
+  background: #163126;
+  border-color: #356f56;
+}
+.session-message.thinking-message {
+  background: #151b25;
+  border-style: dashed;
+}
 @media (prefers-reduced-motion: reduce) {
   .m7-workbench *,
   .m7-workbench *::before,
@@ -1189,4 +1263,155 @@
     top: 70px;
     width: calc(100vw - 20px);
   }
+}
+
+.session-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  gap: 12px;
+  padding: 0 18px 12px;
+}
+.session-lane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid #29384e;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.session-lane > header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border-bottom: 1px solid #29384e;
+}
+.session-lane > header small {
+  color: #9fb0c8;
+  overflow-wrap: anywhere;
+}
+.session-lane label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+.session-lane select {
+  max-width: 100%;
+  min-width: 0;
+  flex: 1;
+  color: #cbd8eb;
+  background: #142033;
+  border: 1px solid #3b4c66;
+  border-radius: 4px;
+  padding: 5px;
+}
+.session-lane .agent-session-stream {
+  flex: 1;
+  min-height: 0;
+  padding: 12px;
+  overscroll-behavior: contain;
+}
+.lane-navigation {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 0 8px;
+}
+.lane-navigation:has(button) {
+  padding: 8px;
+}
+.lane-navigation button {
+  background: #192a3d;
+  color: #cbd8eb;
+  border: 1px solid #3b4c66;
+  padding: 5px;
+  border-radius: 4px;
+}
+.activity-text {
+  margin: 5px 0;
+  padding: 7px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow: auto;
+  font:
+    12px/1.55 ui-monospace,
+    monospace;
+}
+.activity-fields {
+  margin: 6px 0;
+  min-width: 0;
+}
+.activity-fields > div {
+  display: grid;
+  grid-template-columns: minmax(60px, 24%) minmax(0, 1fr);
+  gap: 8px;
+  margin: 5px 0;
+}
+.activity-fields dt {
+  color: #91a6c2;
+  text-transform: capitalize;
+  overflow-wrap: anywhere;
+}
+.activity-fields dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.activity-list {
+  display: grid;
+  gap: 6px;
+}
+.activity-list > div + div {
+  border-top: 1px solid #27364b;
+  padding-top: 6px;
+}
+.tool-output {
+  border-top: 1px solid #2b3b50;
+  padding: 10px 12px;
+  min-width: 0;
+}
+.tool-output > strong {
+  color: #97c5ae;
+  font-size: 11px;
+}
+.tool-output-pending {
+  color: #8da1bb;
+  padding: 0 12px;
+  font-size: 11px;
+}
+.session-tool .activity-fields {
+  padding: 0 6px;
+}
+.session-tool {
+  overflow: hidden;
+}
+.log-line .activity-text {
+  background: transparent;
+  margin: 0;
+  padding: 0;
+}
+@media (max-width: 700px) {
+  .session-split {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+    padding: 0 8px 8px;
+  }
+  .session-lane > header {
+    padding: 8px;
+  }
+  .activity-fields > div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}
+
+.agent-session-stream > * {
+  flex-shrink: 0;
 }

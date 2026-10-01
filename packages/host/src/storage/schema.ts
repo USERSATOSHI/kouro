@@ -94,6 +94,16 @@ export function migrate(db: Database): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS unconfirmed_harness_shutdowns (
+      shutdown_id TEXT PRIMARY KEY NOT NULL,
+      attempt_id TEXT NOT NULL REFERENCES attempts(id),
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      detail TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS unconfirmed_harness_shutdowns_run_idx
+      ON unconfirmed_harness_shutdowns(run_id);
+
     CREATE TABLE IF NOT EXISTS outbox (
       effect_id TEXT PRIMARY KEY REFERENCES effects(id),
       state TEXT NOT NULL,
@@ -330,7 +340,43 @@ export function migrate(db: Database): void {
       record_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS run_deletions (
+      run_id TEXT PRIMARY KEY NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      request_digest TEXT NOT NULL,
+      expected_revision INTEGER NOT NULL,
+      actor TEXT NOT NULL,
+      status TEXT NOT NULL,
+      preview_json TEXT NOT NULL,
+      blobs_json TEXT NOT NULL DEFAULT '[]',
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
+  const shutdownColumns = db
+    .query("PRAGMA table_info(unconfirmed_harness_shutdowns)")
+    .all() as Array<{ name: string }>;
+  if (!shutdownColumns.some((column) => column.name === "shutdown_id")) {
+    db.exec(`
+      DROP INDEX IF EXISTS unconfirmed_harness_shutdowns_run_idx;
+      ALTER TABLE unconfirmed_harness_shutdowns RENAME TO unconfirmed_harness_shutdowns_legacy;
+      CREATE TABLE unconfirmed_harness_shutdowns (
+        shutdown_id TEXT PRIMARY KEY NOT NULL,
+        attempt_id TEXT NOT NULL REFERENCES attempts(id),
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        detail TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO unconfirmed_harness_shutdowns(shutdown_id, attempt_id, run_id, detail, created_at)
+        SELECT 'legacy:' || attempt_id, attempt_id, run_id, detail, created_at
+        FROM unconfirmed_harness_shutdowns_legacy;
+      DROP TABLE unconfirmed_harness_shutdowns_legacy;
+      CREATE INDEX unconfirmed_harness_shutdowns_run_idx
+        ON unconfirmed_harness_shutdowns(run_id);
+    `);
+  }
   try {
     db.exec(
       "ALTER TABLE collaboration_batches ADD COLUMN context_manifest_ids_json TEXT NOT NULL DEFAULT '[]'",

@@ -146,7 +146,16 @@ export interface HarnessAdapter {
   readonly id: string;
   readonly adapterVersion: string;
   capabilities(): Record<string, "supported" | "unsupported" | "conditional">;
+  /** Whether a native turn is ready to accept steering, distinct from adapter support. */
+  canSteer?(input: { invocationId: string }): boolean;
+  /** Provider liveness probe. `working` is a heartbeat, not progress. */
+  probe?(input: { attemptId: string }): Promise<"working" | "disconnected" | "unknown">;
+  /** Optional bounded transport recovery after a provider disconnect. */
+  reconnect?(input: { attemptId: string }): Promise<boolean>;
+  /** Terminate an adapter-owned process after graceful cancellation has expired. */
+  terminate?(input: { attemptId: string; reason: string }): Promise<boolean>;
   run(input: {
+    attemptId?: string;
     runId: string;
     invocationId: string;
     role: string;
@@ -231,6 +240,8 @@ export interface ScoutRequest {
   readonly dispatchId?: string;
   readonly usage?: unknown;
   readonly error?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 export type ScoutResult =

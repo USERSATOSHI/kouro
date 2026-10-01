@@ -59,6 +59,15 @@ interface FileTemplate {
   readonly bundle: Bundle;
 }
 
+interface RunDeletionPreview {
+  runId: string;
+  revision: number;
+  canDelete: boolean;
+  workspaceAdapterMissing?: boolean;
+  blockers?: Array<{ message: string }>;
+  [key: string]: unknown;
+}
+
 export class ApplicationService {
   readonly coordinator: Coordinator;
   readonly experiments: ExperimentService;
@@ -111,6 +120,42 @@ export class ApplicationService {
 
   steer(input: Parameters<Coordinator["steer"]>[0]) {
     return this.coordinator.steer(input);
+  }
+  canSteer(runId: string, invocationId: string): boolean {
+    return this.coordinator.canSteer(runId, invocationId);
+  }
+  interruptAttempt(input: Parameters<Coordinator["interruptAttempt"]>[0]) {
+    return this.coordinator.interruptAttempt(input);
+  }
+
+  operatorState(runId: string) {
+    const view = this.getView(runId);
+    if (!view) return undefined;
+    const invocations = Object.values(view.state.invocations);
+    const retryableInvocationIds = ["failed", "interrupted"].includes(view.state.status)
+      ? invocations
+          .filter((item) => item.status === "failed" && this.coordinator.canRetry(runId, item.id))
+          .map((item) => item.id)
+      : [];
+    const steerableInvocationIds = invocations
+      .filter((item) => item.status === "running" && this.canSteer(runId, item.id))
+      .map((item) => item.id);
+    const interruptibleInvocationIds = invocations
+      .filter((item) => item.status === "running" && this.coordinator.canInterrupt(runId, item.id))
+      .map((item) => item.id);
+    return {
+      capabilities: {
+        pause: view.state.status === "running",
+        resume: view.state.status === "paused",
+        cancel: view.state.status === "running" || view.state.status === "paused",
+        detach: view.state.status === "running" || view.state.status === "paused",
+        steer: steerableInvocationIds.length > 0,
+        retry: retryableInvocationIds.length > 0,
+      },
+      retryableInvocationIds,
+      steerableInvocationIds,
+      interruptibleInvocationIds,
+    };
   }
 
   async start(): Promise<void> {
@@ -173,7 +218,7 @@ export class ApplicationService {
     if (!comparison) throw new Error("comparison not found");
     const spans: ComparisonNodeSpan[] = [];
     for (const run of comparison.runs) {
-      const view = this.getView(run.runId);
+      const view = this.coordinator.journal.getViewAtRevision(run.runId, run.revision);
       if (!view) throw new Error(`comparison run not found: ${run.runId}`);
       for (const invocation of Object.values(view.state.invocations)) {
         if (invocation.startedAt || invocation.completedAt)
@@ -208,7 +253,7 @@ export class ApplicationService {
     evidence: readonly unknown[];
     risks: readonly string[];
   } {
-    const view = this.getView(run.runId);
+    const view = this.coordinator.journal.getViewAtRevision(run.runId, run.revision);
     if (!view) throw new Error(`comparison run not found: ${run.runId}`);
     const evidence = Object.values(view.state.invocations).map((invocation) => ({
       kind: "execution",
@@ -241,11 +286,13 @@ export class ApplicationService {
     const flip = randomBytes(1)[0]! % 2 === 1;
     const sanitizedA = this.blindedEvidence(first);
     const sanitizedB = this.blindedEvidence(second);
+    const runA = flip ? second : first;
+    const runB = flip ? first : second;
     const assignment = this.coordinator.journal.createPairwiseAssignment({
       id: `pair_${randomUUID().replaceAll("-", "")}`,
       comparisonId: input.comparisonId,
-      runA: first,
-      runB: second,
+      runA,
+      runB,
       sideA: flip ? "side-redacted-1" : "side-redacted-2",
       sideB: flip ? "side-redacted-2" : "side-redacted-1",
       rubric: input.rubric,
@@ -344,24 +391,51 @@ export class ApplicationService {
               position: { x: 60 + (ranks.get(node.id) ?? 0) * 250, y: 80 },
             })),
           ),
-          edges: Object.values(bundle.definitions).flatMap((childDefinition) =>
-            childDefinition.controlEdges.map((edge) => ({
-              id: `${childDefinition.id}:${edge.id}`,
-              source: edge.sourceNodeId,
-              target: edge.targetNodeId,
-              definitionId: childDefinition.id,
-              outcome: edge.outcome,
-              label: edge.id.endsWith(":repair")
-                ? `${edge.outcome} · repair`
-                : edge.id.endsWith(":repair-exhausted")
-                  ? `${edge.outcome} · exhausted`
-                  : edge.outcome,
-            })),
-          ),
+          edges: [
+            ...Object.values(bundle.definitions).flatMap((childDefinition) =>
+              childDefinition.controlEdges.map((edge) => ({
+                id: `${childDefinition.id}:${edge.id}`,
+                source: edge.sourceNodeId,
+                target: edge.targetNodeId,
+                definitionId: childDefinition.id,
+                outcome: edge.outcome,
+                label: edge.id.endsWith(":repair")
+                  ? `${edge.outcome} · repair`
+                  : edge.id.endsWith(":repair-exhausted")
+                    ? `${edge.outcome} · exhausted`
+                    : edge.outcome,
+              })),
+            ),
+            ...Object.values(bundle.definitions).flatMap((definition) =>
+              (definition.scouts ?? []).flatMap((scout) => {
+                const child = bundle.definitions[scout.definitionId];
+                const childAgent = child?.nodes.find((node) => node.kind === "agent");
+                if (!child || !childAgent) return [];
+                return definition.nodes
+                  .filter(
+                    (node) =>
+                      node.kind === "agent" &&
+                      (node.uses === undefined || node.uses.includes(scout.id)),
+                  )
+                  .map((parent) => ({
+                    id: `${definition.id}:subagent:${parent.id}:${scout.id}`,
+                    source: parent.id,
+                    target: childAgent.id,
+                    definitionId: definition.id,
+                    targetDefinitionId: child.id,
+                    relation: "subagent",
+                    label: scout.id,
+                  }));
+              }),
+            ),
+          ],
           groups: Object.values(bundle.definitions).map((childDefinition) => ({
             id: childDefinition.id,
             label: childDefinition.id,
             definitionId: childDefinition.id,
+            ...(childDefinition.id === bundle.rootDefinitionId
+              ? {}
+              : { parentId: bundle.rootDefinitionId }),
           })),
         },
         bundle,
@@ -498,7 +572,23 @@ export class ApplicationService {
     if (!source) throw new Error(`Unknown workflow ${input.workflowId}`);
     const bundle = input.nodeSettings ? await configureBundle(source, input.nodeSettings) : source;
     const { nodeSettings: _nodeSettings, ...runInput } = input;
-    return (await this.coordinator.createRun({ ...runInput, bundle })).run;
+    const needsSourceRepository = Object.values(bundle.definitions).some((definition) =>
+      definition.nodes.some(
+        (node) => node.kind === "command" && node.workspaceAccess === "source-repository",
+      ),
+    );
+    const workspace =
+      input.workspace ??
+      (needsSourceRepository
+        ? { repositoryPath: resolve(process.cwd()), workspaceId: "source" }
+        : undefined);
+    return (
+      await this.coordinator.createRun({
+        ...runInput,
+        ...(workspace ? { workspace } : {}),
+        bundle,
+      })
+    ).run;
   }
   /** A playground execution is an ordinary journaled run of a tiny compiled workflow. */
   async runPromptFixture(input: {
@@ -542,7 +632,8 @@ export class ApplicationService {
   decideApproval(input: {
     runId: string;
     invocationId: string;
-    decision: "approved" | "rejected";
+    decision: "approved" | "rejected" | "changes-requested";
+    feedback?: string;
     expectedRevision: number;
     actor: string;
     idempotencyKey: string;
@@ -575,6 +666,26 @@ export class ApplicationService {
   listRunsPage(limit = 100, offset = 0): RunSummary[] {
     return this.coordinator.journal.listRunsPage(limit, offset);
   }
+  pendingApprovals() {
+    return this.coordinator.journal.listRuns().flatMap((run) => {
+      const view = this.getView(run.runId);
+      if (!view) return [];
+      return Object.values(view.state.approvals)
+        .filter((approval) => approval.status === "pending")
+        .map((approval) => ({
+          runId: run.runId,
+          workflowId: run.workflowId,
+          task: run.task,
+          revision: view.revision,
+          invocationId: approval.invocationId,
+          approvalId: approval.id,
+          action: approval.action,
+          bindingDigest: approval.bindingDigest,
+          subjectRevision: approval.subjectRevision,
+          requestedAt: view.state.invocations[approval.invocationId]?.startedAt,
+        }));
+    });
+  }
   collaboration(runId: string): Record<string, unknown> {
     return new CollaborationGateway(this.coordinator.journal).snapshot(runId);
   }
@@ -584,8 +695,17 @@ export class ApplicationService {
   getView(runId: string) {
     return this.coordinator.journal.getView(runId);
   }
-  getEvents(runId: string, after?: number) {
-    return this.coordinator.journal.getEvents(runId, after);
+  getEvents(runId: string, after?: number, limit?: number) {
+    return this.coordinator.journal.getEvents(runId, after, limit);
+  }
+  getHarnessActivity(
+    runId: string,
+    after: number,
+    limit: number,
+    attemptId?: string,
+    tail = false,
+  ) {
+    return this.coordinator.journal.getHarnessActivity(runId, after, limit, attemptId, tail);
   }
   recordEvaluationEvidence(
     evidence: EvaluationEvidence,
@@ -640,6 +760,8 @@ export class ApplicationService {
     runId: string;
     requestKey: string;
     message: string;
+    expectedTree?: string;
+    expectedPatchDigest?: string;
     invocationId?: string;
     validationEvidence?: readonly string[];
     reviewEvidence?: readonly string[];
@@ -673,6 +795,165 @@ export class ApplicationService {
     });
     this.checkpointRetention.assertCleanupAllowed(roots);
     await this.coordinator.cleanupWorkspace(runId);
+  }
+
+  async previewRunDeletion(runId: string): Promise<RunDeletionPreview> {
+    const journal = this.coordinator.journal;
+    const run = journal.getRunRow(runId);
+    if (!run) {
+      const deletion = journal.getRunDeletion(runId);
+      if (!deletion) throw new Error(`Run not found: ${runId}`);
+      return {
+        ...deletion.preview,
+        runId,
+        revision: deletion.expectedRevision,
+        deletionStatus: deletion.status,
+        deletionError: deletion.error,
+        deletionRequestKey: deletion.idempotencyKey,
+        canDelete: false,
+      };
+    }
+    const view = journal.getView(runId);
+    const input = journal.getRunInput(runId) ?? {};
+    const repository = input.__kouroWorkspace as Record<string, unknown> | undefined;
+    const claims = await this.coordinator.workspaceClaims(runId);
+    const blockers = journal.runDeletionBlockers(runId);
+    const status = journal.getRunDeletion(runId)?.status;
+    const deletion = journal.getRunDeletion(runId);
+    const attemptCount = this.countRows("attempts", runId);
+    const artifactCount = this.countRows("artifacts", runId);
+    const eventCount = this.countRows("run_events", runId);
+    const checkpointCount = this.countRows("checkpoints", runId, "source_run_id");
+    const active = (() => {
+      try {
+        this.coordinator.assertRunDrained(runId);
+        return false;
+      } catch {
+        return true;
+      }
+    })();
+    const workspaceAdapterMissing =
+      Boolean(repository?.repositoryPath) &&
+      !this.coordinator.hasWorkspaceAdapter() &&
+      !["workspace-cleaned", "purge-failed"].includes(deletion?.status ?? "");
+    const preview = {
+      runId,
+      workflowId: run.workflowId,
+      status: run.status,
+      revision: run.revision,
+      task: typeof input.task === "string" ? input.task : "",
+      repositoryPath:
+        typeof repository?.repositoryPath === "string" ? repository.repositoryPath : undefined,
+      terminal: ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(
+        run.status,
+      ),
+      drained: !active,
+      workspaceAdapterMissing,
+      workspaces: claims.map((claim) => ({ workspaceId: claim.workspaceId, path: claim.path })),
+      removes: {
+        historyEvents: eventCount,
+        attempts: attemptCount,
+        artifacts: artifactCount,
+        workspaces: claims.length,
+      },
+      retained: { checkpoints: checkpointCount, blockers },
+      blockers,
+      deletionStatus: status,
+      deletionError: deletion?.error,
+      deletionRequestKey: deletion?.idempotencyKey,
+      canDelete:
+        !active &&
+        !workspaceAdapterMissing &&
+        blockers.length === 0 &&
+        ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(
+          run.status,
+        ),
+    };
+    return { ...preview, viewStatus: view?.state.status };
+  }
+
+  incompleteRunDeletions() {
+    return this.coordinator.journal.listIncompleteRunDeletions().map((deletion) => ({
+      runId: deletion.runId,
+      status: deletion.status,
+      task: deletion.preview.task,
+      workflowId: deletion.preview.workflowId,
+      error: deletion.error,
+    }));
+  }
+
+  async deleteRun(input: {
+    runId: string;
+    expectedRevision: number;
+    idempotencyKey: string;
+    actor: string;
+  }) {
+    const journal = this.coordinator.journal;
+    let deletion = journal.getRunDeletion(input.runId);
+    if (deletion?.status === "completed") return deletion;
+    if (deletion && ["database-purged", "blob-cleanup-failed"].includes(deletion.status)) {
+      try {
+        this.coordinator.journal.blobs.removeDigests(deletion.blobDigests);
+      } catch (cause) {
+        return journal.advanceRunDeletion(input.runId, "blob-cleanup-failed", {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      return journal.advanceRunDeletion(input.runId, "completed");
+    }
+
+    this.coordinator.assertRunDrained(input.runId);
+    const preview = await this.previewRunDeletion(input.runId);
+    if (!preview.canDelete)
+      throw new Error(
+        preview.workspaceAdapterMissing
+          ? "run deletion is blocked because its workspace adapter is unavailable"
+          : preview.blockers?.length
+            ? `run deletion blocked: ${preview.blockers.map((item) => item.message).join(" ")}`
+            : "run deletion requires a terminal, drained run",
+      );
+    if (preview.revision !== input.expectedRevision)
+      throw new Error("stale-action: run revision changed");
+
+    deletion = journal.beginRunDeletion({ ...input, preview });
+    if (deletion.status === "requested" || deletion.status === "workspace-cleanup-failed") {
+      try {
+        await this.coordinator.cleanupRunWorkspaces(input.runId);
+        deletion = journal.advanceRunDeletion(input.runId, "workspace-cleaned");
+      } catch (cause) {
+        return journal.advanceRunDeletion(input.runId, "workspace-cleanup-failed", {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+    }
+    if (deletion.status === "workspace-cleaned" || deletion.status === "purge-failed") {
+      try {
+        const exclusive = journal.runArtifactDigests(input.runId);
+        this.checkpointRetention.assertCleanupAllowed(exclusive);
+        journal.purgeRunData(input.runId);
+      } catch (cause) {
+        return journal.advanceRunDeletion(input.runId, "purge-failed", {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      deletion = journal.getRunDeletion(input.runId)!;
+    }
+    try {
+      this.coordinator.journal.blobs.removeDigests(deletion.blobDigests);
+    } catch (cause) {
+      return journal.advanceRunDeletion(input.runId, "blob-cleanup-failed", {
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
+    return journal.advanceRunDeletion(input.runId, "completed");
+  }
+
+  private countRows(table: string, runId: string, key = "run_id"): number {
+    // Table and column names are selected only by this module.
+    const row = this.coordinator.journal.db
+      .query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${key} = ?1`)
+      .get(runId) as { count: number };
+    return row.count;
   }
 
   private async checkpointInput(
@@ -961,21 +1242,39 @@ export class ApplicationService {
   }
 }
 
-async function configureBundle(
+export async function configureBundle(
   source: Bundle,
   settings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>,
 ): Promise<Bundle> {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("nodeSettings must be an object keyed by workflow node ID");
+  const targets = Object.entries(source.definitions).flatMap(([definitionId, definition]) =>
+    definition.nodes.map((node) => ({ definitionId, node, key: `${definitionId}/${node.id}` })),
+  );
+  const resolved = new Map<(typeof targets)[number]["node"], (typeof settings)[string]>();
+  for (const [key, setting] of Object.entries(settings)) {
+    const matches = targets.filter((target) => target.key === key || target.node.id === key);
+    if (!matches.length) throw new Error(`Unknown workflow node ${key}`);
+    if (matches.length !== 1)
+      throw new Error(`Ambiguous workflow node ${key}; use the definition and node ID`);
+    if (resolved.has(matches[0]!.node))
+      throw new Error(`Duplicate settings for workflow node ${key}`);
+    resolved.set(matches[0]!.node, setting);
+  }
+  const childDefinitions = new Set(
+    Object.values(source.definitions).flatMap((definition) =>
+      (definition.scouts ?? []).map((scout) => scout.definitionId),
+    ),
+  );
   const definitions = Object.fromEntries(
     Object.entries(source.definitions).map(([definitionId, definition]) => [
       definitionId,
       {
         ...definition,
         nodes: definition.nodes.map((node) => {
-          const setting = settings[node.id];
-          if (!setting) return node;
-          if (typeof setting !== "object" || Array.isArray(setting))
+          if (!resolved.has(node)) return node;
+          const setting = resolved.get(node)!;
+          if (!setting || typeof setting !== "object" || Array.isArray(setting))
             throw new Error(`Invalid settings for node ${node.id}`);
           if (node.kind !== "agent" && node.kind !== "command")
             throw new Error(`Node ${node.id} cannot have runtime settings`);
@@ -998,6 +1297,11 @@ async function configureBundle(
               ))
           )
             throw new Error(`Invalid capability for node ${node.id}`);
+          if (
+            childDefinitions.has(definitionId) &&
+            setting.capabilities?.some((capability) => capability !== CAPABILITY.REPOSITORY_READ)
+          )
+            throw new Error(`Subagent ${definitionId} must remain read-only`);
           return {
             ...node,
             ...(setting.harness === undefined ? {} : { harness: setting.harness }),
@@ -1010,13 +1314,6 @@ async function configureBundle(
       },
     ]),
   );
-  for (const nodeId of Object.keys(settings))
-    if (
-      !Object.values(source.definitions).some((definition) =>
-        definition.nodes.some((node) => node.id === nodeId),
-      )
-    )
-      throw new Error(`Unknown workflow node ${nodeId}`);
   const executable = {
     formatVersion: source.formatVersion,
     semanticVersions: source.semanticVersions,
@@ -1103,14 +1400,14 @@ async function compileFeature(): Promise<Bundle> {
   const builder = new WorkflowBuilder({ id: "feature", version: "2" });
   const task = builder.input("task", taskSchema, { required: false });
   const workItem = builder.input("workItem", WorkItem, { required: false });
-  builder.subagent("repositoryScout", {
+  const repositoryScout = builder.subagent("repositoryScout", {
     role: "repository-scout",
     prompt: "Inspect the read-only repository view and return a structured repository report.",
     input: { task: taskSchema, question: ScoutQuestion },
     produces: ScoutReport,
     scripted: { output: { summary: "Repository scout fixture", findings: [] } },
   });
-  builder.subagent("testScout", {
+  const testScout = builder.subagent("testScout", {
     role: "test-scout",
     prompt: "Inspect the read-only repository view and return a structured test/build report.",
     input: { task: taskSchema, question: ScoutQuestion },
@@ -1122,6 +1419,7 @@ async function compileFeature(): Promise<Bundle> {
     prompt: "Return JSON with one non-empty string field named summary. Do not use tools.",
     input: { task, workItem },
     produces: AgentSummary,
+    uses: [repositoryScout, testScout],
   });
   const approval = builder.approval("approve-plan", {
     action: "accept-plan",
@@ -1142,6 +1440,11 @@ async function compileFeature(): Promise<Bundle> {
   plan.on("success").to(approval);
   approval.on("approved").to(implement);
   approval.on("rejected").to(failed);
+  approval.on("changes-requested").repair(plan, {
+    maxRepairs: 3,
+    feedback: approval.output,
+    exhausted: failed,
+  });
   implement.on("success").to(validate);
   validate.on("success").to(done);
   validate.on("failure").repair(implement, {

@@ -16,6 +16,7 @@ import { runDeterministicCommandEvaluator } from "./evaluation/verifier.ts";
 
 /** Durable experiment orchestration. Cells only point at ordinary Kouro runs. */
 export class ExperimentService {
+  private readonly activeCells = new Map<string, Promise<void>>();
   constructor(private readonly app: ApplicationService) {}
 
   async create(definition: ExperimentDefinition): Promise<{ id: string; cells: number }> {
@@ -127,30 +128,52 @@ export class ExperimentService {
 
   async resume(
     experimentId: string,
-    options: { actor?: string; maxConcurrent?: number } = {},
+    options: { actor?: string; maxConcurrent?: number; observerWaitMs?: number } = {},
   ): Promise<void> {
     const experiment = this.get(experimentId);
     if (!experiment) throw new Error(`Experiment not found: ${experimentId}`);
+    if (experiment.status === "cancelled") return;
     this.app.coordinator.journal.setExperimentStatus(experimentId, "running");
     const maxConcurrent = Math.max(1, options.maxConcurrent ?? experiment.maxConcurrent);
-    const pending = experiment.cells.filter(
-      (cell) => cell.status === "pending" || cell.status === "reserved",
+    const pending = experiment.cells.filter((cell) =>
+      ["pending", "reserved", "running"].includes(cell.status),
     );
     let cursor = 0;
     const worker = async () => {
       for (;;) {
         const cell = pending[cursor++];
         if (!cell) return;
-        await this.launchCell(experimentId, cell, experiment, options.actor);
+        const key = `${experimentId}/${cell.key}`;
+        const active = this.activeCells.get(key);
+        if (active) {
+          await active;
+          continue;
+        }
+        const work = this.launchCell(experimentId, cell, experiment, options.actor);
+        this.activeCells.set(key, work);
+        try {
+          await work;
+        } finally {
+          if (this.activeCells.get(key) === work) this.activeCells.delete(key);
+        }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(maxConcurrent, pending.length) }, worker));
-    const after = this.get(experimentId);
-    if (
-      after?.status === "running" &&
-      after.cells.every((cell) => ["succeeded", "failed", "cancelled"].includes(cell.status))
-    )
-      this.app.coordinator.journal.setExperimentStatus(experimentId, "completed");
+    const allWorkers = Promise.all(
+      Array.from({ length: Math.min(maxConcurrent, pending.length) }, worker),
+    );
+    const finished = allWorkers.then(() => {
+      const after = this.get(experimentId);
+      if (
+        after?.status === "running" &&
+        after.cells.every((cell) => ["succeeded", "failed", "cancelled"].includes(cell.status))
+      )
+        this.app.coordinator.journal.setExperimentStatus(experimentId, "completed");
+    });
+    // This is only an observation limit. `allWorkers` and each active cell
+    // supervisor remain alive after the caller stops waiting.
+    void finished.catch(() => undefined);
+    const waitMs = Math.max(0, options.observerWaitMs ?? 30_000);
+    await Promise.race([finished, Bun.sleep(waitMs)]);
   }
 
   cancel(experimentId: string): void {
@@ -160,27 +183,29 @@ export class ExperimentService {
     for (const cell of experiment.cells) {
       if (["pending", "reserved"].includes(cell.status)) {
         this.app.coordinator.journal.setExperimentCellStatus(experimentId, cell.key, "cancelled");
-      } else if (cell.status === "running" && cell.runId) {
-        const view = this.app.getView(cell.runId);
-        if (view && ["pending", "running"].includes(view.state.status)) {
-          try {
-            this.app.control({
-              runId: cell.runId,
-              action: "cancel",
-              expectedRevision: view.revision,
-              actor: "experiment",
-              idempotencyKey: `experiment-cancel:${experimentId}:${cell.key}`,
-            });
-            this.app.coordinator.journal.setExperimentCellStatus(
-              experimentId,
-              cell.key,
-              "cancelled",
-              "cancelled by experiment operator",
-            );
-          } catch {
-            /* another operator may have already cancelled it */
+      } else if (cell.status === "running") {
+        if (cell.runId) {
+          const view = this.app.getView(cell.runId);
+          if (view && ["pending", "running"].includes(view.state.status)) {
+            try {
+              this.app.control({
+                runId: cell.runId,
+                action: "cancel",
+                expectedRevision: view.revision,
+                actor: "experiment",
+                idempotencyKey: `experiment-cancel:${experimentId}:${cell.key}`,
+              });
+            } catch {
+              /* another operator may have already cancelled it */
+            }
           }
         }
+        this.app.coordinator.journal.setExperimentCellStatus(
+          experimentId,
+          cell.key,
+          "cancelled",
+          "cancelled by experiment operator",
+        );
       }
     }
   }
@@ -253,6 +278,31 @@ export class ExperimentService {
         ? { repositoryPath: experiment.repositoryPath }
         : undefined,
     });
+    const latestExperiment = this.get(experimentId);
+    const latestCell = latestExperiment?.cells.find((candidate) => candidate.key === cell.key);
+    if (latestCell?.status === "cancelled" || latestExperiment?.status === "cancelled") {
+      const view = this.app.getView(run.runId);
+      if (view && ["pending", "running"].includes(view.state.status)) {
+        try {
+          this.app.control({
+            runId: run.runId,
+            action: "cancel",
+            expectedRevision: view.revision,
+            actor: "experiment",
+            idempotencyKey: `experiment-cancel:${experimentId}:${cell.key}`,
+          });
+        } catch {
+          /* the run may already have reached a terminal state */
+        }
+      }
+      this.app.coordinator.journal.setExperimentCellStatus(
+        experimentId,
+        cell.key,
+        "cancelled",
+        "cancelled by experiment operator",
+      );
+      return;
+    }
     this.app.coordinator.journal.associateExperimentCell(
       experimentId,
       cell.key,
@@ -260,14 +310,27 @@ export class ExperimentService {
       run.runId,
       "running",
     );
-    for (let attempt = 0; attempt < 2_000; attempt += 1) {
-      if (
-        this.get(experimentId)?.cells.find((candidate) => candidate.key === cell.key)?.status ===
-        "cancelled"
-      )
+    for (;;) {
+      const cellState = this.get(experimentId)?.cells.find(
+        (candidate) => candidate.key === cell.key,
+      );
+      if (cellState?.status === "cancelled" || this.get(experimentId)?.status === "cancelled") {
+        if (cellState?.status !== "cancelled")
+          this.app.coordinator.journal.setExperimentCellStatus(
+            experimentId,
+            cell.key,
+            "cancelled",
+            "cancelled by experiment operator",
+          );
         return;
+      }
       const view = this.app.getView(run.runId);
-      if (view && !["pending", "running"].includes(view.state.status)) {
+      if (
+        view &&
+        ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(
+          view.state.status,
+        )
+      ) {
         const target = {
           runId: run.runId,
           revision: view.revision,
@@ -369,18 +432,21 @@ export class ExperimentService {
         this.app.coordinator.journal.setExperimentCellStatus(
           experimentId,
           cell.key,
-          view.state.status === "succeeded"
-            ? "succeeded"
-            : view.state.status === "cancelled"
-              ? "cancelled"
-              : "failed",
+          this.get(experimentId)?.status === "cancelled" ||
+            this.get(experimentId)?.cells.find((candidate) => candidate.key === cell.key)
+              ?.status === "cancelled"
+            ? "cancelled"
+            : view.state.status === "succeeded"
+              ? "succeeded"
+              : view.state.status === "cancelled"
+                ? "cancelled"
+                : "failed",
           view.state.status === "succeeded" ? undefined : `run ended ${view.state.status}`,
         );
         return;
       }
-      await Bun.sleep(5);
+      await Bun.sleep(250);
     }
-    throw new Error(`experiment cell run did not finish: ${cell.key}`);
   }
 
   private caseInput(experimentId: string, caseId: string): Record<string, unknown> {

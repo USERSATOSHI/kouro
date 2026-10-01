@@ -121,4 +121,59 @@ describe("M2 web projection", () => {
     expect(projected.diagnostics).toMatchObject([{ attemptId: "a1", severity: "warning" }]);
     expect(projected.capabilities).toEqual({ cancel: true });
   });
+  test("reads nested retained tool events and correlates results after completion", () => {
+    const source = base() as unknown as Record<string, any>;
+    source.state.attempts = {
+      a: {
+        id: "a",
+        invocationId: "i",
+        ordinal: 0,
+        status: "succeeded",
+        output: [],
+        evidence: [],
+        artifacts: [],
+        workspace: null,
+        harnessEvents: [
+          {
+            type: "tool",
+            data: { id: "shared", name: "Read", status: "started", input: "parent" },
+          },
+          {
+            type: "tool",
+            data: {
+              id: "shared",
+              name: "Read",
+              scoutId: "reviewer",
+              status: "started",
+              input: "child",
+            },
+          },
+          { type: "tool", data: { id: "shared", status: "completed", output: "parent result" } },
+          {
+            type: "tool",
+            data: {
+              id: "shared",
+              scoutId: "reviewer",
+              status: "completed",
+              output: "child result",
+            },
+          },
+        ],
+      },
+    };
+    const projected = viewFromCore(source as unknown as RunView);
+    expect(projected.tools).toHaveLength(2);
+    expect(projected.tools[0]).toMatchObject({
+      name: "Read",
+      input: "parent",
+      output: "parent result",
+      status: "completed",
+    });
+    expect(projected.tools[1]).toMatchObject({
+      name: "Read",
+      input: "child",
+      output: "child result",
+      status: "completed",
+    });
+  });
 });

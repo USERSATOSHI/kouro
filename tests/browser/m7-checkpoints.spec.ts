@@ -9,7 +9,19 @@ const repositoryPath = mkdtempSync(join(tmpdir(), "kouro-m7-browser-repo-"));
 execFileSync("git", ["init", "--initial-branch=main"], { cwd: repositoryPath });
 writeFileSync(join(repositoryPath, "README.md"), "M7 browser fixture\n");
 execFileSync("git", ["add", "."], { cwd: repositoryPath });
-execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"], { cwd: repositoryPath });
+execFileSync(
+  "git",
+  [
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+    "-m",
+    "fixture",
+  ],
+  { cwd: repositoryPath },
+);
 test.afterAll(() => rmSync(repositoryPath, { recursive: true, force: true }));
 
 test("M7 refuses an active cut, then captures and exposes fork genealogy", async ({ page }) => {
@@ -19,8 +31,16 @@ test("M7 refuses an active cut, then captures and exposes fork genealogy", async
   // A checkpoint requires a Git-backed run. The ordinary tiny UI launch has no
   // workspace, so create a real repository-backed feature run through the API.
   const runId = await page.evaluate(async (repositoryPath) => {
-    const session = await (await fetch("/api/session")).json() as { csrfToken: string };
-    const response = await fetch("/api/runs", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": session.csrfToken }, body: JSON.stringify({ workflowId: "feature", idempotencyKey: crypto.randomUUID(), workspace: { repositoryPath } }) });
+    const session = (await (await fetch("/api/session")).json()) as { csrfToken: string };
+    const response = await fetch("/api/runs", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-csrf-token": session.csrfToken },
+      body: JSON.stringify({
+        workflowId: "feature",
+        idempotencyKey: crypto.randomUUID(),
+        workspace: { repositoryPath },
+      }),
+    });
     if (!response.ok) throw new Error(await response.text());
     return ((await response.json()) as { id: string }).id;
   }, repositoryPath);
@@ -45,10 +65,8 @@ test("M7 refuses an active cut, then captures and exposes fork genealogy", async
   await page.getByRole("button", { name: "Capture checkpoint" }).click();
   await expect(page.getByText("Checkpoint captured.")).toBeVisible({ timeout: 15_000 });
   await expect(page.getByLabel("Child run name")).toBeEnabled();
-  await expect(page.getByLabel("Execution profile for new work")).toHaveValue("");
 
   await page.getByLabel("Child run name").fill("browser-approaches");
-  await page.getByLabel("Execution profile for new work").selectOption("pi-readonly");
   await page.getByText("Change an unexecuted agent prompt").click();
   await page.getByLabel("Agent node ID").fill("implement");
   await page.getByLabel("Replacement prompt").fill("Implement the task using the forked prompt.");
@@ -59,12 +77,17 @@ test("M7 refuses an active cut, then captures and exposes fork genealogy", async
   await expect(page.getByText(/inherited/).first()).toBeVisible();
 });
 
-test("M7 checkpoint surface remains usable at 768px and is keyboard reachable", async ({ page }) => {
+test("M7 checkpoint surface remains usable at 768px and is keyboard reachable", async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 768, height: 900 });
   await page.goto(`/#token=${token}`);
   await expect(page.getByTestId("start-run").first()).toBeEnabled();
   const tinyRunId = await page.evaluate(async () => {
-    const runs = (await (await fetch("/api/runs")).json()) as Array<{ id: string; workflowId: string }>;
+    const runs = (await (await fetch("/api/runs")).json()) as Array<{
+      id: string;
+      workflowId: string;
+    }>;
     return runs.find((run) => run.workflowId === "tiny")?.id;
   });
   expect(tinyRunId).toBeTruthy();

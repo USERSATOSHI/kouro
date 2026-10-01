@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { projectHierarchicalGraph } from "./hierarchicalProjection";
+import { graphSelectionBreadcrumbs, projectHierarchicalGraph } from "./hierarchicalProjection";
 import type { UiRunView, WorkflowGraph } from "../types";
 
 const fixture = (): { graph: WorkflowGraph; view: UiRunView } => {
@@ -95,6 +95,8 @@ describe("hierarchical graph projection", () => {
   test("keeps repeated child instances distinct and preserves descendant selection", () => {
     const { graph, view } = fixture();
     const projected = projectHierarchicalGraph(graph, view, new Set(), "i2");
+    expect(graphSelectionBreadcrumbs(graph, view, "i2")).toEqual(projected.breadcrumbs);
+    expect(graphSelectionBreadcrumbs(graph, view, "missing")).toEqual([]);
     expect(
       projected.instances
         .filter((item) => item.sourceNodeId === "read")

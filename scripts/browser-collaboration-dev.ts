@@ -3,12 +3,22 @@ import { resolve } from "node:path";
 import { ApplicationService } from "../packages/host/src/application/service.ts";
 import { CollaborationGateway } from "../packages/host/src/collaboration/gateway.ts";
 import { createHostServer } from "../packages/host/src/http/server.ts";
+import {
+  BrowserSessionHarness,
+  prepareLaunchTemplate,
+  seedSessionFixtures,
+} from "./browser-session-fixture";
 
 // Browser acceptance uses the same host and HTTP route as production. This
 // launcher only adds durable collaboration rows to a dedicated temporary test
 // data directory so the UI has real participants/messages to render.
 const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-browser-data");
-const service = new ApplicationService({ dataDir, scriptedDelayMs: 5_000 });
+const service = new ApplicationService({
+  dataDir,
+  templateRoot: await prepareLaunchTemplate(dataDir),
+  scriptedDelayMs: 5_000,
+  harness: new BrowserSessionHarness(),
+});
 await service.start();
 const run = await service.createRun({
   workflowId: "tiny",
@@ -51,6 +61,8 @@ gateway.send(planner.grantId, {
   body: "Review the generated artifact before handoff.",
   idempotencyKey: "browser-blackboard-entry",
 });
+
+await seedSessionFixtures(service);
 
 const host = createHostServer(service, {
   staticRoot: resolve("packages/web/dist"),

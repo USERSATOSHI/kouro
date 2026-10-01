@@ -6,14 +6,23 @@ export class TrackingHarnessDecorator implements HarnessAdapter {
   readonly id: string;
   readonly adapterVersion: string;
   readonly steer?: HarnessAdapter["steer"];
+  readonly canSteer?: HarnessAdapter["canSteer"];
+  readonly probe?: HarnessAdapter["probe"];
+  readonly reconnect?: HarnessAdapter["reconnect"];
+  readonly terminate?: HarnessAdapter["terminate"];
 
   constructor(
     private readonly inner: HarnessAdapter,
     private readonly track: (event: HarnessEvent) => void,
+    private readonly normalize?: (event: HarnessEvent) => HarnessEvent,
   ) {
     this.id = inner.id;
     this.adapterVersion = inner.adapterVersion;
     if (inner.steer) this.steer = (input) => inner.steer!(input);
+    if (inner.canSteer) this.canSteer = (input) => inner.canSteer!(input);
+    if (inner.probe) this.probe = (input) => inner.probe!(input);
+    if (inner.reconnect) this.reconnect = (input) => inner.reconnect!(input);
+    if (inner.terminate) this.terminate = (input) => inner.terminate!(input);
   }
 
   capabilities() {
@@ -22,16 +31,14 @@ export class TrackingHarnessDecorator implements HarnessAdapter {
 
   async run(input: Parameters<HarnessAdapter["run"]>[0]) {
     const startedAt = performance.now();
-    const seen = new Set<string>();
     const trackedEvents: HarnessEvent[] = [];
     let streamedAny = false;
     let pendingText = "";
     let textTimer: ReturnType<typeof setTimeout> | undefined;
     const emit = (event: HarnessEvent) => {
-      const key = JSON.stringify(event);
-      if (seen.has(key)) return;
-      seen.add(key);
+      event = this.normalize?.(event) ?? event;
       trackedEvents.push(event);
+      if (trackedEvents.length > 4000) trackedEvents.splice(0, trackedEvents.length - 4000);
       input.onEvent?.(event);
       this.track(event);
     };
@@ -50,7 +57,7 @@ export class TrackingHarnessDecorator implements HarnessAdapter {
         ...input,
         onEvent: (event) => {
           streamedAny = true;
-          if (event.type === "text") {
+          if (event.type === "text" && typeof event.data === "string") {
             pendingText += String(event.data);
             if (!textTimer) textTimer = setTimeout(flushText, 100);
           } else {

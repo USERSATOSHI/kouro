@@ -10,24 +10,55 @@ declare global {
 
 test("M8 real GraphPanel and Timeline handle the large-data target", async ({ page }) => {
   const fixture = m8PerformanceFixture();
-  await page.route("**/api/session**", async (route) => route.fulfill({ json: { csrfToken: "m8" } }));
-  await page.route("**/api/workflows**", async (route) => route.fulfill({ json: [fixture.workflow] }));
+  await page.route("**/api/session**", async (route) =>
+    route.fulfill({ json: { csrfToken: "m8" } }),
+  );
+  await page.route("**/api/workflows**", async (route) =>
+    route.fulfill({ json: [fixture.workflow] }),
+  );
   await page.route("**/api/runs**", async (route) => {
     if (route.request().url().includes("/view")) return route.fulfill({ json: fixture.run });
-    if (route.request().url().includes("/stream")) return route.fulfill({ status: 200, contentType: "text/event-stream", body: ": m8 fixture\n\n" });
-    return route.fulfill({ json: [{ id: fixture.run.runId, workflowId: fixture.workflow.id, state: "running" }] });
+    if (route.request().url().includes("/stream"))
+      return route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: ": m8 fixture\n\n",
+      });
+    return route.fulfill({
+      json: [{ id: fixture.run.runId, workflowId: fixture.workflow.id, state: "running" }],
+    });
   });
   await page.route("**/api/execution-profiles**", async (route) => route.fulfill({ json: [] }));
   await page.route("**/api/experiments**", async (route) => route.fulfill({ json: [] }));
   await page.addInitScript(() => {
+    // Keep the synthetic transport open: a fulfilled SSE response closes
+    // immediately and would measure repeated recovery of 10k-row snapshots.
+    class FixtureEventSource extends EventTarget {
+      readyState = 1;
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      constructor() {
+        super();
+        queueMicrotask(() => this.onopen?.(new Event("open")));
+      }
+      close() {
+        this.readyState = 2;
+      }
+    }
+    window.EventSource = FixtureEventSource as unknown as typeof EventSource;
     window.__m8MeasureSelection = async () => {
       const node = document.querySelectorAll<HTMLElement>(".work-node")[499];
       if (!node) throw new Error("500th GraphPanel node was not rendered");
       const started = performance.now();
       const done = new Promise<number>((resolve) => {
         const observer = new MutationObserver(() => {
-          if (document.querySelector("[data-testid=node-inspector]")?.getAttribute("data-invocation-id")) {
-            observer.disconnect(); resolve(performance.now() - started);
+          if (
+            document
+              .querySelector("[data-testid=node-inspector]")
+              ?.getAttribute("data-invocation-id")
+          ) {
+            observer.disconnect();
+            resolve(performance.now() - started);
           }
         });
         observer.observe(document.body, { subtree: true, childList: true, attributes: true });
@@ -47,8 +78,14 @@ test("M8 real GraphPanel and Timeline handle the large-data target", async ({ pa
           frame += 1;
           if (frame < 90) requestAnimationFrame(tick);
           else {
-            const intervals = times.slice(1).map((value, index) => value - times[index]).sort((a, b) => a - b);
-            resolve({ frames: times.length, p95FrameMs: intervals[Math.floor(intervals.length * 0.95)] ?? 0 });
+            const intervals = times
+              .slice(1)
+              .map((value, index) => value - times[index])
+              .sort((a, b) => a - b);
+            resolve({
+              frames: times.length,
+              p95FrameMs: intervals[Math.floor(intervals.length * 0.95)] ?? 0,
+            });
           }
         };
         requestAnimationFrame(tick);

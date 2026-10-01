@@ -257,4 +257,44 @@ describe("M3 bounded controls", () => {
     expect(state.counters).toEqual({});
     expect(state.invocations.v.repairPass).toBeUndefined();
   });
+  test("reopens a failed run for retry while preserving attempts and fencing other terminal states", () => {
+    let state = createInitialState("retry-terminal");
+    state = reduceEvent(state, ev(state.runId, 1, "run.started", {}));
+    state = reduceEvent(
+      state,
+      ev(state.runId, 2, "invocation.created", { invocationId: "v", nodeId: "work" }),
+    );
+    state = reduceEvent(
+      state,
+      ev(state.runId, 3, "attempt.reserved", { attemptId: "a1", invocationId: "v" }),
+    );
+    state = reduceEvent(state, ev(state.runId, 4, "attempt.started", { attemptId: "a1" }));
+    state = reduceEvent(
+      state,
+      ev(state.runId, 5, "attempt.completed", { attemptId: "a1", status: "failed" }),
+    );
+    state = reduceEvent(
+      state,
+      ev(state.runId, 6, "invocation.completed", { invocationId: "v", status: "failed" }),
+    );
+    state = reduceEvent(state, ev(state.runId, 7, "run.completed", { status: "failed" }));
+    const retry = ev(state.runId, 8, "run.retried", {
+      invocationId: "v",
+      sourceAttemptId: "a1",
+      attemptId: "a2",
+    });
+    const reopened = reduceEvent(state, retry);
+    expect(reopened.status).toBe("running");
+    expect(reopened.finishedAt).toBeNull();
+    expect(reopened.invocations.v).toMatchObject({
+      status: "running",
+      completedAt: null,
+      outcome: null,
+    });
+    expect(reopened.attempts.a1.status).toBe("failed");
+    for (const status of ["succeeded", "cancelled", "interrupted"] as const) {
+      expect(() => reduceEvent({ ...state, status }, retry)).toThrow();
+    }
+    expect(() => reduceEvent({ ...state, control: "cancel-requested" }, retry)).toThrow();
+  });
 });

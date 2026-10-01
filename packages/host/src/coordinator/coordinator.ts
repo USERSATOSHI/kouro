@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
   canonicalize,
+  approvalRepairsRemaining,
   CAPABILITY,
   createContextManifest,
   decide,
@@ -25,6 +27,7 @@ import type { RuntimeHarness } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harness/scripted.ts";
 import { TrackingHarnessDecorator } from "../adapters/harness/tracking.ts";
+import { activityPreview } from "../adapters/harness/activity-preview";
 import {
   CodexAppServerHarness,
   CodexHarnessAdapter,
@@ -56,6 +59,7 @@ import type {
   ScriptedAgent,
   DeliveryAction,
 } from "../types.ts";
+import type { HarnessEvent } from "@kouro/core";
 import { ReadySetScheduler } from "../scheduler/scheduler.ts";
 import { CollaborationGateway } from "../collaboration/gateway.ts";
 import { prepareAgentHandoff } from "../handoff/index.ts";
@@ -76,6 +80,10 @@ export interface CoordinatorOptions {
   process?: ProcessAdapter;
   scriptedDelayMs?: number;
   commandTimeoutMs?: number;
+  agentIdleTimeoutMs?: number;
+  agentObservationGraceMs?: number;
+  operationTimeoutMs?: number;
+  cancelGraceMs?: number;
   workspaceAdapter?: GitWorkspaceAdapter;
 }
 
@@ -94,6 +102,10 @@ export class Coordinator {
   private readonly dataDir: string;
   private readonly scriptedDelayMs: number;
   private readonly commandTimeoutMs: number;
+  private readonly agentIdleTimeoutMs: number;
+  private readonly agentObservationGraceMs: number;
+  private readonly operationTimeoutMs: number;
+  private readonly cancelGraceMs: number;
   private readonly defaultProfile:
     | "scripted"
     | "codex-readonly"
@@ -115,6 +127,8 @@ export class Coordinator {
   private opencodeDescriptor?: Awaited<ReturnType<typeof inspectExternalCli>>;
   private readonly active = new Map<string, Promise<void>>();
   private readonly reschedule = new Set<string>();
+  private readonly activeSchedulers = new Map<string, ReadySetScheduler>();
+  private readonly runBudgetTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly aborters = new Map<string, Map<string, AbortController>>();
   private readonly activeAdapters = new Map<string, Map<string, HarnessAdapter>>();
   private readonly activityEvents = new Map<string, import("@kouro/core").JsonValue[]>();
@@ -129,6 +143,10 @@ export class Coordinator {
     this.process = options.process ?? createDefaultProcessAdapter();
     this.scriptedDelayMs = Math.max(0, options.scriptedDelayMs ?? 5_000);
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
+    this.agentIdleTimeoutMs = options.agentIdleTimeoutMs ?? 120_000;
+    this.agentObservationGraceMs = options.agentObservationGraceMs ?? 120_000;
+    this.operationTimeoutMs = options.operationTimeoutMs ?? 15 * 60_000;
+    this.cancelGraceMs = options.cancelGraceMs ?? 5_000;
     this.defaultProfile = options.executionProfile ?? "scripted";
     this.workspaceAdapter = options.workspaceAdapter;
     const row = this.journal.db
@@ -204,6 +222,8 @@ export class Coordinator {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    for (const timer of this.runBudgetTimers.values()) clearTimeout(timer);
+    this.runBudgetTimers.clear();
     await Promise.allSettled(this.active.values());
     this.journal.close();
   }
@@ -364,6 +384,8 @@ export class Coordinator {
     runId: string;
     requestKey: string;
     message: string;
+    expectedTree?: string;
+    expectedPatchDigest?: string;
     invocationId?: string;
     validationEvidence?: readonly string[];
     reviewEvidence?: readonly string[];
@@ -371,6 +393,13 @@ export class Coordinator {
     const ref = this.workspaces.get(input.runId);
     if (!ref || !this.workspaceAdapter) throw new Error("run has no repository workspace");
     const snapshot = await this.workspaceAdapter.snapshot(ref);
+    if (input.expectedTree !== undefined && snapshot.resultTree !== input.expectedTree)
+      throw new Error("stale-review: workspace tree changed after the diff was reviewed");
+    if (
+      input.expectedPatchDigest !== undefined &&
+      snapshot.patchDigest !== input.expectedPatchDigest
+    )
+      throw new Error("stale-review: workspace diff changed after review");
     return this.journal.createDeliveryAction({
       requestKey: input.requestKey,
       runId: input.runId,
@@ -423,10 +452,50 @@ export class Coordinator {
     this.snapshots.delete(runId);
   }
 
+  assertRunDrained(runId: string): void {
+    if (this.active.has(runId))
+      throw new Error("run deletion is blocked while its coordinator is active");
+    if ((this.aborters.get(runId)?.size ?? 0) > 0)
+      throw new Error("run deletion is blocked by active invocation controllers");
+    const unconfirmedShutdowns = this.journal.db
+      .query("SELECT attempt_id FROM unconfirmed_harness_shutdowns WHERE run_id = ?1")
+      .all(runId) as Array<{ attempt_id: string }>;
+    if (unconfirmedShutdowns.length)
+      throw new Error("run deletion is blocked by unconfirmed harness shutdown");
+    const activeAttempts = this.journal.db
+      .query("SELECT id FROM attempts WHERE run_id = ?1 AND state IN ('reserved', 'running')")
+      .all(runId) as Array<{ id: string }>;
+    if (activeAttempts.length) throw new Error("run deletion is blocked by active attempts");
+  }
+
+  async cleanupRunWorkspaces(runId: string): Promise<void> {
+    this.assertRunDrained(runId);
+    const claims = await this.workspaceClaims(runId);
+    for (const claim of claims ?? []) await this.workspaceAdapter!.cleanup(claim);
+    this.workspaces.delete(runId);
+    this.snapshots.delete(runId);
+    for (const [key, claim] of this.branchWorkspaces) {
+      if (claim.runId === runId) this.branchWorkspaces.delete(key);
+    }
+    this.activeAdapters.delete(runId);
+    const view = this.journal.getView(runId);
+    for (const attemptId of Object.keys(view?.state.attempts ?? {}))
+      this.activityEvents.delete(attemptId);
+  }
+
+  async workspaceClaims(runId: string) {
+    return this.workspaceAdapter?.listClaims(runId) ?? [];
+  }
+
+  hasWorkspaceAdapter(): boolean {
+    return Boolean(this.workspaceAdapter);
+  }
+
   decideApproval(input: {
     runId: string;
     invocationId: string;
-    decision: "approved" | "rejected";
+    decision: "approved" | "rejected" | "changes-requested";
+    feedback?: string;
     expectedRevision: number;
     actor: string;
     idempotencyKey: string;
@@ -441,6 +510,7 @@ export class Coordinator {
       requestDigest: JSON.stringify({
         invocationId: input.invocationId,
         decision: input.decision,
+        feedback: input.feedback?.trim() ?? "",
         bindingDigest: input.bindingDigest ?? null,
         subjectRevision: input.subjectRevision ?? null,
       }),
@@ -453,6 +523,8 @@ export class Coordinator {
   ): { revision: number; status: string } {
     const view = this.journal.getView(input.runId);
     if (!view) throw new Error(`Run not found: ${input.runId}`);
+    if (view.state.control !== "none")
+      throw new Error("approval is unavailable while the run is stopping");
     if (view.revision !== input.expectedRevision)
       throw new Error(
         `stale-action: expected revision ${input.expectedRevision}, current revision ${view.revision}`,
@@ -462,10 +534,31 @@ export class Coordinator {
         candidate.invocationId === input.invocationId && candidate.status === "pending",
     );
     if (!approval) throw new Error("approval is not pending");
+    const feedback = input.feedback?.trim() ?? "";
+    if (feedback.length > 20_000) throw new Error("approval feedback exceeds 20000 characters");
+    if (input.decision === "changes-requested") {
+      if (!feedback) throw new Error("request changes requires feedback");
+      if (approvalRepairsRemaining(view.bundle, view.state, input.invocationId) === 0)
+        throw new Error(
+          "request changes is unavailable: no bounded feedback route or repair budget remains",
+        );
+    }
     if (input.bindingDigest !== undefined && input.bindingDigest !== approval.bindingDigest)
       throw new Error("stale-action: approval binding changed");
     if (input.subjectRevision !== undefined && input.subjectRevision !== approval.subjectRevision)
       throw new Error("stale-action: approval subject changed");
+    const invocation = view.state.invocations[input.invocationId]!;
+    const definition =
+      view.bundle.definitions[view.state.scopes[invocation.scopeId]!.definitionId]!;
+    const port = definition.nodes.find((node) => node.id === invocation.nodeId)?.outputPorts[0];
+    const stored = port
+      ? this.journal.blobs.put(
+          input.runId,
+          new TextEncoder().encode(json({ decision: input.decision, feedback })),
+          "application/json",
+        )
+      : undefined;
+    if (stored) this.journal.insertArtifact(stored);
     this.journal.append({
       runId: input.runId,
       type: "approval.decided",
@@ -474,6 +567,19 @@ export class Coordinator {
         decision: input.decision,
         bindingDigest: approval.bindingDigest,
         subjectRevision: approval.subjectRevision,
+        ...(feedback ? { feedback } : {}),
+        ...(stored && port
+          ? {
+              output: [
+                {
+                  id: stored.id,
+                  digest: stored.digest,
+                  mediaType: stored.mediaType,
+                  schemaDigest: port.schemaDigest,
+                },
+              ],
+            }
+          : {}),
       },
       actor: input.actor,
       subjectId: approval.id,
@@ -491,35 +597,68 @@ export class Coordinator {
     idempotencyKey: string;
   }): { revision: number; status: string } {
     if (!input.actor.trim()) throw new Error("action actor is required");
-    return this.journal.command({
+    const result = this.journal.command({
       idempotencyKey: input.idempotencyKey,
       runId: input.runId,
       execute: () => this.controlOnce(input),
     }).result;
+    if (
+      (input.action === "cancel" || input.action === "interrupt") &&
+      !this.active.has(input.runId)
+    )
+      this.schedule(input.runId);
+    return result;
   }
 
   async steer(input: {
     runId: string;
     invocationId: string;
+    attemptId: string;
     message: string;
-    expectedRevision: number;
     actor: string;
-  }): Promise<{ revision: number }> {
+    idempotencyKey: string;
+  }): Promise<{ revision: number; duplicate?: boolean }> {
     const view = this.journal.getView(input.runId);
     if (!view) throw new Error(`Run not found: ${input.runId}`);
-    if (view.revision !== input.expectedRevision)
-      throw new Error("stale-action: run revision changed");
+    const message = input.message.trim();
+    if (!message || message.length > 4000)
+      throw new Error("steer message must be 1 to 4000 characters");
+    if (!input.idempotencyKey.trim()) throw new Error("idempotency key is required");
+    const requestDigest = createHash("sha256")
+      .update(
+        canonicalize({ invocationId: input.invocationId, attemptId: input.attemptId, message }),
+      )
+      .digest("hex");
+    const prior = this.journal.getSteeringCommand(input.runId, input.idempotencyKey);
+    if (prior) {
+      if (prior.requestDigest !== requestDigest)
+        throw new Error("idempotency key payload conflict");
+      if (prior.status === "accepted")
+        return {
+          revision: prior.revision ?? this.journal.getView(input.runId)?.revision ?? view.revision,
+          duplicate: true,
+        };
+      if (prior.status === "rejected")
+        throw new Error(
+          `steer-rejected: ${prior.detail ?? "The harness rejected this instruction"}`,
+        );
+      throw new Error(
+        "steer-outcome-unknown: this instruction may have reached the harness; it was not resent",
+      );
+    }
+    // Activity advances the run revision while the assistant streams. Bind steering to the live
+    // attempt identity instead of rejecting it on those unrelated cursor updates.
     const invocation = view.state.invocations[input.invocationId];
     if (!invocation || invocation.status !== "running")
       throw new Error("steer-unavailable: invocation is not running");
     const adapter = this.activeAdapters.get(input.runId)?.get(input.invocationId);
     if (!adapter?.steer)
       throw new Error("steer-unavailable: active harness does not support mid-turn steering");
-    const message = input.message.trim();
-    if (!message || message.length > 4000)
-      throw new Error("steer message must be 1 to 4000 characters");
     const attempt = Object.values(view.state.attempts).find(
-      (item) => item.invocationId === invocation.id && item.status === "running",
+      (item) =>
+        item.id === input.attemptId &&
+        item.invocationId === invocation.id &&
+        item.status === "running",
     );
     if (!attempt) throw new Error("steer-unavailable: active attempt is missing");
     const secrets = Object.entries(process.env)
@@ -527,28 +666,197 @@ export class Coordinator {
       .map(([, value]) => value!)
       .filter((value) => value.length >= 6);
     const journalMessage = String(redactSecrets(message, secrets));
-    const activity = (status: string, extra: Record<string, string> = {}) =>
+    const activity = (status: string, extra: Record<string, string | number> = {}) =>
       this.journal.append({
         runId: input.runId,
         type: "harness.activity",
         payload: {
           attemptId: attempt.id,
-          event: { type: "log", at: new Date().toISOString(), data: { status, ...extra } },
+          event: {
+            type: "log",
+            at: new Date().toISOString(),
+            data: {
+              status,
+              idempotencyKey: input.idempotencyKey,
+              requestDigest,
+              invocationId: input.invocationId,
+              ...extra,
+            },
+          },
         },
         actor: input.actor,
         subjectId: attempt.id,
       });
-    activity("Sending steering message", { message: journalMessage });
+    const requested = activity("Steering instruction requested", {
+      instruction: journalMessage,
+      outcome: "requested",
+    });
     try {
       await adapter.steer({ invocationId: input.invocationId, message });
-      activity("Steering message sent", { message: journalMessage });
     } catch (cause) {
-      activity("Steering message rejected", {
-        detail: cause instanceof Error ? cause.message : String(cause),
+      const detail = String(
+        redactSecrets(cause instanceof Error ? cause.message : String(cause), secrets),
+      );
+      activity("Steering instruction rejected", {
+        detail,
+        instruction: journalMessage,
+        outcome: "rejected",
       });
-      throw cause;
+      throw new Error(`steer-rejected: ${detail}`);
     }
-    return { revision: this.journal.getView(input.runId)?.revision ?? view.revision };
+    const current = this.journal.getView(input.runId);
+    if (
+      !current ||
+      ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(
+        current.state.status,
+      )
+    )
+      return { revision: requested.sequence };
+    const accepted = activity("Steering instruction accepted", {
+      instruction: journalMessage,
+      outcome: "accepted",
+    });
+    return { revision: accepted.sequence };
+  }
+
+  canSteer(runId: string, invocationId: string): boolean {
+    const adapter = this.activeAdapters.get(runId)?.get(invocationId);
+    return Boolean(adapter?.steer && (adapter.canSteer?.({ invocationId }) ?? true));
+  }
+
+  canInterrupt(runId: string, invocationId: string): boolean {
+    return Boolean(this.aborters.get(runId)?.has(invocationId));
+  }
+
+  interruptAttempt(input: {
+    runId: string;
+    invocationId: string;
+    attemptId: string;
+    expectedRevision: number;
+    actor: string;
+    idempotencyKey: string;
+  }) {
+    if (!input.actor.trim()) throw new Error("action actor is required");
+    return this.journal.command({
+      runId: input.runId,
+      idempotencyKey: input.idempotencyKey,
+      requestDigest: JSON.stringify({
+        action: "interrupt-attempt",
+        invocationId: input.invocationId,
+        attemptId: input.attemptId,
+      }),
+      execute: () => {
+        const view = this.journal.getView(input.runId);
+        if (!view || view.revision !== input.expectedRevision)
+          throw new Error("stale-action: run revision changed");
+        const attempt = view.state.attempts[input.attemptId];
+        const aborter = this.aborters.get(input.runId)?.get(input.invocationId);
+        if (
+          !attempt ||
+          attempt.invocationId !== input.invocationId ||
+          attempt.status !== "running" ||
+          !aborter ||
+          !["running", "paused"].includes(view.state.status) ||
+          (view.state.control ?? "none") !== "none"
+        )
+          throw new Error("interrupt is unavailable: the selected agent attempt is no longer live");
+        const event = this.journal.append({
+          runId: input.runId,
+          type: "harness.activity",
+          actor: input.actor,
+          payload: {
+            attemptId: input.attemptId,
+            event: {
+              type: "log",
+              at: now(),
+              data: {
+                status: "Agent interrupt requested",
+                outcome: "requested",
+                idempotencyKey: input.idempotencyKey,
+              },
+            },
+          },
+        });
+        aborter.abort("operator interrupted this agent");
+        return { revision: event.sequence, status: view.state.status };
+      },
+    }).result;
+  }
+
+  canRetry(runId: string, invocationId: string): boolean {
+    const view = this.journal.getView(runId);
+    if (
+      !view ||
+      !["failed", "interrupted"].includes(view.state.status) ||
+      ((view.state.control ?? "none") !== "none" &&
+        !(view.state.status === "interrupted" && view.state.control === "interrupt-requested"))
+    )
+      return false;
+    if (view.state.status === "interrupted" && view.state.control !== "interrupt-requested")
+      return false;
+    const invocation = view.state.invocations[invocationId];
+    const node = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find(
+      (item) => item.id === invocation?.nodeId,
+    );
+    // Retrying a nested/consumed result requires invalidating its dependants.
+    // Admit only failed root effects whose result has not been consumed.
+    if (
+      !invocation ||
+      invocation.status !== "failed" ||
+      invocation.scopeId !== view.state.rootScopeId ||
+      !node ||
+      !["agent", "command"].includes(node.kind) ||
+      Object.values(view.state.invocations).some(
+        (item) => item.sourceInvocationId === invocationId,
+      ) ||
+      view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.some(
+        (item) => item.kind === "fork" && (item as ForkNode).branchIds.includes(invocation.nodeId),
+      )
+    )
+      return false;
+    const latest = Object.values(view.state.attempts)
+      .filter((item) => item.invocationId === invocationId)
+      .sort((a, b) => b.ordinal - a.ordinal)[0];
+    if (
+      !latest ||
+      !["failed", "cancelled"].includes(latest.status) ||
+      Object.keys(view.state.attempts).length >= view.bundle.limits.maxAttempts
+    )
+      return false;
+    return !this.journal.db
+      .query("SELECT 1 FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 LIMIT 1")
+      .get(runId);
+  }
+
+  private normalizeActivity(runId: string, event: HarnessEvent): HarnessEvent {
+    if (
+      event.type !== "tool" ||
+      !event.data ||
+      typeof event.data !== "object" ||
+      Array.isArray(event.data) ||
+      event.data.output === undefined
+    )
+      return event;
+    const output = redactSecrets(
+      event.data.output,
+      Object.entries(process.env)
+        .filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key))
+        .map(([, value]) => value!)
+        .filter((value) => value.length >= 6),
+    ) as JsonValue;
+    const bytes = new TextEncoder().encode(json(output));
+    if (bytes.byteLength <= 65536) return event;
+    const artifact = this.journal.blobs.put(runId, bytes, "application/json");
+    this.journal.insertArtifact(artifact);
+    return {
+      ...event,
+      data: {
+        ...event.data,
+        output: activityPreview(output),
+        outputArtifactId: artifact.id,
+        outputBytes: bytes.byteLength,
+      },
+    };
   }
 
   private recordHarnessActivity(
@@ -576,6 +884,246 @@ export class Coordinator {
     });
   }
 
+  private async superviseHarness(
+    adapter: HarnessAdapter,
+    input: Parameters<HarnessAdapter["run"]>[0],
+    controller: AbortController,
+    timeoutMs: number | undefined,
+    runDeadlineAt: number | undefined,
+    recoveryAttemptId = input.attemptId ?? input.invocationId,
+    recordSupervisionEvent?: (event: HarnessEvent) => void,
+  ): Promise<Awaited<ReturnType<HarnessAdapter["run"]>> | undefined> {
+    const startedAt = Date.now();
+    const supervisionId = id("supervision");
+    let lastProgressAt = startedAt;
+    let observationUntil: number | undefined;
+    let reconnectAttempts = 0;
+    const runningTools = new Map<string, number>();
+    let stopReason:
+      | "cancelled"
+      | "budget-exhausted"
+      | "run-budget-exhausted"
+      | "possibly-stalled"
+      | "operation-timeout"
+      | undefined;
+    const signal = input.signal;
+    const attemptId = input.attemptId ?? input.invocationId;
+    const record = input.onEvent;
+    const log = (status: string, detail: string) => {
+      const event: HarnessEvent = {
+        type: "log",
+        at: new Date().toISOString(),
+        data: { status, detail },
+      };
+      record?.(event);
+      recordSupervisionEvent?.(event);
+    };
+    const operation = adapter.run({
+      ...input,
+      // `timeoutMs` is supervised as a host attempt budget. Adapter deadlines are
+      // reserved for bounded protocol operations so output can keep an attempt alive.
+      timeoutMs: undefined,
+      onEvent: (event) => {
+        record?.(event);
+        if (event.type === "text") {
+          lastProgressAt = Date.now();
+          observationUntil = undefined;
+        }
+        if (event.type !== "tool" || !event.data || typeof event.data !== "object") return;
+        const tool = event.data as Record<string, unknown>;
+        const id = String(tool.id ?? tool.name ?? "tool");
+        const status = String(tool.status ?? "").toLowerCase();
+        const terminal = /complete|finish|end|fail|error|result|cancel/.test(status);
+        if (terminal) runningTools.delete(id);
+        else if (/start|running|update/.test(status)) {
+          runningTools.set(id, runningTools.get(id) ?? Date.now() + this.operationTimeoutMs);
+        }
+        lastProgressAt = Date.now();
+        observationUntil = undefined;
+      },
+    });
+    type Settled =
+      | { ok: true; result: Awaited<ReturnType<HarnessAdapter["run"]>> }
+      | { ok: false; error: unknown };
+    const settled = operation.then(
+      (result): Settled => ({ ok: true, result }),
+      (error: unknown): Settled => ({ ok: false, error }),
+    );
+    const sleep = (ms: number) => Bun.sleep(Math.max(1, ms));
+    const settleAfterStop = async (
+      reason: NonNullable<typeof stopReason>,
+    ): Promise<Awaited<ReturnType<HarnessAdapter["run"]>> | undefined> => {
+      stopReason = reason;
+      if (!signal?.aborted) controller.abort(reason);
+      log("Cancellation requested", reason);
+      const final = await Promise.race([settled, sleep(this.cancelGraceMs).then(() => null)]);
+      if (final === null) {
+        let terminated = false;
+        if (adapter.terminate) {
+          try {
+            terminated = await Promise.race([
+              adapter.terminate({ attemptId, reason }),
+              sleep(5_000).then(() => false),
+            ]);
+          } catch {
+            terminated = false;
+          }
+        }
+        if (terminated) {
+          log("Owned process termination confirmed", reason);
+          if (reason === "cancelled")
+            return {
+              status: "cancelled",
+              error: "cancelled",
+              events: [],
+              usage: unavailableUsage() as unknown as import("@kouro/core").JsonValue,
+            };
+          return {
+            status: "failed",
+            error: reason,
+            events: [],
+            usage: unavailableUsage() as unknown as import("@kouro/core").JsonValue,
+          };
+        }
+        const detail = `provider did not confirm termination within ${this.cancelGraceMs}ms after ${reason}`;
+        log("Cancellation unconfirmed; recovery required", detail);
+        const effect = this.journal.db
+          .query("SELECT id FROM effects WHERE attempt_id = ?1")
+          .get(recoveryAttemptId) as { id: string } | null;
+        if (effect) {
+          this.journal.markRecoveryRequired(effect.id, detail, supervisionId);
+          // A provider may finish after the cancellation grace window. Keep
+          // deletion fenced until that late settlement confirms shutdown.
+          void settled
+            .then(() => this.journal.confirmHarnessShutdown(supervisionId))
+            .catch(() => undefined);
+        }
+        return undefined;
+      }
+      if (!final.ok) {
+        if (reason === "cancelled")
+          return {
+            status: "cancelled",
+            error: "cancelled",
+            events: [],
+            usage: unavailableUsage() as unknown as import("@kouro/core").JsonValue,
+          };
+        return {
+          status: "failed",
+          error: `${reason}: ${final.error instanceof Error ? final.error.message : String(final.error)}`,
+          events: [],
+          usage: unavailableUsage() as unknown as import("@kouro/core").JsonValue,
+        };
+      }
+      if (reason === "cancelled") {
+        if (final.result.status === "succeeded") return final.result;
+        return { ...final.result, status: "cancelled", error: "cancelled" };
+      }
+      return { ...final.result, status: "failed", error: reason };
+    };
+
+    for (;;) {
+      const now = Date.now();
+      const first = await Promise.race([settled, sleep(250).then(() => null)]);
+      if (first !== null) {
+        if (!first.ok) {
+          if (signal?.aborted) {
+            const reason =
+              signal.reason === "budget-exhausted" || signal.reason === "run-budget-exhausted"
+                ? signal.reason
+                : "cancelled";
+            return settleAfterStop(reason);
+          }
+          return {
+            status: "failed",
+            error: `transport: ${first.error instanceof Error ? first.error.message : String(first.error)}`,
+            events: [],
+            usage: unavailableUsage() as unknown as import("@kouro/core").JsonValue,
+          };
+        }
+        return first.result;
+      }
+      if (signal?.aborted) {
+        const reason =
+          signal.reason === "budget-exhausted" || signal.reason === "run-budget-exhausted"
+            ? signal.reason
+            : "cancelled";
+        return settleAfterStop(reason);
+      }
+      if (timeoutMs !== undefined && now - startedAt >= timeoutMs) {
+        log("Attempt budget exhausted", `maximum attempt duration ${timeoutMs}ms reached`);
+        return settleAfterStop("budget-exhausted");
+      }
+      if (runDeadlineAt !== undefined && now >= runDeadlineAt) {
+        log("Run budget exhausted", "maximum run duration reached");
+        return settleAfterStop("run-budget-exhausted");
+      }
+      const expiredTool = [...runningTools].find(([, deadline]) => deadline <= now)?.[0];
+      if (expiredTool) {
+        log("Tool operation timed out", `${expiredTool} exceeded ${this.operationTimeoutMs}ms`);
+        return settleAfterStop("operation-timeout");
+      }
+      const view = this.journal.getView(input.runId);
+      const suspended =
+        view?.state.status === "paused" ||
+        Object.values(view?.state.approvals ?? {}).some(
+          (approval) => approval.status === "pending",
+        );
+      if (suspended || runningTools.size > 0) {
+        lastProgressAt = now;
+        observationUntil = undefined;
+        continue;
+      }
+      if (now - lastProgressAt < this.agentIdleTimeoutMs) continue;
+      if (observationUntil === undefined || now >= observationUntil) {
+        let probe: "working" | "disconnected" | "unknown" = "unknown";
+        if (adapter.probe) {
+          try {
+            probe = await Promise.race([
+              adapter.probe({ attemptId }),
+              sleep(Math.min(5_000, this.agentObservationGraceMs)).then(() => "unknown" as const),
+            ]);
+          } catch {
+            probe = "unknown";
+          }
+        }
+        if (probe === "disconnected" && adapter.reconnect && reconnectAttempts < 1) {
+          reconnectAttempts += 1;
+          let reconnected = false;
+          try {
+            reconnected = await Promise.race([
+              adapter.reconnect({ attemptId }),
+              sleep(Math.min(5_000, this.agentObservationGraceMs)).then(() => false),
+            ]);
+          } catch {
+            reconnected = false;
+          }
+          log(
+            reconnected ? "Provider reconnected; observing" : "Provider reconnection failed",
+            `status probe reported disconnected for attempt ${attemptId}`,
+          );
+          observationUntil = Date.now() + this.agentObservationGraceMs;
+          continue;
+        }
+        if (probe === "working") {
+          log("Provider reports working; observing", `no progress for attempt ${attemptId}`);
+          observationUntil = Date.now() + this.agentObservationGraceMs;
+          continue;
+        }
+        if (observationUntil === undefined) {
+          log(
+            "Possibly stalled; provider status unknown",
+            `no text or tool progress for ${this.agentIdleTimeoutMs}ms; observing for ${this.agentObservationGraceMs}ms`,
+          );
+          observationUntil = Date.now() + this.agentObservationGraceMs;
+          continue;
+        }
+        log("Agent remained silent after observation grace", `attempt ${attemptId}`);
+        return settleAfterStop("possibly-stalled");
+      }
+    }
+  }
+
   private controlOnce(input: Omit<Parameters<Coordinator["control"]>[0], "idempotencyKey">): {
     revision: number;
     status: string;
@@ -596,17 +1144,9 @@ export class Coordinator {
       throw new Error(`${input.action} is unavailable without an active run`);
     if (input.action === "interrupt" && !active)
       throw new Error("interrupt is unavailable without an active attempt");
-    if ((input.action === "cancel" || input.action === "interrupt") && active) {
-      const profile = this.profileFor(input.runId);
-      const capabilities =
-        profile === "codex-readonly" || profile === "codex-workspace-write"
-          ? this.codexDescriptor?.availability === "available"
-            ? { cancel: "supported" }
-            : { cancel: "unsupported" }
-          : this.harness.capabilities();
-      if (capabilities.cancel !== "supported")
-        throw new Error("cancellation-unsupported: adapter cannot cancel active attempt");
-    }
+    // Persist the stop request even when the provider cannot cancel directly.
+    // The coordinator then applies the bounded grace/termination sequence and
+    // fences the effect as recovery-required if it cannot confirm shutdown.
     const type =
       input.action === "pause"
         ? "run.paused"
@@ -618,9 +1158,12 @@ export class Coordinator {
               ? "run.interrupt.requested"
               : "run.detached";
     this.journal.append({ runId: input.runId, type, payload: {}, actor: input.actor });
-    if (input.action === "cancel" || input.action === "interrupt")
+    if (input.action === "cancel" || input.action === "interrupt") {
+      this.activeSchedulers.get(input.runId)?.cancel(input.action);
+      this.cancelUnstartedWork(input.runId, input.action);
       for (const aborter of this.aborters.get(input.runId)?.values() ?? [])
         aborter.abort(input.action);
+    }
     if (input.action === "resume") {
       if (this.active.has(input.runId)) this.reschedule.add(input.runId);
       else this.schedule(input.runId);
@@ -650,6 +1193,10 @@ export class Coordinator {
   } {
     const view = this.journal.getView(input.runId);
     if (!view) throw new Error(`Run not found: ${input.runId}`);
+    if (!this.canRetry(input.runId, input.invocationId))
+      throw new Error(
+        "retry is unavailable: the failed effect must be drained, unconsumed, and within the attempt budget",
+      );
     if (view.revision !== input.expectedRevision)
       throw new Error(
         `stale-action: expected revision ${input.expectedRevision}, current revision ${view.revision}`,
@@ -659,7 +1206,12 @@ export class Coordinator {
       .filter((attempt) => attempt.invocationId === input.invocationId)
       .sort((a, b) => b.ordinal - a.ordinal);
     const source = attempts[0];
-    if (!invocation || invocation.status !== "failed" || !source || source.status !== "failed")
+    if (
+      !invocation ||
+      invocation.status !== "failed" ||
+      !source ||
+      !["failed", "cancelled"].includes(source.status)
+    )
       throw new Error("retry is only available for a failed terminal invocation");
     const attemptId = id("attempt");
     this.journal.transaction(() => {
@@ -682,26 +1234,6 @@ export class Coordinator {
     return { revision: next.revision, status: next.state.status };
   }
 
-  private profileFor(
-    runId: string,
-  ):
-    | "scripted"
-    | "codex-readonly"
-    | "codex-workspace-write"
-    | "claude-readonly"
-    | "claude-workspace-write"
-    | "pi-readonly" {
-    const row = this.journal.getRunRow(runId);
-    const input = row ? parseJson<Record<string, unknown>>(row.input_json) : {};
-    return input.__kouroExecutionProfile === "codex-readonly" ||
-      input.__kouroExecutionProfile === "codex-workspace-write" ||
-      input.__kouroExecutionProfile === "claude-readonly" ||
-      input.__kouroExecutionProfile === "claude-workspace-write" ||
-      input.__kouroExecutionProfile === "pi-readonly"
-      ? input.__kouroExecutionProfile
-      : "scripted";
-  }
-
   private schedule(runId: string): void {
     if (this.closed) return;
     if (this.active.has(runId)) {
@@ -710,21 +1242,127 @@ export class Coordinator {
     }
     const work = this.drive(runId)
       .catch((cause) => {
-        const run = this.journal.getRunSummary(runId);
-        if (run && (run.status === "pending" || run.status === "running"))
-          this.journal.append({
-            runId,
-            type: "run.completed",
-            payload: { status: "failed" },
-            actor: "system",
-          });
-        throw cause;
+        const view = this.journal.getView(runId);
+        if (view && (view.state.status === "pending" || view.state.status === "running")) {
+          const invocations = Object.values(view.state.invocations);
+          const allSettled =
+            invocations.length > 0 &&
+            invocations.every((invocation) =>
+              ["succeeded", "failed", "recovery-required"].includes(invocation.status),
+            );
+          if (allSettled) {
+            this.journal.append({
+              runId,
+              type: "run.completed",
+              payload: {
+                status:
+                  view.state.control === "cancel-requested"
+                    ? "cancelled"
+                    : view.state.control === "interrupt-requested"
+                      ? "interrupted"
+                      : "failed",
+              },
+              actor: "system",
+            });
+          } else {
+            this.journal.append({
+              runId,
+              type: "recovery.required",
+              payload: {
+                code: "coordinator-drive-failed",
+                detail: cause instanceof Error ? cause.message : String(cause),
+              },
+              actor: "system",
+            });
+          }
+        }
       })
       .finally(() => {
         this.active.delete(runId);
+        const view = this.journal.getView(runId);
+        if (
+          !view ||
+          ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(
+            view.state.status,
+          )
+        ) {
+          const timer = this.runBudgetTimers.get(runId);
+          if (timer) clearTimeout(timer);
+          this.runBudgetTimers.delete(runId);
+        }
         if (!this.closed && this.reschedule.delete(runId)) this.schedule(runId);
       });
     this.active.set(runId, work);
+  }
+
+  private cancelUnstartedWork(runId: string, reason: string): void {
+    const view = this.journal.getView(runId);
+    if (!view) return;
+    for (const invocation of Object.values(view.state.invocations)) {
+      const attempts = Object.values(view.state.attempts).filter(
+        (attempt) => attempt.invocationId === invocation.id,
+      );
+      const reserved = attempts
+        .filter((attempt) => attempt.status === "reserved")
+        .sort((a, b) => b.ordinal - a.ordinal)[0];
+      const hasRunningAttempt = attempts.some((attempt) => attempt.status === "running");
+      if (
+        !["pending", "reserved"].includes(invocation.status) &&
+        !(invocation.status === "running" && !hasRunningAttempt)
+      )
+        continue;
+      if (reserved) this.journal.cancelReservedEffect(reserved.id, reason);
+      this.journal.append({
+        runId,
+        type: "invocation.cancelled",
+        payload: { invocationId: invocation.id, reason },
+        actor: "system",
+        subjectId: invocation.id,
+      });
+    }
+  }
+
+  private armRunBudget(runId: string, view: import("@kouro/core").RunView): void {
+    if (this.runBudgetTimers.has(runId)) return;
+    const startedAt = view.state.startedAt ? Date.parse(view.state.startedAt) : Date.now();
+    const deadline = startedAt + view.bundle.limits.maxRunDurationMs;
+    const timer = setTimeout(() => this.expireRunBudget(runId), Math.max(1, deadline - Date.now()));
+    this.runBudgetTimers.set(runId, timer);
+  }
+
+  private expireRunBudget(runId: string): void {
+    this.runBudgetTimers.delete(runId);
+    const view = this.journal.getView(runId);
+    if (!view || !["running", "paused"].includes(view.state.status)) return;
+    const attemptId = Object.values(view.state.attempts).find(
+      (attempt) => attempt.status === "running",
+    )?.id;
+    this.journal.append({
+      runId,
+      type: "harness.activity",
+      payload: {
+        attemptId: attemptId ?? `${runId}:budget`,
+        event: {
+          type: "log",
+          at: new Date().toISOString(),
+          data: { status: "Run budget exhausted", detail: "maximum run duration reached" },
+        },
+      },
+      actor: "system",
+      ...(attemptId ? { subjectId: attemptId } : {}),
+    });
+    if (view.state.control === "none")
+      this.journal.append({
+        runId,
+        type: "run.cancel.requested",
+        payload: {},
+        actor: "system",
+      });
+    this.activeSchedulers.get(runId)?.cancel("run-budget-exhausted");
+    this.cancelUnstartedWork(runId, "run budget exhausted");
+    for (const aborter of this.aborters.get(runId)?.values() ?? [])
+      aborter.abort("run-budget-exhausted");
+    if (!this.active.has(runId)) this.schedule(runId);
   }
 
   private async drive(runId: string): Promise<void> {
@@ -737,6 +1375,7 @@ export class Coordinator {
         view.state.status === "recovery-required"
       )
         return;
+      if (view.state.status === "running") this.armRunBudget(runId, view);
       if (view.state.control !== "none") {
         const active = Object.values(view.state.invocations).some((item) =>
           ["pending", "reserved", "running"].includes(item.status),
@@ -1024,74 +1663,83 @@ export class Coordinator {
           ),
           resourceCaps: view.bundle.limits.resourceCaps,
         });
-        await scheduler.run(
-          executions.map((intent) => ({
-            id: intent.attemptId,
-            branchId: intent.invocationId,
-            ordinal: view.state.invocations[intent.invocationId]?.activationOrdinal ?? 0,
-            scope: {
-              scopeId:
-                view.state.invocations[intent.invocationId]?.scopeId ?? view.state.rootScopeId,
-              parentScopeId: null,
-              definitionId: view.bundle.rootDefinitionId,
-              activationOrdinal:
-                view.state.invocations[intent.invocationId]?.activationOrdinal ?? 0,
-              controlLineage: [],
-            },
-            resources: (() => {
-              const invocation = view.state.invocations[intent.invocationId];
-              const scope = invocation ? view.state.scopes[invocation.scopeId] : undefined;
-              const node = scope
-                ? view.bundle.definitions[scope.definitionId]?.nodes.find(
-                    (candidate) => candidate.id === invocation?.nodeId,
-                  )
-                : undefined;
-              return node && (node.kind === "agent" || node.kind === "command")
-                ? node.resources
-                : undefined;
-            })(),
-            run: async () => {
-              await this.execute(
-                runId,
-                view.bundle,
-                this.journal.getView(runId)!.state,
-                intent.invocationId,
-                intent.attemptId,
-              );
-              const current = this.journal.getView(runId)?.state.invocations[intent.invocationId];
-              if (current?.status === "failed") {
-                const currentView = this.journal.getView(runId);
-                const owningGroup = groups.find((group) =>
-                  group.expectedBranchIds.includes(intent.invocationId),
+        this.activeSchedulers.set(runId, scheduler);
+        try {
+          await scheduler.run(
+            executions.map((intent) => ({
+              id: intent.attemptId,
+              branchId: intent.invocationId,
+              ordinal: view.state.invocations[intent.invocationId]?.activationOrdinal ?? 0,
+              scope: {
+                scopeId:
+                  view.state.invocations[intent.invocationId]?.scopeId ?? view.state.rootScopeId,
+                parentScopeId: null,
+                definitionId: view.bundle.rootDefinitionId,
+                activationOrdinal:
+                  view.state.invocations[intent.invocationId]?.activationOrdinal ?? 0,
+                controlLineage: [],
+              },
+              resources: (() => {
+                const invocation = view.state.invocations[intent.invocationId];
+                const scope = invocation ? view.state.scopes[invocation.scopeId] : undefined;
+                const node = scope
+                  ? view.bundle.definitions[scope.definitionId]?.nodes.find(
+                      (candidate) => candidate.id === invocation?.nodeId,
+                    )
+                  : undefined;
+                return node && (node.kind === "agent" || node.kind === "command")
+                  ? node.resources
+                  : undefined;
+              })(),
+              run: async () => {
+                await this.execute(
+                  runId,
+                  view.bundle,
+                  this.journal.getView(runId)!.state,
+                  intent.invocationId,
+                  intent.attemptId,
                 );
-                if (owningGroup?.mode === "fail-fast") {
-                  for (const sibling of Object.values(currentView?.state.invocations ?? {}).filter(
-                    (candidate) =>
-                      candidate.id !== intent.invocationId &&
-                      owningGroup.expectedBranchIds.includes(candidate.id) &&
-                      ["pending", "reserved", "running"].includes(candidate.status),
-                  ))
-                    this.journal.append({
-                      runId,
-                      type: "invocation.cancelled",
-                      payload: { invocationId: sibling.id, reason: "fail-fast branch failure" },
-                      actor: "system",
-                      subjectId: sibling.id,
-                    });
-                  for (const aborter of this.aborters.get(runId)?.values() ?? [])
-                    aborter.abort("fail-fast branch failure");
-                }
-                if (owningGroup)
-                  throw new Error(
-                    current.outcome === "cancelled"
-                      ? "cancelled"
-                      : (current.error ?? "branch failed"),
+                const current = this.journal.getView(runId)?.state.invocations[intent.invocationId];
+                if (current?.status === "failed") {
+                  const currentView = this.journal.getView(runId);
+                  const owningGroup = groups.find((group) =>
+                    group.expectedBranchIds.includes(intent.invocationId),
                   );
-              }
-            },
-          })),
-          groups,
-        );
+                  if (owningGroup?.mode === "fail-fast") {
+                    for (const sibling of Object.values(
+                      currentView?.state.invocations ?? {},
+                    ).filter(
+                      (candidate) =>
+                        candidate.id !== intent.invocationId &&
+                        owningGroup.expectedBranchIds.includes(candidate.id) &&
+                        ["pending", "reserved", "running"].includes(candidate.status),
+                    ))
+                      this.journal.append({
+                        runId,
+                        type: "invocation.cancelled",
+                        payload: { invocationId: sibling.id, reason: "fail-fast branch failure" },
+                        actor: "system",
+                        subjectId: sibling.id,
+                      });
+                    for (const aborter of this.aborters.get(runId)?.values() ?? [])
+                      aborter.abort("fail-fast branch failure");
+                  }
+                  if (owningGroup)
+                    throw new Error(
+                      current.outcome === "cancelled" ||
+                        currentView?.state.control === "cancel-requested" ||
+                        currentView?.state.control === "interrupt-requested"
+                        ? "cancelled"
+                        : (current.error ?? "branch failed"),
+                    );
+                }
+              },
+            })),
+            groups,
+          );
+        } finally {
+          if (this.activeSchedulers.get(runId) === scheduler) this.activeSchedulers.delete(runId);
+        }
         continue;
       }
       const intent = intents[0];
@@ -1458,7 +2106,7 @@ export class Coordinator {
     if (detail.state !== "claimed" && this.journal.getEffect(detail.id)?.state !== "claimed")
       return;
     let result: ProcessResult | undefined;
-    let status: "succeeded" | "failed" = "succeeded";
+    let status: "succeeded" | "failed" | "cancelled" = "succeeded";
     let commandEvidence: import("@kouro/core/contracts").CommandEvidence | undefined;
     let error: string | undefined;
     const row = this.journal.getRunRow(runId);
@@ -1496,7 +2144,12 @@ export class Coordinator {
         this.branchWorkspaces.set(key, invocationWorkspace);
       }
     }
-    const invocationWorkspaceDir = invocationWorkspace?.path ?? workspaceDir;
+    let invocationWorkspaceDir = invocationWorkspace?.path ?? workspaceDir;
+    if (node.kind === "command" && node.workspaceAccess === "source-repository") {
+      if (!registeredWorkspace)
+        throw new Error(`Command ${node.id} requires a repository workspace`);
+      invocationWorkspaceDir = registeredWorkspace.repositoryPath;
+    }
     if (node.kind === "agent") {
       const config = collaborationConfig;
       const definition = bundle.definitions[scope?.definitionId ?? bundle.rootDefinitionId];
@@ -1810,14 +2463,10 @@ export class Coordinator {
         resolvedVersion = pi.adapterVersion;
         const piSelection = resolvePiSelection(
           { harness: "pi", model: { id: node.modelId ?? "" } },
-          {
-            ...(node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs }),
-            ...(node.modelId ? { model: node.modelId } : {}),
-          },
+          node.modelId ? { model: node.modelId } : {},
         );
         resolvedModelId = piSelection.model;
         nativeConfig = {
-          ...(node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs }),
           ...(piSelection.provider ? { provider: piSelection.provider } : {}),
           ...(piSelection.model ? { model: piSelection.model } : {}),
         };
@@ -1911,61 +2560,103 @@ export class Coordinator {
           return;
         }
       }
+      const currentControl = this.journal.getView(runId)?.state.control;
+      if (currentControl === "cancel-requested" || currentControl === "interrupt-requested") {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [],
+          artifacts: [],
+          evidence: [],
+          output: [],
+          status: "cancelled",
+          error: currentControl === "cancel-requested" ? "cancelled" : "interrupted",
+          resolvedExecution: {
+            role: node.role,
+            harness: resolvedHarness,
+            adapterVersion: resolvedVersion,
+            ...(resolvedModelId ? { modelId: resolvedModelId } : {}),
+          },
+          contextManifest: JSON.parse(JSON.stringify(contextManifest)),
+        });
+        return;
+      }
       mkdirSync(invocationWorkspaceDir, { recursive: true, mode: 0o700 });
-      let harnessResult: Awaited<ReturnType<HarnessAdapter["run"]>>;
+      let harnessResult: Awaited<ReturnType<HarnessAdapter["run"]>> | undefined;
       const aborter = new AbortController();
       const runAborters = this.aborters.get(runId) ?? new Map<string, AbortController>();
       runAborters.set(invocationId, aborter);
       this.aborters.set(runId, runAborters);
-      const trackingAdapter = new TrackingHarnessDecorator(selected, (event) =>
-        this.recordHarnessActivity(runId, invocationId, attemptId, event),
+      const trackingAdapter = new TrackingHarnessDecorator(
+        selected,
+        (event) => this.recordHarnessActivity(runId, invocationId, attemptId, event),
+        (event) => this.normalizeActivity(runId, event),
       );
       const activeAdapters = this.activeAdapters.get(runId) ?? new Map<string, HarnessAdapter>();
       activeAdapters.set(invocationId, trackingAdapter);
       this.activeAdapters.set(runId, activeAdapters);
+      const attemptStartedAtText =
+        this.journal.getView(runId)?.state.attempts[attemptId]?.startedAt ?? attempt.startedAt;
+      const attemptStartedAt = attemptStartedAtText ? Date.parse(attemptStartedAtText) : Date.now();
+      const attemptBudgetRemaining =
+        node.timeoutMs === undefined
+          ? undefined
+          : Math.max(1, node.timeoutMs - Math.max(0, Date.now() - attemptStartedAt));
+      const runStartedAt = this.journal.getView(runId)?.state.startedAt;
+      const runDeadlineAt =
+        runStartedAt && Number.isFinite(Date.parse(runStartedAt))
+          ? Date.parse(runStartedAt) + bundle.limits.maxRunDurationMs
+          : Date.now() + bundle.limits.maxRunDurationMs;
       try {
-        harnessResult = await trackingAdapter.run({
-          runId,
-          invocationId,
-          role: node.role,
-          prompt: node.prompt,
-          timeoutMs: node.timeoutMs,
-          ...(node.modelId ? { modelId: node.modelId } : {}),
-          outputSchema,
-          delayMs: this.scriptedDelayMs,
-          cwd: invocationWorkspaceDir,
-          nativeConfig,
-          context: contextManifest,
-          ...(collaborationGateway && collaborationGrant
-            ? {
-                collaboration: {
-                  ...collaborationGateway.tools(
-                    collaborationGrant,
-                    subagentIds.length ? this.scouts : undefined,
-                    subagentIds.length
-                      ? (subagentInput) =>
-                          this.invokeScout({
-                            runId,
-                            parentInvocationId: invocationId,
-                            parentAttemptId: attemptId,
-                            requestId: subagentInput.requestId,
-                            scoutId: subagentInput.subagentId,
-                            input: subagentInput.input,
-                            adapter: selected,
-                            cwd: invocationWorkspaceDir,
-                            parentModelId: resolvedModelId ?? node.modelId,
-                            signal: aborter.signal,
-                          })
-                      : undefined,
-                  ),
-                  // The host freezes the selected delivery batch into context;
-                  // expose that same batch to the scripted/provider tool view.
-                  wait: () => collaborationBatch,
-                },
-              }
-            : {}),
-          signal: aborter.signal,
-        });
+        harnessResult = await this.superviseHarness(
+          trackingAdapter,
+          {
+            attemptId,
+            runId,
+            invocationId,
+            role: node.role,
+            prompt: node.prompt,
+            ...(node.modelId ? { modelId: node.modelId } : {}),
+            outputSchema,
+            delayMs: this.scriptedDelayMs,
+            cwd: invocationWorkspaceDir,
+            nativeConfig,
+            context: contextManifest,
+            ...(collaborationGateway && collaborationGrant
+              ? {
+                  collaboration: {
+                    ...collaborationGateway.tools(
+                      collaborationGrant,
+                      subagentIds.length ? this.scouts : undefined,
+                      subagentIds.length
+                        ? (subagentInput) =>
+                            this.invokeScout({
+                              runId,
+                              parentInvocationId: invocationId,
+                              parentAttemptId: attemptId,
+                              requestId: subagentInput.requestId,
+                              scoutId: subagentInput.subagentId,
+                              input: subagentInput.input,
+                              adapter: selected,
+                              cwd: invocationWorkspaceDir,
+                              parentModelId: resolvedModelId ?? node.modelId,
+                              signal: aborter.signal,
+                            })
+                        : undefined,
+                    ),
+                    // The host freezes the selected delivery batch into context;
+                    // expose that same batch to the scripted/provider tool view.
+                    wait: () => collaborationBatch,
+                  },
+                }
+              : {}),
+            signal: aborter.signal,
+          },
+          aborter,
+          attemptBudgetRemaining,
+          runDeadlineAt,
+          undefined,
+          (event) => this.recordHarnessActivity(runId, invocationId, attemptId, event),
+        );
       } catch (cause) {
         harnessResult = {
           status: "failed",
@@ -1986,6 +2677,13 @@ export class Coordinator {
           )
           .all(runId, attemptId) as Array<{ id: string }>;
         for (const batch of outstanding) collaborationGateway.releaseDelivery(batch.id);
+      }
+      if (!harnessResult) {
+        const aborters = this.aborters.get(runId);
+        aborters?.delete(invocationId);
+        if (aborters?.size === 0) this.aborters.delete(runId);
+        this.activityEvents.delete(attemptId);
+        return;
       }
       const collaborationSent = Boolean(
         harnessResult.output &&
@@ -2008,7 +2706,7 @@ export class Coordinator {
       runAbortersAfter?.delete(invocationId);
       if (runAbortersAfter?.size === 0) this.aborters.delete(runId);
       if (harnessResult.status !== "succeeded") {
-        status = "failed";
+        status = harnessResult.status === "cancelled" ? "cancelled" : "failed";
         error = harnessResult.error ?? harnessResult.status;
       }
       if (status === "succeeded" && outputSchema) {
@@ -2055,7 +2753,7 @@ export class Coordinator {
           ...(node.outputPorts[0] ? { schemaDigest: node.outputPorts[0].schemaDigest } : {}),
         });
       }
-      if (harnessResult.rawOutput !== undefined || status === "failed") {
+      if (harnessResult.rawOutput !== undefined || status === "failed" || status === "cancelled") {
         const raw = harnessResult.rawOutput ?? json(harnessResult.output ?? { error });
         const redacted = String(redactSecrets(raw, secretValues));
         const evidenceArtifact = this.journal.blobs.put(
@@ -2086,6 +2784,7 @@ export class Coordinator {
       }
       const retryable =
         status === "failed" &&
+        this.journal.getView(runId)?.state.control === "none" &&
         (harnessResult.status === "unavailable" ||
           error?.startsWith("invalid-output:") ||
           error?.startsWith("transport:"));
@@ -2160,17 +2859,48 @@ export class Coordinator {
       this.validateCommandForRun(runId, node);
       const startedAt = now();
       try {
-        result = await this.process.executeCommand({
-          runId,
-          operationKey: detail.operationKey,
-          workspaceDir: invocationWorkspaceDir,
-          executable: node.executable,
-          args: node.args,
-          timeoutMs: node.timeoutMs || this.commandTimeoutMs,
-          executionMode: node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE)
-            ? "trusted-unrestricted"
-            : node.executionMode,
-        });
+        if (node.workspaceAccess === "source-repository") {
+          if (!registeredWorkspace || !this.workspaceAdapter)
+            throw new Error(`Command ${node.id} requires a repository workspace`);
+          if (
+            node.executable !== "git" ||
+            node.args.length !== 4 ||
+            node.args[0] !== "diff" ||
+            node.args[1] !== "--no-ext-diff" ||
+            node.args[2] !== "--no-textconv"
+          )
+            throw new Error("source-repository commands must be the declared read-only git diff");
+          const stdout = await this.workspaceAdapter.diffRepository(
+            registeredWorkspace.repositoryPath,
+            node.args[3]!,
+          );
+          result = {
+            operationKey: detail.operationKey,
+            evidence: {
+              argv: [node.executable, ...node.args],
+              cwd: registeredWorkspace.repositoryPath,
+              exitCode: 0,
+              signal: null,
+              timedOut: false,
+              spawnError: null,
+              stdout: new TextEncoder().encode(stdout),
+              stderr: new Uint8Array(),
+              enforcementMode: "trusted-unrestricted",
+            },
+          };
+        } else {
+          result = await this.process.executeCommand({
+            runId,
+            operationKey: detail.operationKey,
+            workspaceDir: invocationWorkspaceDir,
+            executable: node.executable,
+            args: node.args,
+            timeoutMs: node.timeoutMs || this.commandTimeoutMs,
+            executionMode: node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE)
+              ? "trusted-unrestricted"
+              : node.executionMode,
+          });
+        }
       } catch (cause) {
         status = "failed";
         error = cause instanceof Error ? cause.message : String(cause);
@@ -2259,6 +2989,7 @@ export class Coordinator {
         new TextEncoder().encode(
           json({
             exitCode: commandEvidence.exitCode,
+            stdout: new TextDecoder().decode(result?.evidence.stdout ?? new Uint8Array()),
             executionMode: commandEvidence.executionMode,
             signal: commandEvidence.signal,
             timeout: commandEvidence.timeout,
@@ -2320,7 +3051,9 @@ export class Coordinator {
       let value = binding ? this.resolveBoundInput(binding, state, invocationId) : undefined;
       if (value !== undefined && binding?.path?.length) value = selectJsonPath(value, binding.path);
       if (value === undefined) {
-        const missing = binding?.missing ?? (port.defaultValue === undefined ? "error" : "default");
+        const missing =
+          binding?.missing ??
+          (port.defaultValue !== undefined ? "default" : port.required ? "error" : "omit");
         if (missing === "default" && port.defaultValue !== undefined) value = port.defaultValue;
         else if (missing === "omit" && !port.required) continue;
         else
@@ -2425,56 +3158,92 @@ export class Coordinator {
         signal?.addEventListener("abort", abort, { once: true });
         const timeoutMs =
           childAgent.timeoutMs === undefined ? undefined : Math.min(childAgent.timeoutMs, 60_000);
-        const timeout =
-          timeoutMs === undefined ? undefined : setTimeout(() => childAborter.abort(), timeoutMs);
         let scoutReplyStarted = false;
-        const trackedChild = new TrackingHarnessDecorator(childAdapter, (event) => {
-          const data =
-            event.data && typeof event.data === "object" && !Array.isArray(event.data)
-              ? event.data
-              : { detail: event.data };
-          this.recordHarnessActivity(input.runId, input.parentInvocationId, input.parentAttemptId, {
-            ...event,
-            data:
-              event.type === "text"
-                ? {
-                    scoutId: input.scoutId,
-                    label: !scoutReplyStarted,
-                    text: event.data,
-                  }
-                : { ...data, scoutId: input.scoutId },
-          });
-          if (event.type === "text") scoutReplyStarted = true;
-        });
+        const trackedChild = new TrackingHarnessDecorator(
+          childAdapter,
+          (event) => {
+            const data =
+              event.data && typeof event.data === "object" && !Array.isArray(event.data)
+                ? event.data
+                : { detail: event.data };
+            this.recordHarnessActivity(
+              input.runId,
+              input.parentInvocationId,
+              input.parentAttemptId,
+              {
+                ...event,
+                data:
+                  event.type === "text"
+                    ? {
+                        scoutId: input.scoutId,
+                        requestId: input.requestId,
+                        label: !scoutReplyStarted,
+                        text: event.data,
+                      }
+                    : { ...data, scoutId: input.scoutId, requestId: input.requestId },
+              },
+            );
+            if (event.type === "text") scoutReplyStarted = true;
+          },
+          (event) => this.normalizeActivity(input.runId, event),
+        );
         try {
-          const result = await trackedChild.run({
-            runId: input.runId,
-            invocationId: childInvocationId,
-            role: childAgent.role,
-            prompt: childAgent.prompt,
-            ...(outputSchema ? { outputSchema } : {}),
-            delayMs: this.scriptedDelayMs,
-            ...(timeoutMs === undefined ? {} : { timeoutMs }),
-            cwd: input.cwd,
-            ...(childAgent.modelId
-              ? { modelId: childAgent.modelId }
-              : childAdapter.id === input.adapter.id && input.parentModelId
-                ? { modelId: input.parentModelId }
-                : {}),
-            nativeConfig:
-              childAdapter.id === "claude"
-                ? { permissionMode: "dontAsk" }
-                : childAdapter.id === "codex"
-                  ? { sandbox: "read-only" }
-                  : {},
-            context,
-            signal: childAborter.signal,
-          });
+          const childRunDeadline =
+            view.state.startedAt && Number.isFinite(Date.parse(view.state.startedAt))
+              ? Date.parse(view.state.startedAt) + view.bundle.limits.maxRunDurationMs
+              : Date.now() + view.bundle.limits.maxRunDurationMs;
+          const result = await this.superviseHarness(
+            trackedChild,
+            {
+              attemptId: childInvocationId,
+              runId: input.runId,
+              invocationId: childInvocationId,
+              role: childAgent.role,
+              prompt: childAgent.prompt,
+              ...(outputSchema ? { outputSchema } : {}),
+              delayMs: this.scriptedDelayMs,
+              cwd: input.cwd,
+              ...(childAgent.modelId
+                ? { modelId: childAgent.modelId }
+                : childAdapter.id === input.adapter.id && input.parentModelId
+                  ? { modelId: input.parentModelId }
+                  : {}),
+              nativeConfig:
+                childAdapter.id === "claude"
+                  ? { permissionMode: "dontAsk" }
+                  : childAdapter.id === "codex"
+                    ? { sandbox: "read-only" }
+                    : {},
+              context,
+              signal: childAborter.signal,
+              onEvent: () => undefined,
+            },
+            childAborter,
+            timeoutMs,
+            childRunDeadline,
+            input.parentAttemptId,
+            (event) => {
+              const data =
+                event.data && typeof event.data === "object" && !Array.isArray(event.data)
+                  ? event.data
+                  : { detail: event.data };
+              this.recordHarnessActivity(
+                input.runId,
+                input.parentInvocationId,
+                input.parentAttemptId,
+                {
+                  ...event,
+                  data: { ...data, scoutId: input.scoutId, requestId: input.requestId },
+                },
+              );
+            },
+          );
+          if (!result)
+            throw new Error("subagent cancellation was not confirmed; parent requires recovery");
           if (result.status !== "succeeded" || result.output === undefined)
             throw new Error(result.error ?? `scout harness ${result.status}`);
           return result.output;
         } finally {
-          if (timeout) clearTimeout(timeout);
           signal?.removeEventListener("abort", abort);
         }
       },

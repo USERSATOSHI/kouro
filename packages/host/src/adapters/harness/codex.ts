@@ -17,6 +17,8 @@ import {
 } from "@kouro/core";
 import type { CollaborationTools, HarnessAdapter } from "../../types.ts";
 import { startScoutBridge } from "./scout-bridge.ts";
+import { codexToolEvent } from "./codex-activity.ts";
+import { parseStructuredOutput } from "./structured-output.ts";
 
 export interface CodexRunInput {
   readonly attemptId: string;
@@ -268,7 +270,12 @@ export class CodexSdkHarness implements HarnessPort {
                           data: {
                             id: item.id,
                             name: "Web search",
-                            status: "started",
+                            status:
+                              event.type === "item.completed"
+                                ? "completed"
+                                : event.type === "item.updated"
+                                  ? "running"
+                                  : "started",
                             input: item.query,
                           },
                         }
@@ -329,14 +336,8 @@ export class CodexSdkHarness implements HarnessPort {
       };
     }
 
-    let parsed: JsonValue | undefined = response;
-    if (typeof parsed === "string") {
-      try {
-        parsed = JSON.parse(parsed) as JsonValue;
-      } catch {
-        /* preserve the raw assistant response for consumers of unstructured turns */
-      }
-    }
+    const parsed: JsonValue | undefined =
+      typeof response === "string" ? parseStructuredOutput(response) : response;
     if (input.role.outputSchema) {
       const check = validateJsonSchema(parsed, input.role.outputSchema);
       if (!check.valid) {
@@ -369,6 +370,9 @@ export class CodexAppServerHarness {
   constructor(descriptor: HarnessDescriptor) {
     this.descriptor = descriptor;
   }
+  canSteer(invocationId: string): boolean {
+    return this.active.has(invocationId);
+  }
   async steer(invocationId: string, message: string): Promise<void> {
     const active = this.active.get(invocationId);
     if (!active) throw new Error("steer-unavailable: Codex turn is not active");
@@ -387,12 +391,6 @@ export class CodexAppServerHarness {
       input.onEvent?.(event);
     };
     try {
-      const initialized = await transport.request("initialize", {
-        clientInfo: { name: "kouro", title: "Kouro", version: "2" },
-        capabilities: null,
-      });
-      if (!initialized.ok) throw new Error(initialized.error);
-      transport.notify("initialized", {});
       const scout = input.context?.tools.find((item) => item.name === "subagent");
       const dynamicTools =
         scout && input.collaboration?.subagent
@@ -405,6 +403,12 @@ export class CodexAppServerHarness {
               },
             ]
           : undefined;
+      const initialized = await transport.request("initialize", {
+        clientInfo: { name: "kouro", title: "Kouro", version: "2" },
+        capabilities: dynamicTools ? { experimentalApi: true, requestAttestation: false } : null,
+      });
+      if (!initialized.ok) throw new Error(initialized.error);
+      transport.notify("initialized", {});
       const threadResult = await transport.request("thread/start", {
         cwd: input.cwd,
         ...(input.selection.model.id && input.selection.model.id !== "default"
@@ -431,6 +435,7 @@ export class CodexAppServerHarness {
         ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
         : input.role.prompt;
       let streamed = "";
+      const thinkingItems = new Set<string>();
       let completed:
         | ((result: { ok: boolean; value?: unknown; error?: string }) => void)
         | undefined;
@@ -442,6 +447,35 @@ export class CodexAppServerHarness {
         if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
           streamed += params.delta;
           emit({ type: "text", at: new Date().toISOString(), data: params.delta });
+        } else if (
+          message.method === "item/reasoning/summaryTextDelta" &&
+          typeof params.delta === "string"
+        ) {
+          thinkingItems.add(String(params.itemId));
+          emit({
+            type: "log",
+            at: new Date().toISOString(),
+            data: {
+              status: "Thinking",
+              text: params.delta,
+              channel: "thinking",
+              id: `${String(params.itemId)}:${String(params.summaryIndex ?? 0)}`,
+            },
+          });
+        } else if (
+          message.method === "item/commandExecution/outputDelta" &&
+          typeof params.delta === "string"
+        ) {
+          emit({
+            type: "tool",
+            at: new Date().toISOString(),
+            data: {
+              id: String(params.itemId),
+              name: "commandExecution",
+              status: "running",
+              outputDelta: params.delta,
+            },
+          });
         } else if (
           message.id !== undefined &&
           message.method === "item/commandExecution/requestApproval"
@@ -458,8 +492,32 @@ export class CodexAppServerHarness {
           });
         } else if (message.method === "item/started" || message.method === "item/completed") {
           const item = asObject(params.item);
-          if (item.type === "reasoning")
-            emit({ type: "log", at: new Date().toISOString(), data: { status: "Thinking" } });
+          if (item.type === "reasoning") {
+            const summary = Array.isArray(item.summary)
+              ? item.summary.filter((part): part is string => typeof part === "string").join("\n")
+              : "";
+            emit({
+              type: "log",
+              at: new Date().toISOString(),
+              data: {
+                status: "Thinking",
+                ...(summary && !thinkingItems.has(String(item.id))
+                  ? { text: summary, channel: "thinking" }
+                  : {}),
+              },
+            });
+          } else if (item.type === "userMessage") {
+            /* Operator instructions are journaled by Kouro. */
+          } else if (
+            item.type === "plan" &&
+            message.method === "item/completed" &&
+            typeof item.text === "string"
+          )
+            emit({
+              type: "log",
+              at: new Date().toISOString(),
+              data: { status: "Planning", channel: "thinking", text: item.text },
+            });
           else if (item.type === "agentMessage") {
             if (message.method === "item/started")
               emit({
@@ -468,19 +526,7 @@ export class CodexAppServerHarness {
                 data: { status: "Writing reply" },
               });
           } else if (typeof item.type === "string")
-            emit({
-              type: "tool",
-              at: new Date().toISOString(),
-              data: JSON.parse(
-                JSON.stringify({
-                  id: item.id,
-                  name: item.type,
-                  status: message.method === "item/started" ? "started" : "completed",
-                  ...(item.command ? { input: item.command } : {}),
-                  ...(item.query ? { input: item.query } : {}),
-                }),
-              ),
-            });
+            emit(codexToolEvent(item, message.method === "item/started", new Date().toISOString()));
         } else if (
           message.id !== undefined &&
           message.method === "item/tool/call" &&
@@ -490,7 +536,10 @@ export class CodexAppServerHarness {
         ) {
           void input.collaboration
             .subagent({
-              requestId: String(params.id ?? message.id),
+              requestId:
+                typeof asObject(params.arguments).requestId === "string"
+                  ? String(asObject(params.arguments).requestId)
+                  : String(params.callId ?? params.id ?? message.id),
               subagentId: String(asObject(params.arguments).subagentId ?? ""),
               input: asObject(asObject(params.arguments).input),
             })
@@ -543,6 +592,7 @@ export class CodexAppServerHarness {
         cwd: input.cwd,
         approvalPolicy: "on-request",
         sandboxPolicy: policy,
+        summary: "auto",
         ...(input.selection.model.id && input.selection.model.id !== "default"
           ? { model: input.selection.model.id }
           : {}),
@@ -552,6 +602,11 @@ export class CodexAppServerHarness {
       const turnId = stringAt(started.value, "turn", "id") ?? stringAt(started.value, "id");
       if (!turnId) throw new Error("Codex App Server returned no turn ID");
       this.active.set(input.attemptId, { transport, threadId, turnId });
+      emit({
+        type: "log",
+        at: new Date().toISOString(),
+        data: { status: "Working", readyForSteering: true },
+      });
       const timeoutMs = input.timeoutMs && input.timeoutMs > 0 ? input.timeoutMs : undefined;
       let timeout: ReturnType<typeof setTimeout> | undefined;
       const cancel = () => {
@@ -587,12 +642,7 @@ export class CodexAppServerHarness {
           usage: unavailableUsage(),
           events,
         };
-      let output: JsonValue = final;
-      try {
-        output = JSON.parse(final) as JsonValue;
-      } catch {
-        /* preserve plain text */
-      }
+      const output: JsonValue = parseStructuredOutput(final);
       if (input.outputSchema) {
         const validation = validateJsonSchema(output, input.outputSchema);
         if (!validation.valid)
@@ -813,5 +863,10 @@ export class CodexHarnessAdapter implements HarnessAdapter {
         new Error("steer-unavailable: Codex SDK does not expose turn steering"),
       );
     return this.harness.steer(input.invocationId, input.message);
+  }
+  canSteer(input: { invocationId: string }): boolean {
+    return (
+      this.harness instanceof CodexAppServerHarness && this.harness.canSteer(input.invocationId)
+    );
   }
 }

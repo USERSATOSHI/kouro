@@ -237,6 +237,11 @@ export class GitWorkspaceAdapter {
     }
   }
 
+  async diffRepository(repositoryPath: string, baseRef: string): Promise<string> {
+    const repository = await this.repositoryRoot(repositoryPath);
+    return this.git(repository, ["--no-pager", "diff", "--no-ext-diff", "--no-textconv", baseRef]);
+  }
+
   /** Apply independent child worktree patches only when their changed paths do
    * not overlap. The target is never mutated on a detected conflict. */
   async integrate(input: {

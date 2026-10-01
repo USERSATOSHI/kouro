@@ -6,6 +6,7 @@ import {
   cellStatusSummary,
   evaluationSummary,
   formatEvidenceValue,
+  completedComparisonRuns,
 } from "./m5";
 
 describe("evaluation workbench DTO helpers", () => {
@@ -47,5 +48,18 @@ describe("evaluation workbench DTO helpers", () => {
 
   it("formats structured evidence without rendering a raw JSON blob", () => {
     expect(formatEvidenceValue('{"passed":24,"failed":0}')).toBe("passed: 24 · failed: 0");
+  });
+  it("compares distinct variants with the same case and repetition before comparing repeated samples", () => {
+    const base = M5_FIXTURE.cells.find((cell) => cell.status === "succeeded")!;
+    const experiment = {
+      ...M5_FIXTURE,
+      cells: [
+        { ...base, caseId: "case", variantId: "baseline", repetition: 1, runId: "left" },
+        { ...base, caseId: "case", variantId: "baseline", repetition: 2, runId: "repeat" },
+        { ...base, caseId: "other", variantId: "quality", repetition: 1, runId: "other" },
+        { ...base, caseId: "case", variantId: "quality", repetition: 1, runId: "right" },
+      ],
+    };
+    expect(completedComparisonRuns(experiment)).toEqual(["left", "right"]);
   });
 });

@@ -213,6 +213,9 @@ export function createHostServer(
           maxConcurrent: Number.isSafeInteger(input.maxConcurrent)
             ? Number(input.maxConcurrent)
             : undefined,
+          observerWaitMs: Number.isSafeInteger(input.observerWaitMs)
+            ? Math.max(0, Number(input.observerWaitMs))
+            : undefined,
         })
         .catch(() => {
           // The experiment snapshot and individual cell errors remain the source
@@ -251,6 +254,46 @@ export function createHostServer(
           .map(toWebRun)
       : denied(set),
   );
+  app.get("/api/approvals", ({ request, set }) =>
+    checked(request, set) ? service.pendingApprovals() : denied(set),
+  );
+  app.get("/api/run-deletions", ({ request, set }) =>
+    checked(request, set) ? service.incompleteRunDeletions() : denied(set),
+  );
+  app.get("/api/runs/:id/deletion-preview", async ({ request, set, params }) => {
+    if (!checked(request, set)) return denied(set);
+    try {
+      return await service.previewRunDeletion(params.id);
+    } catch (cause) {
+      set.status = 404;
+      return {
+        error: "run-deletion-preview-failed",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  });
+  app.post("/api/runs/:id/delete", async ({ request, set, params, body }) => {
+    if (!checked(request, set, true)) return denied(set);
+    try {
+      const input = bodyObject(body);
+      if (typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim())
+        throw new Error("idempotencyKey is required");
+      if (!Number.isSafeInteger(input.expectedRevision))
+        throw new Error("expectedRevision is required");
+      return await service.deleteRun({
+        runId: params.id,
+        expectedRevision: Number(input.expectedRevision),
+        idempotencyKey: input.idempotencyKey,
+        actor: typeof input.actor === "string" && input.actor.trim() ? input.actor : "operator",
+      });
+    } catch (cause) {
+      set.status = 409;
+      return {
+        error: "run-deletion-rejected",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  });
   app.get("/api/runs/:id/checkpoint", async ({ request, set, params }) => {
     if (!checked(request, set)) return denied(set);
     try {
@@ -413,10 +456,13 @@ export function createHostServer(
                   repositoryPath: String(
                     (input.workspace as Record<string, unknown>).repositoryPath,
                   ),
-                  workspaceId:
-                    typeof (input.workspace as Record<string, unknown>).workspaceId === "string"
-                      ? String((input.workspace as Record<string, unknown>).workspaceId)
-                      : undefined,
+                  ...(typeof (input.workspace as Record<string, unknown>).workspaceId === "string"
+                    ? {
+                        workspaceId: String(
+                          (input.workspace as Record<string, unknown>).workspaceId,
+                        ),
+                      }
+                    : {}),
                 }
               : undefined,
         }),
@@ -451,7 +497,7 @@ export function createHostServer(
     const input = bodyObject(body);
     if (
       typeof input.action !== "string" ||
-      !Number.isSafeInteger(input.expectedRevision) ||
+      (input.action !== "steer" && !Number.isSafeInteger(input.expectedRevision)) ||
       typeof input.idempotencyKey !== "string" ||
       !input.idempotencyKey.trim()
     ) {
@@ -462,19 +508,35 @@ export function createHostServer(
       if (
         input.action === "steer" &&
         typeof input.invocationId === "string" &&
+        typeof input.attemptId === "string" &&
         typeof input.message === "string"
-      )
+      ) {
         return service.steer({
           runId: params.id,
           invocationId: input.invocationId,
+          attemptId: input.attemptId,
           message: input.message,
-          expectedRevision: Number(input.expectedRevision),
           actor: "local-operator",
+          idempotencyKey: input.idempotencyKey,
         });
+      }
       if (["pause", "resume", "cancel", "interrupt", "detach"].includes(input.action))
         return service.control({
           runId: params.id,
           action: input.action as "pause" | "resume" | "cancel" | "interrupt" | "detach",
+          expectedRevision: Number(input.expectedRevision),
+          actor: "local-operator",
+          idempotencyKey: input.idempotencyKey,
+        });
+      if (
+        input.action === "interrupt-attempt" &&
+        typeof input.invocationId === "string" &&
+        typeof input.attemptId === "string"
+      )
+        return service.interruptAttempt({
+          runId: params.id,
+          invocationId: input.invocationId,
+          attemptId: input.attemptId,
           expectedRevision: Number(input.expectedRevision),
           actor: "local-operator",
           idempotencyKey: input.idempotencyKey,
@@ -489,7 +551,8 @@ export function createHostServer(
         });
       if (
         input.action === "deliver" &&
-        (typeof input.expectedTree === "string" || typeof input.deliveryActionId === "string")
+        typeof input.expectedTree === "string" &&
+        typeof input.deliveryActionId === "string"
       )
         return service.workspaceCommit({
           runId: params.id,
@@ -507,14 +570,20 @@ export function createHostServer(
             : {}),
         });
       if (
-        (input.action !== "approve" && input.action !== "reject") ||
+        !["approve", "reject", "request-changes"].includes(input.action) ||
         typeof input.invocationId !== "string"
       )
         throw new Error("unsupported-or-invalid-action");
       return service.decideApproval({
         runId: params.id,
         invocationId: input.invocationId,
-        decision: input.action === "approve" ? "approved" : "rejected",
+        decision:
+          input.action === "approve"
+            ? "approved"
+            : input.action === "request-changes"
+              ? "changes-requested"
+              : "rejected",
+        ...(typeof input.message === "string" ? { feedback: input.message } : {}),
         expectedRevision: Number(input.expectedRevision),
         actor:
           typeof input.actor === "string" && input.actor.trim() ? input.actor : "local-operator",
@@ -548,11 +617,8 @@ export function createHostServer(
       ...view,
       servedAt: new Date().toISOString(),
       m2: {
-        capabilities: {
-          pause: view.state.status === "running",
-          resume: view.state.status === "paused",
-          detach: view.state.status === "running" || view.state.status === "paused",
-        },
+        ...service.operatorState(params.id),
+        activity: service.getHarnessActivity(params.id, 0, 500, undefined, true),
       },
     };
   });
@@ -563,9 +629,30 @@ export function createHostServer(
       return { error: "run-not-found" };
     }
     const after = nonnegativeInt(query.after);
+    const limit = Math.max(1, Math.min(500, nonnegativeInt(query.limit) || 200));
+    const events = service.getEvents(params.id, after, limit);
+    const lastCursor = events.at(-1)?.sequence ?? after;
+    const head = service.getView(params.id)?.eventCursor ?? after;
     return {
-      events: service.getEvents(params.id, after),
-      nextCursor: service.getView(params.id)?.eventCursor ?? after,
+      events,
+      nextCursor: lastCursor,
+      hasMore: lastCursor < head,
+    };
+  });
+  app.get("/api/runs/:id/activity", ({ request, set, params, query }) => {
+    if (!checked(request, set)) return denied(set);
+    if (!service.getView(params.id)) {
+      set.status = 404;
+      return { error: "run-not-found" };
+    }
+    const after = nonnegativeInt(query.after);
+    const limit = Math.min(500, Math.max(1, nonnegativeInt(query.limit) || 200));
+    const attemptId = typeof query.attemptId === "string" ? query.attemptId : undefined;
+    const items = service.getHarnessActivity(params.id, after, limit, attemptId);
+    return {
+      items,
+      nextCursor: items.at(-1)?.cursor ?? after,
+      hasMore: items.length === limit,
     };
   });
   app.get("/api/runs/:id/evidence", ({ request, set, params, query }) => {
@@ -616,6 +703,10 @@ export function createHostServer(
                 (item): item is string => typeof item === "string",
               ),
             }
+          : {}),
+        ...(typeof input.expectedTree === "string" ? { expectedTree: input.expectedTree } : {}),
+        ...(typeof input.expectedPatchDigest === "string"
+          ? { expectedPatchDigest: input.expectedPatchDigest }
           : {}),
       });
     } catch (cause) {
@@ -695,7 +786,9 @@ export function createHostServer(
             for await (const frame of service.stream(params.id, after, abortController.signal)) {
               if (abortController.signal.aborted) break;
               controller.enqueue(
-                encoder.encode(`id: ${frame.revision}\ndata: ${JSON.stringify(frame)}\n\n`),
+                encoder.encode(
+                  `id: ${frame.revision}\ndata: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}\n\n`,
+                ),
               );
             }
           } catch {

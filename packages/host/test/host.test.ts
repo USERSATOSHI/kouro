@@ -56,6 +56,303 @@ async function git(cwd: string, args: string[]): Promise<void> {
 }
 
 describe("Kouro M1 host", () => {
+  test("a selected agent interrupt is idempotent and a drained cancelled attempt can retry", async () => {
+    let calls = 0;
+    const harness: HarnessAdapter = {
+      id: "scripted",
+      adapterVersion: "interrupt-test",
+      capabilities: () => ({ cancel: "supported" }),
+      async run(input) {
+        calls++;
+        if (calls === 1) {
+          while (!input.signal?.aborted) await Bun.sleep(5);
+          return { status: "cancelled", error: "operator interrupted", events: [], usage: {} };
+        }
+        return {
+          status: "succeeded",
+          output: { summary: "recovered after interrupt" },
+          events: [],
+          usage: {},
+        };
+      },
+    };
+    const service = new ApplicationService({
+      dataDir: temporaryDirectory(),
+      harness,
+      process: new FakeProcessAdapter(),
+      scriptedDelayMs: 0,
+    });
+    await service.start();
+    try {
+      const run = await service.createRun({
+        workflowId: "tiny",
+        idempotencyKey: "interrupt-agent",
+      });
+      let view = service.getView(run.runId)!;
+      for (
+        let tries = 0;
+        tries < 100 && !service.operatorState(run.runId)?.interruptibleInvocationIds.length;
+        tries++
+      ) {
+        await Bun.sleep(5);
+        view = service.getView(run.runId)!;
+      }
+      const attempt = Object.values(view.state.attempts).find((item) => item.status === "running")!;
+      const command = {
+        runId: run.runId,
+        invocationId: attempt.invocationId,
+        attemptId: attempt.id,
+        expectedRevision: view.revision,
+        actor: "operator",
+        idempotencyKey: "interrupt-one",
+      };
+      expect(() =>
+        service.interruptAttempt({
+          ...command,
+          attemptId: "old-attempt",
+          idempotencyKey: "interrupt-stale",
+        }),
+      ).toThrow(/no longer live/);
+      const result = service.interruptAttempt(command);
+      expect(service.interruptAttempt(command)).toEqual(result);
+      const interrupted = await waitForTerminal(service, run.runId);
+      expect(interrupted.state.status).toBe("failed");
+      expect(interrupted.state.control).toBe("none");
+      expect(interrupted.state.attempts[attempt.id]?.status).toBe("cancelled");
+      expect(service.operatorState(run.runId)?.retryableInvocationIds).toEqual([
+        attempt.invocationId,
+      ]);
+      service.retry({
+        runId: run.runId,
+        invocationId: attempt.invocationId,
+        expectedRevision: interrupted.revision,
+        actor: "operator",
+        idempotencyKey: "retry-interrupted",
+      });
+      const recovered = await waitForTerminal(service, run.runId);
+      expect(recovered.state.status).toBe("succeeded");
+      expect(recovered.state.attempts[attempt.id]?.status).toBe("cancelled");
+      expect(calls).toBe(2);
+    } finally {
+      await service.close();
+    }
+  });
+  test("requested changes deliver durable feedback and enforce the repair limit across restart", async () => {
+    const dataDir = temporaryDirectory();
+    let service = new ApplicationService({
+      dataDir,
+      process: new FakeProcessAdapter(),
+      scriptedDelayMs: 1,
+    });
+    await service.start();
+    const run = await service.createRun({
+      workflowId: "feature",
+      idempotencyKey: "review-repairs",
+    });
+    const pending = async (runId = run.runId) => {
+      for (let count = 0; count < 200; count++) {
+        const view = service.getView(runId)!;
+        const approval = Object.values(view.state.approvals).find(
+          (item) => item.status === "pending",
+        );
+        if (approval) return { view, approval };
+        await Bun.sleep(5);
+      }
+      const state = service.getView(runId)!.state;
+      throw new Error(
+        `approval did not become pending: ${JSON.stringify({ status: state.status, recovery: state.recovery, invocations: Object.values(state.invocations).map((item) => ({ node: item.nodeId, status: item.status, error: item.error, bindings: item.inputBindings })) })}`,
+      );
+    };
+    try {
+      for (let repair = 0; repair < 3; repair++) {
+        const { view, approval } = await pending();
+        const command = {
+          runId: run.runId,
+          invocationId: approval.invocationId,
+          decision: "changes-requested" as const,
+          feedback: `Revise requirement ${repair}`,
+          expectedRevision: view.revision,
+          actor: "reviewer",
+          idempotencyKey: `repair-${repair}`,
+        };
+        const result = service.decideApproval(command);
+        expect(service.decideApproval(command)).toEqual(result);
+        expect(() =>
+          service.decideApproval({ ...command, feedback: "different feedback" }),
+        ).toThrow(/payload conflict/);
+        await pending();
+        const next = service.getView(run.runId)!;
+        const replanned = Object.values(next.state.invocations)
+          .filter((item) => item.nodeId === "plan")
+          .at(-1)!;
+        const attempt = Object.values(next.state.attempts).find(
+          (item) => item.invocationId === replanned.id,
+        )!;
+        expect(JSON.stringify(attempt.contextManifest)).toContain(`Revise requirement ${repair}`);
+        expect(next.state.approvals[approval.id]?.feedback).toBe(command.feedback);
+        if (repair === 0) {
+          await service.close();
+          service = new ApplicationService({
+            dataDir,
+            process: new FakeProcessAdapter(),
+            scriptedDelayMs: 1,
+          });
+          await service.start();
+        }
+      }
+      const { view, approval } = await pending();
+      expect(() =>
+        service.decideApproval({
+          runId: run.runId,
+          invocationId: approval.invocationId,
+          decision: "changes-requested",
+          feedback: "one more",
+          expectedRevision: view.revision,
+          actor: "reviewer",
+          idempotencyKey: "repair-over-budget",
+        }),
+      ).toThrow(/repair budget/);
+      service.decideApproval({
+        runId: run.runId,
+        invocationId: approval.invocationId,
+        decision: "rejected",
+        expectedRevision: view.revision,
+        actor: "reviewer",
+        idempotencyKey: "reject-revised-plan",
+      });
+      const terminal = await waitForTerminal(service, run.runId);
+      expect(terminal.state.status).toBe("failed");
+      expect(
+        Object.values(terminal.state.invocations).some((item) => item.nodeId === "failed"),
+      ).toBe(true);
+      const acceptedRun = await service.createRun({
+        workflowId: "feature",
+        idempotencyKey: "review-repairs-accepted",
+      });
+      const first = await pending(acceptedRun.runId);
+      service.decideApproval({
+        runId: acceptedRun.runId,
+        invocationId: first.approval.invocationId,
+        decision: "changes-requested",
+        feedback: "Include the acceptance checks",
+        expectedRevision: first.view.revision,
+        actor: "reviewer",
+        idempotencyKey: "repair-before-acceptance",
+      });
+      const revised = await pending(acceptedRun.runId);
+      service.decideApproval({
+        runId: acceptedRun.runId,
+        invocationId: revised.approval.invocationId,
+        decision: "approved",
+        expectedRevision: revised.view.revision,
+        actor: "reviewer",
+        idempotencyKey: "accept-revised-plan",
+      });
+      const accepted = await waitForTerminal(service, acceptedRun.runId);
+      expect(accepted.state.status).toBe("succeeded");
+      expect(accepted.state.approvals[first.approval.id]?.status).toBe("changes-requested");
+      expect(accepted.state.approvals[revised.approval.id]?.status).toBe("approved");
+    } finally {
+      await service.close();
+    }
+  });
+  test("operator retries a terminal failed effect once and retains recovery history across restart", async () => {
+    let calls = 0;
+    const harness: HarnessAdapter = {
+      id: "scripted-fail-twice",
+      adapterVersion: "test",
+      capabilities: () => ({
+        "structured-output": "supported",
+        cancel: "supported",
+        retry: "supported",
+        reattach: "unsupported",
+      }),
+      async run(input) {
+        calls++;
+        input.onEvent?.({ type: "text", at: new Date().toISOString(), data: `turn-${calls}` });
+        return {
+          status: "succeeded",
+          output: (calls <= 2
+            ? { wrong: true }
+            : { summary: "recovered" }) as import("@kouro/core").JsonValue,
+          events: [],
+          usage: { quality: "unavailable" },
+        };
+      },
+    };
+    const dataDir = temporaryDirectory();
+    const service = new ApplicationService({
+      dataDir,
+      harness,
+      process: new FakeProcessAdapter(),
+      scriptedDelayMs: 0,
+    });
+    await service.start();
+    try {
+      const run = await service.createRun({ workflowId: "tiny", idempotencyKey: "operator-retry" });
+      const failed = await waitForTerminal(service, run.runId);
+      expect(failed.state.status).toBe("failed");
+      const invocation = Object.values(failed.state.invocations).find(
+        (item) => item.status === "failed",
+      )!;
+      expect(service.operatorState(run.runId)?.retryableInvocationIds).toEqual([invocation.id]);
+      const command = {
+        runId: run.runId,
+        invocationId: invocation.id,
+        expectedRevision: failed.revision,
+        actor: "operator",
+        idempotencyKey: "retry-once",
+      };
+      const retried = service.retry(command);
+      expect(retried.status).toBe("running");
+      expect(
+        service.coordinator.journal.db
+          .query("SELECT ended_at, error, output_artifact_ids_json FROM invocations WHERE id = ?1")
+          .get(invocation.id),
+      ).toEqual({
+        ended_at: null,
+        error: null,
+        output_artifact_ids_json: "[]",
+      });
+      expect(service.retry(command)).toEqual(retried);
+      const recovered = await waitForTerminal(service, run.runId);
+      expect(recovered.state.status).toBe("succeeded");
+      expect(calls).toBe(3);
+      expect(
+        Object.values(recovered.state.attempts)
+          .filter((item) => item.invocationId === invocation.id)
+          .map((item) => item.status),
+      ).toEqual(["failed", "failed", "succeeded"]);
+      expect(
+        service.getEvents(run.runId).filter((event) => event.type === "run.retried"),
+      ).toHaveLength(1);
+      expect(service.getHarnessActivity(run.runId, 0, 2, undefined, true)).toHaveLength(2);
+      expect(service.operatorState(run.runId)?.retryableInvocationIds).toEqual([]);
+    } finally {
+      await service.close();
+    }
+    const reopened = new ApplicationService({
+      dataDir,
+      process: new FakeProcessAdapter(),
+      scriptedDelayMs: 0,
+    });
+    await reopened.start();
+    try {
+      const run = reopened.listRuns()[0]!;
+      expect(reopened.getView(run.runId)?.state.status).toBe("succeeded");
+      expect(
+        reopened.getEvents(run.runId).filter((event) => event.type === "run.retried"),
+      ).toHaveLength(1);
+      const activity = reopened.getHarnessActivity(run.runId, 0, 500);
+      expect(activity.some((item) => (item.event as { data?: unknown }).data === "turn-3")).toBe(
+        true,
+      );
+      const tail = reopened.getHarnessActivity(run.runId, 0, 2, undefined, true);
+      expect(tail).toEqual(activity.slice(-2));
+    } finally {
+      await reopened.close();
+    }
+  });
   test("runs commands only when the node declares terminal.execute", async () => {
     const dataDir = temporaryDirectory();
     const repository = await fixtureRepository();
@@ -157,6 +454,7 @@ describe("Kouro M1 host", () => {
       }),
     );
     const cookie = paired.headers.get("set-cookie") ?? "";
+    const csrfToken = ((await paired.clone().json()) as { csrfToken: string }).csrfToken;
     const diff = await host.app.handle(
       new Request(`${origin}/api/runs/${one.runId}/diff`, { headers: { origin, cookie } }),
     );
@@ -164,6 +462,26 @@ describe("Kouro M1 host", () => {
     expect((await diff.json()) as { resultTree: string }).toMatchObject({
       resultTree: snapshot?.resultTree,
     });
+
+    const bypass = await host.app.handle(
+      new Request(`${origin}/api/runs/${one.runId}/actions`, {
+        method: "POST",
+        headers: {
+          origin,
+          cookie,
+          "content-type": "application/json",
+          "x-csrf-token": csrfToken,
+        },
+        body: JSON.stringify({
+          action: "deliver",
+          expectedRevision: 0,
+          idempotencyKey: "unreviewed-delivery",
+          message: "deliver without review",
+        }),
+      }),
+    );
+    expect(bypass.status).toBeGreaterThanOrEqual(400);
+    expect(readFileSync(join(repository, "README.md"), "utf8")).toBe("base\n");
 
     await expect(
       service.workspaceCommit({
@@ -214,6 +532,31 @@ describe("Kouro M1 host", () => {
     expect(view?.state.status).toBe("running");
     const approval = Object.values(view?.state.approvals ?? {})[0];
     expect(approval?.status).toBe("pending");
+    service.coordinator.journal.append({
+      runId: run.runId,
+      type: "harness.activity",
+      actor: "fixture",
+      payload: {
+        attemptId: "steer-attempt-fixture",
+        event: {
+          type: "log",
+          at: "2026-09-25T00:00:00.000Z",
+          data: {
+            status: "Steering fixture",
+            outcome: "requested",
+            idempotencyKey: "steer-fixture-key",
+            requestDigest: "steer-fixture-digest",
+          },
+        },
+      },
+    });
+    expect(
+      service.coordinator.journal.getSteeringCommand(run.runId, "steer-fixture-key"),
+    ).toMatchObject({
+      status: "requested",
+      requestDigest: "steer-fixture-digest",
+    });
+    view = service.getView(run.runId);
     expect(() =>
       service.decideApproval({
         runId: run.runId,
@@ -273,14 +616,19 @@ describe("Kouro M1 host", () => {
     const created = await service.createRun({ workflowId: "tiny", idempotencyKey: "one" });
     const view = await waitForTerminal(service, created.runId);
     expect(view.state.status).toBe("succeeded");
-    expect(view.revision).toBe(14);
+    expect(view.revision).toBeGreaterThanOrEqual(14);
     expect(Object.values(view.state.invocations).map((item) => item.nodeId)).toEqual([
       "scripted-agent",
       "safe-command",
       "complete",
     ]);
     expect(process.operations).toHaveLength(1);
-    expect(service.getEvents(created.runId).map((event) => event.type)).toEqual([
+    expect(
+      service
+        .getEvents(created.runId)
+        .filter((event) => event.type !== "harness.activity")
+        .map((event) => event.type),
+    ).toEqual([
       "run.started",
       "invocation.created",
       "attempt.reserved",
@@ -372,7 +720,22 @@ describe("Kouro M1 host", () => {
     );
     expect(accepted.status).toBe(200);
     const run = (await accepted.json()) as { id: string };
-    await waitForTerminal(service, run.id);
+    const completed = await waitForTerminal(service, run.id);
+    const attemptId = Object.values(completed.state.attempts).find(
+      (attempt) => attempt.harnessEvents?.length,
+    )?.id;
+    expect(attemptId).toBeDefined();
+    const history = await host.app.handle(
+      new Request(`${origin}/api/runs/${run.id}/activity?attemptId=${attemptId!}`, {
+        headers: { origin, cookie: cookie ?? "" },
+      }),
+    );
+    expect(history.status).toBe(200);
+    const historyBody = (await history.json()) as {
+      items: Array<{ attemptId: string; event: { data?: string } }>;
+    };
+    expect(historyBody.items.length).toBeGreaterThan(0);
+    expect(historyBody.items.every((item) => item.attemptId === attemptId)).toBe(true);
     await host.stop();
   });
 
@@ -628,6 +991,229 @@ describe("Kouro M1 host", () => {
     });
     expect(service.getView(run.runId)?.state.status).toBe("paused");
     expect(detached.status).toBe("paused");
+    await service.close();
+  });
+
+  test("cancelling an aborted scripted harness does not reserve a transport retry", async () => {
+    const harness: HarnessAdapter = {
+      id: "abort-rejecting-scripted",
+      adapterVersion: "test",
+      capabilities: () => ({
+        "structured-output": "supported",
+        cancel: "unsupported",
+        retry: "supported",
+        reattach: "unsupported",
+      }),
+      run(input) {
+        return new Promise((_, reject) => {
+          input.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("scripted transport aborted")),
+            { once: true },
+          );
+        });
+      },
+    };
+    const service = new ApplicationService({
+      dataDir: temporaryDirectory(),
+      process: new FakeProcessAdapter(),
+      harness,
+      scriptedDelayMs: 0,
+    });
+    await service.start();
+    const run = await service.createRun({ workflowId: "tiny", idempotencyKey: "cancel-no-retry" });
+    let view = service.getView(run.runId)!;
+    for (
+      let count = 0;
+      count < 200 &&
+      !Object.values(view.state.attempts).some((attempt) => attempt.status === "running");
+      count += 1
+    ) {
+      await Bun.sleep(5);
+      view = service.getView(run.runId)!;
+    }
+    expect(Object.values(view.state.attempts).some((attempt) => attempt.status === "running")).toBe(
+      true,
+    );
+    const receipt = service.control({
+      runId: run.runId,
+      action: "cancel",
+      expectedRevision: view.revision,
+      actor: "test",
+      idempotencyKey: "cancel-action",
+    });
+    expect(receipt.status).toBe("running");
+    expect(service.getView(run.runId)?.state.control).toBe("cancel-requested");
+    const cancelled = await waitForTerminal(service, run.runId);
+    expect(cancelled.state.status).toBe("cancelled");
+    expect(Object.values(cancelled.state.attempts)).toHaveLength(1);
+    expect(Object.values(cancelled.state.attempts).map((attempt) => attempt.status)).toEqual([
+      "cancelled",
+    ]);
+    await service.close();
+  });
+
+  test("unconfirmed harness shutdown durably blocks deletion until late settlement", async () => {
+    let release!: (result: Awaited<ReturnType<HarnessAdapter["run"]>>) => void;
+    const harness: HarnessAdapter = {
+      id: "ignores-cancel",
+      adapterVersion: "test",
+      capabilities: () => ({
+        "structured-output": "supported",
+        cancel: "unsupported",
+        retry: "unsupported",
+        reattach: "unsupported",
+      }),
+      run() {
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      },
+    };
+    const service = new ApplicationService({
+      dataDir: temporaryDirectory(),
+      process: new FakeProcessAdapter(),
+      harness,
+      scriptedDelayMs: 0,
+      agentIdleTimeoutMs: 10,
+      agentObservationGraceMs: 10,
+      cancelGraceMs: 10,
+    });
+    await service.start();
+    const run = await service.createRun({ workflowId: "tiny", idempotencyKey: "stuck-shutdown" });
+    const view = await waitForTerminal(service, run.runId);
+    expect(view.state.status).toBe("recovery-required");
+    await Bun.sleep(20);
+    const blocked = await service.previewRunDeletion(run.runId);
+    expect(blocked.canDelete).toBe(false);
+    expect(blocked.blockers?.some((blocker) => blocker.message.includes("Harness shutdown"))).toBe(
+      true,
+    );
+
+    const effect = service.coordinator.journal.db
+      .query("SELECT id FROM effects WHERE attempt_id = ?1")
+      .get(Object.keys(view.state.attempts)[0]!) as { id: string };
+    service.coordinator.journal.markRecoveryRequired(
+      effect.id,
+      "sibling child did not confirm termination",
+      "child-b-supervision",
+    );
+
+    release({
+      status: "cancelled",
+      error: "cancelled",
+      events: [],
+      usage: { quality: "unavailable" },
+    });
+    let recovered = await service.previewRunDeletion(run.runId);
+    for (
+      let count = 0;
+      count < 100 &&
+      !recovered.blockers?.some((blocker) => blocker.message.includes("child-b-supervision"));
+      count += 1
+    ) {
+      await Bun.sleep(5);
+      recovered = await service.previewRunDeletion(run.runId);
+    }
+    expect(recovered.canDelete).toBe(false);
+    expect(
+      recovered.blockers?.some((blocker) => blocker.message.includes("child-b-supervision")),
+    ).toBe(true);
+    service.coordinator.journal.confirmHarnessShutdown("child-b-supervision");
+    recovered = await service.previewRunDeletion(run.runId);
+    expect(recovered.canDelete).toBe(true);
+    await service.close();
+  });
+
+  test("new text starts a fresh observation grace after a stall warning", async () => {
+    let service!: ApplicationService;
+    const warningPrecededProgress: boolean[] = [];
+    const harness: HarnessAdapter = {
+      id: "progress-after-stall",
+      adapterVersion: "test",
+      capabilities: () => ({
+        "structured-output": "supported",
+        cancel: "supported",
+        retry: "unsupported",
+        reattach: "unsupported",
+      }),
+      run(input) {
+        return new Promise((resolve) => {
+          const warningPoll = setInterval(() => {
+            const warningSeen = service
+              .getEvents(input.runId)
+              .some(
+                (event) =>
+                  event.type === "harness.activity" &&
+                  JSON.stringify(event.payload).includes("Possibly stalled"),
+              );
+            if (!warningSeen) return;
+            clearInterval(warningPoll);
+            warningPrecededProgress.push(true);
+            setTimeout(
+              () =>
+                input.onEvent?.({
+                  type: "text",
+                  at: new Date().toISOString(),
+                  data: "provider is still working",
+                }),
+              20,
+            );
+          }, 5);
+          const finish = setTimeout(
+            () =>
+              resolve({
+                status: "succeeded",
+                output: { summary: "finished" },
+                events: [],
+                usage: { quality: "unavailable" },
+              }),
+            650,
+          );
+          input.signal?.addEventListener(
+            "abort",
+            () => {
+              clearInterval(warningPoll);
+              clearTimeout(finish);
+              resolve({
+                status: "cancelled",
+                error: "cancelled",
+                events: [],
+                usage: { quality: "unavailable" },
+              });
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+    const builder = new WorkflowBuilder({ id: "watchdog-progress" });
+    const agent = builder.agent("agent", { prompt: "work" });
+    const done = builder.complete("done");
+    builder.startAt(agent);
+    builder.sequence(agent, done);
+    service = new ApplicationService({
+      dataDir: temporaryDirectory(),
+      process: new FakeProcessAdapter(),
+      harness,
+      scriptedDelayMs: 0,
+      agentIdleTimeoutMs: 40,
+      agentObservationGraceMs: 120,
+    });
+    await service.start();
+    const run = await service.coordinator.createRun({
+      workflowId: "watchdog-progress",
+      bundle: await compileWorkflow(builder.build()),
+      idempotencyKey: "watchdog-progress",
+    });
+    const view = await waitForTerminal(service, run.run.runId);
+    expect(view.state.status).toBe("succeeded");
+    const events = view.state.attempts[Object.keys(view.state.attempts)[0]!]?.harnessEvents ?? [];
+    const warningIndex = events.findIndex((event) =>
+      JSON.stringify(event).includes("Possibly stalled"),
+    );
+    expect(warningIndex).toBeGreaterThanOrEqual(0);
+    expect(warningPrecededProgress).toEqual([true]);
     await service.close();
   });
 });

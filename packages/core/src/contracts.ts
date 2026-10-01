@@ -62,7 +62,13 @@ export type RunStatus =
   | "cancelled"
   | "interrupted"
   | "recovery-required";
-export type AttemptStatus = "reserved" | "running" | "succeeded" | "failed" | "recovery-required";
+export type AttemptStatus =
+  | "reserved"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "recovery-required";
 export type MissingBinding = "error" | "omit" | "default";
 
 export interface ArtifactType<T = unknown> {
@@ -135,6 +141,8 @@ export interface CommandNode {
   readonly executionMode?: "enforced" | "trusted-unrestricted";
   /** Node-scoped authority requested by this command. */
   readonly capabilities?: readonly WorkflowCapability[];
+  /** Run the command from the registered source repository checkout. */
+  readonly workspaceAccess?: "source-repository";
   readonly args: readonly string[];
   readonly inputPorts: readonly Port[];
   readonly outputPorts: readonly Port[];
@@ -357,6 +365,8 @@ export interface CommandEvidence {
 /** The host's automatic process outcome, kept separate from parsed workflow output. */
 export interface CommandResult {
   readonly exitCode: number | null;
+  /** Captured UTF-8 stdout, available to downstream workflow nodes. */
+  readonly stdout: string;
   readonly signal: string | null;
   readonly timeout: boolean | null;
   readonly spawnError: string | null;
@@ -473,7 +483,11 @@ export interface ForkGroupState {
   >;
 }
 
-export type ApprovalDecision = "approved" | "rejected";
+export type ApprovalDecision = "approved" | "rejected" | "changes-requested";
+export interface ApprovalReview {
+  readonly decision: ApprovalDecision;
+  readonly feedback: string;
+}
 export interface ApprovalState {
   readonly id: string;
   readonly invocationId: string;
@@ -483,6 +497,7 @@ export interface ApprovalState {
   readonly subjectRevision: number;
   readonly actor?: string;
   readonly decidedAt?: string;
+  readonly feedback?: string;
 }
 
 export interface RecoveryState {
@@ -522,6 +537,7 @@ export type LifecycleEventType =
   | "invocation.created"
   | "attempt.reserved"
   | "attempt.started"
+  | "attempt.cancelled"
   | "attempt.completed"
   | "invocation.completed"
   | "run.completed"
@@ -597,6 +613,10 @@ export interface AttemptReservedPayload {
 export interface AttemptStartedPayload {
   readonly attemptId: string;
 }
+export interface AttemptCancelledPayload {
+  readonly attemptId: string;
+  readonly reason: string;
+}
 export interface HarnessActivityPayload {
   readonly attemptId: string;
   readonly event: JsonValue;
@@ -651,6 +671,8 @@ export interface ApprovalDecidedPayload {
   readonly decision: ApprovalDecision;
   readonly bindingDigest: string;
   readonly subjectRevision: number;
+  readonly feedback?: string;
+  readonly output?: readonly ArtifactRef[];
 }
 export interface CounterIncrementedPayload {
   readonly counterId: string;
@@ -684,6 +706,7 @@ export type LifecycleEvent =
   | EventEnvelope<"invocation.cancelled", InvocationCancelledPayload>
   | EventEnvelope<"attempt.reserved", AttemptReservedPayload>
   | EventEnvelope<"attempt.started", AttemptStartedPayload>
+  | EventEnvelope<"attempt.cancelled", AttemptCancelledPayload>
   | EventEnvelope<"attempt.completed", AttemptCompletedPayload>
   | EventEnvelope<"invocation.completed", InvocationCompletedPayload>
   | EventEnvelope<"run.completed", RunCompletedPayload>

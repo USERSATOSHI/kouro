@@ -58,7 +58,10 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       `Event sequence ${event.sequence} must equal revision + 1 (${state.revision + 1})`,
     );
   }
-  if (["succeeded", "failed", "cancelled", "interrupted"].includes(state.status)) {
+  if (
+    ["succeeded", "failed", "cancelled", "interrupted"].includes(state.status) &&
+    !(["failed", "interrupted"].includes(state.status) && event.type === "run.retried")
+  ) {
     throw new Error(`Cannot apply ${event.type} after terminal run status ${state.status}`);
   }
   const next = {
@@ -134,6 +137,8 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       return attemptReserved(next, event);
     case "attempt.started":
       return attemptStarted(next, event);
+    case "attempt.cancelled":
+      return attemptCancelled(next, event);
     case "attempt.completed":
       return attemptCompleted(next, event);
     case "invocation.completed":
@@ -164,21 +169,93 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
     case "run.detached":
       return next;
     case "run.retried": {
+      if (next.status === "interrupted" && next.control !== "interrupt-requested")
+        throw new Error("Interrupted recovery requires a recorded interrupt request");
+      if (
+        !["running", "failed", "interrupted"].includes(next.status) ||
+        ((next.control ?? "none") !== "none" &&
+          !(next.status === "interrupted" && next.control === "interrupt-requested"))
+      )
+        throw new Error("Only a failed run without a pending control can be retried");
       const invocation = next.invocations[event.payload.invocationId];
       if (!invocation || invocation.status !== "failed")
         throw new Error("Only a failed terminal invocation can be retried");
       const source = next.attempts[event.payload.sourceAttemptId];
-      if (!source || source.invocationId !== invocation.id || source.status !== "failed")
+      if (
+        !source ||
+        source.invocationId !== invocation.id ||
+        !["failed", "cancelled"].includes(source.status)
+      )
         throw new Error("Retry source attempt is not failed");
       if (next.attempts[event.payload.attemptId]) throw new Error("Retry attempt already exists");
       return {
         ...next,
-        invocations: { ...next.invocations, [invocation.id]: { ...invocation, status: "running" } },
+        status: "running",
+        control: "none",
+        finishedAt: null,
+        scopes: {
+          ...next.scopes,
+          [next.rootScopeId]: { ...next.scopes[next.rootScopeId]!, status: "running" },
+        },
+        invocations: {
+          ...next.invocations,
+          [invocation.id]: {
+            ...invocation,
+            status: "running",
+            completedAt: null,
+            outcome: null,
+            error: undefined,
+            output: [],
+            evidence: [],
+            artifacts: [],
+          },
+        },
       };
     }
     default:
       return assertNever(event);
   }
+}
+
+/** Only declared, bounded feedback returns are eligible for an operator repair. */
+export function approvalRepairsRemaining(
+  bundle: Bundle,
+  state: ExecutionState,
+  invocationId: string,
+): number {
+  const invocation = state.invocations[invocationId];
+  const definition =
+    invocation && bundle.definitions[state.scopes[invocation.scopeId]?.definitionId ?? ""];
+  if (
+    !invocation ||
+    !definition ||
+    invocation.status !== "pending" ||
+    !definition.nodes.some((node) => node.id === invocation.nodeId && node.kind === "approval")
+  )
+    return 0;
+  const routes = definition.controlEdges.filter(
+    (edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === "changes-requested",
+  );
+  if (!routes.some((edge) => edge.default)) return 0;
+  const bounded = routes.filter((edge) => {
+    const guard = edge.guard as { kind?: string; counterId?: string } | undefined;
+    return (
+      guard?.kind === "counter-below-limit" &&
+      guard.counterId === edge.counterIncrement &&
+      edge.feedbackBindings?.some(
+        (binding) =>
+          binding.source.kind === "producer" && binding.source.sourceId === invocation.nodeId,
+      )
+    );
+  });
+  if (bounded.length !== 1) return 0;
+  const route = bounded[0]!;
+  const max =
+    definition.counters.find((counter) => counter.id === route.counterIncrement)?.max ?? 0;
+  return Math.max(
+    0,
+    max - (state.counters[`${invocation.scopeId}:${route.counterIncrement}`] ?? 0),
+  );
 }
 
 function approvalRequested(
@@ -229,6 +306,7 @@ function approvalDecided(
         status: p.decision,
         actor: event.actor,
         decidedAt: event.recordedAt,
+        ...(p.feedback ? { feedback: p.feedback } : {}),
       },
     },
     invocations: {
@@ -238,6 +316,7 @@ function approvalDecided(
         status,
         completedAt: event.recordedAt,
         outcome: p.decision,
+        output: p.output ?? [],
       },
     },
   };
@@ -322,7 +401,10 @@ function attemptReserved(
     (item) => item.invocationId === invocation.id,
   );
   const latest = [...priorAttempts].sort((left, right) => right.ordinal - left.ordinal)[0];
-  const retrying = invocation.status === "running" && latest?.status === "failed";
+  const retrying =
+    invocation.status === "running" &&
+    latest !== undefined &&
+    ["failed", "cancelled"].includes(latest.status);
   if (invocation.status !== "pending" && !retrying)
     throw new Error(`Invocation ${invocation.id} is not reservable from ${invocation.status}`);
   const attempt: AttemptState = {
@@ -366,6 +448,23 @@ function attemptStarted(
       [invocation.id]: { ...invocation, status: "running", startedAt: event.recordedAt },
     },
   };
+}
+
+function attemptCancelled(
+  state: ExecutionState,
+  event: Extract<LifecycleEvent, { type: "attempt.cancelled" }>,
+): ExecutionState {
+  const attempt = state.attempts[event.payload.attemptId];
+  if (!attempt) throw new Error(`Cannot cancel unknown attempt ${event.payload.attemptId}`);
+  if (attempt.status !== "reserved")
+    throw new Error(`Attempt ${attempt.id} is not cancellable from ${attempt.status}`);
+  const cancelled: AttemptState = {
+    ...attempt,
+    status: "cancelled",
+    finishedAt: event.recordedAt,
+    error: event.payload.reason,
+  };
+  return { ...state, attempts: { ...state.attempts, [attempt.id]: cancelled } };
 }
 
 function attemptCompleted(
@@ -437,7 +536,15 @@ function invocationCompleted(
     throw new Error(`Invocation ${invocation.id} cannot complete while its attempts are active`);
   }
   const latest = [...attempts].sort((left, right) => right.ordinal - left.ordinal)[0];
-  if (latest && latest.status !== payload.status) {
+  if (
+    latest &&
+    latest.status !== payload.status &&
+    !(
+      payload.outcome === "cancelled" &&
+      latest.status === "cancelled" &&
+      payload.status === "failed"
+    )
+  ) {
     throw new Error(
       `Invocation ${invocation.id} status ${payload.status} does not match latest attempt ${latest.status}`,
     );
@@ -476,9 +583,16 @@ function runCompleted(
   }
   if (
     event.payload.status === "succeeded" &&
-    invocations.some((invocation) => invocation.status !== "succeeded")
+    invocations.some(
+      (invocation) =>
+        invocation.status !== "succeeded" &&
+        !(
+          invocation.status === "failed" &&
+          invocations.some((next) => next.sourceInvocationId === invocation.id && next.sourceEdgeId)
+        ),
+    )
   ) {
-    throw new Error("Run cannot succeed with a non-succeeded invocation");
+    throw new Error("Run cannot succeed with an unhandled failed invocation");
   }
   if (state.startedAt && compareTime(event.recordedAt, state.startedAt) < 0)
     throw new Error("Run completed before it started");
@@ -845,6 +959,14 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
           edge.sourceNodeId === invocation.nodeId &&
           edge.outcome === (invocation.outcome ?? "success"),
       );
+      if (
+        Object.values(state.invocations).some(
+          (candidate) =>
+            candidate.sourceInvocationId === invocation.id &&
+            outgoing.some((edge) => edge.id === candidate.sourceEdgeId),
+        )
+      )
+        continue;
       for (const edge of selectEdges(outgoing, state, invocation.scopeId, bundle)) {
         // Join barriers are activated by the barrier itself once all declared
         // branches settle.  Do not create one join invocation per branch.
@@ -881,8 +1003,18 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
     }
     if (invocation.status === "failed") {
       const outgoing = scopeDefinition.controlEdges.filter(
-        (edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === "failure",
+        (edge) =>
+          edge.sourceNodeId === invocation.nodeId &&
+          edge.outcome === (invocation.outcome ?? "failure"),
       );
+      if (
+        Object.values(state.invocations).some(
+          (candidate) =>
+            candidate.sourceInvocationId === invocation.id &&
+            outgoing.some((edge) => edge.id === candidate.sourceEdgeId),
+        )
+      )
+        continue;
       const owningFork = scopeDefinition.nodes.find(
         (candidate) =>
           candidate.kind === "fork" &&
@@ -1096,9 +1228,10 @@ function guardAllows(
   // The compiler guarantees the counter exists; runtime treats absent state as zero.
   const definition = value.counterId;
   const current = state.counters[`${scopeId}:${definition}`] ?? 0;
-  const max = bundle.definitions[bundle.rootDefinitionId]?.counters.find(
-    (counter) => counter.id === definition,
-  )?.max;
+  const scopeDefinitionId = state.scopes[scopeId]?.definitionId ?? bundle.rootDefinitionId;
+  const max = (
+    bundle.definitions[scopeDefinitionId] ?? bundle.definitions[bundle.rootDefinitionId]
+  )?.counters.find((counter) => counter.id === definition)?.max;
   return max === undefined ? false : current < max;
 }
 

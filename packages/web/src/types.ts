@@ -1,3 +1,4 @@
+import { approvalRepairsRemaining } from "@kouro/core";
 import type {
   ArtifactRef,
   Bundle,
@@ -35,6 +36,8 @@ export interface WorkflowEdge {
   target: string;
   label?: string;
   definitionId?: string;
+  targetDefinitionId?: string;
+  relation?: "subagent";
 }
 export interface WorkflowGraph {
   nodes: WorkflowNode[];
@@ -111,7 +114,9 @@ export interface UiInvocation {
   artifactIds: string[];
   error?: string;
   approval?: {
-    status: "pending" | "approved" | "rejected";
+    status: "pending" | "approved" | "rejected" | "changes-requested";
+    feedback?: string;
+    repairsRemaining?: number;
     requestedAt?: string;
     decidedAt?: string;
   };
@@ -164,6 +169,10 @@ export interface ToolCallView {
   endedAt?: string;
   input?: unknown;
   output?: unknown;
+  outputArtifactId?: string;
+  outputBytes?: number;
+  error?: string;
+  scoutId?: string;
   invocationId?: string;
   attemptId?: string;
 }
@@ -234,6 +243,7 @@ export interface UiRunView {
   projectionVersion: number;
   runId: string;
   workflowId: string;
+  bundle: Bundle;
   revision: number;
   eventCursor: number;
   serverClock: string;
@@ -252,7 +262,10 @@ export interface UiRunView {
   usage: UsageView[];
   diagnostics: DiagnosticView[];
   capabilities: RunCapabilities;
-  liveActivity?: Array<{ attemptId: string; event: Record<string, unknown> }>;
+  retryableInvocationIds?: string[];
+  steerableInvocationIds?: string[];
+  interruptibleInvocationIds?: string[];
+  liveActivity?: Array<{ attemptId: string; cursor?: number; event: Record<string, unknown> }>;
 }
 export const asArray = <T>(value: Readonly<Record<string, T>> | undefined): T[] =>
   Object.values(value ?? {});
@@ -282,6 +295,8 @@ export function viewFromCore(view: CoreRunView): UiRunView {
         return {
           status: approval.status,
           decidedAt: approval.decidedAt,
+          feedback: approval.feedback,
+          repairsRemaining: approvalRepairsRemaining(view.bundle, view.state, item.id),
         };
       })(),
     };
@@ -384,27 +399,37 @@ export function viewFromCore(view: CoreRunView): UiRunView {
     const events = array(a.harnessEvents);
     for (const event of events) {
       const kind = text(event.type ?? event.kind) ?? "log";
-      if (kind === "tool" || kind === "tool_call" || kind === "tool_result")
-        tools.push({
-          id: text(event.id) ?? `${attempt.id}:tool:${tools.length}`,
-          name: text(event.name ?? event.tool) ?? "tool",
-          status: text(event.status) ?? (kind === "tool_result" ? "completed" : "started"),
-          capability: text(event.capability),
-          input: event.input,
-          output: event.output,
-          startedAt: text(event.startedAt ?? event.recordedAt),
+      const data = record(event.data) ?? event;
+      if (kind === "tool" || kind === "tool_call" || kind === "tool_result") {
+        const id = `${attempt.id}:${text(data.scoutId) ?? "parent"}:${text(data.requestId) ? `${text(data.requestId)}:` : ""}${text(data.id) ?? `tool:${tools.length}`}`;
+        const previous = tools.find((tool) => tool.id === id);
+        const next = {
+          ...previous,
+          id,
+          name: text(data.name ?? data.tool) ?? previous?.name ?? "tool",
+          status: text(data.status) ?? (kind === "tool_result" ? "completed" : "started"),
+          capability: text(data.capability) ?? previous?.capability,
+          input: data.input ?? previous?.input,
+          output: data.output ?? previous?.output,
+          outputArtifactId: text(data.outputArtifactId) ?? previous?.outputArtifactId,
+          outputBytes:
+            typeof data.outputBytes === "number" ? data.outputBytes : previous?.outputBytes,
+          error: text(data.error) ?? previous?.error,
+          scoutId: text(data.scoutId) ?? previous?.scoutId,
+          startedAt: previous?.startedAt ?? text(event.startedAt ?? event.recordedAt ?? event.at),
           endedAt: text(event.endedAt),
           invocationId: attempt.invocationId,
           attemptId: attempt.id,
-        });
-      else {
-        const data = record(event.data);
+        };
+        if (previous) tools[tools.indexOf(previous)] = next;
+        else tools.push(next);
+      } else {
         logs.push({
           id: text(event.id) ?? `${attempt.id}:log:${logs.length}`,
           level: text(event.level) ?? (kind === "error" ? "error" : "info"),
           message:
             text(event.message ?? event.detail ?? event.data) ??
-            text(data?.message ?? data?.text) ??
+            text(data.message ?? data.text ?? data.status ?? data.detail) ??
             kind,
           timestamp: text(event.timestamp ?? event.recordedAt ?? event.at),
           source: text(event.source ?? event.origin),
@@ -505,12 +530,19 @@ export function viewFromCore(view: CoreRunView): UiRunView {
   }
   // Kouro-owned run controls are declared by the host independently of native
   // harness capabilities. A prior attempt's sparse capability record must not
-  // hide pause/resume/detach once that attempt has completed.
+  // hide pause/resume/cancel/detach while the run is active.
   const runControls = record(m2?.capabilities);
   if (runControls)
-    for (const name of ["pause", "resume", "detach"] as const) {
-      const state = declaredCapability(runControls[name]);
-      if (state !== undefined) capabilities[name] = state;
+    for (const name of ["pause", "resume", "cancel", "detach", "retry", "steer"] as const) {
+      if (name in runControls)
+        capabilities[name] =
+          name === "pause"
+            ? view.state.status === "running"
+            : name === "resume"
+              ? view.state.status === "paused"
+              : name === "retry" || name === "steer"
+                ? runControls[name] === true
+                : view.state.status === "running" || view.state.status === "paused";
     }
   if (Object.values(view.state.approvals).some((approval) => approval.status === "pending")) {
     capabilities.approve = true;
@@ -535,7 +567,8 @@ export function viewFromCore(view: CoreRunView): UiRunView {
   const retryEligible = Object.values(view.state.invocations).some((invocation) => {
     if (invocation.status !== "failed") return false;
     return Object.values(view.state.attempts).some(
-      (attempt) => attempt.invocationId === invocation.id && attempt.status === "failed",
+      (attempt) =>
+        attempt.invocationId === invocation.id && ["failed", "cancelled"].includes(attempt.status),
     );
   });
   if (capabilities.retry !== true || !retryEligible) delete capabilities.retry;
@@ -545,6 +578,7 @@ export function viewFromCore(view: CoreRunView): UiRunView {
     projectionVersion: view.projectionVersion,
     runId: view.runId,
     workflowId: view.bundle.rootDefinitionId,
+    bundle: view.bundle,
     revision: view.revision,
     eventCursor: view.eventCursor,
     serverClock: view.serverClock,
@@ -566,29 +600,73 @@ export function viewFromCore(view: CoreRunView): UiRunView {
     usage,
     diagnostics,
     capabilities,
+    ...(Array.isArray(m2?.retryableInvocationIds)
+      ? { retryableInvocationIds: m2.retryableInvocationIds as string[] }
+      : {}),
+    ...(Array.isArray(m2?.steerableInvocationIds)
+      ? { steerableInvocationIds: m2.steerableInvocationIds as string[] }
+      : {}),
+    ...(Array.isArray(m2?.interruptibleInvocationIds)
+      ? { interruptibleInvocationIds: m2.interruptibleInvocationIds as string[] }
+      : {}),
   };
 }
 export function bundleGraph(bundle: Bundle): WorkflowGraph {
-  const definition: Definition = bundle.definitions[bundle.rootDefinitionId];
-  const nodes = definition.nodes.map((node, index) => ({
-    id: node.id,
-    label:
-      node.kind === "agent" ? node.role : node.kind === "command" ? node.executable : node.kind,
-    kind: node.kind,
-    role: node.kind === "agent" ? node.role : undefined,
-    position: { x: (index % 3) * 230 + 60, y: Math.floor(index / 3) * 150 + 65 },
-  }));
+  const definitions = Object.values(bundle.definitions);
+  const nodes = definitions.flatMap((definition: Definition) =>
+    definition.nodes.map((node, index) => ({
+      id: node.id,
+      label:
+        node.kind === "agent" ? node.role : node.kind === "command" ? node.executable : node.kind,
+      kind: node.kind,
+      role: node.kind === "agent" ? node.role : undefined,
+      definitionId: definition.id,
+      scopeId: definition.id === bundle.rootDefinitionId ? undefined : definition.id,
+      position: { x: (index % 3) * 230 + 60, y: Math.floor(index / 3) * 150 + 65 },
+    })),
+  );
   return {
     nodes,
-    edges: definition.controlEdges.map((edge) => ({
-      id: edge.id,
-      source: edge.sourceNodeId,
-      target: edge.targetNodeId,
-      label: edge.id.endsWith(":repair")
-        ? `${edge.outcome} · repair`
-        : edge.id.endsWith(":repair-exhausted")
-          ? `${edge.outcome} · exhausted`
-          : edge.outcome,
+    edges: [
+      ...definitions.flatMap((definition: Definition) =>
+        definition.controlEdges.map((edge) => ({
+          id: `${definition.id}:${edge.id}`,
+          source: edge.sourceNodeId,
+          target: edge.targetNodeId,
+          definitionId: definition.id,
+          label: edge.id.endsWith(":repair")
+            ? `${edge.outcome} · repair`
+            : edge.id.endsWith(":repair-exhausted")
+              ? `${edge.outcome} · exhausted`
+              : edge.outcome,
+        })),
+      ),
+      ...definitions.flatMap((definition: Definition) =>
+        (definition.scouts ?? []).flatMap((scout) => {
+          const child = bundle.definitions[scout.definitionId];
+          const scoutNode = child?.nodes.find((node) => node.kind === "agent");
+          if (!child || !scoutNode) return [];
+          const parents = definition.nodes.filter(
+            (node) =>
+              node.kind === "agent" && (node.uses === undefined || node.uses.includes(scout.id)),
+          );
+          return parents.map((parent) => ({
+            id: `${definition.id}:subagent:${parent.id}:${scout.id}`,
+            source: parent.id,
+            target: scoutNode.id,
+            definitionId: definition.id,
+            targetDefinitionId: child.id,
+            relation: "subagent" as const,
+            label: scout.id,
+          }));
+        }),
+      ),
+    ],
+    groups: definitions.map((definition) => ({
+      id: definition.id,
+      label: definition.id,
+      definitionId: definition.id,
+      ...(definition.id === bundle.rootDefinitionId ? {} : { parentId: bundle.rootDefinitionId }),
     })),
   };
 }

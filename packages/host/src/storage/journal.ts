@@ -13,6 +13,7 @@ import type {
   LifecycleEventType,
   ProjectionFrame,
   RunView,
+  JsonValue,
 } from "@kouro/core/contracts";
 import type { EvaluationEvidence } from "@kouro/core";
 import type {
@@ -38,6 +39,59 @@ import { OwnerLock } from "./lock.ts";
 
 type Listener = (frame: ProjectionFrame) => void;
 type StoredArtifact = StoredBlobRef;
+
+export type RunDeletionStatus =
+  | "requested"
+  | "workspace-cleanup-failed"
+  | "workspace-cleaned"
+  | "purge-failed"
+  | "database-purged"
+  | "blob-cleanup-failed"
+  | "completed";
+
+export interface RunDeletionBlocker {
+  readonly kind: string;
+  readonly id: string;
+  readonly message: string;
+}
+
+export interface RunDeletionRecord {
+  readonly runId: string;
+  readonly idempotencyKey: string;
+  readonly requestDigest: string;
+  readonly expectedRevision: number;
+  readonly actor: string;
+  readonly status: RunDeletionStatus;
+  readonly preview: Record<string, unknown>;
+  readonly blobDigests: readonly string[];
+  readonly error?: string;
+}
+
+interface RunDeletionRow {
+  run_id: string;
+  idempotency_key: string;
+  request_digest: string;
+  expected_revision: number;
+  actor: string;
+  status: RunDeletionStatus;
+  preview_json: string;
+  blobs_json: string;
+  error: string | null;
+}
+
+function toRunDeletion(row: RunDeletionRow): RunDeletionRecord {
+  return {
+    runId: row.run_id,
+    idempotencyKey: row.idempotency_key,
+    requestDigest: row.request_digest,
+    expectedRevision: row.expected_revision,
+    actor: row.actor,
+    status: row.status,
+    preview: parseJson<Record<string, unknown>>(row.preview_json),
+    blobDigests: parseJson<string[]>(row.blobs_json),
+    ...(row.error === null ? {} : { error: row.error }),
+  };
+}
 
 type AppendInput = {
   [T in LifecycleEventType]: {
@@ -352,6 +406,7 @@ export class Journal {
     status: ExperimentCellStatus = "running",
   ): void {
     this.tx(() => {
+      this.assertRunAvailable(runId);
       const result = this.db
         .query(
           "UPDATE experiment_cells SET status = ?1, run_id = COALESCE(run_id, ?2), updated_at = ?3 WHERE experiment_id = ?4 AND cell_key = ?5 AND (reservation_token = ?6 OR run_id = ?2)",
@@ -411,6 +466,7 @@ export class Journal {
     }
     const createdAt = now();
     const persisted = this.tx(() => {
+      for (const run of input.runs) this.assertRunAvailable(run.runId);
       const prior = this.db
         .query(
           "SELECT id, runs_json, anchors_json, evidence_revision, created_at FROM run_comparisons WHERE id = ?1",
@@ -1030,6 +1086,7 @@ export class Journal {
   private appendInTransaction(input: AppendInput): LifecycleEvent {
     const row = this.getRunRow(input.runId);
     if (!row) throw new Error(`Run not found: ${input.runId}`);
+    this.assertRunAvailable(input.runId);
     const prior = parseJson<{ state: ExecutionState; bundle: Bundle; serverClock: string }>(
       this.projectionJson(input.runId),
     );
@@ -1170,7 +1227,7 @@ export class Journal {
     artifacts: ArtifactRef[];
     evidence: ArtifactRef[];
     output: ArtifactRef[];
-    status: "succeeded" | "failed";
+    status: "succeeded" | "failed" | "cancelled";
     commandEvidence?: import("@kouro/core/contracts").CommandEvidence;
     error?: string;
     resolvedExecution?: import("@kouro/core/contracts").ResolvedExecution;
@@ -1198,7 +1255,7 @@ export class Journal {
       }));
       const changed = this.db
         .query("UPDATE effects SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'claimed'")
-        .run(input.status === "succeeded" ? "succeeded" : "failed", now(), input.effectId).changes;
+        .run(input.status, now(), input.effectId).changes;
       if (changed !== 1) throw new Error(`Effect ${input.effectId} is not claimed`);
       this.db
         .query("UPDATE outbox SET state = 'completed' WHERE effect_id = ?1")
@@ -1246,7 +1303,8 @@ export class Journal {
           type: "invocation.completed",
           payload: {
             invocationId: String(effect.payload.invocationId ?? ""),
-            status: input.status,
+            status: input.status === "cancelled" ? "failed" : input.status,
+            ...(input.status === "cancelled" ? { outcome: "cancelled" } : {}),
             output: input.output,
             evidence: input.evidence,
             artifacts: input.artifacts,
@@ -1258,7 +1316,32 @@ export class Journal {
     });
   }
 
-  markRecoveryRequired(effectId: string, reason: string): void {
+  cancelReservedEffect(attemptId: string, reason: string): void {
+    const effect = this.db
+      .query("SELECT id, run_id as runId FROM effects WHERE attempt_id = ?1 AND state = 'reserved'")
+      .get(attemptId) as { id: string; runId: string } | null;
+    if (!effect) return;
+    this.tx(() => {
+      const changed = this.db
+        .query(
+          "UPDATE effects SET state = 'cancelled', updated_at = ?1 WHERE id = ?2 AND state = 'reserved'",
+        )
+        .run(now(), effect.id).changes;
+      if (changed !== 1) return;
+      this.db.query("UPDATE outbox SET state = 'completed' WHERE effect_id = ?1").run(effect.id);
+      this.db
+        .query("UPDATE attempts SET state = 'cancelled', ended_at = ?1, error = ?2 WHERE id = ?3")
+        .run(now(), reason, attemptId);
+      this.appendInTransaction({
+        runId: effect.runId,
+        type: "attempt.cancelled",
+        payload: { attemptId, reason },
+        actor: "system",
+      });
+    });
+  }
+
+  markRecoveryRequired(effectId: string, reason: string, shutdownId = id("shutdown")): void {
     const effect = this.getEffect(effectId);
     if (!effect) return;
     this.tx(() => {
@@ -1267,16 +1350,45 @@ export class Journal {
           "UPDATE effects SET state = 'unknown', updated_at = ?1 WHERE id = ?2 AND state = 'claimed'",
         )
         .run(now(), effectId).changes;
-      if (changed !== 1) return;
-      this.db.query("UPDATE outbox SET state = 'unknown' WHERE effect_id = ?1").run(effectId);
-      this.appendInTransaction({
-        runId: effect.runId,
-        type: "recovery.required",
-        payload: { code: "effect-ambiguous", subjectId: effectId, detail: reason },
-        actor: "system",
-        subjectId: effectId,
-      });
+      if (changed === 1) {
+        this.db.query("UPDATE outbox SET state = 'unknown' WHERE effect_id = ?1").run(effectId);
+        this.db
+          .query(
+            "UPDATE attempts SET state = 'recovery-required', ended_at = ?1, error = ?2 WHERE id = ?3",
+          )
+          .run(now(), reason, effect.attemptId);
+      }
+      this.db
+        .query(
+          "INSERT OR IGNORE INTO unconfirmed_harness_shutdowns(shutdown_id, attempt_id, run_id, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .run(shutdownId, effect.attemptId, effect.runId, reason, now());
+      if (changed === 1) {
+        this.appendInTransaction({
+          runId: effect.runId,
+          type: "attempt.completed",
+          payload: {
+            attemptId: effect.attemptId,
+            status: "recovery-required",
+            error: reason,
+          },
+          actor: "system",
+        });
+        this.appendInTransaction({
+          runId: effect.runId,
+          type: "recovery.required",
+          payload: { code: "effect-ambiguous", subjectId: effectId, detail: reason },
+          actor: "system",
+          subjectId: effectId,
+        });
+      }
     });
+  }
+
+  confirmHarnessShutdown(shutdownId: string): void {
+    this.db
+      .query("DELETE FROM unconfirmed_harness_shutdowns WHERE shutdown_id = ?1")
+      .run(shutdownId);
   }
 
   insertArtifact(ref: StoredArtifact): void {
@@ -1302,6 +1414,266 @@ export class Journal {
       .get(runId) as (RunSummary & { input_json: string }) | null;
     return row ? this.runSummary(row) : null;
   }
+
+  getRunDeletion(runId: string): RunDeletionRecord | undefined {
+    const row = this.db
+      .query("SELECT * FROM run_deletions WHERE run_id = ?1")
+      .get(runId) as RunDeletionRow | null;
+    return row ? toRunDeletion(row) : undefined;
+  }
+
+  listIncompleteRunDeletions(): RunDeletionRecord[] {
+    const rows = this.db
+      .query("SELECT * FROM run_deletions WHERE status <> 'completed' ORDER BY updated_at")
+      .all() as RunDeletionRow[];
+    return rows.map(toRunDeletion);
+  }
+
+  runDeletionBlockers(runId: string): RunDeletionBlocker[] {
+    const blockers: RunDeletionBlocker[] = [];
+    const unconfirmedShutdowns = this.db
+      .query(
+        "SELECT shutdown_id, attempt_id, detail FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 ORDER BY created_at",
+      )
+      .all(runId) as Array<{ shutdown_id: string; attempt_id: string; detail: string }>;
+    blockers.push(
+      ...unconfirmedShutdowns.map((row) => ({
+        kind: "unconfirmed-harness-shutdown",
+        id: row.shutdown_id,
+        message: `Harness shutdown ${row.shutdown_id} for attempt ${row.attempt_id} is unconfirmed: ${row.detail}`,
+      })),
+    );
+    const checkpoints = this.db
+      .query("SELECT id FROM checkpoints WHERE source_run_id = ?1")
+      .all(runId) as Array<{ id: string }>;
+    blockers.push(
+      ...checkpoints.map((row) => ({
+        kind: "checkpoint",
+        id: row.id,
+        message: `Checkpoint ${row.id} retains this run as its source.`,
+      })),
+    );
+    const cells = this.db
+      .query("SELECT experiment_id, cell_key FROM experiment_cells WHERE run_id = ?1")
+      .all(runId) as Array<{ experiment_id: string; cell_key: string }>;
+    blockers.push(
+      ...cells.map((row) => ({
+        kind: "experiment-cell",
+        id: `${row.experiment_id}/${row.cell_key}`,
+        message: `Experiment cell ${row.experiment_id}/${row.cell_key} retains this run.`,
+      })),
+    );
+    const comparisons = this.db.query("SELECT id, runs_json FROM run_comparisons").all() as Array<{
+      id: string;
+      runs_json: string;
+    }>;
+    blockers.push(
+      ...comparisons
+        .filter((row) =>
+          parseJson<ComparisonRunRef[]>(row.runs_json).some((run) => run.runId === runId),
+        )
+        .map((row) => ({
+          kind: "comparison",
+          id: row.id,
+          message: `Comparison ${row.id} retains a pinned revision of this run.`,
+        })),
+    );
+    const records = this.db.query("SELECT id, record_json FROM checkpoint_records").all() as Array<{
+      id: string;
+      record_json: string;
+    }>;
+    blockers.push(
+      ...records
+        .filter((row) => payloadReferencesRun(parseJson<unknown>(row.record_json), runId))
+        .map((row) => ({
+          kind: "checkpoint-record",
+          id: row.id,
+          message: `Checkpoint record ${row.id} retains this run.`,
+        })),
+    );
+    const evidence = this.db
+      .query("SELECT evidence_id, payload_json FROM evaluation_evidence WHERE run_id <> ?1")
+      .all(runId) as Array<{ evidence_id: string; payload_json: string }>;
+    blockers.push(
+      ...evidence
+        .filter((row) => payloadReferencesRun(parseJson<unknown>(row.payload_json), runId))
+        .map((row) => ({
+          kind: "evaluation-evidence",
+          id: row.evidence_id,
+          message: `Evaluation evidence ${row.evidence_id} cites this run.`,
+        })),
+    );
+    const artifacts = this.db
+      .query("SELECT id FROM artifacts WHERE run_id = ?1")
+      .all(runId) as Array<{ id: string }>;
+    if (artifacts.length) {
+      const ids = new Set(artifacts.map(({ id: artifactId }) => artifactId));
+      const scoutRefs = this.db
+        .query(
+          "SELECT run_id, request_id, result_artifact_id FROM scout_requests WHERE run_id <> ?1 AND result_artifact_id IS NOT NULL",
+        )
+        .all(runId) as Array<{ run_id: string; request_id: string; result_artifact_id: string }>;
+      blockers.push(
+        ...scoutRefs
+          .filter((row) => ids.has(row.result_artifact_id))
+          .map((row) => ({
+            kind: "scout-result",
+            id: `${row.run_id}/${row.request_id}`,
+            message: `A delegated result in ${row.run_id} retains one of this run's artifacts.`,
+          })),
+      );
+    }
+    return blockers;
+  }
+
+  beginRunDeletion(input: {
+    runId: string;
+    expectedRevision: number;
+    idempotencyKey: string;
+    actor: string;
+    preview: Record<string, unknown>;
+  }): RunDeletionRecord {
+    if (!input.idempotencyKey.trim()) throw new Error("idempotency key is required");
+    if (!input.actor.trim()) throw new Error("deletion actor is required");
+    const requestDigest = createHash("sha256")
+      .update(
+        canonicalize({
+          runId: input.runId,
+          expectedRevision: input.expectedRevision,
+          actor: input.actor,
+        }),
+      )
+      .digest("hex");
+    return this.tx(() => {
+      const prior = this.db
+        .query("SELECT * FROM run_deletions WHERE run_id = ?1")
+        .get(input.runId) as RunDeletionRow | null;
+      if (prior) {
+        if (prior.status === "completed") return toRunDeletion(prior);
+        if (
+          prior.idempotency_key !== input.idempotencyKey ||
+          prior.request_digest !== requestDigest
+        )
+          throw new Error("run deletion is already in progress with a different request");
+        return toRunDeletion(prior);
+      }
+      const run = this.getRunRow(input.runId);
+      if (!run) throw new Error(`Run not found: ${input.runId}`);
+      if (run.revision !== input.expectedRevision)
+        throw new Error("stale-action: run revision changed");
+      if (
+        !["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(
+          run.status,
+        )
+      )
+        throw new Error("run deletion requires a terminal run");
+      const activeAttempts = this.db
+        .query("SELECT id FROM attempts WHERE run_id = ?1 AND state IN ('reserved', 'running')")
+        .all(input.runId) as Array<{ id: string }>;
+      if (activeAttempts.length) throw new Error("run deletion is blocked by active attempts");
+      const blockers = this.runDeletionBlockers(input.runId);
+      if (blockers.length)
+        throw new Error(`run deletion blocked: ${blockers.map((item) => item.message).join(" ")}`);
+      const timestamp = now();
+      this.db
+        .query(
+          "INSERT INTO run_deletions(run_id, idempotency_key, request_digest, expected_revision, actor, status, preview_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?7, ?7)",
+        )
+        .run(
+          input.runId,
+          input.idempotencyKey,
+          requestDigest,
+          input.expectedRevision,
+          input.actor,
+          json(input.preview),
+          timestamp,
+        );
+      return this.getRunDeletion(input.runId)!;
+    });
+  }
+
+  advanceRunDeletion(
+    runId: string,
+    status: RunDeletionStatus,
+    input: { error?: string; blobDigests?: readonly string[] } = {},
+  ): RunDeletionRecord {
+    this.db
+      .query(
+        "UPDATE run_deletions SET status = ?1, error = ?2, blobs_json = COALESCE(?3, blobs_json), updated_at = ?4 WHERE run_id = ?5",
+      )
+      .run(
+        status,
+        input.error ?? null,
+        input.blobDigests ? json(input.blobDigests) : null,
+        now(),
+        runId,
+      );
+    const record = this.getRunDeletion(runId);
+    if (!record) throw new Error(`Run deletion is not registered: ${runId}`);
+    return record;
+  }
+
+  purgeRunData(runId: string): readonly string[] {
+    return this.tx(() => {
+      const deletion = this.getRunDeletion(runId);
+      if (!deletion) throw new Error(`Run deletion is not registered: ${runId}`);
+      if (deletion.status === "database-purged" || deletion.status === "blob-cleanup-failed")
+        return deletion.blobDigests;
+      if (deletion.status === "completed") return [];
+      if (deletion.status !== "workspace-cleaned" && deletion.status !== "purge-failed")
+        throw new Error(`workspace cleanup must complete before run purge (${deletion.status})`);
+      const blockers = this.runDeletionBlockers(runId);
+      if (blockers.length)
+        throw new Error(`run deletion blocked: ${blockers.map((item) => item.message).join(" ")}`);
+      const digests = (
+        this.db
+          .query(
+            "SELECT DISTINCT a.digest FROM artifacts a WHERE a.run_id = ?1 AND a.digest <> '' AND NOT EXISTS (SELECT 1 FROM artifacts other WHERE other.digest = a.digest AND other.run_id <> ?1)",
+          )
+          .all(runId) as Array<{ digest: string }>
+      ).map(({ digest }) => digest);
+
+      this.db
+        .query(
+          "DELETE FROM collaboration_message_reservations WHERE message_id IN (SELECT id FROM collaboration_messages WHERE run_id = ?1)",
+        )
+        .run(runId);
+      this.db
+        .query(
+          "DELETE FROM collaboration_batches WHERE wait_id IN (SELECT id FROM collaboration_waits WHERE run_id = ?1)",
+        )
+        .run(runId);
+      this.db.query("DELETE FROM collaboration_waits WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_messages WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_channels WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_participants WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_usage WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM collaboration_grants WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM scout_deliveries WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM scout_requests WHERE run_id = ?1").run(runId);
+      this.db
+        .query("DELETE FROM outbox WHERE effect_id IN (SELECT id FROM effects WHERE run_id = ?1)")
+        .run(runId);
+      this.db.query("DELETE FROM effects WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM attempts WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM invocations WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM artifacts WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM evaluation_evidence WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM delivery_actions WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM command_receipts WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM run_events WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM projection_frames WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM run_projections WHERE run_id = ?1").run(runId);
+      this.db.query("DELETE FROM runs WHERE id = ?1").run(runId);
+      this.db
+        .query(
+          "UPDATE run_deletions SET status = 'database-purged', blobs_json = ?1, error = NULL, updated_at = ?2 WHERE run_id = ?3",
+        )
+        .run(json(digests), now(), runId);
+      return digests;
+    });
+  }
+
   listRuns(): RunSummary[] {
     const rows = this.db
       .query(
@@ -1355,6 +1727,29 @@ export class Journal {
       .get(runId) as { view_json: string } | null;
     return value ? parseJson<RunView>(value.view_json) : null;
   }
+
+  getViewAtRevision(runId: string, revision: number): RunView | null {
+    const row = this.getRunRow(runId);
+    if (!row) return null;
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision > row.revision)
+      throw new Error(`invalid pinned revision ${revision} for run ${runId}`);
+    let state = createInitialState(runId);
+    let recordedAt: string | undefined;
+    let cursor = 0;
+    while (cursor < revision) {
+      const events = this.getEvents(runId, cursor, Math.min(500, revision - cursor));
+      if (!events.length) break;
+      for (const event of events) {
+        if (event.sequence > revision) break;
+        state = reduceEvent(state, event);
+        recordedAt = event.recordedAt;
+        cursor = event.sequence;
+      }
+    }
+    if (state.revision !== revision)
+      throw new Error(`pinned revision ${revision} is not fully retained for run ${runId}`);
+    return createRunView(parseJson<Bundle>(row.bundle_json), state, recordedAt ?? row.createdAt);
+  }
   getRunRow(runId: string): RunRow | null {
     return this.db
       .query(
@@ -1373,6 +1768,7 @@ export class Journal {
     const run = this.getRunRow(certificate.sourceRunId);
     if (!run) throw new Error(`Run not found: ${certificate.sourceRunId}`);
     return this.tx(() => {
+      this.assertRunAvailable(certificate.sourceRunId);
       const prior = this.db
         .query("SELECT certificate_json, certificate_digest FROM checkpoints WHERE id = ?1")
         .get(certificate.checkpointId) as {
@@ -1545,6 +1941,65 @@ export class Journal {
       payload: parseJson<Record<string, unknown>>(String(row.payload_json)),
     })) as unknown as LifecycleEvent[];
   }
+  getHarnessActivity(
+    runId: string,
+    after = 0,
+    limit = 200,
+    attemptId?: string,
+    tail = false,
+  ): Array<{ cursor: number; attemptId: string; event: JsonValue }> {
+    const rows = this.db
+      .query(
+        `SELECT sequence, payload_json FROM run_events WHERE run_id = ?1 AND type = 'harness.activity' AND sequence > ?2 ${attemptId ? "AND json_extract(payload_json, '$.attemptId') = ?4" : ""} ORDER BY sequence ${tail ? "DESC" : "ASC"} LIMIT ?3`,
+      )
+      .all(
+        runId,
+        after,
+        Math.max(1, Math.min(500, limit)),
+        ...(attemptId ? [attemptId] : []),
+      ) as Array<{
+      sequence: number;
+      payload_json: string;
+    }>;
+    return (tail ? rows.reverse() : rows).flatMap((row) => {
+      const payload = parseJson<Record<string, unknown>>(row.payload_json);
+      if (typeof payload.attemptId !== "string") return [];
+      return [
+        {
+          cursor: row.sequence,
+          attemptId: payload.attemptId,
+          event: payload.event as JsonValue,
+        },
+      ];
+    });
+  }
+  getSteeringCommand(
+    runId: string,
+    idempotencyKey: string,
+  ): {
+    requestDigest: string;
+    status: string;
+    revision?: number;
+    detail?: string;
+  } | null {
+    const row = this.db
+      .query(
+        "SELECT json_extract(payload_json, '$.event.data.requestDigest') AS request_digest, json_extract(payload_json, '$.event.data.outcome') AS status, json_extract(payload_json, '$.event.data.revision') AS revision, json_extract(payload_json, '$.event.data.detail') AS detail FROM run_events WHERE run_id = ?1 AND type = 'harness.activity' AND json_extract(payload_json, '$.event.data.idempotencyKey') = ?2 ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(runId, idempotencyKey) as {
+      request_digest: string | null;
+      status: string | null;
+      revision: number | null;
+      detail: string | null;
+    } | null;
+    if (!row?.request_digest || !row.status) return null;
+    return {
+      requestDigest: row.request_digest,
+      status: row.status,
+      ...(typeof row.revision === "number" ? { revision: row.revision } : {}),
+      ...(typeof row.detail === "string" ? { detail: row.detail } : {}),
+    };
+  }
   getFrames(runId: string, after = 0, limit = 500): ProjectionFrame[] {
     const rows = this.db
       .query(
@@ -1562,6 +2017,24 @@ export class Journal {
   }
   hasArtifactDigest(digest: string): boolean {
     return Boolean(this.db.query("SELECT 1 FROM artifacts WHERE digest = ?1 LIMIT 1").get(digest));
+  }
+
+  runArtifactDigests(runId: string): string[] {
+    return (
+      this.db
+        .query(
+          "SELECT DISTINCT a.digest FROM artifacts a WHERE a.run_id = ?1 AND a.digest <> '' AND NOT EXISTS (SELECT 1 FROM artifacts other WHERE other.digest = a.digest AND other.run_id <> ?1)",
+        )
+        .all(runId) as Array<{ digest: string }>
+    ).map(({ digest }) => digest);
+  }
+
+  private assertRunAvailable(runId: string): void {
+    const deletion = this.db
+      .query("SELECT status FROM run_deletions WHERE run_id = ?1")
+      .get(runId) as { status: RunDeletionStatus } | null;
+    if (deletion && deletion.status !== "completed")
+      throw new Error(`run is being deleted: ${runId}`);
   }
 
   /** Persist evaluator output separately from the run projection. Repeating an
@@ -1588,6 +2061,10 @@ export class Journal {
       return parseJson<EvaluationEvidence>(prior.payload_json);
     }
     this.tx(() => {
+      this.assertRunAvailable(evidence.target.runId);
+      for (const source of evidence.provenance ?? []) {
+        if (source.kind === "run") this.assertRunAvailable(source.id);
+      }
       this.db
         .query(
           "INSERT INTO evaluation_evidence(evidence_id, run_id, revision, tree_digest, evaluator_id, evaluator_version, evidence_class, status, experiment_id, cell_key, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -1746,6 +2223,14 @@ export class Journal {
   }
 
   private updateEntityTables(event: LifecycleEvent, bundle: Bundle): void {
+    if (event.type === "run.retried") {
+      this.db
+        .query(
+          "UPDATE invocations SET state = 'running', ended_at = NULL, error = NULL, output_artifact_ids_json = '[]' WHERE id = ?1 AND run_id = ?2",
+        )
+        .run(event.payload.invocationId, event.runId);
+      return;
+    }
     if (event.type === "invocation.created") {
       const definition = bundle.definitions[bundle.rootDefinitionId];
       const kind =
@@ -1778,6 +2263,12 @@ export class Journal {
           .run(event.recordedAt, row.invocationId);
       return;
     }
+    if (event.type === "attempt.cancelled") {
+      this.db
+        .query("UPDATE attempts SET state = 'cancelled', ended_at = ?1, error = ?2 WHERE id = ?3")
+        .run(event.recordedAt, event.payload.reason, event.payload.attemptId);
+      return;
+    }
     if (event.type === "attempt.completed") {
       this.db
         .query("UPDATE attempts SET state = ?1, ended_at = ?2, error = ?3 WHERE id = ?4")
@@ -1787,6 +2278,12 @@ export class Journal {
           event.payload.error ?? null,
           event.payload.attemptId,
         );
+      return;
+    }
+    if (event.type === "invocation.cancelled") {
+      this.db
+        .query("UPDATE invocations SET state = 'failed', ended_at = ?1, error = ?2 WHERE id = ?3")
+        .run(event.recordedAt, event.payload.reason, event.payload.invocationId);
       return;
     }
     if (event.type === "invocation.completed") {
@@ -1814,3 +2311,14 @@ export class Journal {
 }
 
 export type { StoredArtifact };
+
+function payloadReferencesRun(value: unknown, runId: string): boolean {
+  if (Array.isArray(value)) return value.some((item) => payloadReferencesRun(item, runId));
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if ((record.kind === "run" || record.type === "run") && record.id === runId) return true;
+  for (const key of ["runId", "sourceRunId", "candidateRunId", "parentRunId", "childRunId"]) {
+    if (record[key] === runId) return true;
+  }
+  return Object.values(record).some((item) => payloadReferencesRun(item, runId));
+}

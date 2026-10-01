@@ -4,6 +4,7 @@ import type {
   BindingSource,
   CompleteNode,
   ApprovalNode,
+  ApprovalReview,
   CounterDefinition,
   CommandNode,
   CommandResult,
@@ -120,6 +121,7 @@ export interface CommandOptions {
   readonly executable: string;
   readonly executionMode?: "enforced" | "trusted-unrestricted";
   readonly capabilities?: readonly WorkflowCapability[];
+  readonly workspaceAccess?: "source-repository";
   readonly args?: readonly string[];
   readonly input?: Readonly<Record<string, ValueBinding>>;
   readonly timeoutMs?: number;
@@ -540,6 +542,9 @@ export class WorkflowBuilder {
       ...(options.capabilities === undefined
         ? {}
         : { capabilities: [...new Set(options.capabilities)].sort() }),
+      ...(options.workspaceAccess === undefined
+        ? {}
+        : { workspaceAccess: options.workspaceAccess }),
       args: [...(options.args ?? [])],
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), true),
@@ -596,7 +601,16 @@ export class WorkflowBuilder {
   approval(
     id: string,
     options: { input?: Readonly<Record<string, ValueBinding>>; action?: string } = {},
-  ): NodeHandle<never, false> {
+  ): NodeHandle<ApprovalReview, true> {
+    const output = defaultOutput<ApprovalReview>(id, undefined, {
+      type: "object",
+      required: ["decision", "feedback"],
+      additionalProperties: false,
+      properties: {
+        decision: { type: "string", enum: ["approved", "rejected", "changes-requested"] },
+        feedback: { type: "string" },
+      },
+    });
     const node: InternalNode = {
       id,
       kind: "approval",
@@ -604,11 +618,11 @@ export class WorkflowBuilder {
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) =>
         port(name, this.schemaOf(value), false),
       ),
-      outputPorts: [],
+      outputPorts: [output],
       bindings: bindings(options.input, this),
     } as InternalNode;
     this.addNode(node);
-    return this.handle<never, false>(id, undefined);
+    return this.handle(id, output);
   }
   call<T = unknown>(
     id: string,
@@ -937,6 +951,14 @@ export class WorkflowBuilder {
     assertHandleOwner(target, this);
     if (!this.nodeMap.has(sourceNodeId)) throw new Error(`Unknown source node ${sourceNodeId}`);
     if (!this.nodeMap.has(target.id)) throw new Error(`Unknown target node ${target.id}`);
+    for (const [name, value] of Object.entries(options.feedbackBindings ?? {})) {
+      const targetNode = this.nodeMap.get(target.id)!;
+      if (!targetNode.inputPorts.some((input) => input.name === name))
+        this.nodeMap.set(target.id, {
+          ...targetNode,
+          inputPorts: [...targetNode.inputPorts, port(name, this.schemaOf(value), false)],
+        } as InternalNode);
+    }
     const edge: ControlEdge = {
       id: options.id ?? `${sourceNodeId}:${outcome}:${target.id}:${this.edgeList.length}`,
       sourceNodeId,
@@ -1069,6 +1091,7 @@ function stripInternal(node: InternalNode): Node {
       executable: node.executable,
       ...(node.executionMode === undefined ? {} : { executionMode: node.executionMode }),
       ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),
+      ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
       args: node.args,
       timeoutMs: node.timeoutMs,
       acceptedExitCodes: node.acceptedExitCodes,
@@ -1116,6 +1139,7 @@ export const commandResultSchema: JsonValue = {
   type: "object",
   properties: {
     exitCode: { type: ["integer", "null"] },
+    stdout: { type: "string" },
     executionMode: { enum: ["enforced", "trusted-unrestricted"] },
     signal: { type: ["string", "null"] },
     timeout: { type: ["boolean", "null"] },
@@ -1126,6 +1150,7 @@ export const commandResultSchema: JsonValue = {
   },
   required: [
     "exitCode",
+    "stdout",
     "signal",
     "timeout",
     "spawnError",

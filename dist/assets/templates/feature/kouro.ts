@@ -76,5 +76,10 @@ workflow.startAt(plan);
 plan.on("success").to(approval);
 approval.on("approved").to(implement);
 approval.on("rejected").to(failed);
+approval.on("changes-requested").repair(plan, {
+  maxRepairs: 3,
+  feedback: approval.output,
+  exhausted: failed,
+});
 workflow.sequence(implement, typecheck, validate, done);
 export default workflow.build();

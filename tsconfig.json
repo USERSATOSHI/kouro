@@ -21,6 +21,7 @@
     "packages/**/*.tsx",
     "scripts/**/*.ts",
     "playwright.config.ts",
+    "playwright.native.config.ts",
     "tests/**/*.ts"
   ]
 }
