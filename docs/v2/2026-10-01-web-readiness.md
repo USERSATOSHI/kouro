@@ -42,7 +42,7 @@ The reference behaviors were direct access to invocation activity, readable mess
 All commands below were executed against this checkout. Browser hosts used isolated temporary data on port 43281; the native browser host used port 43282.
 
 - `bun run typecheck`, `bun run lint`, `bun run format:check`, and `git diff --check` pass.
-- `bun test packages scripts`: **192 passing tests**, zero failures. Includes actual Pi SDK local discovery/tool activation/result consumption and stale-default rejection, retry idempotency/restart history, scoped interrupt and cancelled-attempt retry, approval feedback across restart, repair exhaustion and subsequent acceptance, independent child settings, lifecycle/deletion fencing, projection, adapter and repeated-event regressions.
+- `bun test packages scripts`: **193 passing tests**, zero failures after the October 2 Chore compatibility follow-up. Includes actual Pi SDK local discovery/tool activation/result consumption and stale-default rejection, retry idempotency/restart history, scoped interrupt and cancelled-attempt retry, approval feedback across restart, repair exhaustion and subsequent acceptance, independent child settings, lifecycle/deletion fencing, projection, adapter and repeated-event regressions.
 - `KOURO_TEST_PORT=43281 bun run test:browser`: **28 passing tests**, zero failures. Nine dedicated session tests cover typed launch and pinned parent/child settings, scoped interrupt/retry, live parent/child activity, a new child spawned during an open session, readable live tool results/logs, steering, completion/replay, failed-run retry, 390px cancellation/focus, re-pairing, snapshot Retry, late failures after switching runs, required-task launch guards, searching 300 tool calls and more than 4,000 journal observations. Workbench tests include requested changes followed by approval and the durable editable delivery message.
 - The large-data fixture uses a pinned 500-node bundle and 10,000 invocation spans. Final measurements: graph 1,611 ms, selection 138.2 ms, 17 rendered bars, scrolling p95 16.8 ms. Selection updates highlighting and breadcrumbs without rebuilding graph edges. Original acceptance budgets remain unchanged. Its synthetic SSE connection stays open; reconnect recovery is tested separately through the real host. These measurements describe this headless Chromium environment.
 - `KOURO_LIVE_SUBAGENT_HARNESS=codex KOURO_LIVE_SUBAGENT_MODEL=gpt-6-luna bun test packages/host/test/live-subagent.test.ts`: **2 passing native tests**. One checks the awaited bridge and request ID; the other runs real Codex parent and child models through the coordinator/scout gateway, verifies attributed durable activity, and checks the parent's output against the child's unique report marker.
@@ -68,6 +68,34 @@ The server became reachable again. Fresh discovery at `http://models:8080/v1/mod
 - Native host and browser fixtures now accept Pi explicitly while preserving Codex as their default. Typecheck, lint, formatting and `git diff --check` pass.
 
 These native results supersede the earlier connectivity blocker for the verified Pi paths. They do not close the broader production gates below.
+
+## Chore compatibility follow-up — 2026-10-02
+
+The local `.kouro/chore` definition and bundled Chore starter now use the current
+plan → change → validate lifecycle, required repository scout, optional test
+scout, explicit capabilities and typed summaries. Worker and validator receive
+the planner's reports and explicitly declare no additional scouts. No fixed
+agent timeouts were added. The local definition retains its existing Codex
+`gpt-6-luna` main agents and Pi/llama.cpp Qwen scouts; the portable starter inherits
+the run's execution profile instead of hardcoding machine-specific models.
+
+Execution exposed a shared authoring bug: `subagentResults` declared arrays of
+plain report payloads while the coordinator supplies report envelopes. Strict
+input validation rejected the worker before execution. The generated schema and
+public TypeScript report type now match the existing envelope, including nested
+payload validation and request/artifact identity. An integration test scaffolds
+the actual starter, runs its coordinator with an isolated scripted harness,
+checks report delivery through both later phases, and verifies that skipping
+the required scout blocks work. This is workflow execution evidence with a
+scripted harness, not a new live documentation-writing run.
+
+The edited local definition loads and compiles as version 2. Its manifest now
+matches that version. The bundled starter replaces its old placeholder printf
+validation with a read-only validation agent. All 193 unit/integration tests,
+typecheck, lint, formatting, CLI build and help pass. `.kouro` remains Git-ignored;
+the corresponding portable source and distribution updates are tracked. A
+running host caches its template catalog and must restart to load these edits;
+already-created runs retain their pinned bundles.
 
 ## Remaining release gates and v1 gaps
 

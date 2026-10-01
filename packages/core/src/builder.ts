@@ -60,12 +60,21 @@ export interface ScoutHandle<T = unknown> {
   readonly ownerToken: symbol;
 }
 
+/** A returned child report with its durable request and artifact identity. */
+export interface SubagentReport<T = unknown> {
+  readonly requestId: string;
+  readonly scoutId: string;
+  readonly resultArtifactId: string | null;
+  readonly resultDigest: string | null;
+  readonly result: T;
+}
+
 export interface ScoutResultsHandle<T = unknown> {
   readonly kind: "scout-results";
   readonly workflowId: string;
   readonly sourceId: string;
   readonly scoutId: string;
-  readonly schema: SchemaInput<T[]>;
+  readonly schema: SchemaInput<SubagentReport<T>[]>;
   readonly ownerToken: symbol;
 }
 
@@ -789,7 +798,21 @@ export class WorkflowBuilder {
       scoutId: scout.id,
       schema: {
         id: `${plan.id}.${scout.id}.results`,
-        schema: { type: "array", items: schemaValue(scout.schema) },
+        schema: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["requestId", "scoutId", "resultArtifactId", "resultDigest", "result"],
+            properties: {
+              requestId: { type: "string" },
+              scoutId: { type: "string" },
+              resultArtifactId: { type: ["string", "null"] },
+              resultDigest: { type: ["string", "null"] },
+              result: schemaValue(scout.schema),
+            },
+          },
+        },
       },
       ownerToken: this.ownerToken,
     });

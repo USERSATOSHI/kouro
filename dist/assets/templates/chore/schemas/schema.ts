@@ -3,6 +3,22 @@ export const Task = artifactType<string>("kouro.workflow-task.v1", {
   type: "string",
   minLength: 1,
 });
+export const ScoutQuestion = artifactType<string>("kouro.scout-question.v1", {
+  type: "string",
+  minLength: 1,
+});
+export const ScoutReport = artifactType<{ summary: string; findings: string[] }>(
+  "kouro.scout-report.v1",
+  {
+    type: "object",
+    additionalProperties: false,
+    required: ["summary", "findings"],
+    properties: {
+      summary: { type: "string", minLength: 1 },
+      findings: { type: "array", items: { type: "string" } },
+    },
+  },
+);
 export const Summary = artifactType<{ summary: string }>("kouro.template-summary.v1", {
   type: "object",
   additionalProperties: false,

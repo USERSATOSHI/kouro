@@ -1,7 +1,7 @@
 {
   "id": "{{id}}",
   "name": "{{name}}",
-  "version": "1",
-  "description": "Focused maintenance workflow.",
+  "version": "2",
+  "description": "Scout-grounded maintenance with planning, changes, and validation.",
   "entrypoint": "./kouro.ts"
 }

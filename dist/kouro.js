@@ -537,7 +537,21 @@ class WorkflowBuilder {
       scoutId: scout.id,
       schema: {
         id: `${plan.id}.${scout.id}.results`,
-        schema: { type: "array", items: schemaValue(scout.schema) }
+        schema: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["requestId", "scoutId", "resultArtifactId", "resultDigest", "result"],
+            properties: {
+              requestId: { type: "string" },
+              scoutId: { type: "string" },
+              resultArtifactId: { type: ["string", "null"] },
+              resultDigest: { type: ["string", "null"] },
+              result: schemaValue(scout.schema)
+            }
+          }
+        }
       },
       ownerToken: this.ownerToken
     });

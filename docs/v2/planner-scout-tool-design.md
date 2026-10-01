@@ -194,6 +194,12 @@ Host checks required scouts and validates Plan before accepting it.
 Implementer receives Plan and repositoryReports containing that report envelope.
 ```
 
+`workflow.subagentResults(plan, repositoryScout)` binds an array of downstream
+report envelopes with `requestId`, `scoutId`, `resultArtifactId`, `resultDigest`,
+and `result`. The nested `result` is validated against the subagent's report
+schema; artifact ID and digest may be null. This downstream envelope differs from
+the immediate tool response, which also includes the request state.
+
 The report above is illustrative, not a verified finding about retry settings.
 An optional test scout can be called in the same way; a failed optional call
 returns an error result, and its downstream report array remains empty.
