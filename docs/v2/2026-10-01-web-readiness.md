@@ -135,6 +135,76 @@ Verification for this follow-up:
 These checks cover the reported regressions, not a new complete v1 parity or
 production sign-off. The active operator host was not restarted.
 
+## Live messages, fullscreen and Pi usage follow-up — 2026-10-02
+
+Agent sessions can toggle between a window and the full viewport while retaining
+the transcript, split panes and controls. Native message/block identities now keep
+separate assistant messages and reasoning blocks distinct across intervening tool
+and status events. Completed snapshots repair missing text without duplicating the
+stream. Codex retains exposed reasoning content separately from its summaries;
+summary-only output is labeled accordingly. Kouro cannot recover thinking that a
+provider does not expose. Claude now explicitly requests partial messages and uses
+one normalizer for streaming and retained history. Pi retains streamed and completed
+text/thinking blocks through the same projection.
+
+The coordinator no longer nests a child's structured text inside another text field,
+which had hidden actual child messages even when their tool results were visible.
+The session projection also reads that shape from older recorded runs. Structured
+assistant deltas retain their message identities while being coalesced before
+journaling. Diagnostics now show recorded provider warnings/errors, failed tools,
+and invocation/attempt failures live and after reload. Successful nodes without
+warnings retain an explicit empty state.
+
+The installed Pi SDK 0.82.1 llama.cpp provider disables streamed usage by default.
+Kouro now enables `supportsUsageInStreaming` on the selected invocation's model
+copy, causing requests to include `stream_options: { include_usage: true }`.
+Saved provider settings and the shared catalog are unchanged. The existing local
+server returned positive token counters; no server-side setting needed changing.
+SDK default zero counters remain unavailable instead of being presented as observed
+usage. Positive SDK pricing calculations are estimates; absent local-model pricing
+remains unavailable rather than reporting a fabricated zero-dollar cost. Older runs
+without recorded counters cannot be backfilled.
+
+Verification for this follow-up:
+
+- `bun test packages scripts`: **204 passing tests**, zero failures. Coverage includes
+  live/retained Codex, Claude and Pi text/thinking, incomplete-snapshot repair, child
+  attribution, older nested child records, diagnostics, streamed usage requests and
+  unavailable default counters. An initial failure expected an unchanged resolved
+  model; the assertion now verifies the invocation-only usage override and confirms
+  that the catalog model was not mutated.
+- `KOURO_TEST_PORT=43284 bun run test:browser tests/browser/sessions.spec.ts`:
+  **9 passing tests**, including separate summary/content blocks, one assembled
+  assistant message, fullscreen toggling, diagnostics, narrow-screen controls and
+  replay. The fullscreen screenshot was visually inspected.
+- `KOURO_TEST_PORT=43284 bun run test:browser --output /tmp/kouro-session-browser-final-results`:
+  **28 passing tests**, zero failures, including the session cases above and existing
+  workbench, review/repair, checkpoint, evaluation and collaboration journeys. The
+  unchanged large-data budgets pass with 500 graph nodes and 10,000 timeline spans:
+  graph 1,575 ms, selection 131.8 ms, 17 rendered bars and scrolling p95 16.8 ms.
+- `KOURO_TEST_PORT=43285 KOURO_LIVE_BROWSER_MODEL=gpt-6-luna bun run test:browser:native --output /tmp/kouro-session-native-codex-results`:
+  **3 passing native Codex browser tests**. Actual assistant messages appear in both
+  parent and child panes; token counts survive reload; steering and cancellation
+  pass. The initial child-message assertion exposed the nested attribution defect
+  described above; this final run verifies its correction.
+- `KOURO_LIVE_SUBAGENT_HARNESS=pi KOURO_LIVE_SUBAGENT_MODEL=llama.cpp/qwen36-35b-a3b-256k-vision-mtp bun test packages/host/test/live-subagent.test.ts`:
+  **2 passing native Pi tests** for direct and coordinator-owned parent/child execution.
+- `KOURO_TEST_PORT=43286 KOURO_LIVE_BROWSER_HARNESS=pi KOURO_LIVE_BROWSER_MODEL=llama.cpp/qwen36-35b-a3b-256k-vision-mtp bun run test:browser:native --grep 'parent and child|cancellation' --output /tmp/kouro-session-native-pi-results`:
+  **2 passing native Pi browser tests**. Actual assistant messages appear in both
+  panes, positive token counts remain visible after reload, and cancellation drains
+  the provider. The earlier run passed message checks but exposed false zero usage;
+  enabling the streamed usage request fixed the final run. Pi's previously documented
+  queued-steering limitation remains open; this follow-up does not retest steering.
+- A current read-only `claude auth status` check using the installed SDK binary
+  reports `loggedIn: false`, `authMethod: none`. Claude normalization has adapter
+  coverage; native acceptance remains blocked by login. No authentication was changed.
+- Typecheck, lint, formatting, `git diff --check`, CLI build and bundled CLI help pass.
+  The existing web chunk-size warning remains.
+
+The active operator host was not restarted. A host restart after active work finishes
+is required to use the rebuilt adapters and client. These results verify the repaired
+paths, not complete v1 parity or blanket production readiness.
+
 ## Remaining release gates and v1 gaps
 
 1. **Provider configuration:** this machine's configured Codex default `gpt-6.1-sol` was rejected by its ChatGPT account. Explicit `gpt-6-luna` parent/child settings completed native tests. Parent and child model controls are now exposed separately. For Pi on the user's local server, select `llama.cpp/qwen36-35b-a3b-256k-vision-mtp` on each intended node while that model is loaded; the saved Pi default names an unloaded model. Claude needs login. No account/configuration file was changed and no silent model fallback was added. A client model catalog alone does not prove successful inference.

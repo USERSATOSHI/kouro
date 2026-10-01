@@ -3719,7 +3719,10 @@ function DiagnosticPanel({ items }: { items: DiagnosticView[] }) {
           </div>
         ))
       ) : (
-        <div className="pending-copy">No diagnostics recorded.</div>
+        <div className="pending-copy">
+          No warnings or errors recorded for this invocation. Open Agent session for live messages,
+          thinking and tool activity.
+        </div>
       )}
     </div>
   );
@@ -4128,25 +4131,20 @@ function OutputPanel({
 }) {
   const output = attempt?.output;
   const captured = Array.isArray(output) ? output.length > 0 : output !== undefined;
-  const liveText = liveActivity
-    .filter((item) => (item.event as { type?: string })?.type === "text")
-    .map((item) => {
-      const data = (item.event as { data?: unknown }).data;
-      if (data && typeof data === "object" && "text" in data) {
-        const text = String((data as { text: unknown }).text ?? "");
-        const label = (data as { label?: unknown }).label === true;
-        return `${label ? `[${String((data as { scoutId?: unknown }).scoutId ?? "scout")}]: ` : ""}${text}`;
-      }
-      return String(data ?? "");
-    })
-    .join("");
-  const activityLabels = projectSession(
+  const activityEntries = projectSession(
     liveActivity.flatMap((item) =>
       item.event && typeof item.event === "object" && !Array.isArray(item.event)
         ? [{ ...item, event: item.event as Record<string, unknown> }]
         : [],
     ),
-  )
+  );
+  const liveText = activityEntries
+    .filter((entry) => entry.kind === "message" && entry.channel === undefined)
+    .map((entry) =>
+      entry.kind === "message" ? `${entry.scoutId ? `[${entry.scoutId}]: ` : ""}${entry.text}` : "",
+    )
+    .join("\n\n");
+  const activityLabels = activityEntries
     .filter((entry) => entry.kind !== "message" || entry.channel === "thinking")
     .map((entry) => {
       const speaker = entry.scoutId ? `${entry.scoutId} · ` : "";

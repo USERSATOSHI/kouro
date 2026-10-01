@@ -143,6 +143,32 @@ export class BrowserSessionHarness implements HarnessAdapter {
     this.active.set(input.invocationId, turn);
     try {
       emit("text", "Parent session marker\n");
+      emit("log", {
+        channel: "thinking",
+        thinkingKind: "summary",
+        id: "summary-1",
+        text: "Identifying relevant files",
+      });
+      emit("log", {
+        channel: "thinking",
+        thinkingKind: "summary",
+        id: "summary-2",
+        text: "Planning verification checks",
+      });
+      emit("log", {
+        channel: "thinking",
+        thinkingKind: "content",
+        id: "reasoning-1",
+        text: "Inspect the repository source, then verify the documented commands.",
+      });
+      emit("text", { id: "reply-1", text: "I am inspecting " });
+      emit("log", { status: "Provider retry", level: "warn", detail: "Transient fixture warning" });
+      emit("text", { id: "reply-1", text: "the repository now." });
+      emit("text", {
+        id: "reply-1",
+        mode: "snapshot",
+        text: "I am inspecting the repository now.",
+      });
       emit("tool", { id: "shared-tool", name: "Read", status: "started", input: "parent.ts" });
       const report = await input.collaboration?.subagent?.({
         subagentId: "reviewer",

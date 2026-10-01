@@ -80,6 +80,19 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
   await expect(dialog).toContainText("Parent session marker");
   await expect(dialog).toContainText("Child session marker");
   await expect(dialog).toContainText("Reviewing the fixture");
+  await expect(dialog.locator(".agent-message")).toContainText(["Parent session marker", "I am inspecting the repository now.", "Child session marker"]);
+  await expect(dialog.locator(".agent-message").filter({ hasText: "I am inspecting the repository now." })).toHaveCount(1);
+  await expect(dialog.locator(".thinking-message").filter({ hasText: "Identifying relevant files" })).not.toContainText("Planning verification checks");
+  await expect(dialog.locator(".thinking-message").filter({ hasText: "Inspect the repository source" })).toContainText("THINKING");
+  const originalSize = await dialog.boundingBox();
+  await dialog.getByRole("button", { name: "Fullscreen", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Exit fullscreen", exact: true })).toHaveAttribute("aria-pressed", "true");
+  const fullSize = await dialog.boundingBox();
+  expect(fullSize!.width).toBeGreaterThan(originalSize!.width);
+  expect(fullSize!.height).toBeGreaterThan(originalSize!.height);
+  await page.screenshot({ path: "test-results/session-fullscreen.png", fullPage: true });
+  await dialog.getByRole("button", { name: "Exit fullscreen", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Fullscreen", exact: true })).toHaveAttribute("aria-pressed", "false");
   await expect(dialog.locator(".session-status").filter({ hasText: /^Thinking$/ })).toHaveCount(0);
   await expect(dialog.locator(".session-tool")).toHaveCount(2);
   await expect(dialog).toContainText("Parent tool result");
@@ -102,6 +115,8 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
   await expect(dialog).toContainText("Instruction received: web-steer-marker");
   await expect(dialog.getByLabel("Steer active agent")).toHaveValue("");
   await dialog.getByLabel("Close agent session").click();
+  await page.getByRole("button", { name: "diagnostics", exact: true }).click();
+  await expect(page.locator(".inspector .evidence-panel")).toContainText("Transient fixture warning");
   await page.getByRole("button", { name: "tools", exact: true }).click();
   await expect(page.locator(".inspector .session-tool")).toHaveCount(2);
   await expect(page.locator(".inspector")).toContainText("Child tool result");
@@ -153,9 +168,12 @@ test("failed invocation recovery starts one attempt and shows its typed output",
 }) => {
   await openFixture(page, "web-session-failure");
   await expect(page.getByTestId("run-status")).toHaveText("failed");
+  await page.getByRole("button", { name: "diagnostics", exact: true }).click();
+  await expect(page.locator(".inspector .evidence-panel")).toContainText("invalid-output");
   await page.getByRole("button", { name: "Retry invocation", exact: true }).click();
   await expect(page.getByTestId("run-status")).toHaveText("succeeded");
   await page.getByLabel("Inspect invocation").selectOption({ label: "parent · succeeded · #1" });
+  await page.getByRole("button", { name: "output", exact: true }).click();
   await expect(page.locator(".artifact-preview")).toContainText("Recovered browser session");
   await page.getByRole("button", { name: "attempts", exact: true }).click();
   await expect(page.locator(".attempt-card")).toHaveCount(3);

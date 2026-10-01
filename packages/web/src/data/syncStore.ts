@@ -1,5 +1,5 @@
 import type { CoreProjectionFrame, CoreRunView, StoreStatus, UiRunView } from "../types";
-import { usageViewFrom, viewFromCore } from "../types";
+import { activityDiagnostic, usageViewFrom, viewFromCore } from "../types";
 import { isEmptyThinkingStatus, projectSession, type SessionObservation } from "../session";
 
 type Listener = () => void;
@@ -138,7 +138,16 @@ export class RunSyncStore {
       byAttempt.set(activity.attemptId, group);
     }
     const tools = new Map(ui.tools.map((tool) => [tool.id, tool]));
+    const diagnostics = new Map(ui.diagnostics.map((item) => [item.id, item]));
     for (const [attemptId, observations] of byAttempt) {
+      for (const item of observations) {
+        const diagnostic = activityDiagnostic(
+          item.event,
+          attemptId,
+          view.state.attempts[attemptId]?.invocationId,
+        );
+        if (diagnostic) diagnostics.set(diagnostic.id, diagnostic);
+      }
       const observedUsage = [...observations].reverse().find((item) => {
         const data = item.event.data;
         return (
@@ -192,6 +201,17 @@ export class RunSyncStore {
       }
     }
     ui.tools = [...tools.values()];
+    for (const tool of ui.tools)
+      if (tool.error)
+        diagnostics.set(`${tool.id}:failure`, {
+          id: `${tool.id}:failure`,
+          severity: "error",
+          message: `${tool.name} failed`,
+          detail: tool.error,
+          invocationId: tool.invocationId,
+          attemptId: tool.attemptId,
+        });
+    ui.diagnostics = [...diagnostics.values()];
     return ui;
   }
   private reset(reason: string): "reset" {

@@ -3175,10 +3175,14 @@ export class Coordinator {
                 data:
                   event.type === "text"
                     ? {
+                        ...(event.data &&
+                        typeof event.data === "object" &&
+                        !Array.isArray(event.data)
+                          ? event.data
+                          : { text: event.data }),
                         scoutId: input.scoutId,
                         requestId: input.requestId,
                         label: !scoutReplyStarted,
-                        text: event.data,
                       }
                     : { ...data, scoutId: input.scoutId, requestId: input.requestId },
               },

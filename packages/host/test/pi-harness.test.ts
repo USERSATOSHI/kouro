@@ -107,7 +107,8 @@ describe("Pi SDK adapter", () => {
     );
     expect(
       await resolvePiModel(runtime, { provider: "llama.cpp", model: local.id }, defaults),
-    ).toEqual(local);
+    ).toEqual({ ...local, compat: { supportsUsageInStreaming: true } });
+    expect(local.compat).toBeUndefined();
     expect(refreshes).toBe(2);
     expect(fallbackReads).toBe(0);
     provider.refreshModels = async () => {

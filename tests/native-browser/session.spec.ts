@@ -20,6 +20,8 @@ test(`native ${harness} parent and child are visible live and retain the consume
   await expect(dialog.getByTestId("session-split")).toBeVisible({ timeout: 90000 });
   await expect(dialog.getByRole("region", { name: "Subagent model session" })).toContainText(marker, { timeout: 90000 });
   await expect(dialog.getByRole("region", { name: "Main model session" })).toContainText(marker, { timeout: 90000 });
+  await expect(dialog.getByRole("region", { name: "Main model session" }).locator(".agent-message").filter({ hasText: marker })).toHaveCount(1);
+  await expect(dialog.getByRole("region", { name: "Subagent model session" }).locator(".agent-message").filter({ hasText: marker })).toHaveCount(1);
   await expect(page.getByTestId("run-status")).toHaveText("succeeded", { timeout: 90000 });
   await dialog.getByLabel("Close agent session").click();
   await page.getByRole("button", { name: "usage", exact: true }).click();

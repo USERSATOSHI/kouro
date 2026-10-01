@@ -46,6 +46,48 @@ const view = (revision = 0): RunView => ({
 });
 
 describe("run projection sync", () => {
+  test("diagnostics show actual provider warnings and failed tools before completion and after reload", () => {
+    const store = new RunSyncStore();
+    store.replace(view());
+    const activity: JsonValue[] = [
+      {
+        type: "log",
+        data: { status: "Provider error", level: "warn", detail: "Retrying a failed request" },
+      },
+      { type: "tool", data: { id: "read", name: "Read", status: "failed", error: "File missing" } },
+      {
+        type: "log",
+        data: {
+          status: "Possibly stalled; provider status unknown",
+          detail: "No progress during observation",
+        },
+      },
+    ];
+    activity.forEach((event, index) =>
+      store.apply({
+        projectionVersion: 1,
+        runId: "run-test",
+        baseRevision: index,
+        revision: index + 1,
+        eventCursor: index + 1,
+        state: view(index + 1).state,
+        activity: { attemptId: "a", event },
+      }),
+    );
+    expect(
+      store
+        .getSnapshot()
+        ?.diagnostics.map((item) => item.detail)
+        .sort(),
+    ).toEqual(
+      ["File missing", "No progress during observation", "Retrying a failed request"].sort(),
+    );
+    store.replace({
+      ...view(3),
+      m2: { activity: activity.map((event, cursor) => ({ attemptId: "a", cursor, event })) },
+    } as RunView);
+    expect(store.getSnapshot()?.diagnostics).toHaveLength(3);
+  });
   test("projects parent usage live and after reconnect without replacing it with child counters", () => {
     const store = new RunSyncStore();
     const initial = view();

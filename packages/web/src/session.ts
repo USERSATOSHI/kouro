@@ -12,6 +12,7 @@ export type SessionEntry =
       scoutId?: string;
       requestId?: string;
       channel?: "thinking" | "operator";
+      thinkingKind?: "content" | "summary";
       status?: string;
     }
   | {
@@ -56,6 +57,8 @@ export function projectSession(observations: readonly SessionObservation[]): Ses
   let messageAttempt: string | undefined;
   let messageRequest: string | undefined;
   const instructions = new Map<string, number>();
+  const messages = new Map<string, number>();
+  let messageNativeId: string | undefined;
   for (const { observation, index } of ordered) {
     if (isEmptyThinkingStatus(observation.event)) continue;
     const fingerprint = `${observation.attemptId}:${JSON.stringify(observation.event)}`;
@@ -69,7 +72,11 @@ export function projectSession(observations: readonly SessionObservation[]): Ses
       continue;
     }
     const { type, data } = observation.event;
-    const payload = record(data);
+    let payload = record(data);
+    // Older child attribution wrapped structured text inside another text field.
+    const nestedText = type === "text" ? record(payload?.text) : undefined;
+    if (nestedText && typeof nestedText.text === "string")
+      payload = { ...payload, text: nestedText.text, id: nestedText.id, mode: nestedText.mode };
     const scoutId = typeof payload?.scoutId === "string" ? payload.scoutId : undefined;
     const requestId = typeof payload?.requestId === "string" ? payload.requestId : undefined;
     if (
@@ -105,26 +112,57 @@ export function projectSession(observations: readonly SessionObservation[]): Ses
             ? payload.text
             : (JSON.stringify(data) ?? String(data));
       const previous = entries.at(-1);
-      if (
+      const thinkingKind =
+        thinking && (payload?.thinkingKind === "content" || payload?.thinkingKind === "summary")
+          ? payload.thinkingKind
+          : undefined;
+      const nativeId = typeof payload?.id === "string" ? payload.id : undefined;
+      const nativeKey = nativeId
+        ? JSON.stringify([
+            observation.attemptId,
+            scoutId,
+            requestId,
+            thinking ? "thinking" : "agent",
+            thinkingKind,
+            nativeId,
+          ])
+        : undefined;
+      const position = nativeKey === undefined ? undefined : messages.get(nativeKey);
+      if (position !== undefined) {
+        const entry = entries[position];
+        if (entry.kind === "message")
+          entries[position] = {
+            ...entry,
+            text: payload?.mode === "snapshot" ? text : entry.text + text,
+          };
+      } else if (
+        !nativeId &&
+        !messageNativeId &&
         previous?.kind === "message" &&
         previous.scoutId === scoutId &&
         messageAttempt === observation.attemptId &&
         messageRequest === requestId &&
-        previous.channel === (thinking ? "thinking" : undefined)
+        previous.channel === (thinking ? "thinking" : undefined) &&
+        previous.thinkingKind === thinkingKind
       ) {
         entries[entries.length - 1] = { ...previous, text: previous.text + text };
       } else {
+        if (nativeKey) messages.set(nativeKey, entries.length);
         entries.push({
           kind: "message",
-          id: `${observation.attemptId}:message:${observation.cursor ?? index}`,
+          id: nativeKey
+            ? `${observation.attemptId}:message:${nativeKey}`
+            : `${observation.attemptId}:message:${observation.cursor ?? index}`,
           text,
           ...(thinking ? { channel: "thinking" as const } : {}),
+          ...(thinkingKind ? { thinkingKind } : {}),
           ...(scoutId ? { scoutId } : {}),
           ...(requestId ? { requestId } : {}),
         });
       }
       messageAttempt = observation.attemptId;
       messageRequest = requestId;
+      messageNativeId = nativeId;
       continue;
     }
     if (type === "tool") {

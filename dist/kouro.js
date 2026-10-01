@@ -16254,6 +16254,8 @@ class TrackingHarnessDecorator {
     const trackedEvents = [];
     let streamedAny = false;
     let pendingText = "";
+    let pendingMetadata;
+    let pendingKey;
     let textTimer;
     const emit = (event) => {
       event = this.normalize?.(event) ?? event;
@@ -16269,8 +16271,10 @@ class TrackingHarnessDecorator {
       textTimer = undefined;
       if (!pendingText)
         return;
-      const data = pendingText;
+      const data = pendingMetadata ? { ...pendingMetadata, text: pendingText } : pendingText;
       pendingText = "";
+      pendingMetadata = undefined;
+      pendingKey = undefined;
       emit({ type: "text", at: new Date().toISOString(), data });
     };
     emit({ type: "log", at: new Date().toISOString(), data: { status: "Starting" } });
@@ -16279,8 +16283,15 @@ class TrackingHarnessDecorator {
         ...input,
         onEvent: (event) => {
           streamedAny = true;
-          if (event.type === "text" && typeof event.data === "string") {
-            pendingText += String(event.data);
+          const structured = event.data && typeof event.data === "object" && !Array.isArray(event.data) ? event.data : undefined;
+          if (event.type === "text" && (typeof event.data === "string" || typeof structured?.text === "string" && structured.mode !== "snapshot")) {
+            const { text: _text, ...metadata } = structured ?? {};
+            const key = structured ? JSON.stringify(metadata) : "legacy";
+            if (pendingKey !== undefined && pendingKey !== key)
+              flushText();
+            pendingKey = key;
+            pendingMetadata = structured ? metadata : undefined;
+            pendingText += structured ? String(structured.text) : String(event.data);
             if (!textTimer)
               textTimer = setTimeout(flushText, 100);
           } else {
@@ -16403,6 +16414,71 @@ function codexToolEvent(item, started, at) {
       ...error2 === undefined ? {} : { error: error2 }
     }))
   };
+}
+
+// packages/host/src/adapters/harness/codex-messages.ts
+class CodexMessages {
+  emit;
+  text = new Map;
+  lastAssistantText = "";
+  constructor(emit) {
+    this.emit = emit;
+  }
+  consume(method, params) {
+    if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
+      this.publish(String(params.itemId), params.delta, false);
+      return true;
+    }
+    if ((method === "item/reasoning/textDelta" || method === "item/reasoning/summaryTextDelta") && typeof params.delta === "string") {
+      const kind = method === "item/reasoning/textDelta" ? "content" : "summary";
+      const index = kind === "content" ? params.contentIndex : params.summaryIndex;
+      this.publish(`${String(params.itemId)}:${kind}:${String(index ?? 0)}`, params.delta, false, kind);
+      return true;
+    }
+    if (method !== "item/started" && method !== "item/completed")
+      return false;
+    const item = params.item;
+    if (!item || item.type !== "agentMessage" && item.type !== "reasoning")
+      return false;
+    if (item.type === "agentMessage") {
+      if (method === "item/started") {
+        this.emit({ type: "log", at: new Date().toISOString(), data: { status: "Writing reply" } });
+      } else if (typeof item.text === "string") {
+        this.publish(String(item.id), item.text, true);
+      }
+    } else if (method === "item/completed") {
+      for (const kind of ["content", "summary"]) {
+        const parts = item[kind];
+        if (Array.isArray(parts))
+          parts.forEach((part, index) => {
+            if (typeof part === "string")
+              this.publish(`${String(item.id)}:${kind}:${index}`, part, true, kind);
+          });
+      }
+    }
+    return true;
+  }
+  publish(id2, text, snapshot, thinkingKind) {
+    if (!text)
+      return;
+    const previous = this.text.get(id2) ?? "";
+    const next = snapshot ? text : previous + text;
+    if (snapshot && next === previous)
+      return;
+    this.text.set(id2, next);
+    if (!thinkingKind)
+      this.lastAssistantText = next;
+    this.emit({
+      type: thinkingKind ? "log" : "text",
+      at: new Date().toISOString(),
+      data: {
+        id: id2,
+        text,
+        ...snapshot ? { mode: "snapshot" } : {},
+        ...thinkingKind ? { channel: "thinking", thinkingKind, status: "Thinking" } : {}
+      }
+    });
+  }
 }
 
 // packages/host/src/adapters/harness/structured-output.ts
@@ -16570,15 +16646,20 @@ class CodexAppServerHarness {
 [KOURO_CONTEXT_BEGIN]
 ${JSON.stringify(input.context)}
 [KOURO_CONTEXT_END]` : input.role.prompt;
-      let streamed = "";
       let activeTurnId;
-      const thinkingItems = new Set;
+      const messages = new CodexMessages(emit);
       let completed;
       const done = new Promise((resolve) => {
         completed = resolve;
       });
       const unsubscribe = transport.subscribe((message) => {
         const params = asObject(message.params);
+        if (params.threadId && params.threadId !== threadId)
+          return;
+        if (activeTurnId && params.turnId && params.turnId !== activeTurnId)
+          return;
+        if (messages.consume(message.method, params))
+          return;
         if (message.method === "thread/tokenUsage/updated") {
           if (params.threadId !== threadId || activeTurnId && params.turnId !== activeTurnId)
             return;
@@ -16591,19 +16672,14 @@ ${JSON.stringify(input.context)}
               data: observed
             });
           }
-        } else if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
-          streamed += params.delta;
-          emit({ type: "text", at: new Date().toISOString(), data: params.delta });
-        } else if (message.method === "item/reasoning/summaryTextDelta" && typeof params.delta === "string") {
-          thinkingItems.add(String(params.itemId));
+        } else if (message.method === "error") {
           emit({
             type: "log",
             at: new Date().toISOString(),
             data: {
-              status: "Thinking",
-              text: params.delta,
-              channel: "thinking",
-              id: `${String(params.itemId)}:${String(params.summaryIndex ?? 0)}`
+              status: "Provider error",
+              level: params.willRetry ? "warn" : "error",
+              detail: String(asObject(params.error).message ?? "Codex reported an error")
             }
           });
         } else if (message.method === "item/commandExecution/outputDelta" && typeof params.delta === "string") {
@@ -16627,31 +16703,13 @@ ${JSON.stringify(input.context)}
           });
         } else if (message.method === "item/started" || message.method === "item/completed") {
           const item = asObject(params.item);
-          if (item.type === "reasoning") {
-            const summary = Array.isArray(item.summary) ? item.summary.filter((part) => typeof part === "string").join(`
-`) : "";
-            emit({
-              type: "log",
-              at: new Date().toISOString(),
-              data: {
-                status: "Thinking",
-                ...summary && !thinkingItems.has(String(item.id)) ? { text: summary, channel: "thinking" } : {}
-              }
-            });
-          } else if (item.type === "userMessage") {} else if (item.type === "plan" && message.method === "item/completed" && typeof item.text === "string")
+          if (item.type === "userMessage") {} else if (item.type === "plan" && message.method === "item/completed" && typeof item.text === "string")
             emit({
               type: "log",
               at: new Date().toISOString(),
               data: { status: "Planning", channel: "thinking", text: item.text }
             });
-          else if (item.type === "agentMessage") {
-            if (message.method === "item/started")
-              emit({
-                type: "log",
-                at: new Date().toISOString(),
-                data: { status: "Writing reply" }
-              });
-          } else if (typeof item.type === "string")
+          else if (typeof item.type === "string")
             emit(codexToolEvent(item, message.method === "item/started", new Date().toISOString()));
         } else if (message.id !== undefined && message.method === "item/tool/call" && params.tool === "subagent" && scout && input.collaboration?.subagent) {
           input.collaboration.subagent({
@@ -16738,7 +16796,9 @@ ${JSON.stringify(input.context)}
           events
         };
       const turn = asObject(result.value);
-      const final = finalCodexText(turn) ?? streamed;
+      for (const item of Array.isArray(turn.items) ? turn.items : [])
+        messages.consume("item/completed", { item });
+      const final = finalCodexText(turn) ?? messages.lastAssistantText;
       if (!final)
         return {
           status: "failed",
@@ -16758,10 +16818,6 @@ ${JSON.stringify(input.context)}
             events
           };
       }
-      if (!streamed)
-        emit({ type: "text", at: new Date().toISOString(), data: final });
-      else if (final.startsWith(streamed) && final.length > streamed.length)
-        emit({ type: "text", at: new Date().toISOString(), data: final.slice(streamed.length) });
       return { status: "succeeded", output, rawOutput: final, usage, events };
     } catch (cause) {
       return {
@@ -36567,6 +36623,130 @@ function date4(params) {
 }
 // packages/host/src/adapters/harness/claude-agent-sdk.ts
 init_src();
+
+// packages/host/src/adapters/harness/claude-messages.ts
+var record2 = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
+
+class ClaudeMessages {
+  emit;
+  currentId;
+  sequence = 0;
+  text = new Map;
+  constructor(emit) {
+    this.emit = emit;
+  }
+  consume(value) {
+    const message = record2(value);
+    const at = new Date().toISOString();
+    if (message.type === "stream_event") {
+      const event = record2(message.event);
+      if (event.type === "message_start")
+        this.currentId = String(record2(event.message).id ?? `claude-${++this.sequence}`);
+      const block = record2(event.content_block);
+      const delta = record2(event.delta);
+      if (event.type === "content_block_delta" || event.type === "content_block_start") {
+        this.currentId ??= `claude-${++this.sequence}`;
+        const content = event.type === "content_block_delta" ? delta : block;
+        if (content.type === "text_delta" || content.type === "text")
+          this.publish(`${this.currentId}:${String(event.index ?? 0)}:text`, content.text, false);
+        else if (content.type === "thinking_delta" || content.type === "thinking")
+          this.publish(`${this.currentId}:${String(event.index ?? 0)}:thinking`, content.thinking, false, true);
+        else if (content.type === "tool_use")
+          this.emit({
+            type: "tool",
+            at,
+            data: {
+              id: String(content.id ?? "tool"),
+              name: String(content.name ?? "Tool"),
+              status: "started",
+              ...content.input === undefined ? {} : { input: content.input }
+            }
+          });
+      }
+    } else if (message.type === "assistant") {
+      const assistant = record2(message.message);
+      const id2 = String(assistant.id ?? this.currentId ?? `claude-${++this.sequence}`);
+      const content = Array.isArray(assistant.content) ? assistant.content : [];
+      content.forEach((value2, index) => {
+        const part = record2(value2);
+        if (part.type === "text")
+          this.publish(`${id2}:${index}:text`, part.text, true);
+        else if (part.type === "thinking")
+          this.publish(`${id2}:${index}:thinking`, part.thinking, true, true);
+        else if (part.type === "tool_use" && typeof part.id === "string")
+          this.emit({
+            type: "tool",
+            at,
+            data: {
+              id: part.id,
+              name: String(part.name ?? "Tool"),
+              status: "running",
+              ...part.input === undefined ? {} : { input: part.input }
+            }
+          });
+      });
+      this.currentId = undefined;
+      if (message.error)
+        this.emit({
+          type: "log",
+          at,
+          data: { status: "Provider error", level: "error", detail: String(message.error) }
+        });
+    } else if (message.type === "user") {
+      const content = record2(message.message).content;
+      if (Array.isArray(content))
+        for (const value2 of content) {
+          const part = record2(value2);
+          if (part.type !== "tool_result" || typeof part.tool_use_id !== "string")
+            continue;
+          this.emit({
+            type: "tool",
+            at,
+            data: {
+              id: part.tool_use_id,
+              status: part.is_error ? "failed" : "completed",
+              ...part.is_error ? {
+                error: typeof part.content === "string" ? part.content : JSON.stringify(part.content) ?? "Tool failed"
+              } : { output: part.content }
+            }
+          });
+        }
+    } else if (message.type === "result")
+      this.emit({
+        type: "log",
+        at,
+        data: {
+          status: message.subtype === "success" ? "Turn completed" : "Provider error",
+          ...message.subtype === "success" ? {} : {
+            level: "error",
+            detail: Array.isArray(message.errors) ? message.errors.join(`
+`) : String(message.subtype)
+          }
+        }
+      });
+  }
+  publish(id2, value, snapshot, thinking = false) {
+    if (typeof value !== "string" || !value)
+      return;
+    const previous = this.text.get(id2) ?? "";
+    const next = snapshot ? value : previous + value;
+    if (snapshot && next === previous)
+      return;
+    this.text.set(id2, next);
+    this.emit({
+      type: thinking ? "log" : "text",
+      at: new Date().toISOString(),
+      data: {
+        id: id2,
+        text: value,
+        ...snapshot ? { mode: "snapshot" } : {},
+        ...thinking ? { channel: "thinking", thinkingKind: "content", status: "Thinking" } : {}
+      }
+    });
+  }
+}
+
+// packages/host/src/adapters/harness/claude-agent-sdk.ts
 var claudeSdkDescriptor = {
   id: "claude",
   adapterVersion: "agent-sdk",
@@ -36639,6 +36819,7 @@ ${JSON.stringify(input2.context)}
       })
     } : undefined;
     const options = {
+      includePartialMessages: true,
       cwd: input2.cwd ?? process.cwd(),
       ...input2.modelId ? { model: input2.modelId } : {},
       ...typeof input2.nativeConfig?.model === "string" ? { model: input2.nativeConfig.model } : {},
@@ -36661,81 +36842,15 @@ ${JSON.stringify(input2.context)}
       } : {}
     };
     let resultMessage;
-    let thinkingStreamed = false;
+    const events = [];
+    const activity = new ClaudeMessages((event) => {
+      events.push(event);
+      input2.onEvent?.(event);
+    });
     try {
       for await (const message of query({ prompt, options })) {
         messages.push(message);
-        const event = message.type === "stream_event" ? message.event : undefined;
-        if (event && typeof event === "object" && "type" in event) {
-          const item = event;
-          const at = new Date().toISOString();
-          if (item.type === "message_start")
-            thinkingStreamed = false;
-          if (item.type === "content_block_delta" && item.delta?.type === "thinking_delta" && typeof item.delta.thinking === "string") {
-            thinkingStreamed = true;
-            input2.onEvent?.({
-              type: "log",
-              at,
-              data: { channel: "thinking", text: item.delta.thinking, status: "Thinking" }
-            });
-          } else if (item.type === "content_block_delta" && item.delta?.type === "text_delta" && typeof item.delta.text === "string") {
-            input2.onEvent?.({ type: "text", at, data: item.delta.text });
-          } else if (item.type === "content_block_start" && item.content_block?.type === "tool_use") {
-            input2.onEvent?.({
-              type: "tool",
-              at,
-              data: {
-                id: item.content_block.id ?? "tool",
-                name: item.content_block.name ?? "Tool",
-                status: "started",
-                ...item.content_block.input === undefined ? {} : { input: item.content_block.input }
-              }
-            });
-          }
-        } else if (message.type === "assistant") {
-          const content = message.message?.content;
-          for (const part of content ?? []) {
-            if (isRecord2(part) && part.type === "thinking" && typeof part.thinking === "string" && !thinkingStreamed)
-              input2.onEvent?.({
-                type: "log",
-                at: new Date().toISOString(),
-                data: { channel: "thinking", text: part.thinking, status: "Thinking" }
-              });
-            if (!isRecord2(part) || part.type !== "tool_use" || typeof part.id !== "string")
-              continue;
-            input2.onEvent?.({
-              type: "tool",
-              at: new Date().toISOString(),
-              data: {
-                id: part.id,
-                name: typeof part.name === "string" ? part.name : "Tool",
-                status: "running",
-                ...part.input === undefined ? {} : { input: part.input }
-              }
-            });
-          }
-          input2.onEvent?.({
-            type: "log",
-            at: new Date().toISOString(),
-            data: { status: "Thinking" }
-          });
-        } else if (message.type === "user") {
-          const content = message.message?.content;
-          for (const part of content ?? []) {
-            if (!isRecord2(part) || part.type !== "tool_result" || typeof part.tool_use_id !== "string")
-              continue;
-            const isError = part.is_error === true;
-            input2.onEvent?.({
-              type: "tool",
-              at: new Date().toISOString(),
-              data: {
-                id: part.tool_use_id,
-                status: isError ? "failed" : "completed",
-                ...isError ? { error: displayToolResult(part.content) } : { output: part.content }
-              }
-            });
-          }
-        }
+        activity.consume(message);
         if (message.type === "result")
           resultMessage = message;
       }
@@ -36750,7 +36865,7 @@ ${JSON.stringify(input2.context)}
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
-        events: eventsFrom(messages)
+        events
       };
     }
     if (timer)
@@ -36763,7 +36878,7 @@ ${JSON.stringify(input2.context)}
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
-        events: eventsFrom(messages)
+        events
       };
     }
     if (resultMessage?.subtype !== "success") {
@@ -36775,7 +36890,7 @@ ${JSON.stringify(input2.context)}
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
-        events: eventsFrom(messages)
+        events
       };
     }
     const structured = "structured_output" in resultMessage ? resultMessage.structured_output : undefined;
@@ -36789,7 +36904,7 @@ ${JSON.stringify(input2.context)}
           stderr,
           rawOutput: JSON.stringify(messages),
           usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
-          events: eventsFrom(messages)
+          events
         };
     }
     return {
@@ -36798,109 +36913,12 @@ ${JSON.stringify(input2.context)}
       stderr,
       rawOutput: JSON.stringify(messages),
       usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
-      events: eventsFrom(messages)
+      events
     };
   }
 }
 function parseJson2(text) {
   return parseStructuredOutput(text);
-}
-function eventsFrom(messages) {
-  const at = new Date().toISOString();
-  const events = [];
-  let streamedText = "";
-  let thinkingStreamed = false;
-  for (const message of messages) {
-    if (message.type === "stream_event") {
-      const event = message.event;
-      const delta = event.delta;
-      const block = event.content_block;
-      if (event.type === "message_start") {
-        streamedText = "";
-        thinkingStreamed = false;
-      }
-      if (event.type === "content_block_delta" && delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
-        thinkingStreamed = true;
-        events.push({
-          type: "log",
-          at,
-          data: { channel: "thinking", status: "Thinking", text: delta.thinking }
-        });
-      }
-      if (event.type === "content_block_delta" && delta?.type === "text_delta" && typeof delta.text === "string") {
-        streamedText += delta.text;
-        events.push({ type: "text", at, data: delta.text });
-      } else if (event.type === "content_block_start" && block?.type === "tool_use")
-        events.push({
-          type: "tool",
-          at,
-          data: {
-            id: typeof block.id === "string" ? block.id : "tool",
-            name: String(block.name ?? "Tool"),
-            status: "started"
-          }
-        });
-      continue;
-    }
-    if (message.type === "assistant") {
-      const content = message.message?.content;
-      for (const part of content ?? []) {
-        if (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string") {
-          if (!streamedText)
-            events.push({ type: "text", at, data: part.text });
-          else if (part.text.startsWith(streamedText) && part.text.length > streamedText.length)
-            events.push({ type: "text", at, data: part.text.slice(streamedText.length) });
-        } else if (isRecord2(part) && part.type === "thinking" && typeof part.thinking === "string" && !thinkingStreamed)
-          events.push({
-            type: "log",
-            at,
-            data: { channel: "thinking", status: "Thinking", text: part.thinking }
-          });
-        else if (isRecord2(part) && part.type === "tool_use" && typeof part.id === "string")
-          events.push({
-            type: "tool",
-            at,
-            data: {
-              id: part.id,
-              name: typeof part.name === "string" ? part.name : "Tool",
-              status: "running",
-              ...part.input === undefined ? {} : { input: part.input }
-            }
-          });
-      }
-    } else if (message.type === "user") {
-      const content = message.message?.content;
-      for (const part of content ?? []) {
-        if (!isRecord2(part) || part.type !== "tool_result" || typeof part.tool_use_id !== "string")
-          continue;
-        const isError = part.is_error === true;
-        events.push({
-          type: "tool",
-          at,
-          data: {
-            id: part.tool_use_id,
-            status: isError ? "failed" : "completed",
-            ...isError ? { error: displayToolResult(part.content) } : { output: part.content }
-          }
-        });
-      }
-    } else if (message.type === "result") {
-      events.push({ type: "log", at, data: { status: "Turn completed" } });
-    }
-  }
-  return events;
-}
-function isRecord2(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function displayToolResult(value) {
-  if (typeof value === "string")
-    return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 function usageFrom(message) {
   if (!message)
@@ -37153,7 +37171,8 @@ class PiSdkHarness {
           usage: piUsage(session.getSessionStats()),
           events
         };
-      const unsubscribe = session.subscribe((event) => emitPiEvent(event, emit));
+      const activity = new PiMessages(emit);
+      const unsubscribe = session.subscribe((event) => activity.consume(event));
       const handoff3 = input2.context ? `${input2.role.prompt}
 
 [KOURO_CONTEXT_BEGIN]
@@ -37166,6 +37185,8 @@ ${JSON.stringify(input2.role.outputSchema)}` : handoff3;
       await session.prompt(prompt);
       unsubscribe();
       const lastMessage = [...session.messages].reverse().find((candidate) => candidate.role === "assistant");
+      if (lastMessage)
+        activity.consume({ type: "message_end", message: lastMessage });
       const message = lastMessage ? assistantText(lastMessage) : undefined;
       let output2 = message;
       if (typeof output2 === "string")
@@ -37253,12 +37274,12 @@ async function resolvePiModel(runtime, selection, settings, signal) {
     const choices = available.map((item) => `${item.provider}/${item.id}`).slice(0, 10).join(", ");
     throw new Error(`Pi model is unavailable: ${provider ? `${provider}/` : ""}${requested ?? "(none)"}.${choices ? ` Available models: ${choices}.` : " No models are available for this provider."}`);
   }
-  return model;
+  return model.provider === "llama.cpp" ? { ...model, compat: { ...model.compat, supportsUsageInStreaming: true } } : model;
 }
 async function loadPiBuiltInExtensions() {
   const entry = fileURLToPath2(import.meta.resolve("@earendil-works/pi-coding-agent"));
   const loaded = await import(resolve(dirname(entry), "extensions/index.js"));
-  if (!isRecord3(loaded) || !Array.isArray(loaded.builtInExtensions))
+  if (!isRecord2(loaded) || !Array.isArray(loaded.builtInExtensions))
     throw new Error("Pi built-in extensions are unavailable in the installed SDK");
   return loaded.builtInExtensions.filter(isInlineExtension);
 }
@@ -37288,15 +37309,84 @@ function createSubagentTool(manifestTool, invoke) {
     }
   });
 }
+
+class PiMessages {
+  emit;
+  sequence = 0;
+  messageId = "pi-0";
+  text = new Map;
+  constructor(emit) {
+    this.emit = emit;
+  }
+  consume(value) {
+    if (!isRecord2(value))
+      return;
+    if (value.type === "message_start" && isRecord2(value.message) && value.message.role === "assistant") {
+      this.messageId = `pi-${++this.sequence}`;
+      return;
+    }
+    const update = value.assistantMessageEvent;
+    if (value.type === "message_update" && isRecord2(update)) {
+      if (update.type === "text_delta" || update.type === "thinking_delta") {
+        const thinking = update.type === "thinking_delta";
+        this.publish(`${this.messageId}:${String(update.contentIndex ?? 0)}:${thinking ? "thinking" : "text"}`, update.delta, false, thinking);
+      }
+      return;
+    }
+    if (value.type === "message_end" && isRecord2(value.message) && value.message.role === "assistant") {
+      const message = value.message;
+      if (Array.isArray(message.content))
+        message.content.forEach((part, index) => {
+          if (!isRecord2(part))
+            return;
+          if (part.type === "text" || part.type === "thinking") {
+            const thinking = part.type === "thinking";
+            this.publish(`${this.messageId}:${index}:${thinking ? "thinking" : "text"}`, thinking ? part.thinking : part.text, true, thinking);
+          }
+        });
+      if (message.stopReason === "error")
+        this.emit({
+          type: "log",
+          at: new Date().toISOString(),
+          data: {
+            status: "Provider error",
+            level: "error",
+            detail: String(message.errorMessage ?? "Pi model request failed")
+          }
+        });
+      return;
+    }
+    emitPiEvent(value, this.emit);
+  }
+  publish(id2, value, snapshot, thinking) {
+    if (typeof value !== "string" || !value)
+      return;
+    const previous = this.text.get(id2) ?? "";
+    const next = snapshot ? value : previous + value;
+    if (snapshot && next === previous)
+      return;
+    this.text.set(id2, next);
+    this.emit({
+      type: thinking ? "log" : "text",
+      at: new Date().toISOString(),
+      data: {
+        id: id2,
+        text: value,
+        ...snapshot ? { mode: "snapshot" } : {},
+        ...thinking ? { channel: "thinking", thinkingKind: "content", status: "Thinking" } : {}
+      }
+    });
+  }
+}
 function emitPiEvent(event, emit) {
-  if (!isRecord3(event) || typeof event.type !== "string")
+  if (!isRecord2(event) || typeof event.type !== "string")
     return;
   const at = new Date().toISOString();
   const update = event.assistantMessageEvent;
-  if (event.type === "message_update" && isRecord3(update) && update.type === "text_delta") {
+  if (event.type === "message_update" && isRecord2(update) && update.type === "text_delta") {
     if (typeof update.delta === "string" && update.delta)
       emit({ type: "text", at, data: update.delta });
-  } else if (event.type === "message_update" && isRecord3(update) && update.type === "thinking_delta") {
+  } else if (event.type === "message_update" && isRecord2(update) && update.type === "thinking_delta") {
     if (typeof update.delta !== "string" || !update.delta)
       return;
     emit({
@@ -37305,18 +37395,19 @@ function emitPiEvent(event, emit) {
       data: {
         status: "Thinking",
         text: update.delta,
-        channel: "thinking"
+        channel: "thinking",
+        thinkingKind: "content"
       }
     });
   } else if (event.type.includes("tool")) {
-    const result = isRecord3(event.result) ? event.result : undefined;
+    const result = isRecord2(event.result) ? event.result : undefined;
     const isError = event.isError === true || result?.isError === true || event.error !== undefined;
     const lifecycle = event.type.toLowerCase();
     emit({
       type: "tool",
       at,
       data: {
-        id: String(event.toolCallId ?? (isRecord3(event.toolCall) ? event.toolCall.id : undefined) ?? event.id ?? `${event.type}:${at}`),
+        id: String(event.toolCallId ?? (isRecord2(event.toolCall) ? event.toolCall.id : undefined) ?? event.id ?? `${event.type}:${at}`),
         name: String(event.toolName ?? event.name ?? "Tool"),
         status: lifecycle.endsWith("_start") ? "running" : lifecycle.endsWith("_end") ? isError ? "failed" : "completed" : lifecycle.includes("update") ? "running" : isError ? "failed" : "completed",
         ...event.args !== undefined ? { input: event.args } : {},
@@ -37344,7 +37435,7 @@ function emitPiEvent(event, emit) {
       at,
       data: {
         status,
-        ...typeof detail === "string" && detail ? { detail } : {},
+        ...typeof detail === "string" && detail ? { detail, level: "warn" } : {},
         ...typeof event.attempt === "number" ? { attempt: event.attempt } : {}
       }
     });
@@ -37355,16 +37446,18 @@ function assistantText(message) {
     return message.text;
   if (!Array.isArray(message.content))
     return;
-  const text = message.content.filter(isRecord3).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => String(part.text)).join("");
+  const text = message.content.filter(isRecord2).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => String(part.text)).join("");
   return text || undefined;
 }
 function piUsage(stats) {
   const tokens = stats.tokens;
+  if (tokens.total <= 0 || ![tokens.input, tokens.output, tokens.total].every((value) => Number.isFinite(value) && value >= 0))
+    return unavailableUsage();
   return {
     inputTokens: { value: tokens.input, quality: "observed", source: "pi" },
     outputTokens: { value: tokens.output, quality: "observed", source: "pi" },
     totalTokens: { value: tokens.total, quality: "observed", source: "pi" },
-    cost: { value: stats.cost, quality: "observed" }
+    cost: stats.cost > 0 ? { value: stats.cost, quality: "estimated", source: "pi-sdk-pricing" } : { value: null, quality: "unavailable" }
   };
 }
 function parseJsonOutput(value) {
@@ -37378,11 +37471,11 @@ function simpleHash(value) {
   }
   return (hash2 >>> 0).toString(16).padStart(8, "0");
 }
-function isRecord3(value) {
+function isRecord2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function isInlineExtension(value) {
-  return typeof value === "function" || isRecord3(value) && typeof value.name === "string" && typeof value.factory === "function";
+  return typeof value === "function" || isRecord2(value) && typeof value.name === "string" && typeof value.factory === "function";
 }
 
 class PiHarnessAdapter {
@@ -39308,10 +39401,10 @@ class Journal {
   }
   advanceRunDeletion(runId, status, input2 = {}) {
     this.db.query("UPDATE run_deletions SET status = ?1, error = ?2, blobs_json = COALESCE(?3, blobs_json), updated_at = ?4 WHERE run_id = ?5").run(status, input2.error ?? null, input2.blobDigests ? json(input2.blobDigests) : null, now(), runId);
-    const record2 = this.getRunDeletion(runId);
-    if (!record2)
+    const record3 = this.getRunDeletion(runId);
+    if (!record3)
       throw new Error(`Run deletion is not registered: ${runId}`);
-    return record2;
+    return record3;
   }
   purgeRunData(runId) {
     return this.tx(() => {
@@ -39699,14 +39792,14 @@ function payloadReferencesRun(value, runId) {
     return value.some((item) => payloadReferencesRun(item, runId));
   if (!value || typeof value !== "object")
     return false;
-  const record2 = value;
-  if ((record2.kind === "run" || record2.type === "run") && record2.id === runId)
+  const record3 = value;
+  if ((record3.kind === "run" || record3.type === "run") && record3.id === runId)
     return true;
   for (const key of ["runId", "sourceRunId", "candidateRunId", "parentRunId", "childRunId"]) {
-    if (record2[key] === runId)
+    if (record3[key] === runId)
       return true;
   }
-  return Object.values(record2).some((item) => payloadReferencesRun(item, runId));
+  return Object.values(record3).some((item) => payloadReferencesRun(item, runId));
 }
 
 // packages/host/src/scheduler/scheduler.ts
@@ -40286,7 +40379,7 @@ function normalizeWorkItemInput(input2) {
     throw new Error("task input must be nonblank");
   let workItem;
   if (rawWorkItem !== undefined) {
-    if (!isRecord4(rawWorkItem))
+    if (!isRecord3(rawWorkItem))
       throw new Error("workItem input must be an object");
     if (rawWorkItem.version !== 1)
       throw new Error("workItem.version must be 1");
@@ -40297,9 +40390,9 @@ function normalizeWorkItemInput(input2) {
       throw new Error("task and workItem.task conflict");
     const rawTicket = rawWorkItem.ticket;
     if (rawTicket !== undefined) {
-      if (!isRecord4(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
+      if (!isRecord3(rawTicket) || typeof rawTicket.reference !== "string" || !rawTicket.reference.trim())
         throw new Error("workItem.ticket.reference must be nonblank");
-      if (!isRecord4(rawTicket.snapshot))
+      if (!isRecord3(rawTicket.snapshot))
         throw new Error("ticket-only admission is unsupported without an immutable snapshot");
       validateTicketSnapshot(rawTicket.snapshot);
     }
@@ -40376,7 +40469,7 @@ function optionalString(value, field) {
     throw new Error(`${field} must be a string`);
   return { [field.slice(field.indexOf(".") + 1)]: value };
 }
-function isRecord4(value) {
+function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -40739,7 +40832,7 @@ function validateScoutOutput(schemas3, ports, result) {
   if (ports.length === 0)
     return;
   for (const port2 of ports) {
-    const value = ports.length === 1 ? result : isRecord5(result) ? result[port2.name] : undefined;
+    const value = ports.length === 1 ? result : isRecord4(result) ? result[port2.name] : undefined;
     const schema = schemas3[port2.schemaDigest];
     if (!schema)
       throw new Error(`missing scout output schema ${port2.schemaDigest}`);
@@ -40748,7 +40841,7 @@ function validateScoutOutput(schemas3, ports, result) {
       throw new Error(`invalid scout output ${port2.name}: ${check2.error}`);
   }
 }
-function isRecord5(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -41335,21 +41428,21 @@ class Coordinator {
     let stopReason;
     const signal = input2.signal;
     const attemptId = input2.attemptId ?? input2.invocationId;
-    const record2 = input2.onEvent;
+    const record3 = input2.onEvent;
     const log = (status, detail) => {
       const event = {
         type: "log",
         at: new Date().toISOString(),
         data: { status, detail }
       };
-      record2?.(event);
+      record3?.(event);
       recordSupervisionEvent?.(event);
     };
     const operation = adapter.run({
       ...input2,
       timeoutMs: undefined,
       onEvent: (event) => {
-        record2?.(event);
+        record3?.(event);
         if (event.type === "text") {
           lastProgressAt = Date.now();
           observationUntil = undefined;
@@ -43086,10 +43179,10 @@ class Coordinator {
           this.recordHarnessActivity(input2.runId, input2.parentInvocationId, input2.parentAttemptId, {
             ...event,
             data: event.type === "text" ? {
+              ...event.data && typeof event.data === "object" && !Array.isArray(event.data) ? event.data : { text: event.data },
               scoutId: input2.scoutId,
               requestId: input2.requestId,
-              label: !scoutReplyStarted,
-              text: event.data
+              label: !scoutReplyStarted
             } : { ...data, scoutId: input2.scoutId, requestId: input2.requestId }
           });
           if (event.type === "text")
@@ -44238,7 +44331,7 @@ class CheckpointMaterializer {
     const capture2 = this.options.journal.listCheckpointOperations(certificate.checkpointId, "checkpoint.capture")[0];
     if (!capture2)
       throw new Error("checkpoint capture materialization record not found");
-    const record2 = capture2.record;
+    const record3 = capture2.record;
     const sourceBundle = input2.bundle;
     if (!sourceBundle)
       throw new Error("checkpoint source bundle not found");
@@ -44305,8 +44398,8 @@ class CheckpointMaterializer {
         workspace = await this.options.workspace.loadByIdentity(created.run.runId, `fork-${index}`);
       } catch {
         workspace = await this.options.workspace.createAtTree({
-          repositoryPath: String(record2.repositoryPath),
-          parentCommit: String(record2.parentCommit),
+          repositoryPath: String(record3.repositoryPath),
+          parentCommit: String(record3.parentCommit),
           tree: certificate.workspaceTreeDigest,
           runId: created.run.runId,
           workspaceId: `fork-${index}`
@@ -47862,8 +47955,8 @@ function FromNumberKey(_2, type, options) {
 function Record(key, type, options = {}) {
   return IsUnion(key) ? FromUnionKey(key.anyOf, type, options) : IsTemplateLiteral(key) ? FromTemplateLiteralKey(key, type, options) : IsLiteral(key) ? FromLiteralKey(key.const, type, options) : IsBoolean3(key) ? FromBooleanKey(key, type, options) : IsInteger2(key) ? FromIntegerKey(key, type, options) : IsNumber3(key) ? FromNumberKey(key, type, options) : IsRegExp2(key) ? FromRegExpKey(key, type, options) : IsString3(key) ? FromStringKey(key, type, options) : IsAny(key) ? FromAnyKey(key, type, options) : IsNever(key) ? FromNeverKey(key, type, options) : Never(options);
 }
-function RecordPattern(record2) {
-  return globalThis.Object.getOwnPropertyNames(record2.patternProperties)[0];
+function RecordPattern(record3) {
+  return globalThis.Object.getOwnPropertyNames(record3.patternProperties)[0];
 }
 function RecordKey2(type) {
   const pattern = RecordPattern(type);
@@ -56651,7 +56744,7 @@ var getResponseSchemaValidator = (s, {
         sanitize: sanitize2
       })
     };
-  const record2 = {};
+  const record3 = {};
   return Object.keys(maybeSchemaOrRecord).forEach((status2) => {
     if (isNaN(+status2))
       return;
@@ -56661,7 +56754,7 @@ var getResponseSchemaValidator = (s, {
         const schema = models[maybeNameOrSchema];
         if (!schema)
           return;
-        record2[+status2] = Kind in schema || "~standard" in schema ? getSchemaValidator(schema, {
+        record3[+status2] = Kind in schema || "~standard" in schema ? getSchemaValidator(schema, {
           modules,
           models,
           additionalProperties,
@@ -56675,7 +56768,7 @@ var getResponseSchemaValidator = (s, {
       }
       return;
     }
-    record2[+status2] = Kind in maybeNameOrSchema || "~standard" in maybeNameOrSchema ? getSchemaValidator(maybeNameOrSchema, {
+    record3[+status2] = Kind in maybeNameOrSchema || "~standard" in maybeNameOrSchema ? getSchemaValidator(maybeNameOrSchema, {
       modules,
       models,
       additionalProperties,
@@ -56686,7 +56779,7 @@ var getResponseSchemaValidator = (s, {
       validators: validators.map((x) => x[+status2]),
       sanitize: sanitize2
     }) : maybeNameOrSchema;
-  }), record2;
+  }), record3;
 };
 var getCookieValidator = ({
   validator,

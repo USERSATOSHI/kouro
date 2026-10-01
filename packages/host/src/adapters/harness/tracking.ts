@@ -34,6 +34,8 @@ export class TrackingHarnessDecorator implements HarnessAdapter {
     const trackedEvents: HarnessEvent[] = [];
     let streamedAny = false;
     let pendingText = "";
+    let pendingMetadata: Record<string, JsonValue> | undefined;
+    let pendingKey: string | undefined;
     let textTimer: ReturnType<typeof setTimeout> | undefined;
     const emit = (event: HarnessEvent) => {
       event = this.normalize?.(event) ?? event;
@@ -46,8 +48,10 @@ export class TrackingHarnessDecorator implements HarnessAdapter {
       if (textTimer) clearTimeout(textTimer);
       textTimer = undefined;
       if (!pendingText) return;
-      const data = pendingText;
+      const data = pendingMetadata ? { ...pendingMetadata, text: pendingText } : pendingText;
       pendingText = "";
+      pendingMetadata = undefined;
+      pendingKey = undefined;
       emit({ type: "text", at: new Date().toISOString(), data });
     };
 
@@ -57,8 +61,21 @@ export class TrackingHarnessDecorator implements HarnessAdapter {
         ...input,
         onEvent: (event) => {
           streamedAny = true;
-          if (event.type === "text" && typeof event.data === "string") {
-            pendingText += String(event.data);
+          const structured =
+            event.data && typeof event.data === "object" && !Array.isArray(event.data)
+              ? event.data
+              : undefined;
+          if (
+            event.type === "text" &&
+            (typeof event.data === "string" ||
+              (typeof structured?.text === "string" && structured.mode !== "snapshot"))
+          ) {
+            const { text: _text, ...metadata } = structured ?? {};
+            const key = structured ? JSON.stringify(metadata) : "legacy";
+            if (pendingKey !== undefined && pendingKey !== key) flushText();
+            pendingKey = key;
+            pendingMetadata = structured ? metadata : undefined;
+            pendingText += structured ? String(structured.text) : String(event.data);
             if (!textTimer) textTimer = setTimeout(flushText, 100);
           } else {
             flushText();

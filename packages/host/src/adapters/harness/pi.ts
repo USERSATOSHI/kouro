@@ -281,7 +281,8 @@ export class PiSdkHarness {
           usage: piUsage(session.getSessionStats()),
           events,
         };
-      const unsubscribe = session.subscribe((event) => emitPiEvent(event, emit));
+      const activity = new PiMessages(emit);
+      const unsubscribe = session.subscribe((event) => activity.consume(event));
       const handoff = input.context
         ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
         : input.role.prompt;
@@ -293,6 +294,7 @@ export class PiSdkHarness {
       const lastMessage = [...session.messages]
         .reverse()
         .find((candidate) => candidate.role === "assistant");
+      if (lastMessage) activity.consume({ type: "message_end", message: lastMessage });
       const message = lastMessage
         ? assistantText(lastMessage as unknown as Record<string, unknown>)
         : undefined;
@@ -405,7 +407,11 @@ export async function resolvePiModel(
       `Pi model is unavailable: ${provider ? `${provider}/` : ""}${requested ?? "(none)"}.${choices ? ` Available models: ${choices}.` : " No models are available for this provider."}`,
     );
   }
-  return model;
+  // The SDK's llama.cpp catalog disables streamed usage. Request the standard
+  // usage chunk for this invocation without modifying the saved provider/catalog.
+  return model.provider === "llama.cpp"
+    ? { ...model, compat: { ...model.compat, supportsUsageInStreaming: true } }
+    : model;
 }
 
 async function loadPiBuiltInExtensions(): Promise<InlineExtension[]> {
@@ -444,6 +450,86 @@ function createSubagentTool(
   });
 }
 
+export class PiMessages {
+  private sequence = 0;
+  private messageId = "pi-0";
+  private text = new Map<string, string>();
+  constructor(private readonly emit: (event: HarnessEvent) => void) {}
+  consume(value: unknown) {
+    if (!isRecord(value)) return;
+    if (
+      value.type === "message_start" &&
+      isRecord(value.message) &&
+      value.message.role === "assistant"
+    ) {
+      this.messageId = `pi-${++this.sequence}`;
+      return;
+    }
+    const update = value.assistantMessageEvent;
+    if (value.type === "message_update" && isRecord(update)) {
+      if (update.type === "text_delta" || update.type === "thinking_delta") {
+        const thinking = update.type === "thinking_delta";
+        this.publish(
+          `${this.messageId}:${String(update.contentIndex ?? 0)}:${thinking ? "thinking" : "text"}`,
+          update.delta,
+          false,
+          thinking,
+        );
+      }
+      return;
+    }
+    if (
+      value.type === "message_end" &&
+      isRecord(value.message) &&
+      value.message.role === "assistant"
+    ) {
+      const message = value.message;
+      if (Array.isArray(message.content))
+        message.content.forEach((part, index) => {
+          if (!isRecord(part)) return;
+          if (part.type === "text" || part.type === "thinking") {
+            const thinking = part.type === "thinking";
+            this.publish(
+              `${this.messageId}:${index}:${thinking ? "thinking" : "text"}`,
+              thinking ? part.thinking : part.text,
+              true,
+              thinking,
+            );
+          }
+        });
+      if (message.stopReason === "error")
+        this.emit({
+          type: "log",
+          at: new Date().toISOString(),
+          data: {
+            status: "Provider error",
+            level: "error",
+            detail: String(message.errorMessage ?? "Pi model request failed"),
+          },
+        });
+      return;
+    }
+    emitPiEvent(value, this.emit);
+  }
+  private publish(id: string, value: unknown, snapshot: boolean, thinking: boolean) {
+    if (typeof value !== "string" || !value) return;
+    const previous = this.text.get(id) ?? "";
+    const next = snapshot ? value : previous + value;
+    if (snapshot && next === previous) return;
+    this.text.set(id, next);
+    this.emit({
+      type: thinking ? "log" : "text",
+      at: new Date().toISOString(),
+      data: {
+        id,
+        text: value,
+        ...(snapshot ? { mode: "snapshot" } : {}),
+        ...(thinking ? { channel: "thinking", thinkingKind: "content", status: "Thinking" } : {}),
+      },
+    });
+  }
+}
+
 export function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void): void {
   if (!isRecord(event) || typeof event.type !== "string") return;
   const at = new Date().toISOString();
@@ -464,6 +550,7 @@ export function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void)
         status: "Thinking",
         text: update.delta,
         channel: "thinking",
+        thinkingKind: "content",
       },
     });
   } else if (event.type.includes("tool")) {
@@ -522,7 +609,7 @@ export function emitPiEvent(event: unknown, emit: (event: HarnessEvent) => void)
       at,
       data: {
         status,
-        ...(typeof detail === "string" && detail ? { detail } : {}),
+        ...(typeof detail === "string" && detail ? { detail, level: "warn" } : {}),
         ...(typeof event.attempt === "number" ? { attempt: event.attempt } : {}),
       },
     });
@@ -540,7 +627,7 @@ function assistantText(message: Record<string, unknown>): string | undefined {
   return text || undefined;
 }
 
-function piUsage(
+export function piUsage(
   stats: ReturnType<
     NonNullable<
       Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]["getSessionStats"]
@@ -548,11 +635,21 @@ function piUsage(
   >,
 ) {
   const tokens = stats.tokens;
+  if (
+    tokens.total <= 0 ||
+    ![tokens.input, tokens.output, tokens.total].every(
+      (value) => Number.isFinite(value) && value >= 0,
+    )
+  )
+    return unavailableUsage();
   return {
     inputTokens: { value: tokens.input, quality: "observed" as const, source: "pi" },
     outputTokens: { value: tokens.output, quality: "observed" as const, source: "pi" },
     totalTokens: { value: tokens.total, quality: "observed" as const, source: "pi" },
-    cost: { value: stats.cost, quality: "observed" as const },
+    cost:
+      stats.cost > 0
+        ? { value: stats.cost, quality: "estimated" as const, source: "pi-sdk-pricing" }
+        : { value: null, quality: "unavailable" as const },
   };
 }
 

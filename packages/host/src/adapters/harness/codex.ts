@@ -18,6 +18,7 @@ import {
 import type { CollaborationTools, HarnessAdapter } from "../../types.ts";
 import { startScoutBridge } from "./scout-bridge.ts";
 import { codexToolEvent } from "./codex-activity.ts";
+import { CodexMessages } from "./codex-messages.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
 
 export interface CodexRunInput {
@@ -435,9 +436,8 @@ export class CodexAppServerHarness {
       const prompt = input.context
         ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
         : input.role.prompt;
-      let streamed = "";
       let activeTurnId: string | undefined;
-      const thinkingItems = new Set<string>();
+      const messages = new CodexMessages(emit);
       let completed:
         | ((result: { ok: boolean; value?: unknown; error?: string }) => void)
         | undefined;
@@ -446,6 +446,9 @@ export class CodexAppServerHarness {
       });
       const unsubscribe = transport.subscribe((message) => {
         const params = asObject(message.params);
+        if (params.threadId && params.threadId !== threadId) return;
+        if (activeTurnId && params.turnId && params.turnId !== activeTurnId) return;
+        if (messages.consume(message.method, params)) return;
         if (message.method === "thread/tokenUsage/updated") {
           if (params.threadId !== threadId || (activeTurnId && params.turnId !== activeTurnId))
             return;
@@ -458,25 +461,14 @@ export class CodexAppServerHarness {
               data: observed as unknown as JsonValue,
             });
           }
-        } else if (
-          message.method === "item/agentMessage/delta" &&
-          typeof params.delta === "string"
-        ) {
-          streamed += params.delta;
-          emit({ type: "text", at: new Date().toISOString(), data: params.delta });
-        } else if (
-          message.method === "item/reasoning/summaryTextDelta" &&
-          typeof params.delta === "string"
-        ) {
-          thinkingItems.add(String(params.itemId));
+        } else if (message.method === "error") {
           emit({
             type: "log",
             at: new Date().toISOString(),
             data: {
-              status: "Thinking",
-              text: params.delta,
-              channel: "thinking",
-              id: `${String(params.itemId)}:${String(params.summaryIndex ?? 0)}`,
+              status: "Provider error",
+              level: params.willRetry ? "warn" : "error",
+              detail: String(asObject(params.error).message ?? "Codex reported an error"),
             },
           });
         } else if (
@@ -509,21 +501,7 @@ export class CodexAppServerHarness {
           });
         } else if (message.method === "item/started" || message.method === "item/completed") {
           const item = asObject(params.item);
-          if (item.type === "reasoning") {
-            const summary = Array.isArray(item.summary)
-              ? item.summary.filter((part): part is string => typeof part === "string").join("\n")
-              : "";
-            emit({
-              type: "log",
-              at: new Date().toISOString(),
-              data: {
-                status: "Thinking",
-                ...(summary && !thinkingItems.has(String(item.id))
-                  ? { text: summary, channel: "thinking" }
-                  : {}),
-              },
-            });
-          } else if (item.type === "userMessage") {
+          if (item.type === "userMessage") {
             /* Operator instructions are journaled by Kouro. */
           } else if (
             item.type === "plan" &&
@@ -535,14 +513,7 @@ export class CodexAppServerHarness {
               at: new Date().toISOString(),
               data: { status: "Planning", channel: "thinking", text: item.text },
             });
-          else if (item.type === "agentMessage") {
-            if (message.method === "item/started")
-              emit({
-                type: "log",
-                at: new Date().toISOString(),
-                data: { status: "Writing reply" },
-              });
-          } else if (typeof item.type === "string")
+          else if (typeof item.type === "string")
             emit(codexToolEvent(item, message.method === "item/started", new Date().toISOString()));
         } else if (
           message.id !== undefined &&
@@ -652,7 +623,9 @@ export class CodexAppServerHarness {
           events,
         };
       const turn = asObject(result.value);
-      const final = finalCodexText(turn) ?? streamed;
+      for (const item of Array.isArray(turn.items) ? turn.items : [])
+        messages.consume("item/completed", { item });
+      const final = finalCodexText(turn) ?? messages.lastAssistantText;
       if (!final)
         return {
           status: "failed",
@@ -672,9 +645,6 @@ export class CodexAppServerHarness {
             events,
           };
       }
-      if (!streamed) emit({ type: "text", at: new Date().toISOString(), data: final });
-      else if (final.startsWith(streamed) && final.length > streamed.length)
-        emit({ type: "text", at: new Date().toISOString(), data: final.slice(streamed.length) });
       return { status: "succeeded", output, rawOutput: final, usage, events };
     } catch (cause) {
       return {

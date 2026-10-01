@@ -169,6 +169,7 @@ test("real Pi SDK discovers a local model, activates subagent tools and consumes
     expect(result.output).toEqual({ summary: marker });
     expect(delegated).toBe(true);
     expect(calls).toBe(2);
+    expect(requests[0]!.stream_options).toEqual({ include_usage: true });
     expect(discoveries).toBe(1);
     expect(
       requests[0]!.tools.map((tool: { function: { name: string } }) => tool.function.name),

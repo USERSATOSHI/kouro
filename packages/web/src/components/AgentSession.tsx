@@ -67,6 +67,7 @@ export function AgentSessionModal({
   const [steeringError, setSteeringError] = useState<string>();
   const [speaker, setSpeaker] = useState(initialSpeaker);
   const [split, setSplit] = useState(true);
+  const [fullscreen, setFullscreen] = useState(false);
   const [selectedChild, setSelectedChild] = useState<string>();
   const [newActivity, setNewActivity] = useState(false);
   const streamRef = useRef<HTMLDivElement>(null);
@@ -77,6 +78,9 @@ export function AgentSessionModal({
   onCloseRef.current = onClose;
   const stickToBottom = useRef(true);
   const activeEntries = useMemo(() => projectSession([...history, ...events]), [history, events]);
+  const summariesOnly =
+    activeEntries.some((entry) => entry.kind === "message" && entry.thinkingKind === "summary") &&
+    !activeEntries.some((entry) => entry.kind === "message" && entry.thinkingKind === "content");
   const childLanes = useMemo(() => {
     const lanes = new Map(subagents.map((agent) => [`${agent.scoutId}:${agent.requestId}`, agent]));
     for (const entry of activeEntries)
@@ -246,7 +250,7 @@ export function AgentSessionModal({
   };
   return (
     <div
-      className="agent-session-backdrop"
+      className={`agent-session-backdrop${fullscreen ? " session-fullscreen" : ""}`}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
@@ -280,15 +284,31 @@ export function AgentSessionModal({
               Copy session link
             </button>
           </div>
-          <button
-            ref={closeButtonRef}
-            type="button"
-            aria-label="Close agent session"
-            onClick={onClose}
-          >
-            ×
-          </button>
+          <div className="session-window-controls">
+            <button
+              type="button"
+              className="session-size-toggle"
+              aria-pressed={fullscreen}
+              onClick={() => setFullscreen((current) => !current)}
+            >
+              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+            </button>
+            <button
+              ref={closeButtonRef}
+              type="button"
+              aria-label="Close agent session"
+              onClick={onClose}
+            >
+              ×
+            </button>
+          </div>
         </header>
+        {summariesOnly && (
+          <p className="session-provider-note">
+            The provider has supplied reasoning summaries; full thinking text has not been provided.
+            Assistant messages appear as they arrive.
+          </p>
+        )}
         {hasMoreHistory && (
           <button
             type="button"
@@ -520,7 +540,9 @@ function SessionEntryView({ entry }: { entry: SessionEntry }) {
       <span>
         {entry.scoutId ? `${entry.scoutId} · ` : ""}
         {entry.channel === "thinking"
-          ? "THINKING SUMMARY"
+          ? entry.thinkingKind === "content"
+            ? "THINKING"
+            : "THINKING SUMMARY"
           : entry.channel === "operator"
             ? `YOU · ${entry.status ?? "requested"}`
             : "AGENT"}

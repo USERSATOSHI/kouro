@@ -7,6 +7,7 @@ import { ApplicationService } from "../src/application/service.ts";
 import { FakeProcessAdapter } from "../src/adapters/process/bwrap.ts";
 import { ScriptedHarnessAdapter } from "../src/adapters/harness/scripted.ts";
 import type { HarnessAdapter } from "../src/types.ts";
+import { projectSession } from "../../web/src/session";
 
 test("scaffolded chore delivers scout reports through change and validation, and blocks a missing required scout", async () => {
   const templateRoot = mkdtempSync(resolve(".kouro", ".chore-test-"));
@@ -20,6 +21,16 @@ test("scaffolded chore delivers scout reports through change and validation, and
     capabilities: () => scripted.capabilities(),
     async run(input) {
       turns.push(input);
+      if (input.role.endsWith("-scout")) {
+        const at = new Date().toISOString();
+        input.onEvent?.({ type: "text", at, data: { id: "reply", text: "Inspecting " } });
+        input.onEvent?.({ type: "text", at, data: { id: "reply", text: input.role } });
+        input.onEvent?.({
+          type: "text",
+          at,
+          data: { id: "reply", mode: "snapshot", text: `Inspecting ${input.role}` },
+        });
+      }
       if (skipScouts)
         return {
           status: "succeeded",
@@ -94,6 +105,19 @@ test("scaffolded chore delivers scout reports through change and validation, and
       "succeeded",
       "succeeded",
     ]);
+    const observations = service.getHarnessActivity(success.state.runId, 0, 1000);
+    const projected = projectSession(
+      observations.map((item) => ({
+        ...item,
+        event: item.event as unknown as Record<string, unknown>,
+      })),
+    );
+    expect(
+      projected
+        .filter((item) => item.kind === "message" && item.text.startsWith("Inspecting "))
+        .map((item) => item.scoutId)
+        .sort(),
+    ).toEqual(["repositoryScout", "testScout"]);
     turns.length = 0;
     skipScouts = true;
     const blocked = await execute("without-required-scout");

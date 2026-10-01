@@ -2,6 +2,36 @@ import { describe, expect, test } from "bun:test";
 import { projectSession } from "./session";
 
 describe("agent session projection", () => {
+  test("legacy nested child text preserves identity and snapshot semantics", () => {
+    const events = [
+      {
+        type: "text",
+        data: { scoutId: "reviewer", requestId: "r", text: { id: "m", text: "Inspecting " } },
+      },
+      {
+        type: "text",
+        data: { scoutId: "reviewer", requestId: "r", text: { id: "m", text: "source" } },
+      },
+      {
+        type: "text",
+        data: {
+          scoutId: "reviewer",
+          requestId: "r",
+          text: { id: "m", text: "Inspecting source files", mode: "snapshot" },
+        },
+      },
+    ];
+    const entries = projectSession(
+      events.map((event, cursor) => ({ event, cursor, attemptId: "a" })),
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "message",
+      text: "Inspecting source files",
+      scoutId: "reviewer",
+      requestId: "r",
+    });
+  });
   test("old empty Thinking logs do not split real child thinking, replies, or hide tool results", () => {
     const entries = projectSession([
       ...Array.from({ length: 100 }, (_, index) => ({

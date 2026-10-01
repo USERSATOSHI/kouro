@@ -118,7 +118,10 @@ describe("M2 web projection", () => {
     expect(projected.logs).toMatchObject([{ attemptId: "a1", level: "warn" }]);
     expect(projected.usage).toMatchObject([{ attemptId: "a1", completeness: "partial" }]);
     expect(projected.usage[0].cost).toBeUndefined();
-    expect(projected.diagnostics).toMatchObject([{ attemptId: "a1", severity: "warning" }]);
+    expect(projected.diagnostics).toMatchObject([
+      { attemptId: "a1", severity: "warning", message: "provider note" },
+      { attemptId: "a1", severity: "warning", message: "truncated" },
+    ]);
     expect(projected.capabilities).toEqual({ cancel: true });
   });
   test("reads nested retained tool events and correlates results after completion", () => {

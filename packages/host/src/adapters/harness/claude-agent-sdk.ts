@@ -16,6 +16,7 @@ import {
 } from "@kouro/core";
 import type { HarnessAdapter } from "../../types.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
+import { ClaudeMessages } from "./claude-messages.ts";
 
 export const claudeSdkDescriptor: HarnessDescriptor = {
   id: "claude",
@@ -124,6 +125,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
           }
         : undefined;
     const options: Options = {
+      includePartialMessages: true,
       cwd: input.cwd ?? process.cwd(),
       ...(input.modelId ? { model: input.modelId } : {}),
       ...(typeof input.nativeConfig?.model === "string" ? { model: input.nativeConfig.model } : {}),
@@ -150,110 +152,15 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         : {}),
     };
     let resultMessage: SDKResultMessage | undefined;
-    let thinkingStreamed = false;
+    const events: HarnessEvent[] = [];
+    const activity = new ClaudeMessages((event) => {
+      events.push(event);
+      input.onEvent?.(event);
+    });
     try {
       for await (const message of query({ prompt, options })) {
         messages.push(message);
-        const event = message.type === "stream_event" ? message.event : undefined;
-        if (event && typeof event === "object" && "type" in event) {
-          const item = event as {
-            type: string;
-            delta?: { type?: string; text?: string; thinking?: string };
-            content_block?: { type?: string; name?: string; id?: string; input?: unknown };
-          };
-          const at = new Date().toISOString();
-          if (item.type === "message_start") thinkingStreamed = false;
-          if (
-            item.type === "content_block_delta" &&
-            item.delta?.type === "thinking_delta" &&
-            typeof item.delta.thinking === "string"
-          ) {
-            thinkingStreamed = true;
-            input.onEvent?.({
-              type: "log",
-              at,
-              data: { channel: "thinking", text: item.delta.thinking, status: "Thinking" },
-            });
-          } else if (
-            item.type === "content_block_delta" &&
-            item.delta?.type === "text_delta" &&
-            typeof item.delta.text === "string"
-          ) {
-            input.onEvent?.({ type: "text", at, data: item.delta.text });
-          } else if (
-            item.type === "content_block_start" &&
-            item.content_block?.type === "tool_use"
-          ) {
-            input.onEvent?.({
-              type: "tool",
-              at,
-              data: {
-                id: item.content_block.id ?? "tool",
-                name: item.content_block.name ?? "Tool",
-                status: "started",
-                ...(item.content_block.input === undefined
-                  ? {}
-                  : { input: item.content_block.input }),
-              } as unknown as JsonValue,
-            });
-          }
-        } else if (message.type === "assistant") {
-          const content = (message as unknown as { message?: { content?: unknown[] } }).message
-            ?.content;
-          for (const part of content ?? []) {
-            if (
-              isRecord(part) &&
-              part.type === "thinking" &&
-              typeof part.thinking === "string" &&
-              !thinkingStreamed
-            )
-              input.onEvent?.({
-                type: "log",
-                at: new Date().toISOString(),
-                data: { channel: "thinking", text: part.thinking, status: "Thinking" },
-              });
-            if (!isRecord(part) || part.type !== "tool_use" || typeof part.id !== "string")
-              continue;
-            input.onEvent?.({
-              type: "tool",
-              at: new Date().toISOString(),
-              data: {
-                id: part.id,
-                name: typeof part.name === "string" ? part.name : "Tool",
-                status: "running",
-                ...(part.input === undefined ? {} : { input: part.input }),
-              } as unknown as JsonValue,
-            });
-          }
-          input.onEvent?.({
-            type: "log",
-            at: new Date().toISOString(),
-            data: { status: "Thinking" },
-          });
-        } else if (message.type === "user") {
-          const content = (message as unknown as { message?: { content?: unknown[] } }).message
-            ?.content;
-          for (const part of content ?? []) {
-            if (
-              !isRecord(part) ||
-              part.type !== "tool_result" ||
-              typeof part.tool_use_id !== "string"
-            )
-              continue;
-            const isError = part.is_error === true;
-            input.onEvent?.({
-              type: "tool",
-              at: new Date().toISOString(),
-              data: {
-                id: part.tool_use_id,
-                status: isError ? "failed" : "completed",
-                ...(isError
-                  ? { error: displayToolResult(part.content) }
-                  : { output: part.content }),
-              } as unknown as JsonValue,
-            });
-          }
-        }
+        activity.consume(message);
         if (message.type === "result") resultMessage = message;
       }
     } catch (cause) {
@@ -266,7 +173,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
-        events: eventsFrom(messages),
+        events,
       };
     }
     if (timer) clearTimeout(timer);
@@ -280,7 +187,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
-        events: eventsFrom(messages),
+        events,
       };
     }
     if (resultMessage?.subtype !== "success") {
@@ -292,7 +199,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
-        events: eventsFrom(messages),
+        events,
       };
     }
     const structured =
@@ -309,7 +216,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
           stderr,
           rawOutput: JSON.stringify(messages),
           usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
-          events: eventsFrom(messages),
+          events,
         };
     }
     return {
@@ -318,7 +225,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
       stderr,
       rawOutput: JSON.stringify(messages),
       usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
-      events: eventsFrom(messages),
+      events,
     };
   }
 }
@@ -328,123 +235,10 @@ function parseJson(text: string): JsonValue | undefined {
 }
 
 export function eventsFrom(messages: readonly SDKMessage[]): HarnessEvent[] {
-  const at = new Date().toISOString();
   const events: HarnessEvent[] = [];
-  let streamedText = "";
-  let thinkingStreamed = false;
-  for (const message of messages) {
-    if (message.type === "stream_event") {
-      const event = message.event as unknown as Record<string, unknown>;
-      const delta = event.delta as Record<string, unknown> | undefined;
-      const block = event.content_block as Record<string, unknown> | undefined;
-      if (event.type === "message_start") {
-        streamedText = "";
-        thinkingStreamed = false;
-      }
-      if (
-        event.type === "content_block_delta" &&
-        delta?.type === "thinking_delta" &&
-        typeof delta.thinking === "string"
-      ) {
-        thinkingStreamed = true;
-        events.push({
-          type: "log",
-          at,
-          data: { channel: "thinking", status: "Thinking", text: delta.thinking },
-        });
-      }
-      if (
-        event.type === "content_block_delta" &&
-        delta?.type === "text_delta" &&
-        typeof delta.text === "string"
-      ) {
-        streamedText += delta.text;
-        events.push({ type: "text", at, data: delta.text });
-      } else if (event.type === "content_block_start" && block?.type === "tool_use")
-        events.push({
-          type: "tool",
-          at,
-          data: {
-            id: typeof block.id === "string" ? block.id : "tool",
-            name: String(block.name ?? "Tool"),
-            status: "started",
-          } as unknown as JsonValue,
-        });
-      continue;
-    }
-    if (message.type === "assistant") {
-      const content = (message as unknown as { message?: { content?: unknown[] } }).message
-        ?.content;
-      for (const part of content ?? []) {
-        if (
-          part &&
-          typeof part === "object" &&
-          "type" in part &&
-          part.type === "text" &&
-          "text" in part &&
-          typeof part.text === "string"
-        ) {
-          if (!streamedText) events.push({ type: "text", at, data: part.text });
-          else if (part.text.startsWith(streamedText) && part.text.length > streamedText.length)
-            events.push({ type: "text", at, data: part.text.slice(streamedText.length) });
-        } else if (
-          isRecord(part) &&
-          part.type === "thinking" &&
-          typeof part.thinking === "string" &&
-          !thinkingStreamed
-        )
-          events.push({
-            type: "log",
-            at,
-            data: { channel: "thinking", status: "Thinking", text: part.thinking },
-          });
-        else if (isRecord(part) && part.type === "tool_use" && typeof part.id === "string")
-          events.push({
-            type: "tool",
-            at,
-            data: {
-              id: part.id,
-              name: typeof part.name === "string" ? part.name : "Tool",
-              status: "running",
-              ...(part.input === undefined ? {} : { input: part.input }),
-            } as unknown as JsonValue,
-          });
-      }
-    } else if (message.type === "user") {
-      const content = (message as unknown as { message?: { content?: unknown[] } }).message
-        ?.content;
-      for (const part of content ?? []) {
-        if (!isRecord(part) || part.type !== "tool_result" || typeof part.tool_use_id !== "string")
-          continue;
-        const isError = part.is_error === true;
-        events.push({
-          type: "tool",
-          at,
-          data: {
-            id: part.tool_use_id,
-            status: isError ? "failed" : "completed",
-            ...(isError ? { error: displayToolResult(part.content) } : { output: part.content }),
-          } as unknown as JsonValue,
-        });
-      }
-    } else if (message.type === "result") {
-      events.push({ type: "log", at, data: { status: "Turn completed" } });
-    }
-  }
+  const activity = new ClaudeMessages((event) => events.push(event));
+  for (const message of messages) activity.consume(message);
   return events;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function displayToolResult(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 
 function usageFrom(message?: SDKResultMessage) {

@@ -246,6 +246,38 @@ export interface DiagnosticView {
   attemptId?: string;
 }
 
+export function activityDiagnostic(
+  event: Record<string, unknown>,
+  attemptId: string,
+  invocationId?: string,
+): DiagnosticView | undefined {
+  const data = record(event.data) ?? {};
+  const level = text(data.level ?? event.level);
+  const status = text(data.status);
+  const severity =
+    event.type === "error" || level === "error"
+      ? "error"
+      : level === "warn" ||
+          level === "warning" ||
+          status === "Possibly stalled; provider status unknown" ||
+          status === "Provider reconnection failed"
+        ? "warning"
+        : undefined;
+  if (!severity) return;
+  const message =
+    text(data.message ?? data.status ?? event.message) ?? text(event.data) ?? "Provider diagnostic";
+  const detail = text(data.detail ?? event.detail);
+  const speaker = text(data.scoutId);
+  return {
+    id: JSON.stringify([attemptId, speaker, severity, message, detail]),
+    severity,
+    message: speaker ? `${speaker} · ${message}` : message,
+    detail,
+    attemptId,
+    invocationId,
+  };
+}
+
 type UnknownRecord = Record<string, unknown>;
 const record = (value: unknown): UnknownRecord | undefined =>
   value && typeof value === "object" && !Array.isArray(value)
@@ -425,7 +457,17 @@ export function viewFromCore(view: CoreRunView): UiRunView {
       }
     }
     const events = array(a.harnessEvents);
+    if (attempt.error)
+      diagnostics.push({
+        id: `${attempt.id}:failure`,
+        severity: "error",
+        message: attempt.error,
+        invocationId: attempt.invocationId,
+        attemptId: attempt.id,
+      });
     for (const event of events) {
+      const diagnostic = activityDiagnostic(event, attempt.id, attempt.invocationId);
+      if (diagnostic) diagnostics.push(diagnostic);
       const kind = text(event.type ?? event.kind) ?? "log";
       const data = record(event.data) ?? event;
       if (isEmptyThinkingStatus({ type: kind, data })) continue;
@@ -516,6 +558,29 @@ export function viewFromCore(view: CoreRunView): UiRunView {
   if (!tools.length) tools.push(...compatibility<ToolCallView>("tools"));
   if (!logs.length) logs.push(...compatibility<LogEntryView>("logs"));
   if (!diagnostics.length) diagnostics.push(...compatibility<DiagnosticView>("diagnostics"));
+  for (const invocation of Object.values(view.state.invocations))
+    if (
+      invocation.error &&
+      !diagnostics.some(
+        (item) => item.invocationId === invocation.id && item.message === invocation.error,
+      )
+    )
+      diagnostics.push({
+        id: `${invocation.id}:failure`,
+        severity: "error",
+        message: invocation.error,
+        invocationId: invocation.id,
+      });
+  for (const tool of tools)
+    if (tool.error)
+      diagnostics.push({
+        id: `${tool.id}:failure`,
+        severity: "error",
+        message: `${tool.name} failed`,
+        detail: tool.error,
+        invocationId: tool.invocationId,
+        attemptId: tool.attemptId,
+      });
   if (!declaredAttemptCapabilities) {
     const declared = record(m2?.capabilities ?? raw.capabilities ?? state.capabilities);
     if (declared)

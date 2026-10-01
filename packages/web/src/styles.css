@@ -1610,6 +1610,33 @@ body.resizing-panels {
   background: transparent;
   cursor: pointer;
 }
+.session-window-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.session-provider-note {
+  margin: 0;
+  padding: 8px 20px;
+  color: #9eacc0;
+  font-size: 12px;
+  border-bottom: 1px solid #25364b;
+}
+.agent-session-header .session-size-toggle {
+  font-size: 12px;
+  padding: 8px;
+  border: 1px solid #31445c;
+  border-radius: 5px;
+}
+.agent-session-backdrop.session-fullscreen {
+  padding: 0;
+}
+.session-fullscreen .agent-session-modal {
+  width: 100%;
+  height: 100dvh;
+  max-height: 100dvh;
+  border-radius: 0;
+}
 .agent-session-stream {
   flex: 1;
   overflow: auto;
