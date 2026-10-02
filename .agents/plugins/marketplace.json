@@ -1,0 +1,20 @@
+{
+  "name": "kouro",
+  "interface": {
+    "displayName": "Kouro"
+  },
+  "plugins": [
+    {
+      "name": "kouro",
+      "source": {
+        "source": "local",
+        "path": "./plugins/kouro"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -76,6 +76,64 @@ below the sessions. On narrow screens, sessions stack vertically. Steering and
 interrupt controls target the agent shown in that panel; cancellation stops the
 whole run.
 
+## Automatic workflow tasks
+
+Open **Workflow task** in the sidebar, enter one task, and choose the workflows
+Kouro may use. Choose a planning model and an execution model, then select
+**Start workflow task**. The execution selection fills agents without an explicit
+model; models already chosen by a workflow stay pinned. Each run retains the
+selected workflow versions and bundle digests.
+
+The planner generates up to 12 milestones with workflow assignments and
+dependencies. Kouro validates the entire plan before starting any milestone,
+runs ready milestones up to the chosen parallel limit, and starts dependents
+only after every prerequisite succeeds. A failed prerequisite blocks its
+dependents. Approval gates remain ordinary durable waits: open **Milestones**,
+select **Review approval**, and decide in the invocation inspector. Pending
+approvals and milestone assignments survive a host restart.
+
+Eligible workflows accept a string `task` and need no other required inputs.
+Workflows that schedule another milestone plan or run commands in the source
+checkout are excluded. Workflows
+that write or execute commands require a repository path. Each milestone gets
+an isolated worktree shared by its workflow steps. Dependents receive completed
+prerequisites' results and merged file changes. Successful execution combines
+the milestone trees in the private run worktree, visible in **Delivery**. Merge
+conflicts fail execution and retain the individual worktrees for inspection.
+
+The builder exposes the same scheduler for authored composition. Declare the
+planner with `.agent` (or compose planning with `.fusion`) and supply its plan
+output. Pass workflow builders to `.use`:
+
+```ts
+import { MilestonePlanType } from "@kouro/core";
+
+const planner = workflow.agent("decompose", {
+  prompt: "Generate milestones with id, title, task, workflowId and dependsOn.",
+  input: { task },
+  produces: MilestonePlanType,
+});
+const execute = workflow.milestones("milestones", {
+  plan: planner.output, maxMilestones: 8, maxConcurrent: 2,
+}).use(featureWorkflow, bugfixWorkflow);
+workflow.startAt(planner);
+planner.on("success").to(execute);
+execute.on("success").to(workflow.complete("done", { output: execute.output }));
+execute.on("failure").to(workflow.complete("failed", { result: "failed" }));
+```
+
+Plan shape: `{ milestones: [{ id, title, task, workflowId, dependsOn: [] }] }`.
+`workflowId` is a supplied workflow builder's ID. Output is a durable report of
+milestones and their result artifact references. HTTP clients can discover
+eligibility at `GET /api/task-workflows`, create a run with `POST /api/tasks`, and
+read progress at `GET /api/runs/:id/milestones`. Task creation takes `task`,
+`workflowIds`, `planner` and `executor` (`{ harness, modelId }`), `idempotencyKey`,
+and optional `maxMilestones`, `maxConcurrent`, and `workspace.repositoryPath`.
+
+The same flow is available as `kouro task run`. [CLI workflow tasks and agent
+plugins](./agent-plugins.md) covers headless execution, greenfield setup, approval
+decisions and installation in Codex or Claude Code.
+
 ## Agent swarm
 
 Open **Agent swarm** in the sidebar, list 1–8 models with their harnesses, then

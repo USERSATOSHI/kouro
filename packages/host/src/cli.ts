@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import { ApplicationService } from "./application/service.ts";
 import { createHostServer } from "./http/server.ts";
 import { serveScoutMcp } from "./adapters/harness/scout-mcp.ts";
+import { parseTaskArgs, taskCommand, taskUsage } from "./cli/tasks";
 
 const usage = `Kouro v2 M1
 
@@ -13,6 +14,8 @@ Usage:
   kouro serve     Start the loopback-only local workbench
   kouro create template NAME --template ID  Create a project template under .kouro
   kouro run [WORKFLOW] [--task TEXT] [--profile ID] [--allow-unrestricted-commands]  Execute a workflow headlessly
+  kouro task     Generate and execute dependent milestones; use kouro task --help
+  kouro plugin path  Print the bundled Codex/Claude plugin marketplace directory
   kouro inspect ID  Print one durable run view as JSON
   kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
   kouro retry ID INVOCATION REV  Retry one failed invocation
@@ -37,9 +40,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (
-    !new Set(["serve", "run", "inspect", "control", "retry", "checkpoint", "fork", "create"]).has(
-      command,
-    )
+    !new Set([
+      "serve",
+      "run",
+      "task",
+      "plugin",
+      "inspect",
+      "control",
+      "retry",
+      "checkpoint",
+      "fork",
+      "create",
+    ]).has(command)
   ) {
     process.stderr.write(`Unknown command: ${command}\n\n${usage}`);
     return 2;
@@ -47,14 +59,65 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
   if (command === "create") return createCommand(argv.slice(1));
 
-  const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-data");
+  if (command === "plugin") {
+    const root = firstExistingPath(
+      [resolve(import.meta.dir), resolve(import.meta.dir, "../../..")].filter((candidate) =>
+        existsSync(resolve(candidate, ".agents/plugins/marketplace.json")),
+      ),
+    );
+    if (argv[1] !== "path") {
+      process.stderr.write("Usage: kouro plugin path\n");
+      return 2;
+    }
+    if (!root) {
+      process.stderr.write("Kouro plugin assets are not installed\n");
+      return 1;
+    }
+    process.stdout.write(`${root}\n`);
+    return 0;
+  }
+
+  if (command === "task") {
+    if (argv.includes("--help") || argv.includes("-h") || argv[1] === "help") {
+      process.stdout.write(taskUsage);
+      return 0;
+    }
+    let args;
+    try {
+      args = parseTaskArgs(argv.slice(1));
+    } catch (cause) {
+      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
+      return 2;
+    }
+    const project = args.workspace;
+    let taskService: ApplicationService | undefined;
+    try {
+      taskService = new ApplicationService({
+        dataDir: resolve(
+          args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve(project, ".kouro-data"),
+        ),
+        templateRoot: resolve(project, ".kouro"),
+      });
+      await taskService.start();
+      return await taskCommand(args, taskService);
+    } catch (cause) {
+      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
+      return 1;
+    } finally {
+      await taskService?.close();
+    }
+  }
+
+  const project =
+    command === "run" ? resolve(optionValue(argv, "--workspace") ?? process.cwd()) : process.cwd();
+  const dataDir = resolve(process.env.KOURO_DATA_DIR ?? resolve(project, ".kouro-data"));
   const staticRoot = firstExistingPath([
     resolve("packages/web/dist"),
     resolve(import.meta.dir, "web"),
     resolve(import.meta.dir, "../../web/dist"),
     resolve(import.meta.dir, "../web"),
   ]);
-  const service = new ApplicationService({ dataDir });
+  const service = new ApplicationService({ dataDir, templateRoot: resolve(project, ".kouro") });
   await service.start();
   if (command === "run") {
     const valueOptions = new Set(["--profile", "--task", "--workspace", "--ticket"]);
@@ -75,7 +138,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       profileArg?.slice("--profile=".length) ??
       (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
     const task = optionValue(argv, "--task");
-    const workspace = optionValue(argv, "--workspace");
+    const workspace =
+      optionValue(argv, "--workspace") !== undefined || (await hasGitHead(project))
+        ? { repositoryPath: project }
+        : undefined;
     const ticket = optionValue(argv, "--ticket");
     if (
       profile !== undefined &&
@@ -107,7 +173,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(task === undefined ? {} : { task }),
         ...(ticket === undefined ? {} : { ticket }),
       },
-      ...(workspace === undefined ? {} : { workspace: { repositoryPath: workspace } }),
+      ...(workspace ? { workspace } : {}),
     });
     let view = service.getView(run.runId);
     while (
@@ -262,6 +328,18 @@ function optionValue(argv: readonly string[], name: string): string | undefined 
   if (inline) return inline.slice(name.length + 1);
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : undefined;
+}
+
+async function hasGitHead(project: string): Promise<boolean> {
+  try {
+    const child = Bun.spawn(["git", "-C", project, "rev-parse", "--verify", "HEAD"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    return (await child.exited) === 0;
+  } catch {
+    return false;
+  }
 }
 
 const templateIds = [

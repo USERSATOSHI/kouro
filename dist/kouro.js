@@ -87,7 +87,253 @@ var init_contracts = __esm(() => {
   };
 });
 
+// packages/core/src/milestones.ts
+function validateMilestonePlan(value, workflows, max) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Milestone plan must be an object");
+  const raw = value.milestones;
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > max)
+    throw new Error(`Plan must contain 1 to ${max} milestones`);
+  const ids = new Set;
+  const milestones = raw.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new Error("Invalid milestone");
+    const { id, title, task, workflowId, dependsOn } = item;
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(id) || ids.has(id))
+      throw new Error(`Invalid or duplicate milestone ID: ${id}`);
+    ids.add(id);
+    if (typeof title !== "string" || !title.trim() || title.length > 200 || typeof task !== "string" || !task.trim() || task.length > 20000)
+      throw new Error(`Milestone ${id} needs a title and task`);
+    if (typeof workflowId !== "string" || !workflows.includes(workflowId))
+      throw new Error(`Milestone ${id} selects unavailable workflow ${workflowId}`);
+    if (!Array.isArray(dependsOn) || dependsOn.some((dependency) => typeof dependency !== "string") || new Set(dependsOn).size !== dependsOn.length)
+      throw new Error(`Milestone ${id} has invalid dependencies`);
+    return { id, title: title.trim(), task: task.trim(), workflowId, dependsOn };
+  });
+  for (const milestone of milestones)
+    for (const dependency of milestone.dependsOn)
+      if (dependency === milestone.id || !ids.has(dependency))
+        throw new Error(`Milestone ${milestone.id} has unknown or self dependency ${dependency}`);
+  const ordered = [];
+  const visiting = new Set;
+  const visited = new Set;
+  const visit = (milestone) => {
+    if (visited.has(milestone.id))
+      return;
+    if (visiting.has(milestone.id))
+      throw new Error("Milestone dependencies contain a cycle");
+    visiting.add(milestone.id);
+    for (const dependency of milestone.dependsOn)
+      visit(milestones.find((item) => item.id === dependency));
+    visiting.delete(milestone.id);
+    visited.add(milestone.id);
+    ordered.push(milestone);
+  };
+  milestones.forEach(visit);
+  return { milestones: ordered };
+}
+function milestoneScopeId(ownerInvocationId, milestoneId) {
+  return `${ownerInvocationId}:milestone:${milestoneId}`;
+}
+function milestoneProgress(plan, node, state, owner) {
+  const statuses = new Map;
+  return plan.milestones.map((milestone) => {
+    const scopeId = milestoneScopeId(owner, milestone.id);
+    const invocations = Object.values(state.invocations).filter((item) => item.scopeId === scopeId);
+    const active = invocations.some((item) => ["pending", "reserved", "running"].includes(item.status));
+    const terminal = invocations.some((item) => item.status === "succeeded" && item.outcome === "success" && state.scopes[scopeId]?.milestoneExitIds?.includes(item.nodeId));
+    let status;
+    if (state.scopes[scopeId]) {
+      const approval = Object.values(state.approvals).some((item) => {
+        let scope = state.scopes[state.invocations[item.invocationId]?.scopeId ?? ""];
+        while (scope && scope.id !== scopeId && scope.parentScopeId)
+          scope = state.scopes[scope.parentScopeId];
+        return item.status === "pending" && scope?.id === scopeId;
+      });
+      status = approval ? "approval" : active ? "running" : terminal ? "succeeded" : "failed";
+    } else if (milestone.dependsOn.some((id) => ["failed", "blocked"].includes(statuses.get(id) ?? "waiting")))
+      status = "blocked";
+    else
+      status = milestone.dependsOn.every((id) => statuses.get(id) === "succeeded") ? "ready" : "waiting";
+    statuses.set(milestone.id, status);
+    return {
+      ...milestone,
+      scopeId,
+      definitionId: node.workflows.find((item) => item.id === milestone.workflowId).definitionId,
+      status,
+      invocationIds: invocations.map((item) => item.id)
+    };
+  });
+}
+var MAX_MILESTONES = 12, MilestonePlanType, MilestoneResultType;
+var init_milestones = __esm(() => {
+  MilestonePlanType = {
+    id: "kouro.milestone-plan",
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["milestones"],
+      properties: {
+        milestones: {
+          type: "array",
+          minItems: 1,
+          maxItems: MAX_MILESTONES,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id", "title", "task", "workflowId", "dependsOn"],
+            properties: {
+              id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+              title: { type: "string", minLength: 1, maxLength: 200 },
+              task: { type: "string", minLength: 1, maxLength: 20000 },
+              workflowId: { type: "string", minLength: 1 },
+              dependsOn: {
+                type: "array",
+                uniqueItems: true,
+                maxItems: MAX_MILESTONES,
+                items: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+  MilestoneResultType = {
+    id: "kouro.milestone-result",
+    schema: {
+      type: "object",
+      required: ["milestones"],
+      properties: {
+        milestones: { type: "array", items: { type: "object" } }
+      }
+    }
+  };
+});
+
+// packages/core/src/fusion.ts
+function validateFusionRounds(value) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > MAX_FUSION_ROUNDS)
+    throw new Error(`Fusion review rounds must be an integer from 0 to ${MAX_FUSION_ROUNDS}`);
+  return value;
+}
+function buildFusionStages(workflow, id, options) {
+  const rounds = validateFusionRounds(options.rounds);
+  if (options.members.length < 2)
+    throw new Error("Fusion requires at least two models");
+  const memberIds = options.members.map((member) => member.id);
+  if (memberIds.some((memberId) => !memberId.trim()) || new Set(memberIds).size !== memberIds.length)
+    throw new Error("Fusion members need unique nonblank IDs");
+  if (memberIds.includes(options.synthesis.id))
+    throw new Error("Fusion synthesis needs a distinct node ID");
+  const common = (member) => {
+    const { id: _id, ...agentOptions } = member;
+    return { ...agentOptions, role: member.role ?? member.id };
+  };
+  const stage = (groupId, branches) => {
+    const entry = workflow.parallel(groupId, { branches, maxConcurrent: branches.length });
+    const join = workflow.join(`join-${groupId}`, {
+      groupId,
+      mode: "fail-fast",
+      failure: "cancel-remaining"
+    });
+    entry.on("success").to(join);
+    for (const branch of branches)
+      branch.on("success").to(join);
+    return { entry, join };
+  };
+  const drafts = options.members.map((member) => workflow.agent(member.id, {
+    ...common(member),
+    input: { ...member.input, task: options.task },
+    produces: member.produces ?? options.produces,
+    fusion: { groupId: id, memberId: member.id, stage: "draft", round: 0 }
+  }));
+  const initial = stage(id, drafts);
+  let previous = drafts;
+  let barrier = initial.join;
+  const cycles = [];
+  for (let round = 1;round <= rounds; round++) {
+    const reviews = options.members.map((member, index) => workflow.agent(`${member.id}-review-${round}`, {
+      ...common(member),
+      prompt: `${options.reviewPrompt}
+You are member ${index + 1}. This is review round ${round} of ${rounds}.`,
+      input: {
+        ...member.input,
+        task: options.task,
+        own: previous[index].output,
+        ...Object.fromEntries(previous.flatMap((plan, peerIndex) => peerIndex === index ? [] : [[`peer${peerIndex + 1}`, plan.output]]))
+      },
+      produces: options.reviewProduces,
+      fusion: { groupId: id, memberId: member.id, stage: "review", round }
+    }));
+    const reviewStage = stage(`${id}-review-${round}`, reviews);
+    barrier.on("success").to(reviewStage.entry);
+    const revisions = options.members.map((member, index) => workflow.agent(`${member.id}-revise-${round}`, {
+      ...common(member),
+      prompt: `${options.revisionPrompt}
+You are member ${index + 1}. This is revision round ${round} of ${rounds}.`,
+      input: {
+        ...member.input,
+        task: options.task,
+        previous: previous[index].output,
+        ...Object.fromEntries(reviews.map((review, reviewerIndex) => [`review${reviewerIndex + 1}`, review.output]))
+      },
+      produces: member.produces ?? options.produces,
+      fusion: { groupId: id, memberId: member.id, stage: "revision", round }
+    }));
+    const revisionStage = stage(`${id}-revision-${round}`, revisions);
+    reviewStage.join.on("success").to(revisionStage.entry);
+    cycles.push({ reviews, revisions });
+    previous = revisions;
+    barrier = revisionStage.join;
+  }
+  const result = workflow.agent(options.synthesis.id, {
+    ...common(options.synthesis),
+    input: {
+      ...options.synthesis.input,
+      task: options.task,
+      ...Object.fromEntries(previous.map((plan, index) => [`member${index + 1}`, plan.output])),
+      ...Object.fromEntries((cycles.at(-1)?.reviews ?? []).map((review, index) => [
+        `review${index + 1}`,
+        review.output
+      ]))
+    },
+    produces: options.produces,
+    fusion: { groupId: id, memberId: options.synthesis.id, stage: "synthesis", round: rounds }
+  });
+  barrier.on("success").to(result);
+  return { entry: initial.entry, result, drafts, rounds: cycles };
+}
+var MAX_FUSION_ROUNDS = 10;
+
 // packages/core/src/builder.ts
+function scopeDefinition(source, prefix) {
+  const scopedId = (id) => `${prefix}:${id}`;
+  return {
+    ...source,
+    id: scopedId(source.id),
+    nodes: source.nodes.map((node) => node.kind === "call" && ("definitionId" in node) ? { ...node, definitionId: scopedId(node.definitionId) } : node.kind === "forEach" && ("templateDefinitionId" in node) ? { ...node, templateDefinitionId: scopedId(node.templateDefinitionId) } : node.kind === "milestones" && ("workflows" in node) ? {
+      ...node,
+      workflows: node.workflows.map((item) => ({
+        ...item,
+        definitionId: scopedId(item.definitionId)
+      }))
+    } : node),
+    ...source.scouts ? {
+      scouts: source.scouts.map((scout) => ({
+        ...scout,
+        definitionId: scopedId(scout.definitionId)
+      }))
+    } : {},
+    ...source.definitions ? {
+      definitions: Object.fromEntries(Object.entries(source.definitions).map(([id, child]) => [
+        scopedId(id),
+        scopeDefinition(child, prefix)
+      ]))
+    } : {}
+  };
+}
+
 class NodeHandle {
   workflowId;
   id;
@@ -104,6 +350,21 @@ class NodeHandle {
   }
   on(outcome) {
     return new EdgeBuilder(this.owner, this.id, outcome);
+  }
+}
+
+class FusionBuilder {
+  compose;
+  composed = false;
+  constructor(compose) {
+    this.compose = compose;
+  }
+  use(...members) {
+    if (this.composed)
+      throw new Error("Fusion members have already been composed");
+    const handle = this.compose(members);
+    this.composed = true;
+    return handle;
   }
 }
 
@@ -283,6 +544,7 @@ class WorkflowBuilder {
   version;
   limits;
   nodeMap = new Map;
+  agentOptions = new Map;
   edgeList = [];
   inputMap = new Map;
   counterMap = new Map;
@@ -325,6 +587,7 @@ class WorkflowBuilder {
       prompt: options.prompt,
       ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
+      ...options.fusion === undefined ? {} : { fusion: options.fusion },
       ...options.workspaceAccess === undefined ? {} : { workspaceAccess: options.workspaceAccess },
       ...options.capabilities === undefined ? {} : { capabilities: [...new Set(options.capabilities)].sort() },
       inputPorts: Object.entries(options.input ?? {}).map(([name, value]) => port(name, this.schemaOf(value), isInputHandle(value) ? value.required : true)),
@@ -344,6 +607,7 @@ class WorkflowBuilder {
       ...options.resources ? { resources: options.resources } : {}
     };
     this.addNode(node);
+    this.agentOptions.set(id, options);
     return this.handle(id, output);
   }
   command(id, options) {
@@ -443,6 +707,78 @@ class WorkflowBuilder {
     this.addNode(node);
     this.sourceMap.set(id, { sourceId: id });
     return this.handle(id, output);
+  }
+  fusion(id, options) {
+    validateFusionRounds(options.rounds);
+    return new FusionBuilder((members) => this.composeFusion(id, options, members));
+  }
+  composeFusion(id, options, members) {
+    if (members.length < 2)
+      throw new Error("Fusion requires at least two model agents");
+    const handles = [...members, options.synthesis];
+    const ids = new Set(handles.map((handle) => handle.id));
+    if (ids.size !== handles.length)
+      throw new Error("Fusion requires distinct member and synthesis agents");
+    for (const handle of handles) {
+      assertHandleOwner(handle, this);
+      const node = this.nodeMap.get(handle.id);
+      if (node?.kind !== "agent" || !this.agentOptions.get(handle.id)?.produces)
+        throw new Error(`Fusion ${handle.id} must be an agent with a declared output`);
+      if (node.fusion || this.entryId === handle.id || this.edgeList.some((edge) => edge.sourceNodeId === handle.id || edge.targetNodeId === handle.id) || [...this.nodeMap.values()].some((other) => !ids.has(other.id) && other.bindings.some((binding) => binding.source.kind === "producer" && binding.source.sourceId === handle.id)))
+        throw new Error(`Fusion agent ${handle.id} must be unwired before composition`);
+    }
+    if (this.nodeMap.has(id) && !ids.has(id))
+      throw new Error(`Duplicate node ${id}`);
+    const child = new WorkflowBuilder({ id: `${this.id}:${id}` });
+    const task = child.input("task", this.schemaOf(options.task));
+    const inputs = { task: options.task };
+    const inherit = (handle) => {
+      const member = this.agentOptions.get(handle.id);
+      const memberInputs = Object.fromEntries(Object.entries(member.input ?? {}).filter(([name]) => name !== "task").map(([name, value]) => {
+        if (isOutputHandle(value) && ids.has(value.sourceId))
+          throw new Error("Fusion declarations cannot depend on one another before composition");
+        const portName = `${handle.id}:${name}`;
+        inputs[portName] = value;
+        return [name, child.input(portName, this.schemaOf(value))];
+      }));
+      return {
+        ...member,
+        id: handle.id,
+        input: memberInputs,
+        ...member.uses ? {
+          uses: member.uses.map((scout) => {
+            assertScoutOwner(scout, this);
+            const declaration = this.scoutList.find((item) => item.id === scout.id);
+            if (!child.scoutList.some((item) => item.id === scout.id)) {
+              const scoped = scopeDefinition(this.childDefinitions.get(declaration.definitionId), child.id);
+              child.scoutList.push({ ...declaration, definitionId: scoped.id });
+              child.childDefinitions.set(scoped.id, scoped);
+            }
+            return Object.freeze({
+              ...scout,
+              workflowId: child.id,
+              ownerToken: child.ownerToken
+            });
+          })
+        } : {}
+      };
+    };
+    const stages = buildFusionStages(child, id, {
+      ...options,
+      task,
+      members: members.map(inherit),
+      synthesis: inherit(options.synthesis),
+      produces: this.agentOptions.get(options.synthesis.id).produces
+    });
+    child.output(stages.result.output);
+    const done = child.complete("done", { output: stages.result.output });
+    child.startAt(stages.entry);
+    stages.result.on("success").to(done);
+    for (const handle of handles) {
+      this.nodeMap.delete(handle.id);
+      this.agentOptions.delete(handle.id);
+    }
+    return this.call(id, child, { input: inputs });
   }
   scout(id, child, options = {}) {
     const handle = this.call(id, child, options);
@@ -644,6 +980,44 @@ class WorkflowBuilder {
     this.sourceMap.set(id, { sourceId: id });
     return this.handle(id, output);
   }
+  milestones(id, options) {
+    const maxMilestones = options.maxMilestones ?? 8;
+    const maxConcurrent = options.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxMilestones) || maxMilestones < 1 || maxMilestones > MAX_MILESTONES)
+      throw new Error(`maxMilestones must be between 1 and ${MAX_MILESTONES}`);
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > maxMilestones)
+      throw new Error("maxConcurrent must be between 1 and maxMilestones");
+    return {
+      use: (...workflows) => {
+        if (!workflows.length)
+          throw new Error("milestones.use requires available workflows");
+        const sources = workflows.map((workflow) => workflow instanceof WorkflowBuilder ? workflow.build() : workflow);
+        if (new Set(sources.map((source) => source.id)).size !== sources.length)
+          throw new Error("Duplicate milestone workflow");
+        const choices = sources.map((source) => {
+          const scoped = scopeDefinition(source, id);
+          this.childDefinitions.set(scoped.id, scoped);
+          return { id: source.id, definitionId: scoped.id };
+        });
+        const output = port("output", MilestoneResultType);
+        const node = {
+          id,
+          kind: "milestones",
+          workflows: choices,
+          maxMilestones,
+          maxConcurrent,
+          inputPorts: [port("plan", MilestonePlanType)],
+          outputPorts: [output],
+          bindings: [
+            { targetPort: "plan", source: bindingSource(options.plan, this), missing: "error" }
+          ]
+        };
+        this.addNode(node);
+        this.sourceMap.set(id, { sourceId: id });
+        return this.handle(id, output);
+      }
+    };
+  }
   sequence(...nodes) {
     for (let index = 0;index < nodes.length - 1; index += 1) {
       assertHandleOwner(nodes[index], this);
@@ -797,7 +1171,7 @@ function stripInternal(node) {
     outputPorts: node.outputPorts.map(stripPort),
     bindings: node.bindings
   };
-  if (node.kind === "call" || node.kind === "fork" || node.kind === "join" || node.kind === "loop" || node.kind === "forEach")
+  if (node.kind === "call" || node.kind === "fork" || node.kind === "join" || node.kind === "loop" || node.kind === "forEach" || node.kind === "milestones")
     return { ...base, ...node };
   if (node.kind === "agent") {
     return {
@@ -806,6 +1180,7 @@ function stripInternal(node) {
       prompt: node.prompt,
       ...node.harness === undefined ? {} : { harness: node.harness },
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
+      ...node.fusion === undefined ? {} : { fusion: node.fusion },
       ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
       ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
       ...node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs },
@@ -850,6 +1225,7 @@ function finitePositive(value, fallback) {
 }
 var commandEvidenceSchema, commandResultSchema;
 var init_builder = __esm(() => {
+  init_milestones();
   commandEvidenceSchema = {
     type: "object",
     properties: {
@@ -1015,7 +1391,8 @@ async function compileWorkflowDetailed(source) {
       "fork",
       "join",
       "loop",
-      "forEach"
+      "forEach",
+      "milestones"
     ].includes(node.kind)) {
       diagnostics.push(error("UNSUPPORTED_NODE_KIND", `Node kind ${node.kind} is unsupported by this compiler`, node.id));
     }
@@ -1039,6 +1416,39 @@ async function compileWorkflowDetailed(source) {
       diagnostics.push(error("UNBOUNDED_LOOP", "Loop maxIterations must be a positive safe integer", node.id));
     if (node.kind === "forEach" && (!Number.isSafeInteger(node.maxItems) || node.maxItems <= 0 || !Number.isSafeInteger(node.maxConcurrent) || node.maxConcurrent <= 0))
       diagnostics.push(error("INVALID_MAP_BOUND", "forEach maxItems and maxConcurrent must be positive safe integers", node.id));
+    if (node.kind === "milestones" && !("workflows" in node))
+      diagnostics.push(error("INVALID_MILESTONE_WORKFLOWS", "Milestones require workflow declarations", node.id));
+    if (node.kind === "milestones" && "workflows" in node) {
+      if (!Number.isSafeInteger(node.maxMilestones) || node.maxMilestones < 1 || node.maxMilestones > 12 || !Number.isSafeInteger(node.maxConcurrent) || node.maxConcurrent < 1 || node.maxConcurrent > node.maxMilestones)
+        diagnostics.push(error("INVALID_MILESTONE_BOUND", "Milestone bounds must be positive and at most 12", node.id));
+      if (!node.workflows.length || new Set(node.workflows.map((item) => item.id)).size !== node.workflows.length)
+        diagnostics.push(error("INVALID_MILESTONE_WORKFLOWS", "Milestones need unique available workflows", node.id));
+      for (const choice of node.workflows) {
+        const child = source.definitions?.[choice.definitionId];
+        if (!child)
+          diagnostics.push(error("MISSING_CHILD_DEFINITION", `Missing milestone workflow ${choice.definitionId}`, node.id));
+        else if (!(child.inputPorts ?? []).some((port2) => port2.name === "task") || (child.inputPorts ?? []).some((port2) => port2.required && port2.name !== "task" && port2.defaultValue === undefined))
+          diagnostics.push(error("INVALID_MILESTONE_INPUTS", "Milestone workflows must accept task without other required inputs", node.id));
+        if (child) {
+          const taskPort = child.inputPorts?.find((port2) => port2.name === "task");
+          const taskSchema = taskPort && child.schemaCatalog?.[taskPort.schemaDigest];
+          if (!taskSchema || typeof taskSchema !== "object" || Array.isArray(taskSchema) || taskSchema.type !== "string")
+            diagnostics.push(error("INVALID_MILESTONE_TASK", "Milestone workflows require a string task", node.id));
+          const pending = [child];
+          const seen = new Set;
+          for (const definition of pending) {
+            if (seen.has(definition))
+              continue;
+            seen.add(definition);
+            if (definition.nodes.some((item) => item.kind === "milestones"))
+              diagnostics.push(error("NESTED_MILESTONE_WORKFLOW", "Selected workflows must not schedule another milestone plan", node.id));
+            if (definition.nodes.some((item) => item.kind === "command" && item.workspaceAccess === "source-repository"))
+              diagnostics.push(error("UNSAFE_MILESTONE_WORKSPACE", "Milestone commands must use the isolated workspace", node.id));
+            pending.push(...Object.values(definition.definitions ?? {}));
+          }
+        }
+      }
+    }
     if (node.kind === "agent") {
       const uses = node.uses ?? [];
       const seenUses = new Set;
@@ -1447,6 +1857,12 @@ function summarizeDefinition(definition, definitions, active) {
         attempts = add(attempts, multiply(bodySummary.attempts, multiplier));
         saturated ||= bodySummary.saturated;
       }
+    } else if (node.kind === "milestones" && "workflows" in node) {
+      const children = node.workflows.map((choice) => summarizeDefinition(definitions[choice.definitionId], definitions, active));
+      scopes = add(scopes, multiply(Math.max(0, ...children.map((child) => child.scopes)), node.maxMilestones));
+      invocations = add(invocations, multiply(Math.max(0, ...children.map((child) => child.invocations)), node.maxMilestones));
+      attempts = add(attempts, multiply(Math.max(0, ...children.map((child) => child.attempts)), node.maxMilestones));
+      saturated ||= children.some((child) => child.saturated);
     } else if (node.kind === "forEach") {
       const mapNode = node;
       const child = summarizeDefinition(definitions[mapNode.templateDefinitionId], definitions, active);
@@ -1715,7 +2131,7 @@ function reduceEvent(state, event) {
         throw new Error(`Run cannot resume from ${next.status}`);
       return { ...next, status: "running" };
     case "run.cancel.requested":
-      if (!["running", "paused"].includes(next.status))
+      if (!["running", "paused", "recovery-required"].includes(next.status))
         throw new Error(`Run cannot cancel from ${next.status}`);
       return { ...next, control: "cancel-requested" };
     case "run.interrupt.requested":
@@ -2027,7 +2443,8 @@ function invocationCompleted(state, event) {
   return { ...state, invocations: { ...state.invocations, [invocation.id]: completed } };
 }
 function runCompleted(state, event) {
-  if (state.status !== "running" && state.status !== "paused")
+  const stoppedRecovery = state.status === "recovery-required" && event.payload.status === "cancelled" && state.control === "cancel-requested" && Object.values(state.attempts).every((attempt) => !["reserved", "running"].includes(attempt.status));
+  if (state.status !== "running" && state.status !== "paused" && !stoppedRecovery)
     throw new Error(`Run cannot complete from ${state.status}`);
   const invocations = Object.values(state.invocations);
   if (invocations.length === 0 || invocations.some((invocation) => !["succeeded", "failed", "recovery-required"].includes(invocation.status))) {
@@ -2079,10 +2496,23 @@ function decide(bundle, state) {
     }
     return intents;
   }
+  for (const scope of Object.values(state.scopes)) {
+    if (scope.id === state.rootScopeId || Object.values(state.invocations).some((item) => item.scopeId === scope.id))
+      continue;
+    const child = bundle.definitions[scope.definitionId];
+    const entry = child?.nodes.find((item) => item.id === child.entry);
+    if (entry)
+      intents.push({
+        kind: "activate",
+        scopeId: scope.id,
+        nodeId: entry.id,
+        bindings: bindingsForNode(entry, state, scope.id)
+      });
+  }
   const invocations = Object.values(state.invocations).sort((a, b) => a.activationOrdinal - b.activationOrdinal || a.id.localeCompare(b.id));
   for (const invocation of invocations) {
-    const scopeDefinition = bundle.definitions[state.scopes[invocation.scopeId]?.definitionId ?? bundle.rootDefinitionId] ?? definition;
-    const node = scopeDefinition.nodes.find((candidate) => candidate.id === invocation.nodeId);
+    const scopeDefinition2 = bundle.definitions[state.scopes[invocation.scopeId]?.definitionId ?? bundle.rootDefinitionId] ?? definition;
+    const node = scopeDefinition2.nodes.find((candidate) => candidate.id === invocation.nodeId);
     if (invocation.status === "pending") {
       if (node?.kind === "approval") {
         const approval = Object.values(state.approvals).find((item) => item.invocationId === invocation.id);
@@ -2098,7 +2528,14 @@ function decide(bundle, state) {
         continue;
       }
       if (node?.kind === "complete") {
-        intents.push({ kind: "complete", invocationId: invocation.id, outcome: node.result });
+        const refs = Object.values(state.invocations).flatMap((candidate) => candidate.output);
+        const output = Object.values(invocation.inputBindings).flatMap((binding) => binding.artifactId ? refs.filter((ref) => ref.id === binding.artifactId).slice(0, 1) : []);
+        intents.push({
+          kind: "complete",
+          invocationId: invocation.id,
+          outcome: node.result,
+          ...output.length ? { output } : {}
+        });
         continue;
       }
       if (node?.kind === "call") {
@@ -2113,13 +2550,14 @@ function decide(bundle, state) {
         } else {
           const childInvocations = Object.values(state.invocations).filter((candidate) => candidate.scopeId === childScope.id);
           if (childInvocations.length > 0 && childInvocations.every((candidate) => ["succeeded", "failed", "recovery-required"].includes(candidate.status))) {
-            const output = childInvocations.flatMap((candidate) => candidate.output);
+            const terminals = childInvocations.filter((candidate) => bundle.definitions[childScope.definitionId]?.nodes.some((child) => child.id === candidate.nodeId && child.kind === "complete"));
+            const output = bundle.definitions[childScope.definitionId]?.outputPorts.length ? terminals.flatMap((candidate) => candidate.output) : childInvocations.flatMap((candidate) => candidate.output);
             const evidence = childInvocations.flatMap((candidate) => candidate.evidence);
             const artifacts = childInvocations.flatMap((candidate) => candidate.artifacts);
             intents.push({
               kind: "complete",
               invocationId: invocation.id,
-              outcome: childInvocations.some((candidate) => candidate.status !== "succeeded") ? "failed" : "succeeded",
+              outcome: terminals.length ? terminals.some((candidate) => candidate.status === "succeeded") ? "succeeded" : "failed" : childInvocations.some((candidate) => candidate.status !== "succeeded") ? "failed" : "succeeded",
               output,
               evidence,
               artifacts
@@ -2154,6 +2592,35 @@ function decide(bundle, state) {
             });
           }
         }
+        continue;
+      }
+      if (node?.kind === "milestones" && "workflows" in node) {
+        const raw = invocation.inputBindings.plan?.value;
+        if (raw === undefined)
+          continue;
+        let plan;
+        try {
+          plan = validateMilestonePlan(raw, node.workflows.map((choice) => choice.id), node.maxMilestones);
+        } catch {
+          intents.push({ kind: "complete", invocationId: invocation.id, outcome: "failed" });
+          continue;
+        }
+        const progress = milestoneProgress(plan, node, state, invocation.id);
+        const active = progress.filter((item) => item.status === "running" || item.status === "approval").length;
+        const ready = progress.filter((item) => item.status === "ready");
+        for (const milestone of ready.slice(0, Math.max(0, node.maxConcurrent - active)))
+          intents.push({
+            kind: "milestone",
+            invocationId: invocation.id,
+            definitionId: milestone.definitionId,
+            milestone
+          });
+        if (!active && !ready.length)
+          intents.push({
+            kind: "complete",
+            invocationId: invocation.id,
+            outcome: progress.every((item) => item.status === "succeeded") ? "succeeded" : "failed"
+          });
         continue;
       }
       if (node?.kind === "forEach") {
@@ -2197,7 +2664,7 @@ function decide(bundle, state) {
       }
       if (node?.kind === "join") {
         const joinNode = node;
-        const fork = scopeDefinition.nodes.find((candidate) => candidate.kind === "fork" && candidate.groupId === joinNode.groupId);
+        const fork = scopeDefinition2.nodes.find((candidate) => candidate.kind === "fork" && candidate.groupId === joinNode.groupId);
         const branches = fork?.kind === "fork" ? fork.branchIds : [];
         const branchInvocations = Object.values(state.invocations).filter((candidate) => candidate.scopeId === invocation.scopeId && branches.includes(candidate.nodeId));
         if (joinNode.mode === "fail-fast" && branchInvocations.some((candidate) => candidate.status === "failed")) {
@@ -2246,7 +2713,7 @@ function decide(bundle, state) {
     if (invocation.status === "running")
       continue;
     if (invocation.status === "succeeded") {
-      const node2 = scopeDefinition.nodes.find((candidate) => candidate.id === invocation.nodeId);
+      const node2 = scopeDefinition2.nodes.find((candidate) => candidate.id === invocation.nodeId);
       if (node2?.kind === "complete" && invocation.scopeId === state.rootScopeId) {
         intents.push({ kind: "finish", status: node2.result });
         return intents;
@@ -2254,7 +2721,7 @@ function decide(bundle, state) {
       if (node2?.kind === "fork") {
         const forkNode = node2;
         for (const branchId of forkNode.branchIds) {
-          const target = scopeDefinition.nodes.find((candidate) => candidate.id === branchId);
+          const target = scopeDefinition2.nodes.find((candidate) => candidate.id === branchId);
           if (!target)
             continue;
           const alreadyActivated = Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && candidate.nodeId === branchId);
@@ -2269,10 +2736,10 @@ function decide(bundle, state) {
             });
         }
         const branchInvocations = Object.values(state.invocations).filter((candidate) => candidate.scopeId === invocation.scopeId && forkNode.branchIds.includes(candidate.nodeId));
-        const joinNode = scopeDefinition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === forkNode.groupId);
+        const joinNode = scopeDefinition2.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === forkNode.groupId);
         const failFastReady = joinNode?.mode === "fail-fast" && branchInvocations.some((candidate) => candidate.status === "failed");
         if (failFastReady || branchInvocations.length >= forkNode.branchIds.length && branchInvocations.every((candidate) => ["succeeded", "failed"].includes(candidate.status))) {
-          for (const join of scopeDefinition.nodes.filter((candidate) => candidate.kind === "join" && candidate.groupId === forkNode.groupId)) {
+          for (const join of scopeDefinition2.nodes.filter((candidate) => candidate.kind === "join" && candidate.groupId === forkNode.groupId)) {
             const alreadyActivated = Object.values(state.invocations).some((candidate) => candidate.nodeId === join.id && candidate.sourceInvocationId === invocation.id);
             if (!alreadyActivated)
               intents.push({
@@ -2287,17 +2754,17 @@ function decide(bundle, state) {
         }
         continue;
       }
-      const outgoing = scopeDefinition.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === (invocation.outcome ?? "success"));
+      const outgoing = scopeDefinition2.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === (invocation.outcome ?? "success"));
       if (Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && outgoing.some((edge) => edge.id === candidate.sourceEdgeId)))
         continue;
       for (const edge of selectEdges(outgoing, state, invocation.scopeId, bundle)) {
-        const targetNode = scopeDefinition.nodes.find((candidate) => candidate.id === edge.targetNodeId);
+        const targetNode = scopeDefinition2.nodes.find((candidate) => candidate.id === edge.targetNodeId);
         if (targetNode?.kind === "join")
           continue;
         const alreadyActivated = Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && candidate.sourceEdgeId === edge.id);
         if (alreadyActivated)
           continue;
-        const target = scopeDefinition.nodes.find((candidate) => candidate.id === edge.targetNodeId);
+        const target = scopeDefinition2.nodes.find((candidate) => candidate.id === edge.targetNodeId);
         if (target)
           intents.push({
             kind: "activate",
@@ -2315,24 +2782,24 @@ function decide(bundle, state) {
       continue;
     }
     if (invocation.status === "failed") {
-      const outgoing = scopeDefinition.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === (invocation.outcome ?? "failure"));
+      const outgoing = scopeDefinition2.controlEdges.filter((edge) => edge.sourceNodeId === invocation.nodeId && edge.outcome === (invocation.outcome ?? "failure"));
       if (Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && outgoing.some((edge) => edge.id === candidate.sourceEdgeId)))
         continue;
-      const owningFork = scopeDefinition.nodes.find((candidate) => candidate.kind === "fork" && candidate.branchIds.includes(invocation.nodeId));
+      const owningFork = scopeDefinition2.nodes.find((candidate) => candidate.kind === "fork" && candidate.branchIds.includes(invocation.nodeId));
       if (outgoing.length === 0) {
-        if (owningFork)
+        if (owningFork || invocation.scopeId !== state.rootScopeId)
           continue;
         intents.push({ kind: "finish", status: "failed" });
         return intents;
       }
       for (const edge of selectEdges(outgoing, state, invocation.scopeId, bundle)) {
-        const targetNode = scopeDefinition.nodes.find((candidate) => candidate.id === edge.targetNodeId);
+        const targetNode = scopeDefinition2.nodes.find((candidate) => candidate.id === edge.targetNodeId);
         if (targetNode?.kind === "join")
           continue;
         const alreadyActivated = Object.values(state.invocations).some((candidate) => candidate.sourceInvocationId === invocation.id && candidate.sourceEdgeId === edge.id);
         if (alreadyActivated)
           continue;
-        const target = scopeDefinition.nodes.find((candidate) => candidate.id === edge.targetNodeId);
+        const target = scopeDefinition2.nodes.find((candidate) => candidate.id === edge.targetNodeId);
         if (target)
           intents.push({
             kind: "activate",
@@ -2404,8 +2871,10 @@ function invocationLineage(state, invocationId) {
     lineage.add(current.id);
     if (!current.sourceInvocationId)
       break;
-    lineage.add(current.sourceInvocationId);
-    current = state.invocations[current.sourceInvocationId];
+    const sourceId = current.sourceInvocationId;
+    current = state.invocations[sourceId];
+    if (!current)
+      lineage.add(sourceId);
   }
   return lineage;
 }
@@ -2461,6 +2930,9 @@ function compareTime(left, right) {
     return leftMs - rightMs;
   return left.localeCompare(right);
 }
+var init_execution = __esm(() => {
+  init_milestones();
+});
 
 // node_modules/.bun/ajv@8.17.1/node_modules/ajv/dist/compile/codegen/code.js
 var require_code = __commonJS((exports) => {
@@ -10161,7 +10633,9 @@ var exports_src = {};
 __export(exports_src, {
   validateSchemaFixture: () => validateSchemaFixture,
   validateNativeConfig: () => validateNativeConfig,
+  validateMilestonePlan: () => validateMilestonePlan,
   validateJsonSchema: () => validateJsonSchema,
+  validateFusionRounds: () => validateFusionRounds,
   validateExperiment: () => validateExperiment,
   validateDataset: () => validateDataset,
   validateCollaborationTermination: () => validateCollaborationTermination,
@@ -10175,6 +10649,8 @@ __export(exports_src, {
   redactSecrets: () => redactSecrets,
   promptVersion: () => promptVersion,
   prepareForkProjection: () => prepareForkProjection,
+  milestoneScopeId: () => milestoneScopeId,
+  milestoneProgress: () => milestoneProgress,
   makeEvidence: () => makeEvidence,
   isHarness: () => isHarness,
   invalidateCheckpoint: () => invalidateCheckpoint,
@@ -10216,8 +10692,13 @@ __export(exports_src, {
   WorkflowBuilder: () => WorkflowBuilder,
   PROJECTION_VERSION: () => PROJECTION_VERSION,
   NodeHandle: () => NodeHandle,
+  MilestoneResultType: () => MilestoneResultType,
+  MilestonePlanType: () => MilestonePlanType,
+  MAX_MILESTONES: () => MAX_MILESTONES,
+  MAX_FUSION_ROUNDS: () => MAX_FUSION_ROUNDS,
   HARNESS_ID: () => HARNESS_ID,
   HARNESS: () => HARNESS,
+  FusionBuilder: () => FusionBuilder,
   EdgeBuilder: () => EdgeBuilder,
   DEFAULT_LIMITS: () => DEFAULT_LIMITS,
   CompileError: () => CompileError,
@@ -10255,7 +10736,9 @@ var init_src = __esm(() => {
   init_contracts();
   init_contracts();
   init_builder();
+  init_milestones();
   init_compiler();
+  init_execution();
   init_harness();
   init_evaluations();
   init_evaluator();
@@ -16006,12 +16489,133 @@ var require_dist2 = __commonJS((exports, module) => {
 });
 
 // packages/host/src/cli.ts
-import { randomUUID as randomUUID6 } from "crypto";
+import { randomUUID as randomUUID7 } from "crypto";
 import { existsSync as existsSync4 } from "fs";
 import { mkdir, readdir as readdir2, readFile as readFile2, rename, rm, stat as stat2, writeFile } from "fs/promises";
-import { dirname as dirname3, resolve as resolve5 } from "path";
+import { dirname as dirname3, resolve as resolve6 } from "path";
+
+// packages/host/src/application/tasks.ts
+init_src();
+function taskModel(value) {
+  if (!value || typeof value !== "object")
+    throw new Error("Choose a harness and model for planning and execution");
+  const model = value;
+  if (!isHarness(model.harness) || typeof model.modelId !== "string" || !model.modelId.trim() || model.modelId.length > 200)
+    throw new Error("Choose a supported harness and nonblank model ID");
+  return { harness: model.harness, modelId: model.modelId.trim() };
+}
+function taskWorkflowEligibility(workflow) {
+  const root = workflow.bundle.definitions[workflow.bundle.rootDefinitionId];
+  const task = root.inputPorts.find((port2) => port2.name === "task");
+  const schema = task && workflow.bundle.schemas[task.schemaDigest];
+  const nodes = Object.values(workflow.bundle.definitions).flatMap((definition) => definition.nodes);
+  const reason = !task || !schema || typeof schema !== "object" || Array.isArray(schema) || schema.type !== "string" ? "Workflow must accept a string task" : root.inputPorts.some((port2) => port2.required && port2.name !== "task" && port2.defaultValue === undefined) ? "Workflow requires additional inputs" : nodes.some((node) => node.kind === "milestones") ? "Workflow already schedules milestones" : nodes.some((node) => node.kind === "command" && node.workspaceAccess === "source-repository") ? "Workflow commands run in the source checkout" : undefined;
+  return {
+    eligible: !reason,
+    reason,
+    requiresWorkspace: nodes.some((node) => node.kind === "command" || node.kind === "agent" && (node.workspaceAccess === "workspace-write" || node.capabilities?.includes(CAPABILITY.REPOSITORY_WRITE))),
+    approvalGates: nodes.filter((node) => node.kind === "approval").length
+  };
+}
+function workflowSource(workflow, executor) {
+  const bundle = workflow.bundle;
+  const build = (definitionId, id) => {
+    const definition = bundle.definitions[definitionId];
+    const references = new Set((definition.scouts ?? []).map((scout) => scout.definitionId));
+    for (const node of definition.nodes) {
+      if (node.kind === "call" && "definitionId" in node)
+        references.add(node.definitionId);
+      if (node.kind === "forEach" && "templateDefinitionId" in node)
+        references.add(node.templateDefinitionId);
+      if (node.kind === "milestones" && "workflows" in node)
+        node.workflows.forEach((item) => references.add(item.definitionId));
+    }
+    const childId = (ref) => `${id}/${ref}`;
+    return {
+      ...definition,
+      id,
+      version: workflow.version,
+      limits: bundle.limits,
+      schemaCatalog: bundle.schemas,
+      nodes: definition.nodes.map((node) => {
+        if (node.kind === "agent")
+          return {
+            ...node,
+            harness: node.harness ?? executor.harness,
+            modelId: node.modelId ?? executor.modelId
+          };
+        if (node.kind === "call" && "definitionId" in node)
+          return { ...node, definitionId: childId(node.definitionId) };
+        if (node.kind === "forEach" && "templateDefinitionId" in node)
+          return { ...node, templateDefinitionId: childId(node.templateDefinitionId) };
+        if (node.kind === "milestones" && "workflows" in node)
+          return {
+            ...node,
+            workflows: node.workflows.map((item) => ({
+              ...item,
+              definitionId: childId(item.definitionId)
+            }))
+          };
+        return node;
+      }),
+      scouts: definition.scouts?.map((scout) => ({
+        ...scout,
+        definitionId: childId(scout.definitionId)
+      })),
+      definitions: Object.fromEntries([...references].map((ref) => [childId(ref), build(ref, childId(ref))]))
+    };
+  };
+  return build(bundle.rootDefinitionId, workflow.id);
+}
+async function compileTask(workflows, planner, executor, maxMilestones = 8, maxConcurrent = 2) {
+  const largest = (key) => Math.max(...workflows.map((workflow2) => workflow2.bundle.boundSummary[key]));
+  const workflow = new WorkflowBuilder({
+    id: "automatic-task",
+    version: "1",
+    limits: {
+      maxScopes: 1 + maxMilestones * largest("scopes"),
+      maxInvocations: 4 + maxMilestones * largest("invocations"),
+      maxAttempts: 1 + maxMilestones * largest("attempts"),
+      maxConcurrentEffects: Math.min(4, maxConcurrent),
+      maxRunDurationMs: 24 * 60 * 60 * 1000,
+      maxTurns: 1 + maxMilestones * Math.max(...workflows.map((item) => item.bundle.limits.maxTurns)),
+      maxMessages: 1 + maxMilestones * Math.max(...workflows.map((item) => item.bundle.limits.maxMessages))
+    }
+  });
+  const task = workflow.input("task", { type: "string", minLength: 1, maxLength: 20000 });
+  const catalog = workflows.map((item) => ({
+    id: item.id,
+    name: item.name,
+    version: item.version,
+    digest: item.digest,
+    steps: item.bundle.definitions[item.bundle.rootDefinitionId].nodes.map((node) => ({
+      id: node.id,
+      kind: node.kind,
+      ...node.kind === "agent" ? { role: node.role } : {}
+    })),
+    approvalGates: taskWorkflowEligibility(item).approvalGates
+  }));
+  const plan = workflow.agent("decompose", {
+    role: "task-decomposer",
+    ...planner,
+    produces: MilestonePlanType,
+    prompt: `Decompose the task into 1 to ${maxMilestones} concrete milestones and assign EACH to one available workflow ID from workflows. Return the milestone plan as JSON. Each milestone must have a unique safe id, concise title, self-contained task, workflowId and dependsOn array. Use dependencies when a milestone needs earlier outputs or file changes. Independent milestones may execute in parallel (limit ${maxConcurrent}). Do not create artificial phases that duplicate the steps already in a workflow. Order milestones topologically, reject cycles, and keep approval gates in the selected workflows. Inspect repository context if supplied.`,
+    input: { task, workflows: catalog },
+    capabilities: [CAPABILITY.REPOSITORY_READ],
+    workspaceAccess: "read-only"
+  });
+  const execute = workflow.milestones("execute-milestones", { plan: plan.output, maxMilestones, maxConcurrent }).use(...workflows.map((item) => workflowSource(item, executor)));
+  const done = workflow.complete("done", { output: execute.output });
+  const failed = workflow.complete("failed", { result: "failed" });
+  workflow.startAt(plan);
+  plan.on("success").to(execute);
+  execute.on("success").to(done);
+  execute.on("failure").to(failed);
+  return compileWorkflow(workflow.build());
+}
 
 // packages/host/src/application/service.ts
+init_src();
 init_src();
 
 // packages/host/src/coordinator/coordinator.ts
@@ -40869,6 +41473,7 @@ class Coordinator {
   workspaces = new Map;
   branchWorkspaces = new Map;
   snapshots = new Map;
+  harnessAdapters;
   codex;
   codexDescriptor;
   pi;
@@ -40891,6 +41496,7 @@ class Coordinator {
     this.scouts = new ScoutGateway(this.journal);
     this.agent = options.agent ?? new DelayedScriptedAgent;
     this.harness = options.harness ?? new ScriptedHarnessAdapter;
+    this.harnessAdapters = options.harnessAdapters;
     this.process = options.process ?? createDefaultProcessAdapter();
     this.scriptedDelayMs = Math.max(0, options.scriptedDelayMs ?? 5000);
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30000;
@@ -41009,12 +41615,16 @@ class Coordinator {
       this.schedule(result.run.runId);
     return { run: result.run, created: result.created };
   }
-  async workspaceSnapshot(runId) {
-    const ref = this.workspaces.get(runId);
+  async workspaceSnapshot(runId, invocationId) {
+    const state = invocationId ? this.journal.getView(runId)?.state : undefined;
+    if (invocationId && !state?.invocations[invocationId])
+      throw new Error("Invocation not found");
+    const ref = state && invocationId ? this.milestoneWorkspace(runId, state, state.invocations[invocationId].scopeId) ?? this.workspaces.get(runId) : this.workspaces.get(runId);
     if (!ref || !this.workspaceAdapter)
       return null;
     const snapshot = await this.workspaceAdapter.snapshot(ref);
-    this.snapshots.set(runId, snapshot);
+    if (ref === this.workspaces.get(runId))
+      this.snapshots.set(runId, snapshot);
     return snapshot;
   }
   workspacePath(runId) {
@@ -41133,6 +41743,55 @@ class Coordinator {
     const activeAttempts = this.journal.db.query("SELECT id FROM attempts WHERE run_id = ?1 AND state IN ('reserved', 'running')").all(runId);
     if (activeAttempts.length)
       throw new Error("run deletion is blocked by active attempts");
+  }
+  confirmAbandonedHarnessShutdown(input2) {
+    if (this.active.has(input2.runId) || (this.aborters.get(input2.runId)?.size ?? 0) > 0)
+      throw new Error("An execution is still controlled by this host. Stop it before confirming shutdown.");
+    this.journal.transaction(() => {
+      const view = this.journal.getView(input2.runId);
+      if (!view || view.revision !== input2.expectedRevision)
+        throw new Error("Run changed. Refresh the deletion preview before confirming shutdown.");
+      if (view.state.status !== "recovery-required")
+        throw new Error("Manual shutdown confirmation is only available for recovery runs.");
+      if (Object.values(view.state.attempts).some((attempt) => ["reserved", "running"].includes(attempt.status)))
+        throw new Error("Active attempts must finish before confirming an abandoned shutdown.");
+      const shutdown = this.journal.db.query("SELECT attempt_id FROM unconfirmed_harness_shutdowns WHERE shutdown_id = ?1 AND run_id = ?2").get(input2.shutdownId, input2.runId);
+      if (!shutdown)
+        throw new Error("This shutdown is no longer awaiting confirmation. Refresh the preview.");
+      this.journal.append({
+        runId: input2.runId,
+        type: "harness.activity",
+        actor: input2.actor,
+        subjectId: input2.shutdownId,
+        payload: {
+          attemptId: shutdown.attempt_id,
+          event: {
+            type: "status",
+            data: {
+              status: "shutdown-confirmed",
+              text: "Operator verified the abandoned external agent has stopped.",
+              shutdownId: input2.shutdownId
+            }
+          }
+        }
+      });
+      this.journal.confirmHarnessShutdown(input2.shutdownId);
+      const remaining = this.journal.db.query("SELECT 1 FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 LIMIT 1").get(input2.runId);
+      if (!remaining) {
+        this.assertRunDrained(input2.runId);
+        this.stopDrainedRecoveryRun(input2.runId, input2.actor);
+      }
+    });
+  }
+  stopDrainedRecoveryRun(runId, actor) {
+    this.journal.append({
+      runId,
+      type: "run.cancel.requested",
+      payload: { reason: "Operator confirmed agent shutdown" },
+      actor
+    });
+    this.cancelUnstartedWork(runId, "Agent shutdown confirmed; recovery run stopped by operator");
+    this.journal.append({ runId, type: "run.completed", payload: { status: "cancelled" }, actor });
   }
   async cleanupRunWorkspaces(runId) {
     this.assertRunDrained(runId);
@@ -41623,6 +42282,14 @@ class Coordinator {
       throw new Error(`Run not found: ${input2.runId}`);
     if (view.revision !== input2.expectedRevision)
       throw new Error(`stale-action: expected revision ${input2.expectedRevision}, current revision ${view.revision}`);
+    if (view.state.status === "recovery-required") {
+      if (input2.action !== "cancel")
+        throw new Error("Resolve or stop the recovery run before taking this action.");
+      this.assertRunDrained(input2.runId);
+      this.journal.transaction(() => this.stopDrainedRecoveryRun(input2.runId, input2.actor));
+      const stopped = this.journal.getView(input2.runId);
+      return { revision: stopped.revision, status: stopped.state.status };
+    }
     const active = Object.values(view.state.attempts).some((attempt) => attempt.status === "running");
     const hasWork = Object.values(view.state.invocations).some((invocation) => ["pending", "reserved", "running"].includes(invocation.status));
     if (!hasWork && input2.action !== "detach")
@@ -41793,6 +42460,162 @@ class Coordinator {
     if (!this.active.has(runId))
       this.schedule(runId);
   }
+  milestones(runId, ownerInvocationId) {
+    const view = this.journal.getView(runId);
+    if (!view)
+      throw new Error("Run not found");
+    const owner = Object.values(view.state.invocations).find((invocation) => {
+      const node3 = view.bundle.definitions[view.state.scopes[invocation.scopeId].definitionId]?.nodes.find((item) => item.id === invocation.nodeId);
+      return node3?.kind === "milestones" && (!ownerInvocationId || invocation.id === ownerInvocationId);
+    });
+    if (!owner)
+      return {
+        phase: ["pending", "running"].includes(view.state.status) ? "planning" : view.state.status,
+        milestones: [],
+        error: Object.values(view.state.invocations).find((invocation) => invocation.status === "failed")?.error
+      };
+    const node2 = view.bundle.definitions[view.state.scopes[owner.scopeId].definitionId].nodes.find((item) => item.id === owner.nodeId);
+    try {
+      const plan = validateMilestonePlan(this.resolveBoundInput(owner.inputBindings.plan, view.state, owner.id), node2.workflows.map((item) => item.id), node2.maxMilestones);
+      return {
+        phase: view.state.status === "cancelled" ? "cancelled" : view.state.status === "paused" ? "paused" : owner.status === "succeeded" ? "succeeded" : owner.status === "failed" ? "failed" : "executing",
+        ownerInvocationId: owner.id,
+        maxConcurrent: node2.maxConcurrent,
+        milestones: milestoneProgress(plan, node2, view.state, owner.id).map((milestone) => {
+          const row = this.journal.getRunRow(runId);
+          const catalog = row ? parseJson(row.input_json).__taskWorkflows : undefined;
+          const workflow = catalog?.find((item) => item.id === milestone.workflowId);
+          const status = milestone.status === "succeeded" ? milestone.status : view.state.status === "cancelled" ? "cancelled" : owner.status === "failed" && ["ready", "waiting"].includes(milestone.status) ? "blocked" : milestone.status;
+          return {
+            ...milestone,
+            status,
+            workflowVersion: workflow?.version,
+            workflowName: workflow?.name,
+            workflowDigest: workflow?.digest
+          };
+        }),
+        ...owner.error ? { error: owner.error } : {}
+      };
+    } catch (cause) {
+      return {
+        phase: "failed",
+        milestones: [],
+        error: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  }
+  milestoneWorkspace(runId, state, scopeId) {
+    let scope = state.scopes[scopeId ?? ""];
+    while (scope) {
+      if (scope.milestoneId)
+        return this.branchWorkspaces.get(`${runId}:${scope.id}`);
+      scope = state.scopes[scope.parentScopeId ?? ""];
+    }
+    return;
+  }
+  async startMilestone(runId, bundle, state, intent) {
+    const parent = state.invocations[intent.invocationId];
+    const admitted = () => {
+      const current2 = this.journal.getView(runId)?.state;
+      return current2?.status === "running" && current2.control === "none" && current2.invocations[parent.id]?.status === "pending";
+    };
+    if (!admitted())
+      return;
+    const child = bundle.definitions[intent.definitionId];
+    const milestone = intent.milestone;
+    const scopeId = milestoneScopeId(parent.id, milestone.id);
+    if (this.journal.getView(runId).state.scopes[scopeId])
+      return;
+    const root = this.workspaces.get(runId);
+    const progress = this.milestones(runId, parent.id).milestones;
+    const ancestors = new Set;
+    const visit2 = (id2) => {
+      if (ancestors.has(id2))
+        return;
+      ancestors.add(id2);
+      progress.find((item) => item.id === id2)?.dependsOn.forEach(visit2);
+    };
+    milestone.dependsOn.forEach(visit2);
+    const prerequisites = progress.filter((item) => ancestors.has(item.id));
+    if (root && this.workspaceAdapter) {
+      const key = `${runId}:${scopeId}`;
+      let workspace = this.branchWorkspaces.get(key);
+      if (!workspace) {
+        try {
+          workspace = await this.workspaceAdapter.loadByIdentity(runId, scopeId);
+        } catch {
+          const refs = prerequisites.map((item) => this.branchWorkspaces.get(`${runId}:${item.scopeId}`));
+          if (refs.some((ref) => !ref))
+            throw new Error("Prerequisite workspace is unavailable");
+          const snapshots = await Promise.all(refs.map((ref) => this.workspaceAdapter.snapshot(ref)));
+          const tree = await this.workspaceAdapter.composeTrees(root.repositoryPath, root.baseTree, snapshots);
+          workspace = await this.workspaceAdapter.createAtTree({
+            repositoryPath: root.repositoryPath,
+            runId,
+            workspaceId: scopeId,
+            parentCommit: root.baseCommit,
+            tree
+          });
+        }
+        this.branchWorkspaces.set(key, workspace);
+      }
+    }
+    if (!admitted())
+      return;
+    const dependencies = prerequisites.map((item) => ({
+      id: item.id,
+      title: item.title,
+      results: item.invocationIds.filter((id2) => state.scopes[item.scopeId]?.milestoneExitIds?.includes(state.invocations[id2].nodeId)).flatMap((id2) => state.invocations[id2]?.output ?? []).map((ref) => {
+        try {
+          return JSON.parse(new TextDecoder().decode(this.journal.blobs.read(ref)));
+        } catch {
+          return { artifactId: ref.id };
+        }
+      })
+    }));
+    const task = milestone.task + (dependencies.length ? `
+
+Completed prerequisites:
+${json(dependencies)}` : "");
+    const inputBindings = Object.fromEntries(child.inputPorts.map((port2) => {
+      const value = port2.name === "task" ? task : port2.defaultValue;
+      return [
+        port2.name,
+        {
+          source: { kind: "input", sourceId: port2.name },
+          missing: port2.required ? "error" : "omit",
+          ...value === undefined ? {} : { value }
+        }
+      ];
+    }));
+    this.journal.append({
+      runId,
+      type: "scope.created",
+      actor: "system",
+      subjectId: scopeId,
+      payload: {
+        scope: {
+          id: scopeId,
+          parentScopeId: parent.scopeId,
+          definitionId: child.id,
+          status: "running",
+          activationOrdinal: Object.keys(state.scopes).length,
+          inputBindings,
+          milestoneId: milestone.id,
+          ownerInvocationId: parent.id,
+          milestoneExitIds: child.nodes.filter((node2) => node2.kind === "complete" && node2.result === "succeeded").map((node2) => node2.id)
+        }
+      }
+    });
+    const current = this.journal.getView(runId).state;
+    const entryIntent = decide(bundle, current).find((item) => item.kind === "activate" && item.scopeId === scopeId);
+    if (entryIntent?.kind === "activate")
+      this.activate(runId, current, {
+        ...entryIntent,
+        sourceInvocationId: parent.id,
+        sourceEdgeId: `${parent.nodeId}:milestone:${milestone.id}`
+      });
+  }
   async drive(runId) {
     for (;; ) {
       const view = this.journal.getView(runId);
@@ -41826,7 +42649,48 @@ class Coordinator {
         });
         continue;
       }
-      const intents = decide(view.bundle, view.state);
+      let decisionState = view.state;
+      let invalidPlan = false;
+      for (const invocation of Object.values(view.state.invocations)) {
+        if (invocation.status !== "pending")
+          continue;
+        const node2 = view.bundle.definitions[view.state.scopes[invocation.scopeId].definitionId]?.nodes.find((item) => item.id === invocation.nodeId);
+        if (node2?.kind !== "milestones" || !("workflows" in node2))
+          continue;
+        try {
+          const value = this.resolveBoundInput(invocation.inputBindings.plan, view.state, invocation.id);
+          const plan = validateMilestonePlan(value, node2.workflows.map((item) => item.id), node2.maxMilestones);
+          decisionState = {
+            ...decisionState,
+            invocations: {
+              ...decisionState.invocations,
+              [invocation.id]: {
+                ...invocation,
+                inputBindings: {
+                  ...invocation.inputBindings,
+                  plan: { ...invocation.inputBindings.plan, value: plan }
+                }
+              }
+            }
+          };
+        } catch (cause) {
+          this.journal.append({
+            runId,
+            type: "invocation.completed",
+            actor: "system",
+            payload: {
+              invocationId: invocation.id,
+              status: "failed",
+              direct: true,
+              error: cause instanceof Error ? cause.message : String(cause)
+            }
+          });
+          invalidPlan = true;
+        }
+      }
+      if (invalidPlan)
+        continue;
+      const intents = decide(view.bundle, decisionState);
       const activations = intents.filter((candidate) => candidate.kind === "activate");
       if (activations.length) {
         for (const intent2 of activations)
@@ -41841,44 +42705,30 @@ class Coordinator {
           if (!parent || !child)
             throw new Error(`Call definition ${intent2.definitionId} is unavailable`);
           const scopeId = `${parent.id}:scope`;
-          const entry = child.nodes.find((candidate) => candidate.id === child.entry);
-          this.journal.appendMany([
-            {
-              runId,
-              type: "scope.created",
-              payload: {
-                scope: {
-                  id: scopeId,
-                  parentScopeId: parent.scopeId,
-                  definitionId: intent2.definitionId,
-                  status: "running",
-                  activationOrdinal: parent.activationOrdinal
-                }
-              },
-              actor: "system",
-              subjectId: scopeId
-            },
-            {
-              runId,
-              type: "invocation.created",
-              payload: {
-                invocationId: id("inv"),
-                scopeId,
-                nodeId: child.entry,
-                activationOrdinal: 0,
-                sourceInvocationId: parent.id,
-                sourceEdgeId: `${parent.nodeId}:call`,
-                inputBindings: entry?.bindings.reduce((result, binding) => {
-                  result[binding.targetPort] = parent.inputBindings[binding.targetPort] ?? {
-                    source: binding.source,
-                    missing: binding.missing
-                  };
-                  return result;
-                }, {})
-              },
-              actor: "system"
+          this.journal.append({
+            runId,
+            type: "scope.created",
+            actor: "system",
+            subjectId: scopeId,
+            payload: {
+              scope: {
+                id: scopeId,
+                parentScopeId: parent.scopeId,
+                definitionId: intent2.definitionId,
+                inputBindings: parent.inputBindings,
+                status: "running",
+                activationOrdinal: parent.activationOrdinal
+              }
             }
-          ]);
+          });
+          const current = this.journal.getView(runId).state;
+          const entryIntent = decide(view.bundle, current).find((item) => item.kind === "activate" && item.scopeId === scopeId);
+          if (entryIntent?.kind === "activate")
+            this.activate(runId, current, {
+              ...entryIntent,
+              sourceInvocationId: parent.id,
+              sourceEdgeId: `${parent.nodeId}:call`
+            });
         }
         continue;
       }
@@ -42000,6 +42850,43 @@ class Coordinator {
         }
         continue;
       }
+      const milestones2 = intents.filter((candidate) => candidate.kind === "milestone");
+      if (milestones2.length) {
+        for (const intent2 of milestones2) {
+          try {
+            await this.startMilestone(runId, view.bundle, decisionState, intent2);
+          } catch (cause) {
+            const current = this.journal.getView(runId).state;
+            if (current.control !== "none" || current.invocations[intent2.invocationId]?.status !== "pending")
+              break;
+            for (const child of Object.values(current.invocations)) {
+              let scope = current.scopes[child.scopeId];
+              while (scope && !scope.milestoneId && scope.parentScopeId)
+                scope = current.scopes[scope.parentScopeId];
+              if (scope?.ownerInvocationId === intent2.invocationId && ["pending", "reserved", "running"].includes(child.status))
+                this.journal.append({
+                  runId,
+                  type: "invocation.cancelled",
+                  actor: "system",
+                  payload: { invocationId: child.id, reason: "milestone admission failed" }
+                });
+            }
+            this.journal.append({
+              runId,
+              type: "invocation.completed",
+              actor: "system",
+              payload: {
+                invocationId: intent2.invocationId,
+                status: "failed",
+                direct: true,
+                error: cause instanceof Error ? cause.message : String(cause)
+              }
+            });
+            break;
+          }
+        }
+        continue;
+      }
       const reservations = intents.filter((candidate) => candidate.kind === "reserve");
       if (reservations.length) {
         for (const intent2 of reservations) {
@@ -42011,15 +42898,20 @@ class Coordinator {
       }
       const executions = intents.filter((candidate) => candidate.kind === "execute");
       if (executions.length > 1) {
-        const definition = view.bundle.definitions[view.bundle.rootDefinitionId];
-        const groups = definition ? definition.nodes.filter((candidate) => candidate.kind === "fork").map((fork) => {
-          const join5 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
-          return {
-            id: fork.groupId,
-            expectedBranchIds: executions.filter((intent2) => fork.branchIds.includes(view.state.invocations[intent2.invocationId]?.nodeId ?? "")).map((intent2) => intent2.invocationId),
-            mode: join5?.mode === "fail-fast" ? "fail-fast" : "all-settled"
-          };
-        }).filter((group) => group.expectedBranchIds.length > 0) : [];
+        const groups = Object.values(view.state.scopes).flatMap((scope) => {
+          const definition = view.bundle.definitions[scope.definitionId];
+          return (definition?.nodes ?? []).filter((candidate) => candidate.kind === "fork").map((fork) => {
+            const join5 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
+            return {
+              id: `${scope.id}:${fork.groupId}`,
+              expectedBranchIds: executions.filter((intent2) => {
+                const invocation = view.state.invocations[intent2.invocationId];
+                return invocation?.scopeId === scope.id && fork.branchIds.includes(invocation.nodeId);
+              }).map((intent2) => intent2.invocationId),
+              mode: join5?.mode === "fail-fast" ? "fail-fast" : "all-settled"
+            };
+          }).filter((group) => group.expectedBranchIds.length > 0);
+        });
         const scheduler = new ReadySetScheduler({
           maxConcurrency: Math.max(1, Math.min(4, view.bundle.limits.maxConcurrentEffects, ...executions.map((intent2) => {
             const invocation = view.state.invocations[intent2.invocationId];
@@ -42085,9 +42977,11 @@ class Coordinator {
         continue;
       }
       if (intent.kind === "request-approval") {
-        const workspace = this.workspaces.get(runId);
+        const workspace = this.milestoneWorkspace(runId, view.state, view.state.invocations[intent.invocationId]?.scopeId) ?? this.workspaces.get(runId);
         const workspaceSnapshot = workspace && this.workspaceAdapter ? await this.workspaceAdapter.snapshot(workspace) : undefined;
-        if (workspaceSnapshot)
+        if (this.journal.getView(runId).state.control !== "none")
+          continue;
+        if (workspaceSnapshot && workspace === this.workspaces.get(runId))
           this.snapshots.set(runId, workspaceSnapshot);
         this.journal.append({
           runId,
@@ -42130,17 +43024,71 @@ class Coordinator {
         return;
       }
       if (intent.kind === "complete") {
-        const node2 = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find((candidate) => candidate.id === view.state.invocations[intent.invocationId]?.nodeId);
+        const completion = view.state.invocations[intent.invocationId];
+        const definition = view.bundle.definitions[view.state.scopes[completion?.scopeId ?? ""]?.definitionId ?? view.bundle.rootDefinitionId];
+        const node2 = definition?.nodes.find((candidate) => candidate.id === view.state.invocations[intent.invocationId]?.nodeId);
+        if (node2?.kind === "milestones" && "workflows" in node2 && completion) {
+          let status = intent.outcome;
+          let error63;
+          const progress = this.milestones(runId, completion.id).milestones;
+          try {
+            const root = this.workspaces.get(runId);
+            if (status === "succeeded" && root && this.workspaceAdapter) {
+              const refs = progress.map((item) => this.branchWorkspaces.get(`${runId}:${item.scopeId}`));
+              if (refs.some((ref) => !ref))
+                throw new Error("Milestone workspace is unavailable");
+              const snapshots = await Promise.all(refs.map((ref) => this.workspaceAdapter.snapshot(ref)));
+              const tree = await this.workspaceAdapter.composeTrees(root.repositoryPath, root.baseTree, snapshots);
+              if (this.journal.getView(runId).state.control !== "none")
+                continue;
+              this.snapshots.set(runId, await this.workspaceAdapter.applyTree(root, tree));
+            }
+          } catch (cause) {
+            status = "failed";
+            error63 = cause instanceof Error ? cause.message : String(cause);
+          }
+          if (this.journal.getView(runId).state.control !== "none")
+            continue;
+          const result = {
+            milestones: progress.map((item) => ({
+              ...item,
+              output: item.invocationIds.flatMap((id2) => view.state.invocations[id2]?.output ?? [])
+            })),
+            ...error63 ? { error: error63 } : {}
+          };
+          const stored = this.journal.blobs.put(runId, new TextEncoder().encode(json(result)), "application/json");
+          this.journal.insertArtifact(stored);
+          this.journal.append({
+            runId,
+            type: "invocation.completed",
+            actor: "system",
+            payload: {
+              invocationId: intent.invocationId,
+              status,
+              direct: true,
+              ...error63 ? { error: error63 } : {},
+              output: [
+                {
+                  id: stored.id,
+                  digest: stored.digest,
+                  mediaType: stored.mediaType,
+                  schemaDigest: node2.outputPorts[0].schemaDigest
+                }
+              ]
+            }
+          });
+          continue;
+        }
         if (node2?.kind === "join" && node2.mode === "fail-fast") {
-          const fork = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find((candidate) => candidate.kind === "fork" && candidate.groupId === node2.groupId);
-          const activeBranch = fork?.kind === "fork" && Object.values(view.state.invocations).some((candidate) => fork.branchIds.includes(candidate.nodeId) && ["reserved", "running"].includes(candidate.status));
+          const fork = definition?.nodes.find((candidate) => candidate.kind === "fork" && candidate.groupId === node2.groupId);
+          const activeBranch = fork?.kind === "fork" && Object.values(view.state.invocations).some((candidate) => fork.branchIds.includes(candidate.nodeId) && candidate.scopeId === completion?.scopeId && ["reserved", "running"].includes(candidate.status));
           if (activeBranch) {
             await Bun.sleep(2);
             continue;
           }
         }
         if (node2?.kind === "join") {
-          const fork = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find((candidate) => candidate.kind === "fork" && candidate.groupId === node2.groupId);
+          const fork = definition?.nodes.find((candidate) => candidate.kind === "fork" && candidate.groupId === node2.groupId);
           this.journal.append({
             runId,
             type: "join.completed",
@@ -42150,7 +43098,7 @@ class Coordinator {
               status: intent.outcome === "succeeded" ? "succeeded" : "failed",
               branchIds: fork?.kind === "fork" ? fork.branchIds : [],
               branchStatuses: Object.fromEntries((fork?.kind === "fork" ? fork.branchIds : []).map((branchId) => {
-                const branch = Object.values(view.state.invocations).find((candidate) => candidate.nodeId === branchId);
+                const branch = Object.values(view.state.invocations).find((candidate) => candidate.scopeId === completion?.scopeId && candidate.nodeId === branchId);
                 return [
                   branchId,
                   branch?.outcome === "cancelled" ? "cancelled" : branch?.status === "succeeded" ? "succeeded" : branch?.status === "failed" ? "failed" : "pending"
@@ -42198,9 +43146,20 @@ class Coordinator {
       return;
     const row = this.journal.getRunRow(runId);
     const runInput = row ? parseJson(row.input_json) : {};
+    const parentCall = Object.values(state.invocations).find((candidate) => `${candidate.id}:scope` === intent.scopeId);
     const inputBindings = Object.fromEntries(Object.entries(intent.bindings).map(([name, binding]) => {
       if (binding.source.kind !== "input")
         return [name, binding];
+      const inherited = state.scopes[intent.scopeId]?.inputBindings?.[binding.source.sourceId] ?? parentCall?.inputBindings[binding.source.sourceId];
+      if (inherited)
+        return [
+          name,
+          {
+            ...binding,
+            ...inherited.value === undefined ? {} : { value: inherited.value },
+            ...inherited.artifactId ? { artifactId: inherited.artifactId } : {}
+          }
+        ];
       const value = runInput[binding.source.sourceId];
       if (value === undefined && binding.missing === "error")
         throw new Error(`Missing required workflow input ${binding.source.sourceId}`);
@@ -42226,7 +43185,7 @@ class Coordinator {
     };
     if (intent.counterId) {
       const key = `${intent.scopeId}:${intent.counterId}`;
-      const definition = this.journal.getView(runId)?.bundle.definitions[this.journal.getView(runId)?.bundle.rootDefinitionId ?? ""];
+      const definition = this.journal.getView(runId)?.bundle.definitions[state.scopes[intent.scopeId]?.definitionId ?? ""];
       const max = definition?.counters.find((counter) => counter.id === intent.counterId)?.max;
       const current = state.counters[key] ?? 0;
       if (max === undefined || current >= max)
@@ -42356,9 +43315,9 @@ class Coordinator {
     const profile = runInput.__kouroExecutionProfile === "codex-readonly" || runInput.__kouroExecutionProfile === "codex-workspace-write" || runInput.__kouroExecutionProfile === "claude-readonly" || runInput.__kouroExecutionProfile === "claude-workspace-write" || runInput.__kouroExecutionProfile === "pi-readonly" ? runInput.__kouroExecutionProfile : "scripted";
     const workspaceDir = join4(this.dataDir, "workspaces", runId, invocationId);
     const registeredWorkspace = this.workspaces.get(runId);
-    let invocationWorkspace = registeredWorkspace;
+    let invocationWorkspace = this.milestoneWorkspace(runId, state, state.invocations[invocationId].scopeId) ?? registeredWorkspace;
     const sourceInvocationId = state.invocations[invocationId]?.sourceInvocationId;
-    if (registeredWorkspace && sourceInvocationId && this.workspaceAdapter) {
+    if (registeredWorkspace && invocationWorkspace === registeredWorkspace && sourceInvocationId && this.workspaceAdapter) {
       const key = `${runId}:${invocationId}`;
       invocationWorkspace = this.branchWorkspaces.get(key);
       if (!invocationWorkspace) {
@@ -42582,7 +43541,12 @@ class Coordinator {
       let resolvedModelId;
       let nativeConfig;
       const requestedHarness = node2.harness ?? (profile === "codex-readonly" || profile === "codex-workspace-write" ? "codex" : profile === "claude-readonly" || profile === "claude-workspace-write" ? "claude" : profile === "pi-readonly" ? "pi" : toHarness(this.harness.id));
-      if (requestedHarness === "scripted" && node2.harness !== "codex" && node2.harness !== "pi" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {} else if (requestedHarness === "codex") {
+      const suppliedAdapter = isHarness(requestedHarness) ? this.harnessAdapters?.[requestedHarness] : undefined;
+      if (suppliedAdapter) {
+        selected = suppliedAdapter;
+        resolvedHarness = requestedHarness;
+        resolvedVersion = suppliedAdapter.adapterVersion;
+      } else if (requestedHarness === "scripted" && node2.harness !== "codex" && node2.harness !== "pi" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {} else if (requestedHarness === "codex") {
         this.codexDescriptor ??= await inspectCodex();
         if (this.codexDescriptor.availability !== "available") {
           this.journal.completeEffect({
@@ -43500,6 +44464,71 @@ class GitWorkspaceAdapter {
     const repository = await this.repositoryRoot(repositoryPath);
     return this.git(repository, ["--no-pager", "diff", "--no-ext-diff", "--no-textconv", baseRef]);
   }
+  async composeTrees(repositoryPath, baseTree, sources) {
+    let tree = await this.verifyTree(repositoryPath, baseTree);
+    const env = {
+      GIT_AUTHOR_NAME: "Kouro milestones",
+      GIT_AUTHOR_EMAIL: "kouro@localhost",
+      GIT_COMMITTER_NAME: "Kouro milestones",
+      GIT_COMMITTER_EMAIL: "kouro@localhost"
+    };
+    const commit = (value) => this.git(repositoryPath, ["commit-tree", value], env, `milestone composition
+`);
+    for (const source of sources) {
+      if (source.baseTree === source.resultTree)
+        continue;
+      const [base, left, right] = await Promise.all([
+        commit(source.baseTree),
+        commit(tree),
+        commit(source.resultTree)
+      ]);
+      try {
+        tree = (await this.git(repositoryPath, [
+          "merge-tree",
+          "--write-tree",
+          "--merge-base",
+          base,
+          left,
+          right
+        ])).split(`
+`)[0];
+      } catch (cause) {
+        throw new Error(`Milestone workspace conflict: ${cause instanceof Error ? cause.message : cause}`);
+      }
+    }
+    return tree;
+  }
+  async applyTree(ref, tree) {
+    const before = await this.snapshot(ref);
+    if (before.resultTree === tree)
+      return before;
+    if (before.resultTree !== ref.baseTree)
+      throw new Error("Run workspace changed during milestone execution");
+    const patch = await this.git(ref.path, ["diff", "--binary", before.resultTree, tree]);
+    const backup = join5(this.root, "integration-backups", randomUUID3());
+    mkdirSync7(backup, { recursive: true, mode: 448 });
+    for (const entry of readdirSync(ref.path))
+      if (entry !== ".git")
+        cpSync(join5(ref.path, entry), join5(backup, entry), { recursive: true, force: true });
+    try {
+      if (patch)
+        await this.git(ref.path, ["apply", "--binary", "--whitespace=nowarn"], undefined, `${patch}
+`);
+      const after = await this.snapshot(ref);
+      if (after.resultTree !== tree)
+        throw new Error("Milestone integration tree verification failed");
+      return after;
+    } catch (cause) {
+      for (const entry of readdirSync(ref.path))
+        if (entry !== ".git")
+          rmSync3(join5(ref.path, entry), { recursive: true, force: true });
+      for (const entry of readdirSync(backup))
+        cpSync(join5(backup, entry), join5(ref.path, entry), { recursive: true, force: true });
+      throw cause;
+    } finally {
+      rmSync3(backup, { recursive: true, force: true });
+    }
+  }
   async integrate(input2) {
     const target = await this.snapshot(input2.target);
     const sources = await Promise.all(input2.sources.map((ref) => this.snapshot(ref)));
@@ -43682,25 +44711,29 @@ class GitWorkspaceAdapter {
 `).some((line) => line === `worktree ${resolve2(path)}`);
   }
   async git(cwd, args, extraEnv, stdin) {
-    const proc = Bun.spawn([this.executable, ...args], {
-      cwd,
-      env: { ...process.env, ...extraEnv },
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: stdin === undefined ? undefined : "pipe"
-    });
-    if (stdin !== undefined) {
-      proc.stdin.write(stdin);
-      proc.stdin.end();
+    const inputPath = stdin === undefined ? undefined : join5(this.root, "indexes", `stdin-${randomUUID3()}`);
+    if (inputPath)
+      writeFileSync2(inputPath, stdin, { mode: 384 });
+    try {
+      const proc = Bun.spawn([this.executable, ...args], {
+        cwd,
+        env: { ...process.env, ...extraEnv },
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: inputPath ? Bun.file(inputPath) : undefined
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited
+      ]);
+      if (code !== 0)
+        throw new Error(`git ${args[0] ?? ""} failed (${code}): ${(stderr || stdout).trim()}`);
+      return stdout.trim();
+    } finally {
+      if (inputPath)
+        rmSync3(inputPath, { force: true });
     }
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited
-    ]);
-    if (code !== 0)
-      throw new Error(`git ${args[0] ?? ""} failed (${code}): ${stderr.trim()}`);
-    return stdout.trim();
   }
 }
 function safePart(value) {
@@ -44265,6 +45298,76 @@ class ExperimentService {
     const datasetCase = experiment?.dataset.cases.find((item) => item.id === caseId);
     return datasetCase?.input ?? { caseId };
   }
+}
+
+// packages/host/src/application/swarm.ts
+init_src();
+function normalizeSwarmModels(raw) {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 8)
+    throw new Error("Choose between 1 and 8 swarm models");
+  return raw.map((value, index) => {
+    if (!value || typeof value !== "object" || !isHarness(value.harness))
+      throw new Error(`Choose a harness for model ${index + 1}`);
+    if (typeof value.modelId !== "string" || !value.modelId.trim() || value.modelId.length > 200)
+      throw new Error(`Enter a model ID for model ${index + 1}`);
+    return { harness: value.harness, modelId: value.modelId.trim() };
+  });
+}
+var Report = artifactType("kouro.swarm-report.v1", {
+  type: "object",
+  required: ["summary"],
+  properties: { summary: { type: "string" } },
+  additionalProperties: false
+});
+async function compileSwarm(models) {
+  const digest3 = await sha256Hex(canonicalize(models));
+  const workflow = new WorkflowBuilder({
+    id: `agent-swarm-${digest3.slice(0, 16)}`,
+    version: "1",
+    limits: { maxConcurrentEffects: models.length }
+  });
+  const task = workflow.input("task", { type: "string", minLength: 1 });
+  const members2 = models.map((model, index) => workflow.agent(`member-${index + 1}`, {
+    role: `swarm-member-${index + 1}`,
+    ...model,
+    prompt: "Carry out the shared task in your input. Develop your own answer, inspect available repository context when relevant, and state any uncertainties. Return your complete contribution in the summary field.",
+    input: { task },
+    produces: Report,
+    capabilities: [CAPABILITY.REPOSITORY_READ],
+    workspaceAccess: "read-only"
+  }));
+  if (members2.length === 1) {
+    const done = workflow.complete("done", { output: members2[0].output });
+    workflow.startAt(members2[0]);
+    members2[0].on("success").to(done);
+  } else {
+    const fork = workflow.parallel("members", { branches: members2, maxConcurrent: members2.length });
+    const join7 = workflow.join("join-members", {
+      groupId: "members",
+      mode: "all-settled",
+      failure: "wait-for-all"
+    });
+    const synthesis = workflow.agent("synthesis", {
+      role: "swarm-synthesis",
+      ...models[0],
+      prompt: "Produce the final answer to the shared task. All selected models' contributions are bound to your input by member number. Combine their useful findings, resolve disagreements using evidence, preserve uncertainties, and return the complete final answer in the summary field.",
+      input: {
+        task,
+        ...Object.fromEntries(members2.map((member, index) => [`member${index + 1}`, member.output]))
+      },
+      produces: Report,
+      capabilities: [CAPABILITY.REPOSITORY_READ],
+      workspaceAccess: "read-only"
+    });
+    const final = workflow.complete("final", { output: synthesis.output });
+    workflow.startAt(fork);
+    fork.on("success").to(join7);
+    for (const member of members2)
+      member.on("success").to(join7);
+    join7.on("success").to(synthesis);
+    synthesis.on("success").to(final);
+  }
+  return compileWorkflow(workflow.build());
 }
 
 // packages/host/src/checkpoints/materializer.ts
@@ -44970,6 +46073,68 @@ class ApplicationService {
       }
     ];
   }
+  async taskWorkflows() {
+    return (await this.workflows()).map((workflow) => ({
+      id: workflow.id,
+      name: workflow.name,
+      version: workflow.version,
+      digest: workflow.digest,
+      ...taskWorkflowEligibility(workflow)
+    }));
+  }
+  async createTask(input2) {
+    if (typeof input2.task !== "string" || !input2.task.trim() || input2.task.length > 20000)
+      throw new Error("Enter a task of at most 20000 characters");
+    if (typeof input2.idempotencyKey !== "string" || !input2.idempotencyKey.trim())
+      throw new Error("idempotencyKey is required");
+    if (!Array.isArray(input2.workflowIds) || !input2.workflowIds.length || input2.workflowIds.some((id2) => typeof id2 !== "string") || new Set(input2.workflowIds).size !== input2.workflowIds.length)
+      throw new Error("Choose unique available workflow IDs");
+    const catalog = await this.workflows();
+    const selected = input2.workflowIds.map((id2) => {
+      const workflow = catalog.find((item) => item.id === id2);
+      if (!workflow)
+        throw new Error(`Unknown workflow ${id2}`);
+      const eligibility = taskWorkflowEligibility(workflow);
+      if (!eligibility.eligible)
+        throw new Error(`${workflow.name}: ${eligibility.reason}`);
+      if (eligibility.requiresWorkspace && !input2.workspace)
+        throw new Error(`${workflow.name} needs a repository path`);
+      return workflow;
+    });
+    const bundle = await compileTask(selected, taskModel(input2.planner), taskModel(input2.executor), input2.maxMilestones, input2.maxConcurrent);
+    return (await this.coordinator.createRun({
+      workflowId: "automatic-task",
+      bundle,
+      input: {
+        task: input2.task.trim(),
+        __taskWorkflows: selected.map((workflow) => ({
+          id: workflow.id,
+          name: workflow.name,
+          version: workflow.version,
+          digest: workflow.digest
+        }))
+      },
+      idempotencyKey: input2.idempotencyKey,
+      actor: "operator",
+      ...input2.workspace ? { workspace: input2.workspace } : {}
+    })).run;
+  }
+  async createSwarm(input2) {
+    const models = normalizeSwarmModels(input2.models);
+    if (typeof input2.task !== "string" || !input2.task.trim())
+      throw new Error("Enter a task for the swarm");
+    if (typeof input2.idempotencyKey !== "string" || !input2.idempotencyKey.trim())
+      throw new Error("idempotencyKey is required");
+    const bundle = await compileSwarm(models);
+    return (await this.coordinator.createRun({
+      workflowId: bundle.rootDefinitionId,
+      bundle,
+      input: { task: input2.task.trim() },
+      idempotencyKey: input2.idempotencyKey,
+      actor: "operator",
+      ...input2.workspace ? { workspace: input2.workspace } : {}
+    })).run;
+  }
   async createRun(input2) {
     const source = this.bundles.get(input2.workflowId);
     if (!source)
@@ -45055,6 +46220,86 @@ class ApplicationService {
     });
   }
   collaboration(runId) {
+    const view = this.getView(runId);
+    if (view?.bundle.rootDefinitionId.startsWith("agent-swarm-")) {
+      const nodes = view.bundle.definitions[view.bundle.rootDefinitionId].nodes.filter((node2) => node2.kind === "agent");
+      const invocations = Object.values(view.state.invocations);
+      const attempts = Object.values(view.state.attempts);
+      const invocationFor = (nodeId) => invocations.filter((item) => item.nodeId === nodeId).at(-1);
+      const attemptFor = (nodeId) => attempts.filter((item) => item.invocationId === invocationFor(nodeId)?.id).at(-1);
+      const members2 = nodes.filter((node2) => node2.id !== "synthesis");
+      const synthesis = invocationFor("synthesis");
+      const results = nodes.flatMap((node2) => {
+        const attempt = attemptFor(node2.id);
+        if (attempt?.status !== "succeeded")
+          return [];
+        return attempt.output.map((artifact) => {
+          const report = JSON.parse(new TextDecoder().decode(this.readArtifact(artifact.id)));
+          return {
+            id: artifact.id,
+            participantId: node2.id === "synthesis" ? members2[0].role : node2.role,
+            title: node2.id === "synthesis" ? "Combined answer" : node2.modelId,
+            body: report.summary,
+            artifactId: artifact.id,
+            final: node2.id === "synthesis" || members2.length === 1
+          };
+        });
+      });
+      return {
+        runId,
+        objective: this.coordinator.journal.getRunSummary(runId)?.task,
+        participants: members2.map((node2, index) => {
+          const invocation = invocationFor(node2.id);
+          const attempt = attemptFor(node2.id);
+          const synthesisAttempt = index === 0 ? attemptFor("synthesis") : undefined;
+          const combining = index === 0 && synthesis?.status === "running";
+          return {
+            id: node2.role,
+            name: node2.modelId,
+            role: `Member ${index + 1}`,
+            harness: attempt?.resolvedExecution?.harness ?? node2.harness,
+            model: attempt?.resolvedExecution?.modelId ?? node2.modelId,
+            state: synthesisAttempt?.status ?? attempt?.status ?? invocation?.status ?? "pending",
+            activity: combining ? "Combining answers" : synthesisAttempt?.status === "failed" ? "Combining answers failed" : undefined
+          };
+        }),
+        channels: [],
+        messages: [],
+        blackboard: [],
+        budgets: {},
+        results,
+        artifacts: results.map((result) => ({
+          id: result.artifactId,
+          name: result.title,
+          producerId: result.participantId
+        })),
+        timeline: nodes.flatMap((node2) => {
+          const invocation = invocationFor(node2.id);
+          if (!invocation)
+            return [];
+          return [
+            ...invocation.startedAt ? [
+              {
+                id: `${invocation.id}:start`,
+                participantId: node2.id === "synthesis" ? members2[0].role : node2.role,
+                type: "running",
+                label: node2.id === "synthesis" ? "Combining answers" : `${node2.modelId} started`,
+                at: invocation.startedAt
+              }
+            ] : [],
+            ...invocation.completedAt ? [
+              {
+                id: `${invocation.id}:end`,
+                participantId: node2.id === "synthesis" ? members2[0].role : node2.role,
+                type: invocation.status,
+                label: `${node2.id === "synthesis" ? "Combined answer" : node2.modelId}: ${invocation.status}`,
+                at: invocation.completedAt
+              }
+            ] : []
+          ];
+        })
+      };
+    }
     return new CollaborationGateway(this.coordinator.journal).snapshot(runId);
   }
   scouts(runId) {
@@ -45087,8 +46332,8 @@ class ApplicationService {
       throw new Error("Artifact not found");
     return this.coordinator.journal.blobs.read(ref);
   }
-  workspaceSnapshot(runId) {
-    return this.coordinator.workspaceSnapshot(runId);
+  workspaceSnapshot(runId, invocationId) {
+    return this.coordinator.workspaceSnapshot(runId, invocationId);
   }
   workspacePath(runId) {
     return this.coordinator.workspacePath(runId);
@@ -45151,11 +46396,13 @@ class ApplicationService {
     const artifactCount = this.countRows("artifacts", runId);
     const eventCount = this.countRows("run_events", runId);
     const checkpointCount = this.countRows("checkpoints", runId, "source_run_id");
+    let drainReason;
     const active = (() => {
       try {
         this.coordinator.assertRunDrained(runId);
         return false;
-      } catch {
+      } catch (cause) {
+        drainReason = cause instanceof Error ? cause.message : String(cause);
         return true;
       }
     })();
@@ -45169,6 +46416,7 @@ class ApplicationService {
       repositoryPath: typeof repository?.repositoryPath === "string" ? repository.repositoryPath : undefined,
       terminal: ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(run.status),
       drained: !active,
+      drainReason,
       workspaceAdapterMissing,
       workspaces: claims.map((claim3) => ({ workspaceId: claim3.workspaceId, path: claim3.path })),
       removes: {
@@ -45185,6 +46433,12 @@ class ApplicationService {
       canDelete: !active && !workspaceAdapterMissing && blockers.length === 0 && ["succeeded", "failed", "cancelled", "interrupted", "recovery-required"].includes(run.status)
     };
     return { ...preview, viewStatus: view?.state.status };
+  }
+  async confirmAbandonedHarnessShutdown(input2) {
+    if (input2.verifiedStopped !== true)
+      throw new Error("Verify the external agent has stopped before confirming shutdown.");
+    this.coordinator.confirmAbandonedHarnessShutdown(input2);
+    return this.previewRunDeletion(input2.runId);
   }
   incompleteRunDeletions() {
     return this.coordinator.journal.listIncompleteRunDeletions().map((deletion) => ({
@@ -45481,6 +46735,16 @@ async function configureBundle(source, settings) {
       throw new Error(`Duplicate settings for workflow node ${key}`);
     resolved.set(matches[0].node, setting);
   }
+  for (const [node2, setting] of resolved) {
+    if (node2.kind !== "agent" || node2.fusion?.stage !== "draft")
+      continue;
+    const definitionId = targets.find((target) => target.node === node2).definitionId;
+    for (const target of targets) {
+      const peer = target.node;
+      if (target.definitionId === definitionId && peer.kind === "agent" && peer.fusion?.groupId === node2.fusion.groupId && peer.fusion?.memberId === node2.fusion.memberId && !resolved.has(peer))
+        resolved.set(peer, setting);
+    }
+  }
   const childDefinitions = new Set(Object.values(source.definitions).flatMap((definition) => (definition.scouts ?? []).map((scout) => scout.definitionId)));
   const definitions = Object.fromEntries(Object.entries(source.definitions).map(([definitionId, definition]) => [
     definitionId,
@@ -45668,6 +46932,21 @@ async function compileParallelFixture() {
   join8.on("success").to(done);
   return compileWorkflow(root.build());
 }
+var authoringPluginRegistered = false;
+function registerAuthoringRuntime() {
+  if (authoringPluginRegistered)
+    return;
+  Bun.plugin({
+    name: "kouro-workflow-authoring",
+    setup(build) {
+      build.module("@kouro/core", () => ({
+        loader: "object",
+        exports: exports_src
+      }));
+    }
+  });
+  authoringPluginRegistered = true;
+}
 async function loadFileTemplates(root) {
   let entries;
   try {
@@ -45692,6 +46971,7 @@ async function loadFileTemplates(root) {
       throw new Error(`Invalid file template id: ${manifest.id}`);
     if (!manifest.name || !manifest.version || !manifest.entrypoint)
       throw new Error(`Invalid file template manifest: ${directory}`);
+    registerAuthoringRuntime();
     const module = await import(pathToFileURL(resolve4(directory, manifest.entrypoint)).href);
     const exported = module.default;
     if (!exported)
@@ -60334,6 +61614,30 @@ function createHostServer(service, options = {}) {
       };
     }
   });
+  app.post("/api/runs/:id/confirm-harness-shutdown", async ({ request, set: set2, params, body }) => {
+    if (!checked(request, set2, true))
+      return denied(set2);
+    try {
+      const input2 = bodyObject(body);
+      if (typeof input2.shutdownId !== "string" || !input2.shutdownId.trim())
+        throw new Error("shutdownId is required");
+      if (!Number.isSafeInteger(input2.expectedRevision))
+        throw new Error("expectedRevision is required");
+      return await service.confirmAbandonedHarnessShutdown({
+        runId: params.id,
+        shutdownId: input2.shutdownId,
+        expectedRevision: Number(input2.expectedRevision),
+        verifiedStopped: input2.verifiedStopped === true,
+        actor: typeof input2.actor === "string" && input2.actor.trim() ? input2.actor : "operator"
+      });
+    } catch (cause) {
+      set2.status = 409;
+      return {
+        error: "shutdown-confirmation-rejected",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  });
   app.post("/api/runs/:id/delete", async ({ request, set: set2, params, body }) => {
     if (!checked(request, set2, true))
       return denied(set2);
@@ -60458,6 +61762,76 @@ function createHostServer(service, options = {}) {
     }
     return service.scouts(params.id);
   });
+  app.get("/api/task-workflows", async ({ request, set: set2 }) => checked(request, set2) ? service.taskWorkflows() : denied(set2));
+  app.get("/api/runs/:id/milestones", ({ request, set: set2, params }) => {
+    if (!checked(request, set2))
+      return denied(set2);
+    if (!service.getView(params.id)) {
+      set2.status = 404;
+      return { error: "run-not-found" };
+    }
+    return service.coordinator.milestones(params.id);
+  });
+  app.post("/api/tasks", async ({ request, set: set2, body }) => {
+    if (!checked(request, set2, true))
+      return denied(set2);
+    const input2 = bodyObject(body);
+    try {
+      if (typeof input2.task !== "string" || typeof input2.idempotencyKey !== "string")
+        throw new Error("task and idempotencyKey are required");
+      let workspace;
+      if (input2.workspace !== undefined) {
+        const value = bodyObject(input2.workspace);
+        if (typeof value.repositoryPath !== "string" || !value.repositoryPath.trim())
+          throw new Error("workspace.repositoryPath must be nonblank");
+        workspace = { repositoryPath: value.repositoryPath.trim() };
+      }
+      return toWebRun(await service.createTask({
+        task: input2.task,
+        workflowIds: input2.workflowIds,
+        planner: input2.planner,
+        executor: input2.executor,
+        maxMilestones: input2.maxMilestones,
+        maxConcurrent: input2.maxConcurrent,
+        idempotencyKey: input2.idempotencyKey,
+        workspace
+      }));
+    } catch (cause) {
+      set2.status = 400;
+      return {
+        error: "invalid-task-request",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  });
+  app.post("/api/swarms", async ({ request, set: set2, body }) => {
+    if (!checked(request, set2, true))
+      return denied(set2);
+    const input2 = bodyObject(body);
+    try {
+      if (typeof input2.task !== "string" || typeof input2.idempotencyKey !== "string")
+        throw new Error("task and idempotencyKey are required");
+      let workspace;
+      if (input2.workspace !== undefined) {
+        const value = bodyObject(input2.workspace);
+        if (typeof value.repositoryPath !== "string" || !value.repositoryPath.trim())
+          throw new Error("workspace.repositoryPath must be nonblank");
+        workspace = { repositoryPath: value.repositoryPath.trim() };
+      }
+      return toWebRun(await service.createSwarm({
+        models: input2.models,
+        task: input2.task,
+        idempotencyKey: input2.idempotencyKey,
+        workspace
+      }));
+    } catch (cause) {
+      set2.status = 400;
+      return {
+        error: "invalid-swarm-request",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+  });
   app.post("/api/runs", async ({ request, set: set2, body }) => {
     if (!checked(request, set2, true))
       return denied(set2);
@@ -60503,7 +61877,7 @@ function createHostServer(service, options = {}) {
       return { error: "run-not-found" };
     }
     try {
-      const snapshot = await service.workspaceSnapshot(params.id);
+      const snapshot = await service.workspaceSnapshot(params.id, new URL(request.url).searchParams.get("invocationId") ?? undefined);
       return snapshot ?? { error: "workspace-not-configured" };
     } catch (cause) {
       set2.status = 409;
@@ -60911,6 +62285,19 @@ data: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}
       return { error: "artifact-not-found" };
     }
   });
+  const missingApiRoute = ({ request, set: set2 }) => {
+    if (!validOriginHost(request)) {
+      set2.status = 403;
+      return { error: "invalid-origin" };
+    }
+    set2.status = 404;
+    return {
+      error: "api-route-not-found",
+      message: `No Kouro API route for ${request.method} ${new URL(request.url).pathname}. Restart Kouro from the latest checkout, then reload the page.`
+    };
+  };
+  app.get("/api/*", missingApiRoute);
+  app.all("/api/*", missingApiRoute);
   app.get("/", () => options.staticRoot ? Bun.file(join8(options.staticRoot, "index.html")) : "Kouro local host");
   if (options.staticRoot)
     app.get("/*", async ({ request, set: set2 }) => {
@@ -63377,6 +64764,234 @@ async function serveScoutMcp() {
   await server.connect(new StdioServerTransport);
 }
 
+// packages/host/src/cli/tasks.ts
+import { randomUUID as randomUUID6 } from "crypto";
+import { resolve as resolve5 } from "path";
+var taskUsage = `Usage:
+  kouro task workflows [--workspace PATH]          List available workflows as JSON
+  kouro task run --task TEXT --harness HARNESS --model ID [options]
+  kouro task status RUN [--workspace PATH]         Print milestone progress and pending approvals
+  kouro task resume RUN [--workspace PATH]         Continue a durable task until completion or approval
+  kouro task decide RUN INVOCATION --decision approve|reject|request-changes --revision N
+
+Run options:
+  --workflow ID           Allowed workflow (repeatable; defaults to eligible project workflows)
+  --workspace PATH        Git repository with a committed HEAD (default: current directory)
+  --planner-harness NAME  Override planning harness
+  --planner-model ID      Override planning model
+  --executor-harness NAME Override execution harness
+  --executor-model ID     Override execution model
+  --max-milestones N      Milestone limit, 1-12 (default: 8)
+  --max-concurrent N      Concurrent milestones, 1-4 (default: 2)
+  --idempotency-key KEY   Reuse a task creation or decision request
+  --data-dir PATH         Durable state directory (default: workspace/.kouro-data)
+
+Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
+Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
+Approval gates are preserved. Only one CLI or web host may own a data directory at a time.
+`;
+var valueOptions = new Set([
+  "--task",
+  "--workflow",
+  "--workspace",
+  "--harness",
+  "--model",
+  "--planner-harness",
+  "--planner-model",
+  "--executor-harness",
+  "--executor-model",
+  "--max-milestones",
+  "--max-concurrent",
+  "--idempotency-key",
+  "--data-dir",
+  "--decision",
+  "--revision",
+  "--feedback",
+  "--binding-digest",
+  "--subject-revision"
+]);
+function parseTaskArgs(args) {
+  const positional = [];
+  const options = new Map;
+  for (let i = 0;i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith("--")) {
+      positional.push(arg);
+      continue;
+    }
+    const separator = arg.indexOf("=");
+    const name = separator < 0 ? arg : arg.slice(0, separator);
+    if (!valueOptions.has(name))
+      throw new Error(`Unknown task option ${name}`);
+    const value = separator < 0 ? args[++i] : arg.slice(separator + 1);
+    if (!value || value.startsWith("--"))
+      throw new Error(`${name} requires a value`);
+    if (name !== "--workflow" && options.has(name))
+      throw new Error(`Duplicate task option ${name}`);
+    options.set(name, [...options.get(name) ?? [], value]);
+  }
+  const command = positional[0] ?? "run";
+  if (!["run", "workflows", "status", "resume", "decide"].includes(command))
+    throw new Error(`Unknown task command ${command}`);
+  const expected = command === "decide" ? 3 : ["status", "resume"].includes(command) ? 2 : 1;
+  if (positional.length > expected || expected > 1 && positional.length !== expected)
+    throw new Error(`task ${command} requires ${command === "decide" ? "RUN INVOCATION" : "RUN"}`);
+  const get = (name) => options.get(name)?.[0];
+  const shared = new Set(["--workspace", "--data-dir"]);
+  const decisions = new Set([
+    "--decision",
+    "--revision",
+    "--feedback",
+    "--binding-digest",
+    "--subject-revision"
+  ]);
+  for (const name of options.keys()) {
+    const permitted = shared.has(name) || command === "run" && !decisions.has(name) || command === "decide" && (decisions.has(name) || name === "--idempotency-key");
+    if (!permitted)
+      throw new Error(`${name} is not an option for task ${command}`);
+  }
+  const integer2 = (name, minimum, maximum = Number.MAX_SAFE_INTEGER) => {
+    const value = get(name);
+    if (value === undefined)
+      return;
+    const number5 = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(number5) || number5 < minimum || number5 > maximum)
+      throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    return number5;
+  };
+  const model = (prefix) => taskModel({
+    harness: get(`--${prefix}-harness`) ?? get("--harness"),
+    modelId: get(`--${prefix}-model`) ?? get("--model")
+  });
+  if (command === "run" && !get("--task")?.trim())
+    throw new Error("task run requires --task TEXT");
+  const planner = command === "run" ? model("planner") : undefined;
+  const executor = command === "run" ? model("executor") : undefined;
+  const maxMilestones = integer2("--max-milestones", 1, 12);
+  const maxConcurrent = integer2("--max-concurrent", 1, 4);
+  const revision = integer2("--revision", 0);
+  const subjectRevision = integer2("--subject-revision", 0);
+  const decision = get("--decision");
+  if (command === "decide" && (!decision || !["approve", "reject", "request-changes"].includes(decision) || revision === undefined))
+    throw new Error("task decide requires --decision approve|reject|request-changes and --revision N");
+  if (command === "decide" && decision === "request-changes" && !get("--feedback")?.trim())
+    throw new Error("request-changes requires --feedback TEXT");
+  return {
+    command,
+    workspace: resolve5(get("--workspace") ?? process.cwd()),
+    runId: positional[1],
+    invocationId: positional[2],
+    get,
+    planner,
+    executor,
+    maxMilestones,
+    maxConcurrent,
+    revision,
+    subjectRevision,
+    workflowIds: options.get("--workflow")
+  };
+}
+async function taskCommand(args, service, write = (value) => process.stdout.write(`${JSON.stringify(value)}
+`)) {
+  if (args.command === "workflows") {
+    write(await service.taskWorkflows());
+    return 0;
+  }
+  let runId = args.runId;
+  if (args.command === "run") {
+    const workflowIds = args.workflowIds ?? (await service.taskWorkflows()).filter((item) => item.eligible && !["tiny", "feature", "parallel"].includes(item.id)).map((item) => item.id);
+    if (!workflowIds.length)
+      throw new Error("No eligible project workflows. Create one with kouro create template develop --template feature, configure its validation commands, then rerun.");
+    const run = await service.createTask({
+      task: args.get("--task"),
+      workflowIds,
+      planner: args.planner,
+      executor: args.executor,
+      maxMilestones: args.maxMilestones,
+      maxConcurrent: args.maxConcurrent,
+      idempotencyKey: args.get("--idempotency-key") ?? randomUUID6(),
+      workspace: { repositoryPath: args.workspace }
+    });
+    runId = run.runId;
+  }
+  const view = service.getView(runId);
+  if (!view || view.bundle.rootDefinitionId !== "automatic-task")
+    throw new Error(`Workflow task not found: ${runId}`);
+  if (args.command === "decide") {
+    const decision = args.get("--decision");
+    service.decideApproval({
+      runId,
+      invocationId: args.invocationId,
+      expectedRevision: args.revision,
+      decision: decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "changes-requested",
+      feedback: args.get("--feedback"),
+      bindingDigest: args.get("--binding-digest"),
+      subjectRevision: args.subjectRevision,
+      actor: "cli",
+      idempotencyKey: args.get("--idempotency-key") ?? randomUUID6()
+    });
+  }
+  if (args.command === "resume" && view.state.status === "paused")
+    service.control({
+      runId,
+      action: "resume",
+      expectedRevision: view.revision,
+      actor: "cli",
+      idempotencyKey: randomUUID6()
+    });
+  if (args.command !== "status") {
+    write({ event: "task.started", runId });
+    let interrupted = false;
+    const stop = () => {
+      interrupted = true;
+      const current = service.getView(runId);
+      if (current && ["pending", "running", "paused"].includes(current.state.status))
+        service.control({
+          runId,
+          action: "cancel",
+          expectedRevision: current.revision,
+          actor: "cli",
+          idempotencyKey: randomUUID6()
+        });
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+    try {
+      for (;; ) {
+        await service.coordinator.waitForCheckpointDrain(runId);
+        const current = service.getView(runId);
+        if (!["pending", "running"].includes(current.state.status) || Object.values(current.state.approvals).some((item) => item.status === "pending"))
+          break;
+        await Bun.sleep(50);
+      }
+    } finally {
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
+    }
+    if (interrupted) {
+      write(taskReport(service, runId));
+      return 130;
+    }
+  }
+  const report = taskReport(service, runId);
+  write(report);
+  return args.command === "status" || report.status === "succeeded" ? 0 : report.waitingForApproval || report.status === "paused" ? 3 : 1;
+}
+function taskReport(service, runId) {
+  const view = service.getView(runId);
+  const approvals = Object.values(view.state.approvals).filter((item) => item.status === "pending").map((item) => ({ ...item, inputs: view.state.invocations[item.invocationId]?.inputBindings }));
+  return {
+    runId,
+    status: view.state.status,
+    revision: view.revision,
+    waitingForApproval: approvals.length > 0,
+    approvals,
+    ...service.coordinator.milestones(runId),
+    result: Object.values(view.state.invocations).find((item) => item.scopeId === view.state.rootScopeId && item.nodeId === "done")?.output,
+    workspace: service.coordinator.workspacePath(runId)
+  };
+}
+
 // packages/host/src/cli.ts
 var usage = `Kouro v2 M1
 
@@ -63384,6 +64999,8 @@ Usage:
   kouro serve     Start the loopback-only local workbench
   kouro create template NAME --template ID  Create a project template under .kouro
   kouro run [WORKFLOW] [--task TEXT] [--profile ID] [--allow-unrestricted-commands]  Execute a workflow headlessly
+  kouro task     Generate and execute dependent milestones; use kouro task --help
+  kouro plugin path  Print the bundled Codex/Claude plugin marketplace directory
   kouro inspect ID  Print one durable run view as JSON
   kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
   kouro retry ID INVOCATION REV  Retry one failed invocation
@@ -63406,7 +65023,18 @@ async function main(argv = process.argv.slice(2)) {
     process.stdout.write(usage);
     return 0;
   }
-  if (!new Set(["serve", "run", "inspect", "control", "retry", "checkpoint", "fork", "create"]).has(command)) {
+  if (!new Set([
+    "serve",
+    "run",
+    "task",
+    "plugin",
+    "inspect",
+    "control",
+    "retry",
+    "checkpoint",
+    "fork",
+    "create"
+  ]).has(command)) {
     process.stderr.write(`Unknown command: ${command}
 
 ${usage}`);
@@ -63414,21 +65042,68 @@ ${usage}`);
   }
   if (command === "create")
     return createCommand(argv.slice(1));
-  const dataDir = resolve5(process.env.KOURO_DATA_DIR ?? ".kouro-data");
+  if (command === "plugin") {
+    const root = firstExistingPath([resolve6(import.meta.dir), resolve6(import.meta.dir, "../../..")].filter((candidate) => existsSync4(resolve6(candidate, ".agents/plugins/marketplace.json"))));
+    if (argv[1] !== "path") {
+      process.stderr.write(`Usage: kouro plugin path
+`);
+      return 2;
+    }
+    if (!root) {
+      process.stderr.write(`Kouro plugin assets are not installed
+`);
+      return 1;
+    }
+    process.stdout.write(`${root}
+`);
+    return 0;
+  }
+  if (command === "task") {
+    if (argv.includes("--help") || argv.includes("-h") || argv[1] === "help") {
+      process.stdout.write(taskUsage);
+      return 0;
+    }
+    let args;
+    try {
+      args = parseTaskArgs(argv.slice(1));
+    } catch (cause) {
+      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
+`);
+      return 2;
+    }
+    const project2 = args.workspace;
+    let taskService;
+    try {
+      taskService = new ApplicationService({
+        dataDir: resolve6(args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve6(project2, ".kouro-data")),
+        templateRoot: resolve6(project2, ".kouro")
+      });
+      await taskService.start();
+      return await taskCommand(args, taskService);
+    } catch (cause) {
+      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
+`);
+      return 1;
+    } finally {
+      await taskService?.close();
+    }
+  }
+  const project = command === "run" ? resolve6(optionValue(argv, "--workspace") ?? process.cwd()) : process.cwd();
+  const dataDir = resolve6(process.env.KOURO_DATA_DIR ?? resolve6(project, ".kouro-data"));
   const staticRoot = firstExistingPath([
-    resolve5("packages/web/dist"),
-    resolve5(import.meta.dir, "web"),
-    resolve5(import.meta.dir, "../../web/dist"),
-    resolve5(import.meta.dir, "../web")
+    resolve6("packages/web/dist"),
+    resolve6(import.meta.dir, "web"),
+    resolve6(import.meta.dir, "../../web/dist"),
+    resolve6(import.meta.dir, "../web")
   ]);
-  const service = new ApplicationService({ dataDir });
+  const service = new ApplicationService({ dataDir, templateRoot: resolve6(project, ".kouro") });
   await service.start();
   if (command === "run") {
-    const valueOptions = new Set(["--profile", "--task", "--workspace", "--ticket"]);
+    const valueOptions2 = new Set(["--profile", "--task", "--workspace", "--ticket"]);
     let workflowId = "tiny";
     for (let index = 1;index < argv.length; index += 1) {
       const arg = argv[index];
-      if (valueOptions.has(arg)) {
+      if (valueOptions2.has(arg)) {
         index += 1;
         continue;
       }
@@ -63441,7 +65116,7 @@ ${usage}`);
     const profileIndex = argv.indexOf("--profile");
     const profile = profileArg?.slice("--profile=".length) ?? (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
     const task = optionValue(argv, "--task");
-    const workspace = optionValue(argv, "--workspace");
+    const workspace = optionValue(argv, "--workspace") !== undefined || await hasGitHead(project) ? { repositoryPath: project } : undefined;
     const ticket = optionValue(argv, "--ticket");
     if (profile !== undefined && profile !== "scripted" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {
       process.stderr.write(`Unknown execution profile: ${profile}
@@ -63459,7 +65134,7 @@ ${usage}`);
         ...task === undefined ? {} : { task },
         ...ticket === undefined ? {} : { ticket }
       },
-      ...workspace === undefined ? {} : { workspace: { repositoryPath: workspace } }
+      ...workspace ? { workspace } : {}
     });
     let view = service.getView(run.runId);
     while (view && (view.state.status === "pending" || view.state.status === "running") && !Object.values(view.state.approvals).some((approval) => approval.status === "pending")) {
@@ -63507,7 +65182,7 @@ ${usage}`);
       return 2;
     }
     try {
-      process.stdout.write(`${JSON.stringify(service.coordinator.control({ runId, action, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID6() }))}
+      process.stdout.write(`${JSON.stringify(service.coordinator.control({ runId, action, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID7() }))}
 `);
       await service.close();
       return 0;
@@ -63529,7 +65204,7 @@ ${usage}`);
       return 2;
     }
     try {
-      process.stdout.write(`${JSON.stringify(service.coordinator.retry({ runId, invocationId, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID6() }))}
+      process.stdout.write(`${JSON.stringify(service.coordinator.retry({ runId, invocationId, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID7() }))}
 `);
       await service.close();
       return 0;
@@ -63562,7 +65237,7 @@ ${usage}`);
   }
   if (command === "fork") {
     const checkpointId = argv[1];
-    const requestKey = argv[2] ?? randomUUID6();
+    const requestKey = argv[2] ?? randomUUID7();
     if (!checkpointId) {
       process.stderr.write(`fork requires CHECKPOINT REQUEST
 `);
@@ -63616,6 +65291,17 @@ function optionValue(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : undefined;
 }
+async function hasGitHead(project) {
+  try {
+    const child = Bun.spawn(["git", "-C", project, "rev-parse", "--verify", "HEAD"], {
+      stdout: "ignore",
+      stderr: "ignore"
+    });
+    return await child.exited === 0;
+  } catch {
+    return false;
+  }
+}
 var templateIds = [
   "feature",
   "refactor",
@@ -63648,23 +65334,23 @@ async function createCommand(args) {
 `);
     return 2;
   }
-  const target = resolve5(output2, name);
+  const target = resolve6(output2, name);
   if (await exists(target)) {
     process.stderr.write(`target already exists: ${target}
 `);
     return 1;
   }
   const templateRoot = firstExistingPath([
-    resolve5(import.meta.dir, "..", "assets", "templates"),
-    resolve5(import.meta.dir, "assets", "templates")
+    resolve6(import.meta.dir, "..", "assets", "templates"),
+    resolve6(import.meta.dir, "assets", "templates")
   ]);
   if (!templateRoot) {
     process.stderr.write(`Kouro CLI template assets are not installed
 `);
     return 1;
   }
-  const source = resolve5(templateRoot, template);
-  const temporary = `${target}.tmp-${randomUUID6()}`;
+  const source = resolve6(templateRoot, template);
+  const temporary = `${target}.tmp-${randomUUID7()}`;
   try {
     await renderDirectory(source, temporary, name);
     await mkdir(dirname3(target), { recursive: true });
@@ -63693,8 +65379,8 @@ async function exists(path) {
 async function renderDirectory(source, target, name) {
   await mkdir(target, { recursive: true });
   for (const entry of await readdir2(source, { withFileTypes: true })) {
-    const sourcePath = resolve5(source, entry.name);
-    const targetPath = resolve5(target, entry.name);
+    const sourcePath = resolve6(source, entry.name);
+    const targetPath = resolve6(target, entry.name);
     if (entry.isDirectory())
       await renderDirectory(sourcePath, targetPath, name);
     else if (entry.isFile())

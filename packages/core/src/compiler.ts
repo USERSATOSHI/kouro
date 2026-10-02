@@ -132,6 +132,7 @@ export async function compileWorkflowDetailed(
         "join",
         "loop",
         "forEach",
+        "milestones",
       ].includes(node.kind)
     ) {
       diagnostics.push(
@@ -205,6 +206,104 @@ export async function compileWorkflowDetailed(
           node.id,
         ),
       );
+
+    if (node.kind === "milestones" && !("workflows" in node))
+      diagnostics.push(
+        error("INVALID_MILESTONE_WORKFLOWS", "Milestones require workflow declarations", node.id),
+      );
+    if (node.kind === "milestones" && "workflows" in node) {
+      if (
+        !Number.isSafeInteger(node.maxMilestones) ||
+        node.maxMilestones < 1 ||
+        node.maxMilestones > 12 ||
+        !Number.isSafeInteger(node.maxConcurrent) ||
+        node.maxConcurrent < 1 ||
+        node.maxConcurrent > node.maxMilestones
+      )
+        diagnostics.push(
+          error(
+            "INVALID_MILESTONE_BOUND",
+            "Milestone bounds must be positive and at most 12",
+            node.id,
+          ),
+        );
+      if (
+        !node.workflows.length ||
+        new Set(node.workflows.map((item: { id: string }) => item.id)).size !==
+          node.workflows.length
+      )
+        diagnostics.push(
+          error(
+            "INVALID_MILESTONE_WORKFLOWS",
+            "Milestones need unique available workflows",
+            node.id,
+          ),
+        );
+      for (const choice of node.workflows) {
+        const child = source.definitions?.[choice.definitionId];
+        if (!child)
+          diagnostics.push(
+            error(
+              "MISSING_CHILD_DEFINITION",
+              `Missing milestone workflow ${choice.definitionId}`,
+              node.id,
+            ),
+          );
+        else if (
+          !(child.inputPorts ?? []).some((port) => port.name === "task") ||
+          (child.inputPorts ?? []).some(
+            (port) => port.required && port.name !== "task" && port.defaultValue === undefined,
+          )
+        )
+          diagnostics.push(
+            error(
+              "INVALID_MILESTONE_INPUTS",
+              "Milestone workflows must accept task without other required inputs",
+              node.id,
+            ),
+          );
+        if (child) {
+          const taskPort = child.inputPorts?.find((port) => port.name === "task");
+          const taskSchema = taskPort && child.schemaCatalog?.[taskPort.schemaDigest];
+          if (
+            !taskSchema ||
+            typeof taskSchema !== "object" ||
+            Array.isArray(taskSchema) ||
+            taskSchema.type !== "string"
+          )
+            diagnostics.push(
+              error("INVALID_MILESTONE_TASK", "Milestone workflows require a string task", node.id),
+            );
+          const pending: WorkflowDefinitionSource[] = [child];
+          const seen = new Set<WorkflowDefinitionSource>();
+          for (const definition of pending) {
+            if (seen.has(definition)) continue;
+            seen.add(definition);
+            if (definition.nodes.some((item) => item.kind === "milestones"))
+              diagnostics.push(
+                error(
+                  "NESTED_MILESTONE_WORKFLOW",
+                  "Selected workflows must not schedule another milestone plan",
+                  node.id,
+                ),
+              );
+            if (
+              definition.nodes.some(
+                (item) => item.kind === "command" && item.workspaceAccess === "source-repository",
+              )
+            )
+              diagnostics.push(
+                error(
+                  "UNSAFE_MILESTONE_WORKSPACE",
+                  "Milestone commands must use the isolated workspace",
+                  node.id,
+                ),
+              );
+            pending.push(...Object.values(definition.definitions ?? {}));
+          }
+        }
+      }
+    }
     if (node.kind === "agent") {
       const uses = node.uses ?? [];
       const seenUses = new Set<string>();
@@ -897,6 +996,23 @@ function summarizeDefinition(
         attempts = add(attempts, multiply(bodySummary.attempts, multiplier));
         saturated ||= bodySummary.saturated;
       }
+    } else if (node.kind === "milestones" && "workflows" in node) {
+      const children = node.workflows.map((choice) =>
+        summarizeDefinition(definitions[choice.definitionId], definitions, active),
+      );
+      scopes = add(
+        scopes,
+        multiply(Math.max(0, ...children.map((child) => child.scopes)), node.maxMilestones),
+      );
+      invocations = add(
+        invocations,
+        multiply(Math.max(0, ...children.map((child) => child.invocations)), node.maxMilestones),
+      );
+      attempts = add(
+        attempts,
+        multiply(Math.max(0, ...children.map((child) => child.attempts)), node.maxMilestones),
+      );
+      saturated ||= children.some((child) => child.saturated);
     } else if (node.kind === "forEach") {
       const mapNode = node as import("./contracts").ForEachNode;
       const child = summarizeDefinition(

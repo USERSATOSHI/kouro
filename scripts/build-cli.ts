@@ -34,3 +34,14 @@ if (exitCode !== 0) throw new Error(`Building the bundled CLI failed with exit c
 
 await cp(resolve(root, "packages/host/assets"), resolve(dist, "assets"), { recursive: true });
 await cp(resolve(root, "packages/web/dist"), resolve(dist, "web"), { recursive: true });
+await cp(resolve(root, "plugins"), resolve(dist, "plugins"), { recursive: true });
+await mkdir(resolve(dist, ".agents/plugins"), { recursive: true });
+await mkdir(resolve(dist, ".claude-plugin"), { recursive: true });
+await cp(
+  resolve(root, ".agents/plugins/marketplace.json"),
+  resolve(dist, ".agents/plugins/marketplace.json"),
+);
+await cp(
+  resolve(root, ".claude-plugin/marketplace.json"),
+  resolve(dist, ".claude-plugin/marketplace.json"),
+);

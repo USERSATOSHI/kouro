@@ -1,0 +1,1 @@
+Critically review the peer plan in your input, comparing it with your own plan and the original task. Identify concrete errors, missing requirements, unsafe assumptions, validation gaps, and useful improvements. State which member each finding concerns and give actionable feedback. Return JSON matching the summary schema.

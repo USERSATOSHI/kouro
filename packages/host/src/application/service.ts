@@ -1,3 +1,5 @@
+import { compileTask, taskModel, taskWorkflowEligibility } from "./tasks";
+import * as coreAuthoring from "@kouro/core";
 import {
   WorkflowBuilder,
   artifactType,
@@ -558,6 +560,74 @@ export class ApplicationService {
     ];
   }
 
+  async taskWorkflows() {
+    return (await this.workflows()).map((workflow) => ({
+      id: workflow.id,
+      name: workflow.name,
+      version: workflow.version,
+      digest: workflow.digest,
+      ...taskWorkflowEligibility(workflow),
+    }));
+  }
+
+  async createTask(input: {
+    task: string;
+    workflowIds: unknown;
+    planner: unknown;
+    executor: unknown;
+    maxMilestones?: number;
+    maxConcurrent?: number;
+    idempotencyKey: string;
+    workspace?: { repositoryPath: string };
+  }): Promise<RunSummary> {
+    if (typeof input.task !== "string" || !input.task.trim() || input.task.length > 20000)
+      throw new Error("Enter a task of at most 20000 characters");
+    if (typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim())
+      throw new Error("idempotencyKey is required");
+    if (
+      !Array.isArray(input.workflowIds) ||
+      !input.workflowIds.length ||
+      input.workflowIds.some((id) => typeof id !== "string") ||
+      new Set(input.workflowIds).size !== input.workflowIds.length
+    )
+      throw new Error("Choose unique available workflow IDs");
+    const catalog = await this.workflows();
+    const selected = input.workflowIds.map((id) => {
+      const workflow = catalog.find((item) => item.id === id);
+      if (!workflow) throw new Error(`Unknown workflow ${id}`);
+      const eligibility = taskWorkflowEligibility(workflow);
+      if (!eligibility.eligible) throw new Error(`${workflow.name}: ${eligibility.reason}`);
+      if (eligibility.requiresWorkspace && !input.workspace)
+        throw new Error(`${workflow.name} needs a repository path`);
+      return workflow;
+    });
+    const bundle = await compileTask(
+      selected,
+      taskModel(input.planner),
+      taskModel(input.executor),
+      input.maxMilestones,
+      input.maxConcurrent,
+    );
+    return (
+      await this.coordinator.createRun({
+        workflowId: "automatic-task",
+        bundle,
+        input: {
+          task: input.task.trim(),
+          __taskWorkflows: selected.map((workflow) => ({
+            id: workflow.id,
+            name: workflow.name,
+            version: workflow.version,
+            digest: workflow.digest,
+          })),
+        },
+        idempotencyKey: input.idempotencyKey,
+        actor: "operator",
+        ...(input.workspace ? { workspace: input.workspace } : {}),
+      })
+    ).run;
+  }
+
   async createSwarm(input: {
     models: unknown;
     task: string;
@@ -848,8 +918,8 @@ export class ApplicationService {
     if (!ref?.digest) throw new Error("Artifact not found");
     return this.coordinator.journal.blobs.read(ref);
   }
-  workspaceSnapshot(runId: string) {
-    return this.coordinator.workspaceSnapshot(runId);
+  workspaceSnapshot(runId: string, invocationId?: string) {
+    return this.coordinator.workspaceSnapshot(runId, invocationId);
   }
   workspacePath(runId: string) {
     return this.coordinator.workspacePath(runId);
@@ -1642,6 +1712,23 @@ interface FileTemplateManifest {
   readonly entrypoint: string;
 }
 
+let authoringPluginRegistered = false;
+function registerAuthoringRuntime() {
+  if (authoringPluginRegistered) return;
+  // Project templates may live outside this checkout or a globally installed CLI.
+  // Bind their builder imports to the same core version the host compiles and executes.
+  Bun.plugin({
+    name: "kouro-workflow-authoring",
+    setup(build) {
+      build.module("@kouro/core", () => ({
+        loader: "object",
+        exports: coreAuthoring,
+      }));
+    },
+  });
+  authoringPluginRegistered = true;
+}
+
 async function loadFileTemplates(root: string): Promise<readonly FileTemplate[]> {
   let entries;
   try {
@@ -1669,6 +1756,7 @@ async function loadFileTemplates(root: string): Promise<readonly FileTemplate[]>
       throw new Error(`Invalid file template id: ${manifest.id}`);
     if (!manifest.name || !manifest.version || !manifest.entrypoint)
       throw new Error(`Invalid file template manifest: ${directory}`);
+    registerAuthoringRuntime();
     const module = (await import(pathToFileURL(resolve(directory, manifest.entrypoint)).href)) as {
       default?:
         | WorkflowDefinitionSource

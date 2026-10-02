@@ -23,6 +23,7 @@ const service = new ApplicationService({
   templateRoot: await prepareLaunchTemplate(dataDir),
   scriptedDelayMs: 5_000,
   harness: sessionHarness,
+  harnessAdapters: { codex: sessionHarness },
 });
 await service.start();
 const run = await service.createRun({

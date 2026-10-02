@@ -1,1 +1,1 @@
-Combine the analysis and test review into one canonical refactor plan. Return JSON matching the summary schema.
+Combine the latest revised plans in member1 and member2 into one canonical implementation plan. Use the latest reviews to check unresolved concerns. Resolve conflicts explicitly, preserve uncertainties, and return JSON matching the summary schema.

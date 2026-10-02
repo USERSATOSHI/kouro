@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const registry = "https://git.usersatoshi.com/api/packages/kouro/npm/";
-const packages = ["packages/core", "packages/host"] as const;
+const packages = ["packages/core", "packages/host", "."] as const;
 
 if (!process.env.KOURO_FORGEJO_TOKEN) {
   throw new Error("KOURO_FORGEJO_TOKEN is required");

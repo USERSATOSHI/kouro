@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "kouro",
+  "version": "0.3.0",
+  "description": "Run Kouro commands and implement fusion-produced specifications through dependent workflows with preserved approval gates.",
+  "author": { "name": "Kouro" },
+  "license": "Apache-2.0"
+}

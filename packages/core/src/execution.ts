@@ -1,3 +1,4 @@
+import { validateMilestonePlan, milestoneProgress } from "./milestones";
 import type {
   AttemptState,
   BoundInput,
@@ -651,6 +652,22 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
     return intents;
   }
 
+  for (const scope of Object.values(state.scopes)) {
+    if (
+      scope.id === state.rootScopeId ||
+      Object.values(state.invocations).some((item) => item.scopeId === scope.id)
+    )
+      continue;
+    const child = bundle.definitions[scope.definitionId];
+    const entry = child?.nodes.find((item) => item.id === child.entry);
+    if (entry)
+      intents.push({
+        kind: "activate",
+        scopeId: scope.id,
+        nodeId: entry.id,
+        bindings: bindingsForNode(entry, state, scope.id),
+      });
+  }
   const invocations = Object.values(state.invocations).sort(
     (a, b) => a.activationOrdinal - b.activationOrdinal || a.id.localeCompare(b.id),
   );
@@ -724,9 +741,13 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
             intents.push({
               kind: "complete",
               invocationId: invocation.id,
-              outcome: childInvocations.some((candidate) => candidate.status !== "succeeded")
-                ? "failed"
-                : "succeeded",
+              outcome: terminals.length
+                ? terminals.some((candidate) => candidate.status === "succeeded")
+                  ? "succeeded"
+                  : "failed"
+                : childInvocations.some((candidate) => candidate.status !== "succeeded")
+                  ? "failed"
+                  : "succeeded",
               output,
               evidence,
               artifacts,
@@ -774,6 +795,41 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
             });
           }
         }
+        continue;
+      }
+
+      if (node?.kind === "milestones" && "workflows" in node) {
+        const raw = invocation.inputBindings.plan?.value;
+        if (raw === undefined) continue; // The host materializes durable artifact bindings.
+        let plan;
+        try {
+          plan = validateMilestonePlan(
+            raw,
+            node.workflows.map((choice) => choice.id),
+            node.maxMilestones,
+          );
+        } catch {
+          intents.push({ kind: "complete", invocationId: invocation.id, outcome: "failed" });
+          continue;
+        }
+        const progress = milestoneProgress(plan, node, state, invocation.id);
+        const active = progress.filter(
+          (item) => item.status === "running" || item.status === "approval",
+        ).length;
+        const ready = progress.filter((item) => item.status === "ready");
+        for (const milestone of ready.slice(0, Math.max(0, node.maxConcurrent - active)))
+          intents.push({
+            kind: "milestone",
+            invocationId: invocation.id,
+            definitionId: milestone.definitionId,
+            milestone,
+          });
+        if (!active && !ready.length)
+          intents.push({
+            kind: "complete",
+            invocationId: invocation.id,
+            outcome: progress.every((item) => item.status === "succeeded") ? "succeeded" : "failed",
+          });
         continue;
       }
       if (node?.kind === "forEach") {

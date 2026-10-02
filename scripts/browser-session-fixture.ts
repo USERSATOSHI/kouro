@@ -1,3 +1,4 @@
+import { TaskFixtureHarness, installTaskFixture } from "./task-fixture";
 import { FusionFixtureHarness, fusionFixture } from "./fusion-fixture";
 import {
   WorkflowBuilder,
@@ -19,6 +20,8 @@ export class BrowserSessionHarness implements HarnessAdapter {
   readonly adapterVersion = "browser-fixture";
   private scripted = new ScriptedHarnessAdapter();
   private fusion = new FusionFixtureHarness();
+  private tasks = new TaskFixtureHarness();
+  private gatedTasks = new TaskFixtureHarness("normal", "task-gated");
   private liveFusion = new FusionFixtureHarness("slow-review");
   capabilities() {
     return this.scripted.capabilities();
@@ -56,6 +59,15 @@ export class BrowserSessionHarness implements HarnessAdapter {
   }
 
   async run(input: Parameters<HarnessAdapter["run"]>[0]): ReturnType<HarnessAdapter["run"]> {
+    if (input.role === "task-decomposer" || input.role.startsWith("task-fixture-")) {
+      const catalog =
+        input.context?.segments.find((segment) => segment.id.endsWith(":workflows"))?.content ?? "";
+      return (
+        catalog.includes('"task-gated"') && !catalog.includes('"task-fixture"')
+          ? this.gatedTasks
+          : this.tasks
+      ).run(input);
+    }
     if (input.role.startsWith("fusion-fixture-"))
       return (input.runId === this.liveFusionRunId ? this.liveFusion : this.fusion).run(input);
     if (!input.role.startsWith("web-session-")) return this.scripted.run(input);
@@ -282,6 +294,8 @@ export async function prepareLaunchTemplate(dataDir: string): Promise<string> {
     join(directory, "workflow.ts"),
     `export default ${JSON.stringify(builder.build())};\n`,
   );
+  await installTaskFixture(root);
+  await installTaskFixture(root, true);
   return root;
 }
 

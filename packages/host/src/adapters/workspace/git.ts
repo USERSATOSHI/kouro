@@ -242,6 +242,83 @@ export class GitWorkspaceAdapter {
     return this.git(repository, ["--no-pager", "diff", "--no-ext-diff", "--no-textconv", baseRef]);
   }
 
+  /** Compose milestone deltas in dependency order, retaining each source's own base. */
+  async composeTrees(
+    repositoryPath: string,
+    baseTree: string,
+    sources: readonly WorkspaceSnapshot[],
+  ): Promise<string> {
+    let tree = await this.verifyTree(repositoryPath, baseTree);
+    const env = {
+      GIT_AUTHOR_NAME: "Kouro milestones",
+      GIT_AUTHOR_EMAIL: "kouro@localhost",
+      GIT_COMMITTER_NAME: "Kouro milestones",
+      GIT_COMMITTER_EMAIL: "kouro@localhost",
+    };
+    const commit = (value: string) =>
+      this.git(repositoryPath, ["commit-tree", value], env, "milestone composition\n");
+    for (const source of sources) {
+      if (source.baseTree === source.resultTree) continue;
+      const [base, left, right] = await Promise.all([
+        commit(source.baseTree),
+        commit(tree),
+        commit(source.resultTree),
+      ]);
+      try {
+        tree = (
+          await this.git(repositoryPath, [
+            "merge-tree",
+            "--write-tree",
+            "--merge-base",
+            base,
+            left,
+            right,
+          ])
+        ).split("\n")[0]!;
+      } catch (cause) {
+        throw new Error(
+          `Milestone workspace conflict: ${cause instanceof Error ? cause.message : cause}`,
+        );
+      }
+    }
+    return tree;
+  }
+
+  /** Apply a composed tree only to the private run worktree, with crash-safe retry identity. */
+  async applyTree(ref: WorkspaceRef, tree: string): Promise<WorkspaceSnapshot> {
+    const before = await this.snapshot(ref);
+    if (before.resultTree === tree) return before;
+    if (before.resultTree !== ref.baseTree)
+      throw new Error("Run workspace changed during milestone execution");
+    const patch = await this.git(ref.path, ["diff", "--binary", before.resultTree, tree]);
+    const backup = join(this.root, "integration-backups", randomUUID());
+    mkdirSync(backup, { recursive: true, mode: 0o700 });
+    for (const entry of readdirSync(ref.path))
+      if (entry !== ".git")
+        cpSync(join(ref.path, entry), join(backup, entry), { recursive: true, force: true });
+    try {
+      if (patch)
+        await this.git(
+          ref.path,
+          ["apply", "--binary", "--whitespace=nowarn"],
+          undefined,
+          `${patch}\n`,
+        );
+      const after = await this.snapshot(ref);
+      if (after.resultTree !== tree)
+        throw new Error("Milestone integration tree verification failed");
+      return after;
+    } catch (cause) {
+      for (const entry of readdirSync(ref.path))
+        if (entry !== ".git") rmSync(join(ref.path, entry), { recursive: true, force: true });
+      for (const entry of readdirSync(backup))
+        cpSync(join(backup, entry), join(ref.path, entry), { recursive: true, force: true });
+      throw cause;
+    } finally {
+      rmSync(backup, { recursive: true, force: true });
+    }
+  }
+
   /** Apply independent child worktree patches only when their changed paths do
    * not overlap. The target is never mutated on a detected conflict. */
   async integrate(input: {
@@ -468,24 +545,28 @@ export class GitWorkspaceAdapter {
     extraEnv?: Record<string, string>,
     stdin?: string,
   ): Promise<string> {
-    const proc = Bun.spawn([this.executable, ...args], {
-      cwd,
-      env: { ...process.env, ...extraEnv },
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: stdin === undefined ? undefined : "pipe",
-    });
-    if (stdin !== undefined) {
-      proc.stdin.write(stdin);
-      proc.stdin.end();
+    const inputPath =
+      stdin === undefined ? undefined : join(this.root, "indexes", `stdin-${randomUUID()}`);
+    if (inputPath) writeFileSync(inputPath, stdin!, { mode: 0o600 });
+    try {
+      const proc = Bun.spawn([this.executable, ...args], {
+        cwd,
+        env: { ...process.env, ...extraEnv },
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: inputPath ? Bun.file(inputPath) : undefined,
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      if (code !== 0)
+        throw new Error(`git ${args[0] ?? ""} failed (${code}): ${(stderr || stdout).trim()}`);
+      return stdout.trim();
+    } finally {
+      if (inputPath) rmSync(inputPath, { force: true });
     }
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    if (code !== 0) throw new Error(`git ${args[0] ?? ""} failed (${code}): ${stderr.trim()}`);
-    return stdout.trim();
   }
 }
 

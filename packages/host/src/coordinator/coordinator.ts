@@ -12,6 +12,9 @@ import {
   sha256Hex,
   unavailableUsage,
   validateJsonSchema,
+  validateMilestonePlan,
+  milestoneProgress,
+  milestoneScopeId,
 } from "@kouro/core";
 import type {
   ArtifactRef,
@@ -70,6 +73,8 @@ export interface CoordinatorOptions {
   dataDir: string;
   agent?: ScriptedAgent;
   harness?: HarnessAdapter;
+  /** Explicit provider adapters for embedding and deterministic integration tests. */
+  harnessAdapters?: Partial<Record<import("@kouro/core").Harness, HarnessAdapter>>;
   executionProfile?:
     | "scripted"
     | "codex-readonly"
@@ -117,6 +122,7 @@ export class Coordinator {
   private readonly workspaces = new Map<string, WorkspaceRef>();
   private readonly branchWorkspaces = new Map<string, WorkspaceRef>();
   private readonly snapshots = new Map<string, WorkspaceSnapshot>();
+  private readonly harnessAdapters: CoordinatorOptions["harnessAdapters"];
   private codex?: HarnessAdapter;
   private codexDescriptor?: Awaited<ReturnType<typeof inspectCodex>>;
   private pi?: HarnessAdapter;
@@ -140,6 +146,7 @@ export class Coordinator {
     this.scouts = new ScoutGateway(this.journal);
     this.agent = options.agent ?? new DelayedScriptedAgent();
     this.harness = options.harness ?? new ScriptedHarnessAdapter();
+    this.harnessAdapters = options.harnessAdapters;
     this.process = options.process ?? createDefaultProcessAdapter();
     this.scriptedDelayMs = Math.max(0, options.scriptedDelayMs ?? 5_000);
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
@@ -298,11 +305,17 @@ export class Coordinator {
     return { run: result.run, created: result.created };
   }
 
-  async workspaceSnapshot(runId: string): Promise<WorkspaceSnapshot | null> {
-    const ref = this.workspaces.get(runId);
+  async workspaceSnapshot(runId: string, invocationId?: string): Promise<WorkspaceSnapshot | null> {
+    const state = invocationId ? this.journal.getView(runId)?.state : undefined;
+    if (invocationId && !state?.invocations[invocationId]) throw new Error("Invocation not found");
+    const ref =
+      state && invocationId
+        ? (this.milestoneWorkspace(runId, state, state.invocations[invocationId]!.scopeId) ??
+          this.workspaces.get(runId))
+        : this.workspaces.get(runId);
     if (!ref || !this.workspaceAdapter) return null;
     const snapshot = await this.workspaceAdapter.snapshot(ref);
-    this.snapshots.set(runId, snapshot);
+    if (ref === this.workspaces.get(runId)) this.snapshots.set(runId, snapshot);
     return snapshot;
   }
 
@@ -1441,6 +1454,227 @@ export class Coordinator {
     if (!this.active.has(runId)) this.schedule(runId);
   }
 
+  milestones(runId: string, ownerInvocationId?: string) {
+    const view = this.journal.getView(runId);
+    if (!view) throw new Error("Run not found");
+    const owner = Object.values(view.state.invocations).find((invocation) => {
+      const node = view.bundle.definitions[
+        view.state.scopes[invocation.scopeId]!.definitionId
+      ]?.nodes.find((item) => item.id === invocation.nodeId);
+      return (
+        node?.kind === "milestones" && (!ownerInvocationId || invocation.id === ownerInvocationId)
+      );
+    });
+    if (!owner)
+      return {
+        phase: ["pending", "running"].includes(view.state.status) ? "planning" : view.state.status,
+        milestones: [],
+        error: Object.values(view.state.invocations).find(
+          (invocation) => invocation.status === "failed",
+        )?.error,
+      };
+    const node = view.bundle.definitions[
+      view.state.scopes[owner.scopeId]!.definitionId
+    ]!.nodes.find((item) => item.id === owner.nodeId) as import("@kouro/core").MilestonesNode;
+    try {
+      const plan = validateMilestonePlan(
+        this.resolveBoundInput(owner.inputBindings.plan!, view.state, owner.id),
+        node.workflows.map((item) => item.id),
+        node.maxMilestones,
+      );
+      return {
+        phase:
+          view.state.status === "cancelled"
+            ? "cancelled"
+            : view.state.status === "paused"
+              ? "paused"
+              : owner.status === "succeeded"
+                ? "succeeded"
+                : owner.status === "failed"
+                  ? "failed"
+                  : "executing",
+        ownerInvocationId: owner.id,
+        maxConcurrent: node.maxConcurrent,
+        milestones: milestoneProgress(plan, node, view.state, owner.id).map((milestone) => {
+          const row = this.journal.getRunRow(runId);
+          const catalog = row
+            ? parseJson<{
+                __taskWorkflows?: Array<{
+                  id: string;
+                  name: string;
+                  version: string;
+                  digest: string;
+                }>;
+              }>(row.input_json).__taskWorkflows
+            : undefined;
+          const workflow = catalog?.find((item) => item.id === milestone.workflowId);
+          const status =
+            milestone.status === "succeeded"
+              ? milestone.status
+              : view.state.status === "cancelled"
+                ? ("cancelled" as const)
+                : owner.status === "failed" && ["ready", "waiting"].includes(milestone.status)
+                  ? ("blocked" as const)
+                  : milestone.status;
+          return {
+            ...milestone,
+            status,
+            workflowVersion: workflow?.version,
+            workflowName: workflow?.name,
+            workflowDigest: workflow?.digest,
+          };
+        }),
+        ...(owner.error ? { error: owner.error } : {}),
+      };
+    } catch (cause) {
+      return {
+        phase: "failed",
+        milestones: [],
+        error: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  }
+
+  private milestoneWorkspace(
+    runId: string,
+    state: ExecutionState,
+    scopeId?: string,
+  ): WorkspaceRef | undefined {
+    let scope = state.scopes[scopeId ?? ""];
+    while (scope) {
+      if (scope.milestoneId) return this.branchWorkspaces.get(`${runId}:${scope.id}`);
+      scope = state.scopes[scope.parentScopeId ?? ""];
+    }
+    return undefined;
+  }
+
+  private async startMilestone(
+    runId: string,
+    bundle: Bundle,
+    state: ExecutionState,
+    intent: Extract<DecisionIntent, { kind: "milestone" }>,
+  ): Promise<void> {
+    const parent = state.invocations[intent.invocationId]!;
+    const admitted = () => {
+      const current = this.journal.getView(runId)?.state;
+      return (
+        current?.status === "running" &&
+        current.control === "none" &&
+        current.invocations[parent.id]?.status === "pending"
+      );
+    };
+    if (!admitted()) return;
+    const child = bundle.definitions[intent.definitionId]!;
+    const milestone = intent.milestone;
+    const scopeId = milestoneScopeId(parent.id, milestone.id);
+    if (this.journal.getView(runId)!.state.scopes[scopeId]) return;
+    const root = this.workspaces.get(runId);
+    const progress = this.milestones(runId, parent.id).milestones;
+    const ancestors = new Set<string>();
+    const visit = (id: string) => {
+      if (ancestors.has(id)) return;
+      ancestors.add(id);
+      progress.find((item) => item.id === id)?.dependsOn.forEach(visit);
+    };
+    milestone.dependsOn.forEach(visit);
+    const prerequisites = progress.filter((item) => ancestors.has(item.id));
+    if (root && this.workspaceAdapter) {
+      const key = `${runId}:${scopeId}`;
+      let workspace = this.branchWorkspaces.get(key);
+      if (!workspace) {
+        try {
+          workspace = await this.workspaceAdapter.loadByIdentity(runId, scopeId);
+        } catch {
+          const refs = prerequisites.map((item) =>
+            this.branchWorkspaces.get(`${runId}:${item.scopeId}`),
+          );
+          if (refs.some((ref) => !ref)) throw new Error("Prerequisite workspace is unavailable");
+          const snapshots = await Promise.all(
+            refs.map((ref) => this.workspaceAdapter!.snapshot(ref!)),
+          );
+          const tree = await this.workspaceAdapter.composeTrees(
+            root.repositoryPath,
+            root.baseTree,
+            snapshots,
+          );
+          workspace = await this.workspaceAdapter.createAtTree({
+            repositoryPath: root.repositoryPath,
+            runId,
+            workspaceId: scopeId,
+            parentCommit: root.baseCommit,
+            tree,
+          });
+        }
+        this.branchWorkspaces.set(key, workspace);
+      }
+    }
+    if (!admitted()) return;
+    const dependencies = prerequisites.map((item) => ({
+      id: item.id,
+      title: item.title,
+      results: item.invocationIds
+        .filter((id) =>
+          state.scopes[item.scopeId]?.milestoneExitIds?.includes(state.invocations[id]!.nodeId),
+        )
+        .flatMap((id) => state.invocations[id]?.output ?? [])
+        .map((ref) => {
+          try {
+            return JSON.parse(new TextDecoder().decode(this.journal.blobs.read(ref)));
+          } catch {
+            return { artifactId: ref.id };
+          }
+        }),
+    }));
+    const task =
+      milestone.task +
+      (dependencies.length ? `\n\nCompleted prerequisites:\n${json(dependencies)}` : "");
+    const inputBindings: Record<string, BoundInput> = Object.fromEntries(
+      child.inputPorts.map((port) => {
+        const value = port.name === "task" ? task : port.defaultValue;
+        return [
+          port.name,
+          {
+            source: { kind: "input", sourceId: port.name },
+            missing: port.required ? "error" : "omit",
+            ...(value === undefined ? {} : { value }),
+          },
+        ];
+      }),
+    );
+    this.journal.append({
+      runId,
+      type: "scope.created",
+      actor: "system",
+      subjectId: scopeId,
+      payload: {
+        scope: {
+          id: scopeId,
+          parentScopeId: parent.scopeId,
+          definitionId: child.id,
+          status: "running",
+          activationOrdinal: Object.keys(state.scopes).length,
+          inputBindings,
+          milestoneId: milestone.id,
+          ownerInvocationId: parent.id,
+          milestoneExitIds: child.nodes
+            .filter((node) => node.kind === "complete" && node.result === "succeeded")
+            .map((node) => node.id),
+        },
+      },
+    });
+    // Use ordinary activation to preserve bindings, literals and output schemas.
+    const current = this.journal.getView(runId)!.state;
+    const entryIntent = decide(bundle, current).find(
+      (item) => item.kind === "activate" && item.scopeId === scopeId,
+    );
+    if (entryIntent?.kind === "activate")
+      this.activate(runId, current, {
+        ...entryIntent,
+        sourceInvocationId: parent.id,
+        sourceEdgeId: `${parent.nodeId}:milestone:${milestone.id}`,
+      });
+  }
+
   private async drive(runId: string): Promise<void> {
     for (;;) {
       const view = this.journal.getView(runId);
@@ -1484,7 +1718,55 @@ export class Coordinator {
         });
         continue;
       }
-      const intents = decide(view.bundle, view.state);
+      let decisionState = view.state;
+      let invalidPlan = false;
+      for (const invocation of Object.values(view.state.invocations)) {
+        if (invocation.status !== "pending") continue;
+        const node = view.bundle.definitions[
+          view.state.scopes[invocation.scopeId]!.definitionId
+        ]?.nodes.find((item) => item.id === invocation.nodeId);
+        if (node?.kind !== "milestones" || !("workflows" in node)) continue;
+        try {
+          const value = this.resolveBoundInput(
+            invocation.inputBindings.plan!,
+            view.state,
+            invocation.id,
+          );
+          const plan = validateMilestonePlan(
+            value,
+            node.workflows.map((item) => item.id),
+            node.maxMilestones,
+          );
+          decisionState = {
+            ...decisionState,
+            invocations: {
+              ...decisionState.invocations,
+              [invocation.id]: {
+                ...invocation,
+                inputBindings: {
+                  ...invocation.inputBindings,
+                  plan: { ...invocation.inputBindings.plan!, value: plan as unknown as JsonValue },
+                },
+              },
+            },
+          };
+        } catch (cause) {
+          this.journal.append({
+            runId,
+            type: "invocation.completed",
+            actor: "system",
+            payload: {
+              invocationId: invocation.id,
+              status: "failed",
+              direct: true,
+              error: cause instanceof Error ? cause.message : String(cause),
+            },
+          });
+          invalidPlan = true;
+        }
+      }
+      if (invalidPlan) continue;
+      const intents = decide(view.bundle, decisionState);
       // Structural activation and reservation are committed in one pass so a
       // ready set can become runnable together.  This is important for fork
       // branches: reserving only intents[0] would accidentally serialize the
@@ -1503,47 +1785,32 @@ export class Coordinator {
           if (!parent || !child)
             throw new Error(`Call definition ${intent.definitionId} is unavailable`);
           const scopeId = `${parent.id}:scope`;
-          const entry = child.nodes.find((candidate) => candidate.id === child.entry);
-          this.journal.appendMany([
-            {
-              runId,
-              type: "scope.created",
-              payload: {
-                scope: {
-                  id: scopeId,
-                  parentScopeId: parent.scopeId,
-                  definitionId: intent.definitionId,
-                  status: "running",
-                  activationOrdinal: parent.activationOrdinal,
-                },
+          this.journal.append({
+            runId,
+            type: "scope.created",
+            actor: "system",
+            subjectId: scopeId,
+            payload: {
+              scope: {
+                id: scopeId,
+                parentScopeId: parent.scopeId,
+                definitionId: intent.definitionId,
+                inputBindings: parent.inputBindings,
+                status: "running",
+                activationOrdinal: parent.activationOrdinal,
               },
-              actor: "system",
-              subjectId: scopeId,
             },
-            {
-              runId,
-              type: "invocation.created",
-              payload: {
-                invocationId: id("inv"),
-                scopeId,
-                nodeId: child.entry,
-                activationOrdinal: 0,
-                sourceInvocationId: parent.id,
-                sourceEdgeId: `${parent.nodeId}:call`,
-                inputBindings: entry?.bindings.reduce(
-                  (result, binding) => {
-                    result[binding.targetPort] = parent.inputBindings[binding.targetPort] ?? {
-                      source: binding.source,
-                      missing: binding.missing,
-                    };
-                    return result;
-                  },
-                  {} as Record<string, import("@kouro/core").BoundInput>,
-                ),
-              },
-              actor: "system",
-            },
-          ]);
+          });
+          const current = this.journal.getView(runId)!.state;
+          const entryIntent = decide(view.bundle, current).find(
+            (item) => item.kind === "activate" && item.scopeId === scopeId,
+          );
+          if (entryIntent?.kind === "activate")
+            this.activate(runId, current, {
+              ...entryIntent,
+              sourceInvocationId: parent.id,
+              sourceEdgeId: `${parent.nodeId}:call`,
+            });
         }
         continue;
       }
@@ -1677,6 +1944,49 @@ export class Coordinator {
               actor: "system",
             },
           ]);
+        }
+        continue;
+      }
+      const milestones = intents.filter((candidate) => candidate.kind === "milestone");
+      if (milestones.length) {
+        for (const intent of milestones) {
+          try {
+            await this.startMilestone(runId, view.bundle, decisionState, intent);
+          } catch (cause) {
+            const current = this.journal.getView(runId)!.state;
+            if (
+              current.control !== "none" ||
+              current.invocations[intent.invocationId]?.status !== "pending"
+            )
+              break;
+            for (const child of Object.values(current.invocations)) {
+              let scope = current.scopes[child.scopeId];
+              while (scope && !scope.milestoneId && scope.parentScopeId)
+                scope = current.scopes[scope.parentScopeId];
+              if (
+                scope?.ownerInvocationId === intent.invocationId &&
+                ["pending", "reserved", "running"].includes(child.status)
+              )
+                this.journal.append({
+                  runId,
+                  type: "invocation.cancelled",
+                  actor: "system",
+                  payload: { invocationId: child.id, reason: "milestone admission failed" },
+                });
+            }
+            this.journal.append({
+              runId,
+              type: "invocation.completed",
+              actor: "system",
+              payload: {
+                invocationId: intent.invocationId,
+                status: "failed",
+                direct: true,
+                error: cause instanceof Error ? cause.message : String(cause),
+              },
+            });
+            break;
+          }
         }
         continue;
       }
@@ -1826,12 +2136,19 @@ export class Coordinator {
         continue;
       }
       if (intent.kind === "request-approval") {
-        const workspace = this.workspaces.get(runId);
+        const workspace =
+          this.milestoneWorkspace(
+            runId,
+            view.state,
+            view.state.invocations[intent.invocationId]?.scopeId,
+          ) ?? this.workspaces.get(runId);
         const workspaceSnapshot =
           workspace && this.workspaceAdapter
             ? await this.workspaceAdapter.snapshot(workspace)
             : undefined;
-        if (workspaceSnapshot) this.snapshots.set(runId, workspaceSnapshot);
+        if (this.journal.getView(runId)!.state.control !== "none") continue;
+        if (workspaceSnapshot && workspace === this.workspaces.get(runId))
+          this.snapshots.set(runId, workspaceSnapshot);
         this.journal.append({
           runId,
           type: "approval.requested",
@@ -1882,6 +2199,67 @@ export class Coordinator {
         const node = definition?.nodes.find(
           (candidate) => candidate.id === view.state.invocations[intent.invocationId]?.nodeId,
         );
+        if (node?.kind === "milestones" && "workflows" in node && completion) {
+          let status = intent.outcome;
+          let error: string | undefined;
+          const progress = this.milestones(runId, completion.id).milestones;
+          try {
+            const root = this.workspaces.get(runId);
+            if (status === "succeeded" && root && this.workspaceAdapter) {
+              const refs = progress.map((item) =>
+                this.branchWorkspaces.get(`${runId}:${item.scopeId}`),
+              );
+              if (refs.some((ref) => !ref)) throw new Error("Milestone workspace is unavailable");
+              const snapshots = await Promise.all(
+                refs.map((ref) => this.workspaceAdapter!.snapshot(ref!)),
+              );
+              const tree = await this.workspaceAdapter.composeTrees(
+                root.repositoryPath,
+                root.baseTree,
+                snapshots,
+              );
+              if (this.journal.getView(runId)!.state.control !== "none") continue;
+              this.snapshots.set(runId, await this.workspaceAdapter.applyTree(root, tree));
+            }
+          } catch (cause) {
+            status = "failed";
+            error = cause instanceof Error ? cause.message : String(cause);
+          }
+          if (this.journal.getView(runId)!.state.control !== "none") continue;
+          const result = {
+            milestones: progress.map((item) => ({
+              ...item,
+              output: item.invocationIds.flatMap((id) => view.state.invocations[id]?.output ?? []),
+            })),
+            ...(error ? { error } : {}),
+          };
+          const stored = this.journal.blobs.put(
+            runId,
+            new TextEncoder().encode(json(result)),
+            "application/json",
+          );
+          this.journal.insertArtifact(stored);
+          this.journal.append({
+            runId,
+            type: "invocation.completed",
+            actor: "system",
+            payload: {
+              invocationId: intent.invocationId,
+              status,
+              direct: true,
+              ...(error ? { error } : {}),
+              output: [
+                {
+                  id: stored.id,
+                  digest: stored.digest,
+                  mediaType: stored.mediaType,
+                  schemaDigest: node.outputPorts[0]!.schemaDigest,
+                },
+              ],
+            },
+          });
+          continue;
+        }
         if (node?.kind === "join" && (node as JoinNode).mode === "fail-fast") {
           const fork = definition?.nodes.find(
             (candidate) =>
@@ -2008,7 +2386,9 @@ export class Coordinator {
     const inputBindings = Object.fromEntries(
       Object.entries(intent.bindings).map(([name, binding]) => {
         if (binding.source.kind !== "input") return [name, binding];
-        const inherited = parentCall?.inputBindings[binding.source.sourceId];
+        const inherited =
+          state.scopes[intent.scopeId]?.inputBindings?.[binding.source.sourceId] ??
+          parentCall?.inputBindings[binding.source.sourceId];
         if (inherited)
           return [
             name,
@@ -2050,7 +2430,7 @@ export class Coordinator {
       const key = `${intent.scopeId}:${intent.counterId}`;
       const definition =
         this.journal.getView(runId)?.bundle.definitions[
-          this.journal.getView(runId)?.bundle.rootDefinitionId ?? ""
+          state.scopes[intent.scopeId]?.definitionId ?? ""
         ];
       const max = definition?.counters.find((counter) => counter.id === intent.counterId)?.max;
       const current = state.counters[key] ?? 0;
@@ -2223,9 +2603,16 @@ export class Coordinator {
         : "scripted";
     const workspaceDir = join(this.dataDir, "workspaces", runId, invocationId);
     const registeredWorkspace = this.workspaces.get(runId);
-    let invocationWorkspace = registeredWorkspace;
+    let invocationWorkspace =
+      this.milestoneWorkspace(runId, state, state.invocations[invocationId]!.scopeId) ??
+      registeredWorkspace;
     const sourceInvocationId = state.invocations[invocationId]?.sourceInvocationId;
-    if (registeredWorkspace && sourceInvocationId && this.workspaceAdapter) {
+    if (
+      registeredWorkspace &&
+      invocationWorkspace === registeredWorkspace &&
+      sourceInvocationId &&
+      this.workspaceAdapter
+    ) {
       const key = `${runId}:${invocationId}`;
       invocationWorkspace = this.branchWorkspaces.get(key);
       if (!invocationWorkspace) {
@@ -2487,7 +2874,14 @@ export class Coordinator {
             : profile === "pi-readonly"
               ? "pi"
               : toHarness(this.harness.id));
-      if (
+      const suppliedAdapter = isHarness(requestedHarness)
+        ? this.harnessAdapters?.[requestedHarness]
+        : undefined;
+      if (suppliedAdapter) {
+        selected = suppliedAdapter;
+        resolvedHarness = requestedHarness;
+        resolvedVersion = suppliedAdapter.adapterVersion;
+      } else if (
         requestedHarness === "scripted" &&
         node.harness !== "codex" &&
         node.harness !== "pi" &&

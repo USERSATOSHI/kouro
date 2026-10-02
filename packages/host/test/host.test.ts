@@ -660,6 +660,39 @@ describe("Kouro M1 host", () => {
     await reopened.close();
   });
 
+  test("returns JSON for missing API routes while retaining browser navigation fallback", async () => {
+    const staticRoot = temporaryDirectory();
+    writeFileSync(join(staticRoot, "index.html"), "<!doctype html><title>Kouro</title>");
+    const service = new ApplicationService({
+      dataDir: temporaryDirectory(),
+      process: new FakeProcessAdapter(),
+    });
+    await service.start();
+    const host = createHostServer(service, { staticRoot });
+    const origin = "http://127.0.0.1:43127";
+    try {
+      for (const method of ["GET", "POST"]) {
+        const missing = await host.app.handle(
+          new Request(`${origin}/api/missing-route`, { method }),
+        );
+        expect(missing.status).toBe(404);
+        expect(missing.headers.get("content-type")).toContain("application/json");
+        expect(await missing.json()).toMatchObject({ error: "api-route-not-found" });
+      }
+      const navigation = await host.app.handle(new Request(`${origin}/runs/example`));
+      expect(navigation.status).toBe(200);
+      expect(await navigation.text()).toContain("<!doctype html>");
+      const session = await host.app.handle(new Request(`${origin}/api/session`));
+      expect(session.status).toBe(401);
+      const rejected = await host.app.handle(
+        new Request(`${origin}/api/missing-route`, { headers: { origin: "https://example.com" } }),
+      );
+      expect(rejected.status).toBe(403);
+    } finally {
+      await host.stop();
+    }
+  });
+
   test("requires pairing and CSRF while keeping the token out of later API calls", async () => {
     const service = new ApplicationService({
       dataDir: temporaryDirectory(),

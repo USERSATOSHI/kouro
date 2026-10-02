@@ -1,3 +1,4 @@
+import { MAX_MILESTONES, MilestonePlanType, MilestoneResultType } from "./milestones";
 import { buildFusionStages, validateFusionRounds, type FusionOptions } from "./fusion";
 import type {
   ArtifactType,
@@ -22,6 +23,7 @@ import type {
   JoinNode,
   LoopNode,
   ForEachNode,
+  MilestonesNode,
   JoinMode,
   JoinFailure,
   Harness,
@@ -206,6 +208,7 @@ type InternalNode = (
   | JoinNode
   | LoopNode
   | ForEachNode
+  | MilestonesNode
   | UnsupportedNode
 ) & {
   readonly inputPorts: readonly InternalPort[];
@@ -225,7 +228,15 @@ function scopeDefinition(
         ? { ...node, definitionId: scopedId(node.definitionId) }
         : node.kind === "forEach" && "templateDefinitionId" in node
           ? { ...node, templateDefinitionId: scopedId(node.templateDefinitionId) }
-          : node,
+          : node.kind === "milestones" && "workflows" in node
+            ? {
+                ...node,
+                workflows: node.workflows.map((item) => ({
+                  ...item,
+                  definitionId: scopedId(item.definitionId),
+                })),
+              }
+            : node,
     ),
     ...(source.scouts
       ? {
@@ -1075,6 +1086,53 @@ export class WorkflowBuilder {
     return this.handle<unknown[], true>(id, output);
   }
 
+  milestones(
+    id: string,
+    options: { plan: ValueBinding; maxMilestones?: number; maxConcurrent?: number },
+  ): {
+    use: (
+      ...workflows: readonly (WorkflowBuilder | WorkflowDefinitionSource)[]
+    ) => NodeHandle<unknown, true>;
+  } {
+    const maxMilestones = options.maxMilestones ?? 8;
+    const maxConcurrent = options.maxConcurrent ?? 2;
+    if (!Number.isSafeInteger(maxMilestones) || maxMilestones < 1 || maxMilestones > MAX_MILESTONES)
+      throw new Error(`maxMilestones must be between 1 and ${MAX_MILESTONES}`);
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > maxMilestones)
+      throw new Error("maxConcurrent must be between 1 and maxMilestones");
+    return {
+      use: (...workflows) => {
+        if (!workflows.length) throw new Error("milestones.use requires available workflows");
+        const sources = workflows.map((workflow) =>
+          workflow instanceof WorkflowBuilder ? workflow.build() : workflow,
+        );
+        if (new Set(sources.map((source) => source.id)).size !== sources.length)
+          throw new Error("Duplicate milestone workflow");
+        const choices = sources.map((source) => {
+          const scoped = scopeDefinition(source, id);
+          this.childDefinitions.set(scoped.id, scoped);
+          return { id: source.id, definitionId: scoped.id };
+        });
+        const output = port("output", MilestoneResultType);
+        const node: MilestonesNode = {
+          id,
+          kind: "milestones",
+          workflows: choices,
+          maxMilestones,
+          maxConcurrent,
+          inputPorts: [port("plan", MilestonePlanType)],
+          outputPorts: [output],
+          bindings: [
+            { targetPort: "plan", source: bindingSource(options.plan, this), missing: "error" },
+          ],
+        };
+        this.addNode(node as InternalNode);
+        this.sourceMap.set(id, { sourceId: id });
+        return this.handle<unknown, true>(id, output);
+      },
+    };
+  }
+
   sequence(...nodes: readonly NodeHandle<any, any>[]): void {
     for (let index = 0; index < nodes.length - 1; index += 1) {
       assertHandleOwner(nodes[index], this);
@@ -1251,7 +1309,8 @@ function stripInternal(node: InternalNode): Node {
     node.kind === "fork" ||
     node.kind === "join" ||
     node.kind === "loop" ||
-    node.kind === "forEach"
+    node.kind === "forEach" ||
+    node.kind === "milestones"
   )
     return { ...base, ...node } as Node;
   if (node.kind === "agent") {

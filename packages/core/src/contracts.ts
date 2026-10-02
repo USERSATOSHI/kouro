@@ -44,7 +44,8 @@ export type NodeKind =
   | "fork"
   | "join"
   | "loop"
-  | "forEach";
+  | "forEach"
+  | "milestones";
 export type SupportedNodeKind = "agent" | "command" | "approval" | "complete";
 export type NodeStatus =
   | "pending"
@@ -245,6 +246,17 @@ export interface ForEachNode {
   readonly bindings: readonly Binding[];
 }
 
+export interface MilestonesNode {
+  readonly id: string;
+  readonly kind: "milestones";
+  readonly workflows: readonly { readonly id: string; readonly definitionId: string }[];
+  readonly maxMilestones: number;
+  readonly maxConcurrent: number;
+  readonly inputPorts: readonly Port[];
+  readonly outputPorts: readonly Port[];
+  readonly bindings: readonly Binding[];
+}
+
 export type Node =
   | AgentNode
   | CommandNode
@@ -255,6 +267,7 @@ export type Node =
   | JoinNode
   | LoopNode
   | ForEachNode
+  | MilestonesNode
   | UnsupportedNode;
 
 export interface CounterDefinition {
@@ -456,6 +469,10 @@ export interface BoundInput {
 }
 
 export interface ScopeState {
+  readonly inputBindings?: Readonly<Record<string, BoundInput>>;
+  readonly milestoneId?: string;
+  readonly ownerInvocationId?: string;
+  readonly milestoneExitIds?: readonly string[];
   readonly id: string;
   readonly parentScopeId: string | null;
   readonly definitionId: string;
@@ -763,6 +780,13 @@ export interface ForEachIntent {
   readonly item: JsonValue;
 }
 
+export interface MilestoneIntent {
+  readonly kind: "milestone";
+  readonly invocationId: string;
+  readonly definitionId: string;
+  readonly milestone: import("./milestones").Milestone;
+}
+
 export interface RequestApprovalIntent {
   readonly kind: "request-approval";
   readonly invocationId: string;
@@ -802,6 +826,7 @@ export type DecisionIntent =
   | CallIntent
   | LoopIntent
   | ForEachIntent
+  | MilestoneIntent
   | RequestApprovalIntent
   | ReserveIntent
   | ExecuteIntent

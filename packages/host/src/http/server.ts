@@ -436,6 +436,50 @@ export function createHostServer(
     }
     return service.scouts(params.id);
   });
+  app.get("/api/task-workflows", async ({ request, set }) =>
+    checked(request, set) ? service.taskWorkflows() : denied(set),
+  );
+  app.get("/api/runs/:id/milestones", ({ request, set, params }) => {
+    if (!checked(request, set)) return denied(set);
+    if (!service.getView(params.id)) {
+      set.status = 404;
+      return { error: "run-not-found" };
+    }
+    return service.coordinator.milestones(params.id);
+  });
+  app.post("/api/tasks", async ({ request, set, body }) => {
+    if (!checked(request, set, true)) return denied(set);
+    const input = bodyObject(body);
+    try {
+      if (typeof input.task !== "string" || typeof input.idempotencyKey !== "string")
+        throw new Error("task and idempotencyKey are required");
+      let workspace: { repositoryPath: string } | undefined;
+      if (input.workspace !== undefined) {
+        const value = bodyObject(input.workspace);
+        if (typeof value.repositoryPath !== "string" || !value.repositoryPath.trim())
+          throw new Error("workspace.repositoryPath must be nonblank");
+        workspace = { repositoryPath: value.repositoryPath.trim() };
+      }
+      return toWebRun(
+        await service.createTask({
+          task: input.task,
+          workflowIds: input.workflowIds,
+          planner: input.planner,
+          executor: input.executor,
+          maxMilestones: input.maxMilestones as number | undefined,
+          maxConcurrent: input.maxConcurrent as number | undefined,
+          idempotencyKey: input.idempotencyKey,
+          workspace,
+        }),
+      );
+    } catch (cause) {
+      set.status = 400;
+      return {
+        error: "invalid-task-request",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  });
   app.post("/api/swarms", async ({ request, set, body }) => {
     if (!checked(request, set, true)) return denied(set);
     const input = bodyObject(body);
@@ -534,7 +578,10 @@ export function createHostServer(
       return { error: "run-not-found" };
     }
     try {
-      const snapshot = await service.workspaceSnapshot(params.id);
+      const snapshot = await service.workspaceSnapshot(
+        params.id,
+        new URL(request.url).searchParams.get("invocationId") ?? undefined,
+      );
       return snapshot ?? { error: "workspace-not-configured" };
     } catch (cause) {
       set.status = 409;
@@ -1000,6 +1047,22 @@ export function createHostServer(
       return { error: "artifact-not-found" };
     }
   });
+
+  // Unknown API routes must never fall through to the browser's HTML entrypoint.
+  // A newer frontend can otherwise turn an older host's missing route into a JSON parse error.
+  const missingApiRoute = ({ request, set }: { request: Request; set: MutableStatus }) => {
+    if (!validOriginHost(request)) {
+      set.status = 403;
+      return { error: "invalid-origin" };
+    }
+    set.status = 404;
+    return {
+      error: "api-route-not-found",
+      message: `No Kouro API route for ${request.method} ${new URL(request.url).pathname}. Restart Kouro from the latest checkout, then reload the page.`,
+    };
+  };
+  app.get("/api/*", missingApiRoute);
+  app.all("/api/*", missingApiRoute);
 
   app.get("/", () =>
     options.staticRoot ? Bun.file(join(options.staticRoot, "index.html")) : "Kouro local host",

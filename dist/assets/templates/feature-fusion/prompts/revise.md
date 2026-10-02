@@ -1,0 +1,1 @@
+Revise your previous plan using the reviews from both members. Address feedback concerning your plan, incorporate useful findings, and resolve disagreements using repository evidence. Preserve uncertainties and include concrete implementation and validation steps. Return the complete revised plan as JSON matching the summary schema.

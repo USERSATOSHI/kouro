@@ -1,0 +1,11 @@
+{
+  "name": "kouro",
+  "version": "0.3.0",
+  "description": "Kouro commands, fusion specification handoff, greenfield implementation and language porting workflows.",
+  "author": { "name": "Kouro" },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Kouro",
+    "shortDescription": "Plan and execute dependent project milestones"
+  }
+}

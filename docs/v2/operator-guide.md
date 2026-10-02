@@ -5,6 +5,10 @@ the Elysia host; `bun run kouro --help` lists headless commands. Keep the printe
 pairing token private. State lives in `KOURO_DATA_DIR` (default `.kouro-data`).
 Only one writable host may own that directory at a time.
 
+`kouro task run` generates and executes dependent milestones headlessly.
+See [CLI workflow tasks and agent plugins](./agent-plugins.md) for commands and
+the shared Codex/Claude Code plugin.
+
 ## Inspect a run
 
 Use Runs for the compiled graph, live timeline, invocation inspector, context,

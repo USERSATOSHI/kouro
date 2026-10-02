@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kouro Implement"
+  short_description: "Implement fusion specs through Kouro workflows"
+  default_prompt: "Use $kouro:implement to implement this fusion-produced spec and plan through Kouro workflows."

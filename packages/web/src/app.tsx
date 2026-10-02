@@ -1,3 +1,6 @@
+import { TaskLauncher, type TaskLaunchRequest } from "./components/TaskLauncher";
+import { readApiJson } from "./data/apiResponse";
+import { MilestonesPanel } from "./components/MilestonesPanel";
 import { FusionSessions, fusionGroups } from "./components/FusionSessions";
 import { artifactIdentity, evidenceBelongsTo, invocationLabel } from "./data/evidenceIdentity";
 import { layoutWorkbenchGraph } from "./data/workbenchLayout";
@@ -139,6 +142,7 @@ type Surface =
   | "new-run"
   | "evals"
   | "swarm"
+  | "task"
   | "development"
   | "checkpoints"
   | "dashboard"
@@ -240,7 +244,7 @@ const ensureSession = async (): Promise<void> => {
     signal: AbortSignal.timeout(20_000),
   });
   if (existing.ok) {
-    csrfToken = ((await existing.json()) as { csrfToken: string }).csrfToken;
+    csrfToken = (await readApiJson<{ csrfToken: string }>(existing, "/api/session")).csrfToken;
     return;
   }
   const token =
@@ -253,8 +257,8 @@ const ensureSession = async (): Promise<void> => {
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  csrfToken = (await readApiJson<{ csrfToken: string }>(response, "/api/session")).csrfToken;
   savePairingToken(token);
-  csrfToken = ((await response.json()) as { csrfToken: string }).csrfToken;
   history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
 };
 
@@ -298,7 +302,7 @@ const api = async <T,>(path: string, init: RequestInit = {}, recovered = false):
     }
     throw new Error(detail || `${response.status} ${response.statusText}`);
   }
-  return response.json() as Promise<T>;
+  return readApiJson<T>(response, path);
 };
 
 /** Advance host wall time from a snapshot using a monotonic browser clock. */
@@ -512,7 +516,7 @@ export function App() {
   const [navigationOpen, navigation] = useDisclosure(false);
   const appearance = useComputedColorScheme("dark");
   const [requestedWorkspace, setRequestedWorkspace] = useState<{
-    tab: "session" | "review";
+    tab: "session" | "review" | "milestones";
     nonce: number;
   }>();
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
@@ -1010,6 +1014,32 @@ export function App() {
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to start swarm");
+      return false;
+    } finally {
+      launchingRef.current = false;
+      setLaunching(false);
+    }
+  };
+
+  const launchTask = async (request: TaskLaunchRequest) => {
+    if (launchingRef.current) return false;
+    launchingRef.current = true;
+    setLaunching(true);
+    setError(undefined);
+    try {
+      const created = await api<RunSummary>("/api/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      setRuns((old) => [created, ...old.filter((run) => run.id !== created.id)]);
+      setSelectedRunId(created.id);
+      setSelectedInvocationId(undefined);
+      setSurface("runs");
+      setRequestedWorkspace({ tab: "milestones", nonce: Date.now() });
+      return true;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to start workflow task");
       return false;
     } finally {
       launchingRef.current = false;
@@ -1614,6 +1644,8 @@ export function App() {
                 </Stack>
               )}
             </>
+          ) : surface === "task" ? (
+            <TaskLauncher api={api} onLaunch={launchTask} launching={launching} />
           ) : surface === "swarm" && (composingSwarm || !selectedRunId) ? (
             <SwarmLauncher onLaunch={launchSwarm} launching={launching} />
           ) : surface === "swarm" && selectedRunId ? (
@@ -1920,6 +1952,7 @@ function Sidebar({
     | "new-run"
     | "evals"
     | "swarm"
+    | "task"
     | "development"
     | "checkpoints"
     | "dashboard"
@@ -1931,6 +1964,8 @@ function Sidebar({
       | "new-run"
       | "evals"
       | "swarm"
+      | "task"
+      | "task"
       | "development"
       | "checkpoints"
       | "dashboard"
@@ -1944,6 +1979,7 @@ function Sidebar({
     { id: "new-run", label: "Workflows", icon: IconRoute },
     { id: "approvals", label: "Approvals", icon: IconShieldCheck },
     { id: "swarm", label: "Agent swarm", icon: IconUsers },
+    { id: "task", label: "Workflow task", icon: IconRoute },
     { id: "evals", label: "Evaluations", icon: IconChartBar },
     { id: "checkpoints", label: "Checkpoints", icon: IconGitBranch },
     { id: "development", label: "Developer tools", icon: IconCode },
@@ -3158,7 +3194,7 @@ function Workbench({
   taskLabel,
   requestedWorkspace,
 }: {
-  requestedWorkspace?: { tab: "session" | "review"; nonce: number };
+  requestedWorkspace?: { tab: "session" | "review" | "milestones"; nonce: number };
   taskLabel?: string;
   workflow?: WorkflowSummary;
   view: UiRunView;
@@ -3171,6 +3207,9 @@ function Workbench({
 }) {
   const [scoutRequests, setScoutRequests] = useState<ScoutTimelineRequest[]>([]);
   const hasFusion = fusionGroups(view).length > 0;
+  const hasMilestones = Object.values(view.bundle.definitions).some((definition) =>
+    definition.nodes.some((node) => node.kind === "milestones"),
+  );
   const [sessionMode, setSessionMode] = useState(() =>
     readPreference("kouro.session.mode", "fusion"),
   );
@@ -3184,10 +3223,19 @@ function Workbench({
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [sessionRequest, setSessionRequest] = useState(0);
   const mobile = useMediaQuery("(max-width: 61.99em)");
-  const [workspaceTab, setWorkspaceTab] = useState<string>(requestedWorkspace?.tab ?? "workbench");
+  const [workspaceTab, setWorkspaceTab] = useState<string>(
+    requestedWorkspace?.tab === "milestones" && !hasMilestones
+      ? "workbench"
+      : (requestedWorkspace?.tab ?? "workbench"),
+  );
   useEffect(() => {
-    if (requestedWorkspace) setWorkspaceTab(requestedWorkspace.tab);
-  }, [requestedWorkspace]);
+    if (requestedWorkspace)
+      setWorkspaceTab(
+        requestedWorkspace.tab === "milestones" && !hasMilestones
+          ? "workbench"
+          : requestedWorkspace.tab,
+      );
+  }, [requestedWorkspace, hasMilestones]);
   const selectInvocation = useCallback(
     (id: string) => {
       setSelectedInvocationId(id);
@@ -3454,6 +3502,7 @@ function Workbench({
       <Tabs value={workspaceTab} onChange={(value) => setWorkspaceTab(value ?? "workbench")}>
         <Tabs.List px="lg" aria-label="Run views">
           <Tabs.Tab value="workbench">Workbench</Tabs.Tab>
+          {hasMilestones && <Tabs.Tab value="milestones">Milestones</Tabs.Tab>}
           <Tabs.Tab
             value="session"
             onClick={() => {
@@ -3469,7 +3518,46 @@ function Workbench({
           <Tabs.Tab value="delivery">Delivery</Tabs.Tab>
         </Tabs.List>
       </Tabs>
-      {workspaceTab === "session" ? (
+      {workspaceTab === "milestones" ? (
+        <MilestonesPanel
+          runId={view.runId}
+          revision={view.revision}
+          api={api}
+          onOpen={(scopeId, approval) => {
+            const belongs = (candidateScopeId: string) => {
+              let scope = view.scopes[candidateScopeId];
+              while (scope && scope.id !== scopeId && scope.parentScopeId)
+                scope = view.scopes[scope.parentScopeId];
+              return scope?.id === scopeId;
+            };
+            const candidates = Object.values(view.invocations).filter((item) =>
+              belongs(item.scopeId),
+            );
+            const target =
+              candidates.find(
+                (item) =>
+                  approval && item.state === "pending" && item.approval?.status === "pending",
+              ) ??
+              candidates.find(
+                (item) =>
+                  item.state === "running" &&
+                  view.bundle.definitions[view.scopes[item.scopeId]!.definitionId]?.nodes.some(
+                    (node) => node.id === item.sourceNodeId && node.kind === "agent",
+                  ),
+              ) ??
+              candidates
+                .filter((item) =>
+                  view.bundle.definitions[view.scopes[item.scopeId]!.definitionId]?.nodes.some(
+                    (node) => node.id === item.sourceNodeId && node.kind === "agent",
+                  ),
+                )
+                .at(-1) ??
+              candidates.at(-1);
+            if (target) setSelectedInvocationId(target.invocationId);
+            setWorkspaceTab(approval ? "review" : "session");
+          }}
+        />
+      ) : workspaceTab === "session" ? (
         <Box p={{ base: "sm", md: "lg" }}>
           <Stack>
             {hasFusion && (
@@ -3503,7 +3591,11 @@ function Workbench({
         <Grid gap={0}>
           <Grid.Col span={{ base: 12, lg: 8 }}>
             <Box p="lg">
-              <DiffPanel runId={view.runId} revision={view.revision} />
+              <DiffPanel
+                runId={view.runId}
+                revision={view.revision}
+                invocationId={selectedInvocationId}
+              />
             </Box>
           </Grid.Col>
           <Grid.Col span={{ base: 12, lg: 4 }}>{inspector}</Grid.Col>
@@ -5107,11 +5199,14 @@ function DiffPanel({
   runId,
   revision,
   showDelivery = false,
+  invocationId,
 }: {
   runId: string;
   revision: number;
   showDelivery?: boolean;
+  invocationId?: string;
 }) {
+  const diffUrl = `/api/runs/${encodeURIComponent(runId)}/diff${invocationId ? `?invocationId=${encodeURIComponent(invocationId)}` : ""}`;
   const [selectedPath, setSelectedPath] = useState<string | undefined>();
   const [state, setState] = useState<
     | { kind: "loading" }
@@ -5146,7 +5241,7 @@ function DiffPanel({
   useEffect(() => {
     let cancelled = false;
     setState({ kind: "loading" });
-    void api<unknown>(`/api/runs/${encodeURIComponent(runId)}/diff`)
+    void api<unknown>(diffUrl)
       .then((raw) => {
         if (cancelled) return;
         if (!raw || typeof raw !== "object") {
@@ -5202,7 +5297,7 @@ function DiffPanel({
     return () => {
       cancelled = true;
     };
-  }, [runId, refreshNonce]);
+  }, [diffUrl, revision, refreshNonce]);
   const prepare = async () => {
     if (state.kind !== "snapshot") return;
     setDelivery({ kind: "working" });
@@ -5291,12 +5386,7 @@ function DiffPanel({
       <Text size="sm" className="pending-copy">
         The diff is read from the run worktree, not inferred from agent output.
       </Text>
-      <Anchor
-        className="diff-link"
-        href={`/api/runs/${encodeURIComponent(runId)}/diff`}
-        target="_blank"
-        rel="noreferrer"
-      >
+      <Anchor className="diff-link" href={diffUrl} target="_blank" rel="noreferrer">
         Open complete Git diff ↗
       </Anchor>
       {state.kind === "loading" && (

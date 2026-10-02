@@ -1,6 +1,6 @@
 {
   "name": "kouro",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "description": "A local workbench for declarative agent workflows",
   "homepage": "https://github.com/usersatoshi/kouro#readme",
   "bugs": {
@@ -26,7 +26,7 @@
     "kouro": "bun run packages/host/src/cli.ts",
     "build": "bun run --cwd packages/web build",
     "build:cli": "bun run build && bun run scripts/build-cli.ts",
-    "release:forgejo": "bun run typecheck && bun test packages/core packages/host && bun run build && bun run scripts/publish-forgejo.ts",
+    "release:forgejo": "bun run typecheck && bun test packages scripts && bun run build:cli && bun run scripts/publish-forgejo.ts",
     "test": "bun test packages scripts",
     "test:browser": "playwright test",
     "test:browser:native": "playwright test --config playwright.native.config.ts",

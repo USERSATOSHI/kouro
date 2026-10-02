@@ -122,6 +122,8 @@ See the operator guide for checkpoint and recovery limits.
 
 - [Local workflow use](docs/v2/local-workflow-use.md): starter workflows, permissions,
   bounded subagents, and access over SSH.
+- [Agent plugins](docs/v2/agent-plugins.md): planning, implementation milestones,
+  CLI usage, and the shared Claude/Codex plugin.
 - [Operator guide](docs/v2/operator-guide.md): inspecting runs, recovery, checkpoints,
   backups, and evaluations.
 - [Protocol contracts](docs/v2/contracts.md): contributor reference for identity,

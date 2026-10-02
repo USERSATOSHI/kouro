@@ -1,0 +1,11 @@
+{
+  "name": "kouro",
+  "owner": { "name": "Kouro" },
+  "plugins": [
+    {
+      "name": "kouro",
+      "source": "./plugins/kouro",
+      "description": "Kouro commands, fusion spec handoff and workflow execution."
+    }
+  ]
+}
