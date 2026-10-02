@@ -17,6 +17,7 @@ import type { ExecutionProfileId, ExecutionProfileSummary, RunSummary } from "..
 import type { EvaluationEvidence } from "@kouro/core";
 import { ExperimentService } from "../evaluations.ts";
 import { CollaborationGateway } from "../collaboration/gateway.ts";
+import { compileSwarm, normalizeSwarmModels } from "./swarm.ts";
 import {
   CheckpointMaterializer,
   CheckpointRetention,
@@ -557,6 +558,30 @@ export class ApplicationService {
     ];
   }
 
+  async createSwarm(input: {
+    models: unknown;
+    task: string;
+    idempotencyKey: string;
+    workspace?: { repositoryPath: string };
+  }): Promise<RunSummary> {
+    const models = normalizeSwarmModels(input.models);
+    if (typeof input.task !== "string" || !input.task.trim())
+      throw new Error("Enter a task for the swarm");
+    if (typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim())
+      throw new Error("idempotencyKey is required");
+    const bundle = await compileSwarm(models);
+    return (
+      await this.coordinator.createRun({
+        workflowId: bundle.rootDefinitionId,
+        bundle,
+        input: { task: input.task.trim() },
+        idempotencyKey: input.idempotencyKey,
+        actor: "operator",
+        ...(input.workspace ? { workspace: input.workspace } : {}),
+      })
+    ).run;
+  }
+
   async createRun(input: {
     workflowId: string;
     idempotencyKey: string;
@@ -687,6 +712,99 @@ export class ApplicationService {
     });
   }
   collaboration(runId: string): Record<string, unknown> {
+    const view = this.getView(runId);
+    if (view?.bundle.rootDefinitionId.startsWith("agent-swarm-")) {
+      const nodes = view.bundle.definitions[view.bundle.rootDefinitionId]!.nodes.filter(
+        (node) => node.kind === "agent",
+      );
+      const invocations = Object.values(view.state.invocations);
+      const attempts = Object.values(view.state.attempts);
+      const invocationFor = (nodeId: string) =>
+        invocations.filter((item) => item.nodeId === nodeId).at(-1);
+      const attemptFor = (nodeId: string) =>
+        attempts.filter((item) => item.invocationId === invocationFor(nodeId)?.id).at(-1);
+      const members = nodes.filter((node) => node.id !== "synthesis");
+      const synthesis = invocationFor("synthesis");
+      const results = nodes.flatMap((node) => {
+        const attempt = attemptFor(node.id);
+        if (attempt?.status !== "succeeded") return [];
+        return attempt.output.map((artifact) => {
+          const report = JSON.parse(new TextDecoder().decode(this.readArtifact(artifact.id))) as {
+            summary: string;
+          };
+          return {
+            id: artifact.id,
+            participantId: node.id === "synthesis" ? members[0]!.role : node.role,
+            title: node.id === "synthesis" ? "Combined answer" : node.modelId,
+            body: report.summary,
+            artifactId: artifact.id,
+            final: node.id === "synthesis" || members.length === 1,
+          };
+        });
+      });
+      return {
+        runId,
+        objective: this.coordinator.journal.getRunSummary(runId)?.task,
+        participants: members.map((node, index) => {
+          const invocation = invocationFor(node.id);
+          const attempt = attemptFor(node.id);
+          const synthesisAttempt = index === 0 ? attemptFor("synthesis") : undefined;
+          const combining = index === 0 && synthesis?.status === "running";
+          return {
+            id: node.role,
+            name: node.modelId,
+            role: `Member ${index + 1}`,
+            harness: attempt?.resolvedExecution?.harness ?? node.harness,
+            model: attempt?.resolvedExecution?.modelId ?? node.modelId,
+            state: synthesisAttempt?.status ?? attempt?.status ?? invocation?.status ?? "pending",
+            activity: combining
+              ? "Combining answers"
+              : synthesisAttempt?.status === "failed"
+                ? "Combining answers failed"
+                : undefined,
+          };
+        }),
+        channels: [],
+        messages: [],
+        blackboard: [],
+        budgets: {},
+        results,
+        artifacts: results.map((result) => ({
+          id: result.artifactId,
+          name: result.title,
+          producerId: result.participantId,
+        })),
+        timeline: nodes.flatMap((node) => {
+          const invocation = invocationFor(node.id);
+          if (!invocation) return [];
+          return [
+            ...(invocation.startedAt
+              ? [
+                  {
+                    id: `${invocation.id}:start`,
+                    participantId: node.id === "synthesis" ? members[0]!.role : node.role,
+                    type: "running",
+                    label:
+                      node.id === "synthesis" ? "Combining answers" : `${node.modelId} started`,
+                    at: invocation.startedAt,
+                  },
+                ]
+              : []),
+            ...(invocation.completedAt
+              ? [
+                  {
+                    id: `${invocation.id}:end`,
+                    participantId: node.id === "synthesis" ? members[0]!.role : node.role,
+                    type: invocation.status,
+                    label: `${node.id === "synthesis" ? "Combined answer" : node.modelId}: ${invocation.status}`,
+                    at: invocation.completedAt,
+                  },
+                ]
+              : []),
+          ];
+        }),
+      };
+    }
     return new CollaborationGateway(this.coordinator.journal).snapshot(runId);
   }
   scouts(runId: string) {

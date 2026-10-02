@@ -436,6 +436,35 @@ export function createHostServer(
     }
     return service.scouts(params.id);
   });
+  app.post("/api/swarms", async ({ request, set, body }) => {
+    if (!checked(request, set, true)) return denied(set);
+    const input = bodyObject(body);
+    try {
+      if (typeof input.task !== "string" || typeof input.idempotencyKey !== "string")
+        throw new Error("task and idempotencyKey are required");
+      let workspace: { repositoryPath: string } | undefined;
+      if (input.workspace !== undefined) {
+        const value = bodyObject(input.workspace);
+        if (typeof value.repositoryPath !== "string" || !value.repositoryPath.trim())
+          throw new Error("workspace.repositoryPath must be nonblank");
+        workspace = { repositoryPath: value.repositoryPath.trim() };
+      }
+      return toWebRun(
+        await service.createSwarm({
+          models: input.models,
+          task: input.task,
+          idempotencyKey: input.idempotencyKey,
+          workspace,
+        }),
+      );
+    } catch (cause) {
+      set.status = 400;
+      return {
+        error: "invalid-swarm-request",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  });
   app.post("/api/runs", async ({ request, set, body }) => {
     if (!checked(request, set, true)) return denied(set);
     const input = bodyObject(body);

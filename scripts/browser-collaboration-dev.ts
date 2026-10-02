@@ -3,6 +3,8 @@ import { resolve } from "node:path";
 import { ApplicationService } from "../packages/host/src/application/service.ts";
 import { CollaborationGateway } from "../packages/host/src/collaboration/gateway.ts";
 import { createHostServer } from "../packages/host/src/http/server.ts";
+import { prepareSwarmProviderFixture } from "./swarm-provider-fixture";
+import { mkdir } from "node:fs/promises";
 import {
   BrowserSessionHarness,
   prepareLaunchTemplate,
@@ -13,6 +15,8 @@ import {
 // launcher only adds durable collaboration rows to a dedicated temporary test
 // data directory so the UI has real participants/messages to render.
 const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-browser-data");
+await mkdir(dataDir, { recursive: true });
+process.env.KOURO_OPENCODE_BIN = await prepareSwarmProviderFixture(dataDir);
 const service = new ApplicationService({
   dataDir,
   templateRoot: await prepareLaunchTemplate(dataDir),

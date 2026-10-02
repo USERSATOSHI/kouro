@@ -4,7 +4,7 @@ const token = "kouro-browser-test-token";
 
 test("M6 collaboration view renders the durable host snapshot", async ({ page }) => {
   await page.goto(`/#token=${token}`);
-  await expect(page.getByTestId("start-run").first()).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Agent swarm", exact: true })).toBeEnabled();
   const fixtureRunId = await page.evaluate(async () => {
     const runs = (await (await fetch("/api/runs")).json()) as Array<{ id: string }>;
     for (const run of runs) {
@@ -21,9 +21,9 @@ test("M6 collaboration view renders the durable host snapshot", async ({ page })
   });
   expect(fixtureRunId).toBeTruthy();
   await page.goto(`/?run=${encodeURIComponent(fixtureRunId!)}#token=${token}`);
-  await page.getByRole("button", { name: "Collaboration", exact: true }).first().click();
+  await page.getByRole("button", { name: "Team activity", exact: true }).click();
 
-  await expect(page.getByText("M6 · COLLABORATION")).toBeVisible();
+  await expect(page.getByText(/Agent team · 2 members/)).toBeVisible();
   await expect(page.getByText("planner").first()).toBeVisible();
   await expect(page.getByText("reviewer").first()).toBeVisible();
   await expect(page.getByText("Direct message stream")).toBeVisible();
@@ -65,7 +65,7 @@ test("M6 collaboration view renders the durable host snapshot", async ({ page })
 test("M6 collaboration view remains usable at 768px", async ({ page }) => {
   await page.setViewportSize({ width: 768, height: 900 });
   await page.goto(`/#token=${token}`);
-  await expect(page.getByTestId("start-run").first()).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Agent swarm", exact: true })).toBeEnabled();
   const fixtureRunId = await page.evaluate(async () => {
     const runs = (await (await fetch("/api/runs")).json()) as Array<{ id: string }>;
     for (const run of runs) {
@@ -82,7 +82,7 @@ test("M6 collaboration view remains usable at 768px", async ({ page }) => {
   });
   expect(fixtureRunId).toBeTruthy();
   await page.goto(`/?run=${encodeURIComponent(fixtureRunId!)}#token=${token}`);
-  await page.getByRole("button", { name: "Collaboration", exact: true }).last().click();
+  await page.getByRole("button", { name: "Team activity", exact: true }).click();
   await expect(page.getByText("Direct message stream")).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   await page.screenshot({ path: "test-results/m6-collaboration-768.png", fullPage: true });

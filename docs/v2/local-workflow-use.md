@@ -31,6 +31,20 @@ requires the corresponding harness to be installed and authenticated. The local
 test suite exercises the MCP and extension bridges; it does not make a live
 provider call.
 
+## Agent swarm
+
+Open **Agent swarm** in the sidebar, list 1–8 models with their harnesses, then
+enter a shared task and select **Start swarm**. No workflow template is needed.
+Model IDs must be available through the selected, authenticated harness.
+
+The models work on the task in parallel. The first listed model combines their
+completed answers; a single-model swarm returns its answer directly. An optional
+repository path provides read-only context. The swarm view shows each model's
+progress, contributions and final answer. Select a member and **Open agent
+activity** to inspect its session. Runs, results and cancellation use the same
+durable host runtime as workflows. Acceptance tests use a local provider fixture;
+they do not establish live multi-provider readiness.
+
 ## Opening the workbench over SSH
 
 `kouro serve` listens on the remote machine's loopback interface. When the

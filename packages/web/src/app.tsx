@@ -122,6 +122,7 @@ import {
   type EvalEvidence,
 } from "./m5";
 import { SwarmWorkbench } from "./swarm";
+import { SwarmLauncher, type SwarmLaunchRequest } from "./components/SwarmLauncher";
 import { M7Workbench, M7_ENDPOINTS } from "./m7";
 import { ActivityValue, ToolActivity } from "./components/ActivityValue";
 import { WorkflowInputs, launchInputs } from "./components/WorkflowInputs";
@@ -546,6 +547,7 @@ export function App() {
   const [pairwise, setPairwise] = useState<BlindedPairwise>();
   const [loading, setLoading] = useState(true);
   const [launching, setLaunching] = useState(false);
+  const [composingSwarm, setComposingSwarm] = useState(true);
   const [pendingAction, setPendingAction] = useState<string>();
   const actionKeys = useRef(new Map<string, string>());
   const [actionNotice, setActionNotice] = useState<string>();
@@ -988,6 +990,32 @@ export function App() {
     }
   };
 
+  const launchSwarm = async (request: SwarmLaunchRequest) => {
+    if (launchingRef.current) return false;
+    launchingRef.current = true;
+    setLaunching(true);
+    setError(undefined);
+    try {
+      const created = await api<RunSummary>("/api/swarms", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      setRuns((old) => [created, ...old.filter((run) => run.id !== created.id)]);
+      setSelectedRunId(created.id);
+      setSelectedInvocationId(undefined);
+      setComposingSwarm(false);
+      setSurface("swarm");
+      return true;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to start swarm");
+      return false;
+    } finally {
+      launchingRef.current = false;
+      setLaunching(false);
+    }
+  };
+
   const openNewRun = () => {
     setTask("");
     setError(undefined);
@@ -1331,11 +1359,17 @@ export function App() {
           setSelectedRunId={(id) => {
             setSelectedRunId(id);
             setSelectedInvocationId(undefined);
-            setSurface("runs");
+            setComposingSwarm(false);
+            setSurface(
+              runs.find((run) => run.id === id)?.workflowId.startsWith("agent-swarm-")
+                ? "swarm"
+                : "runs",
+            );
             navigation.close();
           }}
           surface={surface}
           setSurface={(next) => {
+            if (next === "swarm") setComposingSwarm(true);
             setSurface(next);
             navigation.close();
           }}
@@ -1344,46 +1378,50 @@ export function App() {
       </AppShell.Navbar>
       <AppShell.Main bg={appearance === "dark" ? "dark.8" : "gray.0"}>
         <Stack gap={0} className="main-column" miw={0}>
-          {["runs", "swarm", "checkpoints"].includes(surface) && (
-            <Topbar
-              run={surface === "new-run" ? undefined : activeRun}
-              view={surface === "new-run" ? null : (activeView ?? null)}
-              store={store}
-              onLaunch={launch}
-              pendingApprovals={pendingApprovals}
-              pendingRunDeletions={pendingRunDeletions}
-              onOpenApproval={(approval) => {
-                setSelectedRunId(approval.runId);
-                setSelectedInvocationId(approval.invocationId);
-                setSurface("runs");
-              }}
-              onOpenDeletion={(runId) => void previewRunDeletion(runId)}
-              runs={visibleRuns}
-              selectedRunId={selectedRunId}
-              onSelectRun={(id) => {
-                setSelectedRunId(id || undefined);
-                setSelectedInvocationId(undefined);
-                setSurface("runs");
-                if (!id) store.clear();
-              }}
-              onNewRun={openNewRun}
-              launching={launching}
-              canLaunch={canLaunch}
-              pendingAction={pendingAction}
-              actionNotice={actionNotice}
-              onControl={controlRun}
-              workflows={workflows}
-              workflowId={workflowId}
-              setWorkflowId={(id) => {
-                setWorkflowId(id);
-                setNodeSettings({});
-                setInputDrafts({});
-                openNewRun();
-              }}
-              surface={surface}
-              setSurface={setSurface}
-            />
-          )}
+          {["runs", "swarm", "checkpoints"].includes(surface) &&
+            !(surface === "swarm" && composingSwarm) && (
+              <Topbar
+                run={surface === "new-run" ? undefined : activeRun}
+                view={surface === "new-run" ? null : (activeView ?? null)}
+                store={store}
+                onLaunch={launch}
+                pendingApprovals={pendingApprovals}
+                pendingRunDeletions={pendingRunDeletions}
+                onOpenApproval={(approval) => {
+                  setSelectedRunId(approval.runId);
+                  setSelectedInvocationId(approval.invocationId);
+                  setSurface("runs");
+                }}
+                onOpenDeletion={(runId) => void previewRunDeletion(runId)}
+                runs={visibleRuns}
+                selectedRunId={selectedRunId}
+                onSelectRun={(id) => {
+                  setSelectedRunId(id || undefined);
+                  setSelectedInvocationId(undefined);
+                  setSurface("runs");
+                  if (!id) store.clear();
+                }}
+                onNewRun={openNewRun}
+                launching={launching}
+                canLaunch={canLaunch}
+                pendingAction={pendingAction}
+                actionNotice={actionNotice}
+                onControl={controlRun}
+                workflows={workflows}
+                workflowId={workflowId}
+                setWorkflowId={(id) => {
+                  setWorkflowId(id);
+                  setNodeSettings({});
+                  setInputDrafts({});
+                  openNewRun();
+                }}
+                surface={surface}
+                setSurface={(next) => {
+                  if (next === "swarm") setComposingSwarm(false);
+                  setSurface(next);
+                }}
+              />
+            )}
           {(error || catalogError) && (
             <Alert color="red" title="Action needs attention">
               <Stack gap="xs">
@@ -1575,23 +1613,50 @@ export function App() {
                 </Stack>
               )}
             </>
+          ) : surface === "swarm" && (composingSwarm || !selectedRunId) ? (
+            <SwarmLauncher onLaunch={launchSwarm} launching={launching} />
           ) : surface === "swarm" && selectedRunId ? (
-            <SwarmWorkbench
-              runId={selectedRunId}
-              runView={activeView ?? undefined}
-              fetchView={fetchCollaboration}
-              objective={runs.find((run) => run.id === selectedRunId)?.task}
-              checkpointPanel={
-                <M7Workbench
-                  compact
-                  runId={selectedRunId}
-                  revision={activeView?.revision}
-                  fetchView={fetchCheckpointView}
-                  createCheckpoint={captureCheckpoint}
-                  forkCheckpoint={forkCheckpoint}
-                />
-              }
-            />
+            <>
+              <Group px="lg" pt="md">
+                <Button variant="light" onClick={() => setComposingSwarm(true)}>
+                  New swarm
+                </Button>
+              </Group>
+              <SwarmWorkbench
+                runId={selectedRunId}
+                runView={activeView ?? undefined}
+                fetchView={fetchCollaboration}
+                objective={runs.find((run) => run.id === selectedRunId)?.task}
+                onOpenParticipant={(participantId) => {
+                  if (!activeView) return;
+                  const root = activeView.bundle.definitions[activeView.bundle.rootDefinitionId];
+                  const member = root?.nodes.find(
+                    (node) => node.kind === "agent" && node.role === participantId,
+                  );
+                  const synthesis = asArray(activeView.invocations)
+                    .filter((item) => item.sourceNodeId === "synthesis")
+                    .at(-1);
+                  const invocation =
+                    (member?.id === "member-1" && synthesis) ||
+                    asArray(activeView.invocations)
+                      .filter((item) => item.sourceNodeId === member?.id)
+                      .at(-1);
+                  setSelectedInvocationId(invocation?.invocationId);
+                  setRequestedWorkspace({ tab: "session", nonce: Date.now() });
+                  setSurface("runs");
+                }}
+                checkpointPanel={
+                  <M7Workbench
+                    compact
+                    runId={selectedRunId}
+                    revision={activeView?.revision}
+                    fetchView={fetchCheckpointView}
+                    createCheckpoint={captureCheckpoint}
+                    forkCheckpoint={forkCheckpoint}
+                  />
+                }
+              />
+            </>
           ) : loading ? (
             <Stack p="xl" align="center" justify="center" mih={240} className="empty-state">
               <Loader size="sm" className="loader" />
@@ -1877,7 +1942,7 @@ function Sidebar({
     { id: "dashboard", label: "Runs", icon: IconLayoutDashboard },
     { id: "new-run", label: "Workflows", icon: IconRoute },
     { id: "approvals", label: "Approvals", icon: IconShieldCheck },
-    { id: "swarm", label: "Agent teams", icon: IconUsers },
+    { id: "swarm", label: "Agent swarm", icon: IconUsers },
     { id: "evals", label: "Evaluations", icon: IconChartBar },
     { id: "checkpoints", label: "Checkpoints", icon: IconGitBranch },
     { id: "development", label: "Developer tools", icon: IconCode },
@@ -1904,7 +1969,7 @@ function Sidebar({
                 color="gray"
                 variant="subtle"
                 active={surface === link.id || (link.id === "dashboard" && surface === "runs")}
-                disabled={["swarm", "checkpoints"].includes(link.id) && !selectedRunId}
+                disabled={link.id === "checkpoints" && !selectedRunId}
                 rightSection={
                   link.id === "approvals" && approvals ? (
                     <Badge size="xs" color="indigo">
@@ -2689,6 +2754,18 @@ function Topbar({
           {run && <Code visibleFrom="lg">{run.id.slice(0, 16)}</Code>}
         </Group>
         <Group gap="sm">
+          {run && (
+            <Button
+              variant="subtle"
+              onClick={() => setSurface(surface === "swarm" ? "runs" : "swarm")}
+            >
+              {surface === "swarm"
+                ? "Run workbench"
+                : run.workflowId.startsWith("agent-swarm-")
+                  ? "Swarm activity"
+                  : "Team activity"}
+            </Button>
+          )}
           <Text
             size="xs"
             c={store.status === "live" ? "teal" : "yellow"}
