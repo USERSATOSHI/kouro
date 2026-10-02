@@ -1,3 +1,20 @@
+import type { ReactNode } from "react";
+import type { UiRunView } from "./types";
+import { asArray } from "./types";
+import { PageHeader } from "./components/WorkbenchPrimitives";
+import { Disclosure, DisclosureTitle } from "./components/Disclosure";
+import {
+  Alert,
+  Anchor,
+  Badge,
+  Grid,
+  NavLink,
+  Progress,
+  ScrollArea,
+  ThemeIcon,
+} from "@mantine/core";
+import { stateColor } from "./theme";
+import { Button, Code, Group, Loader, Paper, SimpleGrid, Stack, Text, Title } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { isHarness } from "@kouro/core";
 import type { RuntimeHarness } from "@kouro/core";
@@ -148,10 +165,10 @@ export function normalizeCollaboration(raw: unknown, runId: string): Collaborati
       const x = obj(value);
       return {
         id: text(x.id),
-        type: text(x.type, "finding"),
-        title: text(x.title, "Untitled entry"),
+        type: text(x.type, text(x.channelId).replace(/^blackboard:/, "") || "finding"),
+        title: text(x.title, "Shared finding"),
         body: text(x.body, text(x.content)),
-        authorId: text(x.authorId) || undefined,
+        authorId: text(x.authorId, text(x.senderId)) || undefined,
         createdAt: text(x.createdAt) || undefined,
         status: text(x.status) || undefined,
       };
@@ -191,7 +208,13 @@ export function formatBudget(value?: { used: number; limit: number }, suffix = "
 export function SwarmWorkbench({
   runId,
   fetchView,
+  checkpointPanel,
+  objective,
+  runView,
 }: {
+  runView?: UiRunView;
+  checkpointPanel?: ReactNode;
+  objective?: string;
   runId: string;
   fetchView: (runId: string) => Promise<unknown>;
 }) {
@@ -200,190 +223,335 @@ export function SwarmWorkbench({
   const [selectedParticipant, setSelectedParticipant] = useState<string>();
   useEffect(() => {
     let cancelled = false;
-    void fetchView(runId)
-      .then((raw) => {
-        if (!cancelled) {
-          setView(normalizeCollaboration(raw, runId));
-          setError(undefined);
-        }
-      })
-      .catch((cause) => {
-        if (!cancelled)
-          setError(cause instanceof Error ? cause.message : "Collaboration data unavailable");
-      });
+    setView(undefined);
+    setError(undefined);
+    const refresh = () =>
+      void fetchView(runId)
+        .then((raw) => {
+          if (!cancelled) {
+            setView(normalizeCollaboration(raw, runId));
+            setError(undefined);
+          }
+        })
+        .catch((cause) => {
+          if (!cancelled)
+            setError(cause instanceof Error ? cause.message : "Agent team data unavailable");
+        });
+    refresh();
+    const timer = runView?.state === "running" ? window.setInterval(refresh, 3000) : undefined;
     return () => {
       cancelled = true;
+      if (timer) window.clearInterval(timer);
     };
-  }, [fetchView, runId]);
+  }, [fetchView, runId, runView?.state]);
   if (error)
     return (
-      <section className="swarm-empty" role="status">
-        <span className="eyebrow">COLLABORATION</span>
-        <h1>Collaboration records unavailable</h1>
-        <p>{error}</p>
-      </section>
+      <Stack p="xl" align="center" justify="center" mih={240} className="swarm-empty" role="status">
+        <Text component="span" size="sm" c="dimmed" className="eyebrow">
+          COLLABORATION
+        </Text>
+        <Title order={1}>Agent team records unavailable</Title>
+        <Text size="sm">{error}</Text>
+      </Stack>
     );
   if (!view)
     return (
-      <section className="swarm-empty">
-        <div className="loader" />
+      <Stack p="xl" align="center" justify="center" mih={240} className="swarm-empty">
+        <Loader size="sm" className="loader" />
         Loading durable collaboration records…
-      </section>
+      </Stack>
     );
-  const participant = view.participants.find((item) => item.id === selectedParticipant);
+  const members = view.participants.map((member) => {
+    const invocation =
+      runView &&
+      asArray(runView.invocations)
+        .filter((invocation) =>
+          runView.bundle.definitions[
+            runView.scopes[invocation.scopeId]?.definitionId ?? runView.bundle.rootDefinitionId
+          ]?.nodes.some(
+            (node) =>
+              node.id === invocation.sourceNodeId &&
+              node.kind === "agent" &&
+              node.role === member.id,
+          ),
+        )
+        .at(-1);
+    const attempt =
+      invocation &&
+      runView &&
+      asArray(runView.attempts)
+        .filter((attempt) => attempt.invocationId === invocation.invocationId)
+        .at(-1);
+    const execution = obj(attempt?.resolvedExecution);
+    return {
+      ...member,
+      role: member.role === "participant" ? member.id : member.role,
+      harness:
+        member.harness ??
+        (isHarness(text(execution.harness)) ? (execution.harness as RuntimeHarness) : undefined),
+      model: member.model ?? (text(execution.modelId) || undefined),
+    };
+  });
+  const participant = members.find((item) => item.id === selectedParticipant);
+  const peerMessages = view.messages.filter(
+    (message) => !message.channelId.startsWith("blackboard"),
+  );
   const messages = participant
-    ? view.messages.filter(
+    ? peerMessages.filter(
         (item) => item.senderId === participant.id || item.recipientIds.includes(participant.id),
       )
-    : view.messages;
+    : peerMessages;
   return (
-    <section className="swarm-workbench">
-      <div className="swarm-header">
-        <div>
-          <span className="eyebrow">M6 · COLLABORATION</span>
-          <h1>{view.objective}</h1>
-          <p>
-            {view.participants.length} participants · {view.channels.length} channels · durable run
-            records
-          </p>
-        </div>
-        <div className="swarm-budgets">
-          <Budget label="MESSAGE TURNS" value={formatBudget(view.budgets.messageTurns)} />
-          <Budget label="MESSAGES" value={formatBudget(view.budgets.messages)} />
-          <Budget label="ELAPSED" value={formatBudget(view.budgets.elapsedMs, " ms")} />
-        </div>
-      </div>
-      <div className="swarm-grid">
-        <div className="swarm-panel swarm-participants">
-          <PanelTitle title="Participants" detail="role · harness · model · state" />
-          <div className="participant-list">
-            {view.participants.map((item) => (
-              <button
-                key={item.id}
-                className={`participant ${item.id === selectedParticipant ? "selected" : ""}`}
-                onClick={() => setSelectedParticipant(item.id)}
-              >
-                <Status state={item.state} />
-                <span>
-                  <strong>{item.name}</strong>
-                  <em>
-                    {item.role} · {item.harness ?? "harness not recorded"}
-                  </em>
-                  <small>
-                    {item.model ?? "model not recorded"} · {item.activity ?? item.state}
-                  </small>
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="swarm-panel swarm-messages">
-          <PanelTitle title="Direct message stream" detail="separate from workflow topology" />
-          <div className="message-stream">
-            {messages.length ? (
-              messages.map((item) => (
-                <article className="swarm-message" key={item.id}>
-                  <div className="message-meta">
-                    <b>{item.senderId}</b>
-                    <span>
-                      {item.type ?? "message"} ·{" "}
-                      {item.createdAt
-                        ? new Date(item.createdAt).toLocaleTimeString([], {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })
-                        : "time not recorded"}
-                    </span>
-                  </div>
-                  <p>{item.body}</p>
-                  <div className="message-links">
-                    to {item.recipientIds.join(", ") || "channel"}
-                    {item.senderAttemptId && (
-                      <>
-                        {" "}
-                        · sender attempt <code>{item.senderAttemptId}</code>
-                      </>
+    <Stack gap="xs" component="section" className="swarm-workbench">
+      <PageHeader
+        actions={
+          <Group gap="sm">
+            <Budget label="MESSAGE TURNS" budget={view.budgets.messageTurns} />
+            <Budget label="MESSAGES" budget={view.budgets.messages} />
+            <Budget label="ELAPSED" budget={view.budgets.elapsedMs} suffix=" ms" />
+          </Group>
+        }
+      >
+        Agent team · {view.participants.length} members · {view.channels.length} channels
+      </PageHeader>
+      <Stack px="lg" py="md" gap="xs">
+        <Text size="xs" c="dimmed">
+          SHARED OBJECTIVE
+        </Text>
+        <Text size="sm" lineClamp={2}>
+          {objective ?? view.objective}
+        </Text>
+        <Disclosure>
+          <DisclosureTitle>Full objective & team session</DisclosureTitle>
+          <Text size="sm">{objective ?? view.objective}</Text>
+          <Text size="xs" c="dimmed">
+            Session {view.runId}
+          </Text>
+        </Disclosure>
+        {!view.participants.length && (
+          <Alert color="gray">
+            This run has no configured agent team. Team members, peer messages and a shared
+            blackboard appear here only when a collaboration session is configured. Workflow steps
+            and delegated scouts remain in the Workbench.
+          </Alert>
+        )}
+      </Stack>
+      <Grid p="lg" gap="lg" className="swarm-grid">
+        <Grid.Col span={{ base: 12, lg: 3 }}>
+          <Stack gap="lg">
+            <Paper className="swarm-panel swarm-participants">
+              <Stack gap="md">
+                <PanelTitle title="Team members" detail="role · harness · model · state" />
+                <Stack gap="xs" className="participant-list">
+                  {members.map((item) => (
+                    <NavLink
+                      key={item.id}
+                      active={item.id === selectedParticipant}
+                      label={item.name}
+                      description={
+                        <Stack gap={2}>
+                          <Text size="xs" c="dimmed">
+                            {item.role} · {item.harness ?? "harness not recorded"}
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            {item.model ?? "model not recorded"} · {item.activity ?? item.state}
+                          </Text>
+                        </Stack>
+                      }
+                      leftSection={<Status state={item.state} />}
+                      onClick={() => setSelectedParticipant(item.id)}
+                    />
+                  ))}
+                </Stack>
+              </Stack>
+            </Paper>
+            <Paper className="swarm-panel swarm-blackboard">
+              <Stack gap="md">
+                <PanelTitle
+                  title="Blackboard & artifacts"
+                  detail={`${view.blackboard.length} typed entries · ${view.artifacts.length} artifacts`}
+                />
+                {view.blackboard.map((item) => (
+                  <Paper component="article" className="board-entry" key={item.id}>
+                    <Stack gap="md">
+                      <Badge variant="light">{item.type}</Badge>
+                      <Text component="span" size="sm" fw={600}>
+                        {item.title}
+                      </Text>
+                      <Text size="sm">{item.body}</Text>
+                      <Text component="span" size="xs" c="dimmed">
+                        {item.authorId ?? "author not recorded"} · {item.status ?? "active"}
+                      </Text>
+                    </Stack>
+                  </Paper>
+                ))}
+                {view.artifacts.map((item) => (
+                  <Stack gap="xs" className="artifact-row" key={item.id}>
+                    <Text component="span" size="sm">
+                      <Anchor
+                        href={`/api/artifacts/${encodeURIComponent(item.id)}/content`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        {item.name}
+                      </Anchor>
+                      <Text component="span" size="sm" c="dimmed">
+                        {item.kind ?? item.contentType ?? "artifact"} ·{" "}
+                        {item.producerId ?? "producer not recorded"}
+                      </Text>
+                    </Text>
+                  </Stack>
+                ))}
+              </Stack>
+            </Paper>
+          </Stack>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 5 }}>
+          <Stack gap="md">
+            <Paper className="swarm-panel swarm-messages">
+              <Stack gap="md">
+                <PanelTitle
+                  title="Direct message stream"
+                  detail={participant ? participant.name : "all teammates"}
+                />
+                <ScrollArea.Autosize mah={480}>
+                  <Stack gap="md" className="message-stream">
+                    {messages.length ? (
+                      messages.map((item) => (
+                        <Paper component="article" className="swarm-message" key={item.id}>
+                          <Stack gap="md">
+                            <Group
+                              gap="xs"
+                              justify="space-between"
+                              wrap="wrap"
+                              className="message-meta"
+                            >
+                              <Text component="span" size="sm" fw={600}>
+                                {view.participants.find((member) => member.id === item.senderId)
+                                  ?.name ?? item.senderId}
+                              </Text>
+                              <Text component="span" size="sm">
+                                {item.type ?? "message"} ·{" "}
+                                {item.createdAt
+                                  ? new Date(item.createdAt).toLocaleTimeString([], {
+                                      hour: "2-digit",
+                                      minute: "2-digit",
+                                    })
+                                  : "time not recorded"}
+                              </Text>
+                            </Group>
+                            <Text size="sm">{item.body}</Text>
+                            <Group
+                              gap="xs"
+                              justify="space-between"
+                              wrap="wrap"
+                              className="message-links"
+                            >
+                              to {item.recipientIds.join(", ") || "channel"}
+                              {item.senderAttemptId && (
+                                <>
+                                  {" "}
+                                  · sender attempt <Code>{item.senderAttemptId}</Code>
+                                </>
+                              )}
+                              {item.recipientContextIds?.length ? (
+                                <> · context {item.recipientContextIds.join(", ")}</>
+                              ) : null}
+                            </Group>
+                          </Stack>
+                        </Paper>
+                      ))
+                    ) : (
+                      <Stack gap="xs" className="empty-inline">
+                        No messages recorded for this participant.
+                      </Stack>
                     )}
-                    {item.recipientContextIds?.length ? (
-                      <> · context {item.recipientContextIds.join(", ")}</>
-                    ) : null}
-                  </div>
-                </article>
-              ))
-            ) : (
-              <div className="empty-inline">No messages recorded for this participant.</div>
-            )}
-          </div>
-        </div>
-        <div className="swarm-panel swarm-blackboard">
-          <PanelTitle
-            title="Blackboard & artifacts"
-            detail={`${view.blackboard.length} typed entries · ${view.artifacts.length} artifacts`}
-          />
-          {view.blackboard.map((item) => (
-            <article className="board-entry" key={item.id}>
-              <span className={`entry-type ${item.type}`}>{item.type}</span>
-              <strong>{item.title}</strong>
-              <p>{item.body}</p>
-              <small>
-                {item.authorId ?? "author not recorded"} · {item.status ?? "active"}
-              </small>
-            </article>
-          ))}
-          {view.artifacts.map((item) => (
-            <div className="artifact-row" key={item.id}>
-              ◈{" "}
-              <span>
-                <strong>{item.name}</strong>
-                <em>
-                  {item.kind ?? item.contentType ?? "artifact"} ·{" "}
-                  {item.producerId ?? "producer not recorded"}
-                </em>
-              </span>
-            </div>
-          ))}
-        </div>
-        <div className="swarm-panel swarm-timeline">
-          <PanelTitle
-            title="Participant timeline"
-            detail={participant ? participant.name : "all participants"}
-          />
-          <div className="timeline-events">
-            {view.timeline
-              .filter((event) => !participant || event.participantId === participant.id)
-              .map((event) => (
-                <div className="timeline-event" key={event.id}>
-                  <Status state={event.type} />
-                  <span>
-                    <strong>{event.label}</strong>
-                    <em>
-                      {event.participantId} · {event.at}
-                    </em>
-                  </span>
-                </div>
-              ))}
-          </div>
-        </div>
-      </div>
-    </section>
+                  </Stack>
+                </ScrollArea.Autosize>
+              </Stack>
+            </Paper>
+            <Paper className="swarm-panel swarm-timeline">
+              <Stack gap="md">
+                <PanelTitle
+                  title="Participant timeline"
+                  detail={participant ? participant.name : "all participants"}
+                />
+                <Stack gap="xs" className="timeline-events">
+                  {view.timeline
+                    .filter((event) => !participant || event.participantId === participant.id)
+                    .map((event) => (
+                      <Stack gap="xs" className="timeline-event" key={event.id}>
+                        <Status state={event.type} />
+                        <Stack gap={0}>
+                          <Text size="sm" fw={600}>
+                            {event.label}
+                          </Text>
+                          <Text size="sm" c="dimmed">
+                            {event.participantId} · {event.at}
+                          </Text>
+                        </Stack>
+                      </Stack>
+                    ))}
+                </Stack>
+              </Stack>
+            </Paper>
+          </Stack>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 4 }}>{checkpointPanel}</Grid.Col>
+      </Grid>
+    </Stack>
   );
 }
 function PanelTitle({ title, detail }: { title: string; detail: string }) {
   return (
-    <div className="swarm-panel-heading">
-      <strong>{title}</strong>
-      <span>{detail}</span>
-    </div>
+    <Group gap="sm" justify="space-between" mb="md" className="swarm-panel-heading">
+      <Text component="span" size="sm" fw={600}>
+        {title}
+      </Text>
+      <Text component="span" size="sm">
+        {detail}
+      </Text>
+    </Group>
   );
 }
-function Budget({ label, value }: { label: string; value: string }) {
+function Budget({
+  label,
+  budget,
+  suffix = "",
+}: {
+  label: string;
+  budget?: { used: number; limit: number };
+  suffix?: string;
+}) {
   return (
-    <div className="swarm-budget">
-      <span>{label}</span>
-      <b>{value}</b>
-    </div>
+    <Paper p="xs" miw={130}>
+      <Stack gap={6}>
+        <Text size="xs" c="dimmed">
+          {label}
+        </Text>
+        <Text size="sm" fw={600}>
+          {formatBudget(budget, suffix)}
+        </Text>
+        {budget && budget.limit > 0 && (
+          <Progress
+            size="xs"
+            value={Math.min(100, (budget.used / budget.limit) * 100)}
+            color={budget.used >= budget.limit ? "yellow" : "indigo"}
+          />
+        )}
+      </Stack>
+    </Paper>
   );
 }
 function Status({ state }: { state: string }) {
-  return <i className={`swarm-status swarm-${state}`} aria-label={state} />;
+  return (
+    <ThemeIcon
+      size={10}
+      radius="xl"
+      variant="filled"
+      color={stateColor(state)}
+      className={`swarm-status swarm-${state}`}
+      aria-label={state}
+    />
+  );
 }

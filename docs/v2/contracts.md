@@ -1,8 +1,8 @@
 # Normative protocol and data contracts
 
-This supplements [plan.md](../../plan.md). These are proposed serialized contracts
-and algorithms, not implementation code. Names can change during initial scaffolding;
-identity, lifecycle and authority semantics must not change silently.
+This contributor reference describes the intended serialized contracts and
+algorithms. It is a design specification, not evidence that every behavior is
+implemented. Identity, lifecycle and authority semantics must not change silently.
 
 ## A. Plain ports, bindings and control tokens
 

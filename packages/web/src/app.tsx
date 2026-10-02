@@ -1,3 +1,67 @@
+import { artifactIdentity, evidenceBelongsTo, invocationLabel } from "./data/evidenceIdentity";
+import { layoutWorkbenchGraph } from "./data/workbenchLayout";
+import { PageHeader, WorkbenchPanel } from "./components/WorkbenchPrimitives";
+import { useComputedColorScheme } from "@mantine/core";
+import { Grid, Stepper, JsonInput } from "@mantine/core";
+import { WorkflowPreviewGraph } from "./components/WorkflowPreviewGraph";
+import {
+  AppShell,
+  ActionIcon,
+  Alert,
+  Badge,
+  Box,
+  Burger,
+  Divider,
+  Drawer,
+  Flex,
+  Indicator,
+  Modal,
+  NavLink,
+  Popover,
+  ScrollArea,
+  SegmentedControl,
+  Splitter,
+  Tabs,
+  ThemeIcon,
+  Tooltip,
+} from "@mantine/core";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import {
+  IconActivity,
+  IconArrowRight,
+  IconChartBar,
+  IconCode,
+  IconGitBranch,
+  IconLayoutDashboard,
+  IconList,
+  IconPlayerPlay,
+  IconSettings,
+  IconShieldCheck,
+  IconTrash,
+  IconUsers,
+  IconRoute,
+} from "@tabler/icons-react";
+import { RunsDashboard, ApprovalQueue, WorkbenchSettings } from "./components/WorkbenchPages";
+import { stateColor } from "./theme";
+import {
+  Anchor,
+  Button,
+  Checkbox,
+  Code,
+  Fieldset,
+  Group,
+  List,
+  Loader,
+  NativeSelect,
+  Paper,
+  SimpleGrid,
+  Stack,
+  Text,
+  TextInput,
+  Textarea,
+  Title,
+} from "@mantine/core";
+import { Disclosure, DisclosureTitle } from "./components/Disclosure";
 import {
   memo,
   useCallback,
@@ -6,9 +70,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
-  type CSSProperties,
   type FormEvent,
-  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -69,6 +131,17 @@ import {
   SafeMarkdown,
   type ActivityPage,
 } from "./components/AgentSession";
+
+type Surface =
+  | "runs"
+  | "new-run"
+  | "evals"
+  | "swarm"
+  | "development"
+  | "checkpoints"
+  | "dashboard"
+  | "approvals"
+  | "settings";
 
 type ControlAction = (
   action: string,
@@ -405,16 +478,22 @@ async function fetchActivityPage(
 }
 
 function StatusDot({ state }: { state?: string }) {
-  return <span className={`status-dot status-${state ?? "idle"}`} />;
+  return (
+    <ThemeIcon
+      size={10}
+      radius="xl"
+      color={stateColor(state)}
+      variant="filled"
+      aria-label={state ?? "idle"}
+      className={`status-dot status-${state ?? "idle"}`}
+    />
+  );
 }
-
 function LogoMark() {
   return (
-    <span className="logo-mark">
-      <i />
-      <i />
-      <i />
-    </span>
+    <ThemeIcon variant="light" size={32} radius="md">
+      <IconActivity size={21} />
+    </ThemeIcon>
   );
 }
 
@@ -427,25 +506,13 @@ function readPanelWidth(key: string, fallback: number, min: number, max: number)
   }
 }
 
-function ResizeHandle({
-  label,
-  onStart,
-}: {
-  label: string;
-  onStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
-}) {
-  return (
-    <div
-      className="resize-handle"
-      role="separator"
-      aria-orientation="vertical"
-      aria-label={label}
-      onPointerDown={onStart}
-    />
-  );
-}
-
 export function App() {
+  const [navigationOpen, navigation] = useDisclosure(false);
+  const appearance = useComputedColorScheme("dark");
+  const [requestedWorkspace, setRequestedWorkspace] = useState<{
+    tab: "session" | "review";
+    nonce: number;
+  }>();
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
@@ -467,9 +534,9 @@ export function App() {
   const [selectedInvocationId, setSelectedInvocationId] = useState<string | undefined>(
     () => new URLSearchParams(window.location.search).get("invocation") ?? undefined,
   );
-  const [surface, setSurface] = useState<
-    "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints"
-  >("runs");
+  const [surface, setSurface] = useState<Surface>(() =>
+    new URLSearchParams(window.location.search).has("run") ? "runs" : "dashboard",
+  );
   const [experiments, setExperiments] = useState<EvalExperiment[]>([]);
   const [selectedExperimentId, setSelectedExperimentId] = useState<string>();
   const [experimentError, setExperimentError] = useState<string>();
@@ -492,10 +559,10 @@ export function App() {
   const [deletionError, setDeletionError] = useState<string>();
   const [deletingRun, setDeletingRun] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
-    readPanelWidth("kouro.sidebar.width", 232, 180, 420),
+    readPanelWidth("kouro.sidebar.width", 258, 200, 360),
   );
   const [inspectorWidth, setInspectorWidth] = useState(() =>
-    readPanelWidth("kouro.inspector.width", 310, 260, 560),
+    readPanelWidth("kouro.inspector.width", 420, 280, 560),
   );
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   useSyncExternalStore(store.subscribe, store.getConnectionSnapshot, store.getConnectionSnapshot);
@@ -522,34 +589,6 @@ export function App() {
     setComparisonTimelineError(undefined);
     setExperimentError(undefined);
   }, [selectedExperimentId]);
-
-  const startPanelResize = useCallback(
-    (panel: "sidebar" | "inspector", event: ReactPointerEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      const initialX = event.clientX;
-      const initialWidth = panel === "sidebar" ? sidebarWidth : inspectorWidth;
-      const min = panel === "sidebar" ? 180 : 260;
-      const max = panel === "sidebar" ? 420 : 560;
-      const update = (move: PointerEvent) => {
-        const delta = move.clientX - initialX;
-        const next = Math.min(
-          max,
-          Math.max(min, initialWidth + (panel === "sidebar" ? delta : -delta)),
-        );
-        if (panel === "sidebar") setSidebarWidth(next);
-        else setInspectorWidth(next);
-      };
-      const stop = () => {
-        window.removeEventListener("pointermove", update);
-        window.removeEventListener("pointerup", stop);
-        document.body.classList.remove("resizing-panels");
-      };
-      document.body.classList.add("resizing-panels");
-      window.addEventListener("pointermove", update);
-      window.addEventListener("pointerup", stop, { once: true });
-    },
-    [inspectorWidth, sidebarWidth],
-  );
 
   const loadCatalog = useCallback(async () => {
     if (catalogLoading.current) return;
@@ -968,6 +1007,63 @@ export function App() {
     }
   };
 
+  const confirmAbandonedShutdown = async (shutdownId: string) => {
+    const preview = deletionPreview;
+    if (!preview || typeof preview.runId !== "string") return;
+    setDeletingRun(true);
+    setDeletionError(undefined);
+    try {
+      setDeletionPreview(
+        await api<Record<string, unknown>>(
+          `/api/runs/${encodeURIComponent(preview.runId)}/confirm-harness-shutdown`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              shutdownId,
+              expectedRevision: preview.revision,
+              verifiedStopped: true,
+              actor: "operator",
+            }),
+          },
+        ),
+      );
+      void loadCatalog();
+    } catch (cause) {
+      setDeletionError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to confirm shutdown. Restart Kouro with this checkout to load the recovery action.",
+      );
+    } finally {
+      setDeletingRun(false);
+    }
+  };
+
+  const stopRecoveryRun = async () => {
+    const preview = deletionPreview;
+    if (!preview || typeof preview.runId !== "string") return;
+    setDeletingRun(true);
+    setDeletionError(undefined);
+    try {
+      await api(`/api/runs/${encodeURIComponent(preview.runId)}/actions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "cancel",
+          expectedRevision: preview.revision,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      });
+      await previewRunDeletion(preview.runId);
+      void loadCatalog();
+    } catch (cause) {
+      setDeletionError(cause instanceof Error ? cause.message : "Unable to stop recovery run");
+    } finally {
+      setDeletingRun(false);
+    }
+  };
+
   const confirmRunDeletion = async () => {
     const preview = deletionPreview;
     if (!preview || typeof preview.runId !== "string") return;
@@ -1136,6 +1232,13 @@ export function App() {
     invocations.find((item) => item.approval?.status === "pending") ??
     invocations.find((item) => item.state === "running") ??
     [...invocations].reverse().find((item) => item.state === "failed") ??
+    [...invocations]
+      .reverse()
+      .find((item) =>
+        activeView?.bundle.definitions[
+          activeView.scopes[item.scopeId]?.definitionId ?? activeView.bundle.rootDefinitionId
+        ]?.nodes.some((node) => node.id === item.sourceNodeId && node.kind === "agent"),
+      ) ??
     invocations[invocations.length - 1];
   const visibleRuns = runs.map((run) =>
     run.id === selectedRunId && activeView
@@ -1149,204 +1252,392 @@ export function App() {
       : run,
   );
   return (
-    <div
-      className="app-shell"
-      style={
-        {
-          "--sidebar-width": `${sidebarWidth}px`,
-          "--inspector-width": `${inspectorWidth}px`,
-        } as CSSProperties
-      }
+    <AppShell
+      layout="alt"
+      header={{ height: 64 }}
+      navbar={{ width: sidebarWidth, breakpoint: "md", collapsed: { mobile: !navigationOpen } }}
+      padding={0}
     >
-      <Sidebar
-        workflows={workflows}
-        runs={visibleRuns}
-        shownRunCount={shownRunCount}
-        hasMoreRuns={hasMoreRuns}
-        loadingOlderRuns={loadingOlderRuns}
-        onShowOlderRuns={showOlderRuns}
-        onDeleteRun={(runId) => void previewRunDeletion(runId)}
-        workflowId={workflowId}
-        selectedRunId={selectedRunId}
-        setWorkflowId={(id) => {
-          setWorkflowId(id);
-          setNodeSettings({});
-          setInputDrafts({});
-          openNewRun();
-        }}
-        setSelectedRunId={(id) => {
-          setSelectedRunId(id);
-          setSelectedInvocationId(undefined);
-          setSurface("runs");
-        }}
-        surface={surface}
-        setSurface={setSurface}
-        onResizeStart={(event) => startPanelResize("sidebar", event)}
-      />
-      <main className="main-column">
-        <Topbar
-          run={surface === "new-run" ? undefined : activeRun}
-          view={surface === "new-run" ? null : (activeView ?? null)}
-          store={store}
-          onLaunch={launch}
-          pendingApprovals={pendingApprovals}
-          pendingRunDeletions={pendingRunDeletions}
-          onOpenApproval={(approval) => {
-            setSelectedRunId(approval.runId);
-            setSelectedInvocationId(approval.invocationId);
-            setSurface("runs");
-          }}
-          onOpenDeletion={(runId) => void previewRunDeletion(runId)}
-          runs={visibleRuns}
-          selectedRunId={selectedRunId}
-          onSelectRun={(id) => {
-            setSelectedRunId(id || undefined);
-            setSelectedInvocationId(undefined);
-            setSurface("runs");
-            if (!id) store.clear();
-          }}
-          onNewRun={openNewRun}
-          launching={launching}
-          canLaunch={canLaunch}
-          pendingAction={pendingAction}
-          actionNotice={actionNotice}
-          onControl={controlRun}
+      <AppShell.Header bg="var(--mantine-color-body)">
+        <Group h="100%" px="lg" justify="space-between" wrap="nowrap">
+          <Group gap="md" wrap="nowrap">
+            <Burger
+              opened={navigationOpen}
+              onClick={navigation.toggle}
+              hiddenFrom="md"
+              size="sm"
+              aria-label="Toggle navigation"
+            />
+            <Text visibleFrom="sm" size="xs" c="dimmed">
+              LOCAL
+            </Text>
+            <Text size="sm" visibleFrom="sm">
+              Local workbench
+            </Text>
+            <Text size="sm" hiddenFrom="sm">
+              Kouro
+            </Text>
+          </Group>
+          <Group gap="sm" wrap="nowrap">
+            <Text visibleFrom="sm" size="xs" c={store.status === "live" ? "teal" : "dimmed"}>
+              {selectedRunId
+                ? store.status === "live"
+                  ? "● connected"
+                  : store.status
+                : "local host"}
+            </Text>
+            <ApprovalInbox
+              items={pendingApprovals}
+              onOpen={(approval) => {
+                setSelectedRunId(approval.runId);
+                setSelectedInvocationId(approval.invocationId);
+                setSurface("runs");
+              }}
+            />
+            <RunDeletionInbox
+              items={pendingRunDeletions}
+              onOpen={(runId) => void previewRunDeletion(runId)}
+            />
+            <Button
+              variant="filled"
+              onClick={() => {
+                openNewRun();
+                navigation.close();
+              }}
+            >
+              New run
+            </Button>
+          </Group>
+        </Group>
+      </AppShell.Header>
+      <AppShell.Navbar bg="var(--mantine-color-body)" p={0}>
+        <Sidebar
           workflows={workflows}
+          runs={visibleRuns}
+          shownRunCount={shownRunCount}
+          hasMoreRuns={hasMoreRuns}
+          loadingOlderRuns={loadingOlderRuns}
+          onShowOlderRuns={showOlderRuns}
+          onDeleteRun={(runId) => void previewRunDeletion(runId)}
           workflowId={workflowId}
+          selectedRunId={selectedRunId}
           setWorkflowId={(id) => {
             setWorkflowId(id);
             setNodeSettings({});
             setInputDrafts({});
             openNewRun();
+            navigation.close();
+          }}
+          setSelectedRunId={(id) => {
+            setSelectedRunId(id);
+            setSelectedInvocationId(undefined);
+            setSurface("runs");
+            navigation.close();
           }}
           surface={surface}
-          setSurface={setSurface}
+          setSurface={(next) => {
+            setSurface(next);
+            navigation.close();
+          }}
+          approvals={pendingApprovals.length}
         />
-        {(error || catalogError) && (
-          <div className="notice error">
-            <span>!</span>
-            {error || catalogError}
-            {catalogError && <button onClick={() => void loadCatalog()}>Retry</button>}
-            {error && <button onClick={() => setError(undefined)}>Dismiss</button>}
-          </div>
-        )}
-        {experimentError && surface === "evals" && (
-          <div className="notice error">
-            <span>!</span>
-            {experimentError}
-            <button onClick={() => setExperimentError(undefined)}>Dismiss</button>
-          </div>
-        )}
-        {surface === "runs" && selectedRunId && store.status !== "live" && (
-          <div className="notice" role="status">
-            {store.error ?? "Loading the selected run…"}
-            <button onClick={() => setConnectionNonce((value) => value + 1)}>Reconnect</button>
-          </div>
-        )}
-        {surface === "checkpoints" && selectedRunId ? (
-          <M7Workbench
-            runId={selectedRunId}
-            revision={snapshot?.revision}
-            fetchView={fetchCheckpointView}
-            createCheckpoint={captureCheckpoint}
-            forkCheckpoint={forkCheckpoint}
-          />
-        ) : surface === "development" ? (
-          <DevelopmentWorkbench
-            onOpenRun={(runId) => {
-              setSelectedRunId(runId);
-              setSurface("runs");
-              void loadCatalog();
-            }}
-          />
-        ) : surface === "evals" ? (
-          <>
-            <RunComparisonPanel
+      </AppShell.Navbar>
+      <AppShell.Main bg={appearance === "dark" ? "dark.8" : "gray.0"}>
+        <Stack gap={0} className="main-column" miw={0}>
+          {["runs", "swarm", "checkpoints"].includes(surface) && (
+            <Topbar
+              run={surface === "new-run" ? undefined : activeRun}
+              view={surface === "new-run" ? null : (activeView ?? null)}
+              store={store}
+              onLaunch={launch}
+              pendingApprovals={pendingApprovals}
+              pendingRunDeletions={pendingRunDeletions}
+              onOpenApproval={(approval) => {
+                setSelectedRunId(approval.runId);
+                setSelectedInvocationId(approval.invocationId);
+                setSurface("runs");
+              }}
+              onOpenDeletion={(runId) => void previewRunDeletion(runId)}
               runs={visibleRuns}
-              selectedIds={comparisonRunIds}
-              onSelectionChange={setComparisonRunIds}
-              onCompare={() => void compareSelectedRuns()}
-              timeline={comparisonTimeline}
-              error={comparisonTimelineError}
+              selectedRunId={selectedRunId}
+              onSelectRun={(id) => {
+                setSelectedRunId(id || undefined);
+                setSelectedInvocationId(undefined);
+                setSurface("runs");
+                if (!id) store.clear();
+              }}
+              onNewRun={openNewRun}
+              launching={launching}
+              canLaunch={canLaunch}
+              pendingAction={pendingAction}
+              actionNotice={actionNotice}
+              onControl={controlRun}
+              workflows={workflows}
+              workflowId={workflowId}
+              setWorkflowId={(id) => {
+                setWorkflowId(id);
+                setNodeSettings({});
+                setInputDrafts({});
+                openNewRun();
+              }}
+              surface={surface}
+              setSurface={setSurface}
             />
-            {selectedExperiment ? (
-              <>
-                <ExperimentCreator
-                  workflows={workflows}
-                  onCreated={(id) => {
-                    setSelectedExperimentId(id);
-                    void loadCatalog();
-                  }}
+          )}
+          {(error || catalogError) && (
+            <Alert color="red" title="Action needs attention">
+              <Stack gap="xs">
+                <Text component="span" size="sm">
+                  !
+                </Text>
+                {error || catalogError}
+                {catalogError && <Button onClick={() => void loadCatalog()}>Retry</Button>}
+                {error && <Button onClick={() => setError(undefined)}>Dismiss</Button>}
+              </Stack>
+            </Alert>
+          )}
+          {experimentError && surface === "evals" && (
+            <Alert color="red" title="Action needs attention">
+              <Stack gap="xs">
+                <Text component="span" size="sm">
+                  !
+                </Text>
+                {experimentError}
+                <Button onClick={() => setExperimentError(undefined)}>Dismiss</Button>
+              </Stack>
+            </Alert>
+          )}
+          {surface === "runs" && selectedRunId && store.status !== "live" && (
+            <Alert color="yellow" role="status">
+              <Stack gap="xs">
+                {store.error ?? "Loading the selected run…"}
+                <Button onClick={() => setConnectionNonce((value) => value + 1)}>Reconnect</Button>
+              </Stack>
+            </Alert>
+          )}
+          {surface === "dashboard" ? (
+            <RunsDashboard
+              selectedRunId={selectedRunId}
+              runs={visibleRuns}
+              workflows={workflows}
+              approvals={pendingApprovals.length}
+              onNew={openNewRun}
+              onOpen={(id) => {
+                setSelectedRunId(id);
+                setSelectedInvocationId(undefined);
+                setRequestedWorkspace(undefined);
+                setSurface("runs");
+              }}
+              onDelete={(id) => void previewRunDeletion(id)}
+              hasMore={hasMoreRuns}
+              onOlder={showOlderRuns}
+              loadingOlder={loadingOlderRuns}
+            />
+          ) : surface === "approvals" ? (
+            <ApprovalQueue
+              items={pendingApprovals}
+              onSelect={(item) => {
+                setSelectedRunId(item.runId);
+                setSelectedInvocationId(item.invocationId);
+              }}
+              onOpen={(item) => {
+                setSelectedRunId(item.runId);
+                setSelectedInvocationId(item.invocationId);
+                setRequestedWorkspace({ tab: "review", nonce: Date.now() });
+                setSurface("runs");
+              }}
+              renderDetail={(item) => {
+                if (!activeView || activeView.runId !== item.runId) return <Loader size="sm" />;
+                const invocation = asArray(activeView.invocations).find(
+                  (invocation) => invocation.invocationId === item.invocationId,
+                );
+                return invocation ? (
+                  <Stack gap="md">
+                    <Text size="xs" c="dimmed">
+                      EVIDENCE
+                    </Text>
+                    <ArtifactPanel
+                      artifacts={asArray(activeView.artifacts).filter((artifact) =>
+                        [
+                          ...invocation.evidenceArtifactIds,
+                          ...invocation.outputArtifactIds,
+                        ].includes(artifact.artifactId),
+                      )}
+                    />
+                    <ApprovalPanel
+                      invocation={invocation}
+                      nodeKind="approval"
+                      view={activeView}
+                      pendingAction={pendingAction}
+                      onControl={controlRun}
+                    />
+                  </Stack>
+                ) : (
+                  <Text size="sm" c="dimmed">
+                    This gate is no longer present in the current revision.
+                  </Text>
+                );
+              }}
+            />
+          ) : surface === "settings" ? (
+            <WorkbenchSettings
+              sidebarWidth={sidebarWidth}
+              setSidebarWidth={setSidebarWidth}
+              inspectorWidth={inspectorWidth}
+              setInspectorWidth={setInspectorWidth}
+              status={store.status}
+              error={store.error}
+              onReconnect={() => setConnectionNonce((value) => value + 1)}
+              onOpenSession={() => {
+                setRequestedWorkspace({ tab: "session", nonce: Date.now() });
+                setSurface("runs");
+              }}
+            />
+          ) : surface === "checkpoints" && selectedRunId ? (
+            <M7Workbench
+              runId={selectedRunId}
+              revision={snapshot?.revision}
+              fetchView={fetchCheckpointView}
+              createCheckpoint={captureCheckpoint}
+              forkCheckpoint={forkCheckpoint}
+            />
+          ) : surface === "development" ? (
+            <DevelopmentWorkbench
+              onOpenRun={(runId) => {
+                setSelectedRunId(runId);
+                setSurface("runs");
+                void loadCatalog();
+              }}
+            />
+          ) : surface === "evals" ? (
+            <>
+              {selectedExperiment ? (
+                <>
+                  <M5Workbench
+                    comparisonPicker={
+                      <RunComparisonPanel
+                        runs={visibleRuns}
+                        selectedIds={comparisonRunIds}
+                        onSelectionChange={setComparisonRunIds}
+                        onCompare={() => void compareSelectedRuns()}
+                        timeline={comparisonTimeline}
+                        error={comparisonTimelineError}
+                      />
+                    }
+                    creator={
+                      <ExperimentCreator
+                        workflows={workflows}
+                        onCreated={(id) => {
+                          setSelectedExperimentId(id);
+                          void loadCatalog();
+                        }}
+                      />
+                    }
+                    key={selectedExperiment.id}
+                    experiment={selectedExperiment}
+                    comparisonTimeline={comparisonTimeline}
+                    comparisonTimelineError={comparisonTimelineError}
+                    onCompare={() =>
+                      void compareSelectedRuns(completedComparisonRuns(selectedExperiment))
+                    }
+                    onLoadEvidence={loadCellEvidence}
+                    experiments={experiments.map((item) => ({ id: item.id, name: item.name }))}
+                    onSelectExperiment={setSelectedExperimentId}
+                    pairwise={pairwise}
+                    onPairwiseStart={() => void startPairwise()}
+                    onPairwiseChoice={(choice) => void decidePairwise(choice)}
+                    onOpenRun={(runId) => {
+                      setSurface("runs");
+                      setSelectedRunId(runId);
+                    }}
+                    onResume={() => void resumeExperiment()}
+                    onCancel={() => void cancelExperiment()}
+                  />
+                </>
+              ) : (
+                <Stack p="lg" gap="lg">
+                  <RunComparisonPanel
+                    runs={visibleRuns}
+                    selectedIds={comparisonRunIds}
+                    onSelectionChange={setComparisonRunIds}
+                    onCompare={() => void compareSelectedRuns()}
+                    timeline={comparisonTimeline}
+                    error={comparisonTimelineError}
+                  />
+                  <ExperimentCreator
+                    workflows={workflows}
+                    initiallyOpen
+                    onCreated={(id) => {
+                      setSelectedExperimentId(id);
+                      void loadCatalog();
+                    }}
+                  />
+                </Stack>
+              )}
+            </>
+          ) : surface === "swarm" && selectedRunId ? (
+            <SwarmWorkbench
+              runId={selectedRunId}
+              runView={activeView ?? undefined}
+              fetchView={fetchCollaboration}
+              objective={runs.find((run) => run.id === selectedRunId)?.task}
+              checkpointPanel={
+                <M7Workbench
+                  compact
+                  runId={selectedRunId}
+                  revision={activeView?.revision}
+                  fetchView={fetchCheckpointView}
+                  createCheckpoint={captureCheckpoint}
+                  forkCheckpoint={forkCheckpoint}
                 />
-                <M5Workbench
-                  key={selectedExperiment.id}
-                  experiment={selectedExperiment}
-                  comparisonTimeline={comparisonTimeline}
-                  comparisonTimelineError={comparisonTimelineError}
-                  onCompare={() =>
-                    void compareSelectedRuns(completedComparisonRuns(selectedExperiment))
-                  }
-                  onLoadEvidence={loadCellEvidence}
-                  experiments={experiments.map((item) => ({ id: item.id, name: item.name }))}
-                  onSelectExperiment={setSelectedExperimentId}
-                  pairwise={pairwise}
-                  onPairwiseStart={() => void startPairwise()}
-                  onPairwiseChoice={(choice) => void decidePairwise(choice)}
-                  onOpenRun={(runId) => {
-                    setSurface("runs");
-                    setSelectedRunId(runId);
-                  }}
-                  onResume={() => void resumeExperiment()}
-                  onCancel={() => void cancelExperiment()}
-                />
-              </>
-            ) : (
-              <ExperimentCreator
-                workflows={workflows}
-                initiallyOpen
-                onCreated={(id) => {
-                  setSelectedExperimentId(id);
-                  void loadCatalog();
-                }}
-              />
-            )}
-          </>
-        ) : surface === "swarm" && selectedRunId ? (
-          <SwarmWorkbench runId={selectedRunId} fetchView={fetchCollaboration} />
-        ) : loading ? (
-          <div className="empty-state">
-            <div className="loader" />
-            Loading local workbench…
-          </div>
-        ) : surface !== "new-run" && selectedRunId && activeView ? (
-          <Workbench
-            key={activeView.runId}
-            workflow={activeWorkflow}
-            view={activeView}
-            selectedInvocationId={selectedInvocation?.invocationId}
-            setSelectedInvocationId={setSelectedInvocationId}
-            onControl={controlRun}
-            pendingAction={pendingAction}
-            onInspectorResizeStart={(event) => startPanelResize("inspector", event)}
-          />
-        ) : surface === "runs" && selectedRunId ? (
-          <div className="empty-state">{store.error ?? "Loading the selected run…"}</div>
-        ) : (
-          <Preview
-            workflow={workflow}
-            nodeSettings={nodeSettings}
-            setNodeSettings={setNodeSettings}
-            task={task}
-            setTask={setTask}
-            inputDrafts={inputDrafts}
-            setInputDrafts={setInputDrafts}
-            workspacePath={workspacePath}
-            setWorkspacePath={setWorkspacePath}
-            onLaunch={launch}
-            launching={launching}
-          />
-        )}
-      </main>
+              }
+            />
+          ) : loading ? (
+            <Stack p="xl" align="center" justify="center" mih={240} className="empty-state">
+              <Loader size="sm" className="loader" />
+              Loading local workbench…
+            </Stack>
+          ) : surface !== "new-run" && selectedRunId && activeView ? (
+            <Workbench
+              key={activeView.runId}
+              workflow={activeWorkflow}
+              view={activeView}
+              selectedInvocationId={selectedInvocation?.invocationId}
+              setSelectedInvocationId={setSelectedInvocationId}
+              onControl={controlRun}
+              pendingAction={pendingAction}
+              requestedWorkspace={requestedWorkspace}
+              taskLabel={activeRun?.task}
+              inspectorWidth={inspectorWidth}
+              setInspectorWidth={setInspectorWidth}
+            />
+          ) : surface === "runs" && selectedRunId ? (
+            <Stack p="xl" align="center" justify="center" mih={240} className="empty-state">
+              {store.error ?? "Loading the selected run…"}
+            </Stack>
+          ) : (
+            <Preview
+              workflows={workflows}
+              onSelectWorkflow={(id) => {
+                setWorkflowId(id);
+                setNodeSettings({});
+                setInputDrafts({});
+              }}
+              workflow={workflow}
+              nodeSettings={nodeSettings}
+              setNodeSettings={setNodeSettings}
+              task={task}
+              setTask={setTask}
+              inputDrafts={inputDrafts}
+              setInputDrafts={setInputDrafts}
+              workspacePath={workspacePath}
+              setWorkspacePath={setWorkspacePath}
+              onLaunch={launch}
+              launching={launching}
+            />
+          )}
+        </Stack>
+      </AppShell.Main>
       {deletionPreview && (
         <RunDeletionDialog
           preview={deletionPreview}
@@ -1356,9 +1647,12 @@ export function App() {
             if (!deletingRun) setDeletionPreview(undefined);
           }}
           onConfirm={() => void confirmRunDeletion()}
+          onRefresh={() => void previewRunDeletion(String(deletionPreview.runId))}
+          onConfirmShutdown={(shutdownId) => void confirmAbandonedShutdown(shutdownId)}
+          onStop={() => void stopRecoveryRun()}
         />
       )}
-    </div>
+    </AppShell>
   );
 }
 
@@ -1423,48 +1717,108 @@ function DevelopmentWorkbench({ onOpenRun }: { onOpenRun: (runId: string) => voi
     }
   };
   return (
-    <section className="development-workbench" aria-label="Developer tools">
-      <div className="section-heading">
-        <div>
-          <div className="eyebrow">M8.1 · DEVELOPMENT</div>
-          <h1>Prompt & schema playground</h1>
-          <p>Validate fixtures and render prompt versions without starting the feature workflow.</p>
-        </div>
-      </div>
-      <div className="dev-grid">
-        <label>
-          VARIABLE SCHEMA
-          <textarea value={schema} onChange={(event) => setSchema(event.target.value)} />
-        </label>
-        <label>
-          FIXTURE JSON
-          <textarea value={value} onChange={(event) => setValue(event.target.value)} />
-        </label>
-        <label className="dev-prompt">
-          PROMPT TEMPLATE
-          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
-        </label>
-        <div className="dev-actions">
-          <button className="primary-button" disabled={busy} onClick={() => void run("schema")}>
-            Validate schema
-          </button>
-          <button className="subtle-button" disabled={busy} onClick={() => void run("prompt")}>
-            Render prompt
-          </button>
-          <button className="subtle-button" disabled={busy} onClick={() => void runPrompt()}>
-            Run prompt fixture
-          </button>
-        </div>
-        {promptRunId && (
-          <button className="subtle-button" onClick={() => onOpenRun(promptRunId)}>
-            Open run {promptRunId.slice(0, 12)}
-          </button>
-        )}
-        <pre className="dev-result" aria-live="polite">
-          {result ?? "Results and precise validation paths appear here."}
-        </pre>
-      </div>
-    </section>
+    <Stack gap={0} className="development-workbench">
+      <Paper p="md" radius={0} withBorder={false}>
+        <Text size="sm">Developer tools</Text>
+      </Paper>
+      <Divider />
+      <Grid gap="lg" p="lg">
+        <Grid.Col span={{ base: 12, lg: 6 }}>
+          <Stack gap="lg">
+            <Stack gap="xs">
+              <Text size="xs" c="dimmed">
+                PROMPT RENDERING
+              </Text>
+              <Paper>
+                <Stack gap="md">
+                  <Textarea
+                    label="Prompt template"
+                    value={prompt}
+                    onChange={(event) => setPrompt(event.currentTarget.value)}
+                    minRows={3}
+                    autosize
+                    maxRows={12}
+                  />
+                  <Group>
+                    <Button variant="filled" disabled={busy} onClick={() => void runPrompt()}>
+                      Run prompt fixture
+                    </Button>
+                    <Button disabled={busy} onClick={() => void run("prompt")}>
+                      Render prompt
+                    </Button>
+                  </Group>
+                </Stack>
+              </Paper>
+            </Stack>
+            <Stack gap="xs">
+              <Text size="xs" c="dimmed">
+                SCHEMA VALIDATION
+              </Text>
+              <Paper>
+                <Stack gap="md">
+                  <JsonInput
+                    label="Variable schema"
+                    value={schema}
+                    onChange={setSchema}
+                    minRows={6}
+                    autosize
+                    maxRows={14}
+                    formatOnBlur
+                    validationError="Enter valid JSON"
+                  />
+                  <JsonInput
+                    label="Fixture JSON"
+                    value={value}
+                    onChange={setValue}
+                    minRows={4}
+                    autosize
+                    maxRows={12}
+                    formatOnBlur
+                    validationError="Enter valid JSON"
+                  />
+                  <Button variant="filled" disabled={busy} onClick={() => void run("schema")}>
+                    Validate schema
+                  </Button>
+                </Stack>
+              </Paper>
+            </Stack>
+          </Stack>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 6 }}>
+          <Stack gap="lg">
+            <Stack gap="xs">
+              <Text size="xs" c="dimmed">
+                LAUNCHED RUN
+              </Text>
+              <Paper>
+                <Stack gap="md">
+                  {promptRunId ? (
+                    <>
+                      <Code>{promptRunId} · prompt fixture</Code>
+                      <Button onClick={() => onOpenRun(promptRunId)}>Open run</Button>
+                    </>
+                  ) : (
+                    <Text size="sm" c="dimmed">
+                      Run a prompt fixture to inspect its ordinary execution.
+                    </Text>
+                  )}
+                </Stack>
+              </Paper>
+            </Stack>
+            <Stack gap="xs">
+              <Text size="xs" c="dimmed">
+                RESULT
+              </Text>
+              <Paper>
+                <Code block mah={500} style={{ overflow: "auto" }} aria-live="polite">
+                  {result ?? "Validation paths and rendered prompt results appear here."}
+                </Code>
+              </Paper>
+            </Stack>
+          </Stack>
+        </Grid.Col>
+      </Grid>
+    </Stack>
   );
 }
 
@@ -1482,7 +1836,7 @@ function Sidebar({
   setSelectedRunId,
   surface,
   setSurface,
-  onResizeStart,
+  approvals,
 }: {
   workflows: WorkflowSummary[];
   runs: RunSummary[];
@@ -1490,140 +1844,135 @@ function Sidebar({
   hasMoreRuns: boolean;
   loadingOlderRuns: boolean;
   onShowOlderRuns: () => void;
-  onDeleteRun: (runId: string) => void;
+  onDeleteRun: (id: string) => void;
   workflowId: string;
   selectedRunId?: string;
   setWorkflowId: (id: string) => void;
   setSelectedRunId: (id: string) => void;
-  surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints";
+  surface:
+    | "runs"
+    | "new-run"
+    | "evals"
+    | "swarm"
+    | "development"
+    | "checkpoints"
+    | "dashboard"
+    | "approvals"
+    | "settings";
   setSurface: (
-    surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints",
+    surface:
+      | "runs"
+      | "new-run"
+      | "evals"
+      | "swarm"
+      | "development"
+      | "checkpoints"
+      | "dashboard"
+      | "approvals"
+      | "settings",
   ) => void;
-  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  approvals: number;
 }) {
+  const links = [
+    { id: "dashboard", label: "Runs", icon: IconLayoutDashboard },
+    { id: "new-run", label: "Workflows", icon: IconRoute },
+    { id: "approvals", label: "Approvals", icon: IconShieldCheck },
+    { id: "swarm", label: "Agent teams", icon: IconUsers },
+    { id: "evals", label: "Evaluations", icon: IconChartBar },
+    { id: "checkpoints", label: "Checkpoints", icon: IconGitBranch },
+    { id: "development", label: "Developer tools", icon: IconCode },
+    { id: "settings", label: "Settings", icon: IconSettings },
+  ] as const;
   return (
-    <aside className="sidebar">
-      <div className="brand">
-        <LogoMark />
-        <span>KOURO</span>
-        <small>LOCAL</small>
-      </div>
-      <div className="side-label">
-        WORKFLOWS <span>{workflows.length}</span>
-      </div>
-      <div className="workflow-list">
-        {workflows.map((workflow) => (
-          <button
-            className={`workflow-row ${workflow.id === workflowId ? "selected" : ""}`}
-            key={workflow.id}
-            onClick={() => setWorkflowId(workflow.id)}
-          >
-            <span className="workflow-glyph">◇</span>
-            <span>
-              <strong>{workflow.name ?? workflow.id}</strong>
-              <em>{workflow.version ? `v${workflow.version}` : "local bundle"}</em>
-            </span>
-          </button>
-        ))}
-      </div>
-      <div className="side-label runs-label">
-        RECENT RUNS <span>{runs.length}</span>
-      </div>
-      <button
-        className={`workflow-row ${surface === "checkpoints" ? "selected" : ""}`}
-        onClick={() => setSurface("checkpoints")}
-        disabled={!selectedRunId}
-        aria-label="Open checkpoints and forks"
-      >
-        <span className="workflow-glyph">⌘</span>
-        <span>
-          <strong>Checkpoints</strong>
-          <em>safe forks & genealogy</em>
-        </span>
-      </button>
-      <div className="side-label runs-label">WORKBENCH</div>
-      <button
-        className={`workflow-row ${surface === "swarm" ? "selected" : ""}`}
-        disabled={!selectedRunId}
-        onClick={() => setSurface("swarm")}
-      >
-        <span className="workflow-glyph">⌘</span>
-        <span>
-          <strong>Collaboration</strong>
-          <em>participants · messages</em>
-        </span>
-      </button>
-      <button
-        className={`workflow-row ${surface === "development" ? "selected" : ""}`}
-        onClick={() => setSurface("development")}
-      >
-        <span className="workflow-glyph">✦</span>
-        <span>
-          <strong>Developer tools</strong>
-          <em>prompts · schemas · graph</em>
-        </span>
-      </button>
-      <button
-        className={`workflow-row ${surface === "evals" ? "selected" : ""}`}
-        onClick={() => setSurface("evals")}
-      >
-        <span className="workflow-glyph">▦</span>
-        <span>
-          <strong>Evaluations</strong>
-          <em>datasets · experiments</em>
-        </span>
-      </button>
-      <div className="run-list">
-        {runs.slice(0, shownRunCount).map((run) => (
-          <div className="run-row-shell" key={run.id}>
-            <button
-              className={`run-row ${run.id === selectedRunId ? "selected" : ""}`}
-              onClick={() => setSelectedRunId(run.id)}
-            >
-              <StatusDot state={run.state} />
-              <span>
-                <strong>{run.workflowId || "run"}</strong>
-                <em>
-                  {run.task ? `${run.task.slice(0, 48)} · ` : ""}
-                  {run.id.slice(0, 12)} ·{" "}
-                  {run.createdAt
-                    ? new Date(run.createdAt).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })
-                    : "just now"}
-                </em>
-              </span>
-              <small>{run.state}</small>
-            </button>
-            <button
-              type="button"
-              className="run-delete-action"
-              aria-label={`Delete run ${run.id.slice(0, 12)}`}
-              title="Delete run"
-              onClick={() => onDeleteRun(run.id)}
-            >
-              ×
-            </button>
-          </div>
-        ))}
-        {(runs.length > shownRunCount || hasMoreRuns) && (
-          <button
-            type="button"
-            className="older-runs-button"
-            onClick={onShowOlderRuns}
-            disabled={loadingOlderRuns}
-          >
-            {loadingOlderRuns ? "Loading older runs…" : "Show older runs"}
-          </button>
-        )}
-      </div>
-      <div className="sidebar-footer">
-        <span className="connection-dot" /> local host{" "}
-        <span className="footer-version">v2 / local</span>
-      </div>
-      <ResizeHandle label="Resize navigation sidebar" onStart={onResizeStart} />
-    </aside>
+    <Stack className="sidebar" h="100%" gap={0}>
+      <Group h={64} px="lg" wrap="nowrap">
+        <Text fw={700} fz={20}>
+          KOURO
+        </Text>
+      </Group>
+      <Divider />
+      <AppShell.Section p="sm">
+        <Stack gap={2}>
+          {links
+            .filter((link) => link.id !== "settings")
+            .map((link) => (
+              <NavLink
+                component="button"
+                type="button"
+                key={link.id}
+                label={link.label}
+                color="gray"
+                variant="subtle"
+                active={surface === link.id || (link.id === "dashboard" && surface === "runs")}
+                disabled={["swarm", "checkpoints"].includes(link.id) && !selectedRunId}
+                rightSection={
+                  link.id === "approvals" && approvals ? (
+                    <Badge size="xs" color="indigo">
+                      {approvals}
+                    </Badge>
+                  ) : undefined
+                }
+                onClick={() => setSurface(link.id)}
+              />
+            ))}
+        </Stack>
+      </AppShell.Section>
+      <AppShell.Section grow component={ScrollArea} p="sm">
+        <Stack gap="sm">
+          <Text size="xs" c="dimmed" px="xs" mt="sm">
+            RECENT RUNS
+          </Text>
+          {runs.slice(0, shownRunCount).map((run) => (
+            <Group key={run.id} gap={0} wrap="nowrap">
+              <NavLink
+                component="button"
+                type="button"
+                className="run-row"
+                flex={1}
+                active={run.id === selectedRunId && surface === "runs"}
+                label={run.task?.slice(0, 30) || run.workflowId}
+                description={run.id.slice(0, 8)}
+                rightSection={
+                  <Text size="xs" c={stateColor(run.state)}>
+                    {run.state === "succeeded"
+                      ? "done"
+                      : run.state === "recovery-required"
+                        ? "recovery"
+                        : run.state}
+                  </Text>
+                }
+                onClick={() => setSelectedRunId(run.id)}
+              />
+              <ActionIcon
+                variant="subtle"
+                color="gray"
+                aria-label={`Delete run ${run.id.slice(0, 12)}`}
+                onClick={() => onDeleteRun(run.id)}
+              >
+                <IconTrash size={13} />
+              </ActionIcon>
+            </Group>
+          ))}
+          {(runs.length > shownRunCount || hasMoreRuns) && (
+            <Button size="xs" onClick={onShowOlderRuns} loading={loadingOlderRuns}>
+              Show older runs
+            </Button>
+          )}
+        </Stack>
+      </AppShell.Section>
+      <Divider />
+      <AppShell.Section p="sm">
+        <NavLink
+          component="button"
+          type="button"
+          label="Settings"
+          color="gray"
+          variant="subtle"
+          active={surface === "settings"}
+          onClick={() => setSurface("settings")}
+        />
+      </AppShell.Section>
+    </Stack>
   );
 }
 
@@ -1692,87 +2041,101 @@ function ExperimentCreator({
     }
   };
   return (
-    <section className={`experiment-creator ${open ? "expanded" : ""}`}>
+    <Paper component="section" className={`experiment-creator ${open ? "expanded" : ""}`}>
       {!open ? (
-        <button className="subtle-button" onClick={() => setOpen(true)}>
+        <Button className="subtle-button" onClick={() => setOpen(true)}>
           ＋ New experiment
-        </button>
+        </Button>
       ) : (
-        <form onSubmit={(event) => void create(event)}>
-          <header>
-            <div>
-              <div className="eyebrow">EVALUATION SETUP</div>
-              <h2>Create experiment</h2>
-            </div>
+        <Stack
+          gap="xs"
+          component="form"
+          onSubmit={(event) => void create(event as unknown as FormEvent<HTMLFormElement>)}
+        >
+          <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+            <Stack gap="xs">
+              <Stack gap="xs" className="eyebrow">
+                EVALUATION SETUP
+              </Stack>
+              <Title order={2}>Create experiment</Title>
+            </Stack>
             {!initiallyOpen && (
-              <button type="button" className="subtle-button" onClick={() => setOpen(false)}>
+              <Button type="button" className="subtle-button" onClick={() => setOpen(false)}>
                 Close
-              </button>
+              </Button>
             )}
-          </header>
-          <label>
+          </Group>
+          <Stack gap={4} component="label">
             NAME
-            <input
+            <TextInput
               value={name}
               onChange={(event) => setName(event.target.value)}
               placeholder="e.g. prompt-baseline-check"
             />
-          </label>
-          <label>
+          </Stack>
+          <Stack gap={4} component="label">
             WORKFLOW
-            <select value={workflowId} onChange={(event) => setWorkflowId(event.target.value)}>
+            <NativeSelect
+              value={workflowId}
+              onChange={(event) => setWorkflowId(event.target.value)}
+            >
               {available.map((item) => (
                 <option key={item.id} value={item.id}>
                   {item.name ?? item.id}
                 </option>
               ))}
-            </select>
-          </label>
-          <label>
+            </NativeSelect>
+          </Stack>
+          <Stack gap={4} component="label">
             DATASET CASES · JSON
-            <textarea
+            <Textarea
               value={cases}
               onChange={(event) => setCases(event.target.value)}
               rows={5}
               spellCheck={false}
             />
-          </label>
-          <div className="experiment-numeric-fields">
-            <label>
+          </Stack>
+          <Group gap="xs" justify="space-between" wrap="wrap" className="experiment-numeric-fields">
+            <Stack gap={4} component="label">
               REPETITIONS
-              <input
+              <TextInput
                 type="number"
                 min={1}
                 max={100}
                 value={repetitions}
                 onChange={(event) => setRepetitions(Math.max(1, Number(event.target.value) || 1))}
               />
-            </label>
-            <label>
+            </Stack>
+            <Stack gap={4} component="label">
               MAX CONCURRENT
-              <input
+              <TextInput
                 type="number"
                 min={1}
                 max={32}
                 value={maxConcurrent}
                 onChange={(event) => setMaxConcurrent(Math.max(1, Number(event.target.value) || 1))}
               />
-            </label>
-          </div>
-          <p>
+            </Stack>
+          </Group>
+          <Text size="sm">
             Creates one scripted baseline variant. Dataset manifests are immutable after creation.
-          </p>
+          </Text>
           {error && (
-            <p className="notice error" role="alert">
+            <Text size="sm" className="notice error" role="alert">
               {error}
-            </p>
+            </Text>
           )}
-          <button className="primary-button" type="submit" disabled={busy || !available.length}>
+          <Button
+            variant="filled"
+            className="primary-button"
+            type="submit"
+            disabled={busy || !available.length}
+          >
             {busy ? "Creating…" : "Create experiment"}
-          </button>
-        </form>
+          </Button>
+        </Stack>
       )}
-    </section>
+    </Paper>
   );
 }
 
@@ -1786,38 +2149,68 @@ function RunDeletionInbox({
   const [open, setOpen] = useState(false);
   if (!items.length) return null;
   return (
-    <div className="approval-inbox">
-      <button
-        className="subtle-button surface-switch"
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-      >
-        Cleanup <b>{items.length}</b>
-      </button>
+    <Popover
+      opened={open}
+      onChange={setOpen}
+      width={340}
+      position="bottom-end"
+      withArrow
+      shadow="md"
+    >
+      <Popover.Target>
+        <Button
+          className="subtle-button surface-switch"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          Cleanup{" "}
+          <Text component="span" size="sm" fw={600}>
+            {items.length}
+          </Text>
+        </Button>
+      </Popover.Target>
       {open && (
-        <section className="approval-inbox-menu" role="dialog" aria-label="Incomplete run cleanup">
-          <header>
-            <strong>Incomplete run cleanup</strong>
-            <button onClick={() => setOpen(false)} aria-label="Close cleanup list">
-              ×
-            </button>
-          </header>
-          {items.map((item) => (
-            <button
-              key={item.runId}
-              onClick={() => {
-                onOpen(item.runId);
-                setOpen(false);
-              }}
-            >
-              <strong>{item.status}</strong>
-              <span>{String(item.task || item.workflowId || item.runId)}</span>
-              <small>{item.error || item.runId}</small>
-            </button>
-          ))}
-        </section>
+        <Popover.Dropdown>
+          <Stack
+            gap="sm"
+            mah={420}
+            style={{ overflow: "auto" }}
+            component="section"
+            className="approval-inbox-menu"
+            role="dialog"
+            aria-label="Incomplete run cleanup"
+          >
+            <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+              <Text component="span" size="sm" fw={600}>
+                Incomplete run cleanup
+              </Text>
+              <Button onClick={() => setOpen(false)} aria-label="Close cleanup list">
+                ×
+              </Button>
+            </Group>
+            {items.map((item) => (
+              <Button
+                key={item.runId}
+                onClick={() => {
+                  onOpen(item.runId);
+                  setOpen(false);
+                }}
+              >
+                <Text component="span" size="sm" fw={600}>
+                  {item.status}
+                </Text>
+                <Text component="span" size="sm">
+                  {String(item.task || item.workflowId || item.runId)}
+                </Text>
+                <Text component="span" size="xs" c="dimmed">
+                  {item.error || item.runId}
+                </Text>
+              </Button>
+            ))}
+          </Stack>
+        </Popover.Dropdown>
       )}
-    </div>
+    </Popover>
   );
 }
 
@@ -1830,45 +2223,73 @@ function ApprovalInbox({
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="approval-inbox">
-      <button
-        className="subtle-button surface-switch"
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => setOpen((value) => !value)}
-      >
-        Approvals <b>{items.length}</b>
-      </button>
+    <Popover
+      opened={open}
+      onChange={setOpen}
+      width={340}
+      position="bottom-end"
+      withArrow
+      shadow="md"
+    >
+      <Popover.Target>
+        <Button
+          className="subtle-button surface-switch"
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          onClick={() => setOpen((value) => !value)}
+        >
+          Approvals{" "}
+          <Badge size="xs" ml="xs" variant="light">
+            {items.length}
+          </Badge>
+        </Button>
+      </Popover.Target>
       {open && (
-        <section className="approval-inbox-menu" role="dialog" aria-label="Pending approvals">
-          <header>
-            <strong>Pending approvals</strong>
-            <button onClick={() => setOpen(false)} aria-label="Close approvals">
-              ×
-            </button>
-          </header>
-          {items.length ? (
-            items.map((item) => (
-              <button
-                key={item.approvalId ?? `${item.runId}:${item.invocationId}`}
-                onClick={() => {
-                  onOpen(item);
-                  setOpen(false);
-                }}
-              >
-                <strong>{item.action}</strong>
-                <span>{item.task || item.workflowId}</span>
-                <small>
-                  {item.runId.slice(0, 12)} · {item.invocationId.slice(0, 12)}
-                </small>
-              </button>
-            ))
-          ) : (
-            <p>No pending approvals.</p>
-          )}
-        </section>
+        <Popover.Dropdown>
+          <Stack
+            gap="sm"
+            mah={420}
+            style={{ overflow: "auto" }}
+            component="section"
+            className="approval-inbox-menu"
+            role="dialog"
+            aria-label="Pending approvals"
+          >
+            <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+              <Text component="span" size="sm" fw={600}>
+                Pending approvals
+              </Text>
+              <Button onClick={() => setOpen(false)} aria-label="Close approvals">
+                ×
+              </Button>
+            </Group>
+            {items.length ? (
+              items.map((item) => (
+                <Button
+                  key={item.approvalId ?? `${item.runId}:${item.invocationId}`}
+                  onClick={() => {
+                    onOpen(item);
+                    setOpen(false);
+                  }}
+                >
+                  <Text component="span" size="sm" fw={600}>
+                    {item.action}
+                  </Text>
+                  <Text component="span" size="sm">
+                    {item.task || item.workflowId}
+                  </Text>
+                  <Text component="span" size="xs" c="dimmed">
+                    {item.runId.slice(0, 12)} · {item.invocationId.slice(0, 12)}
+                  </Text>
+                </Button>
+              ))
+            ) : (
+              <Text size="sm">No pending approvals.</Text>
+            )}
+          </Stack>
+        </Popover.Dropdown>
       )}
-    </div>
+    </Popover>
   );
 }
 
@@ -1893,70 +2314,83 @@ function RunComparisonPanel({
     (selected[0]?.workflowId !== selected[1]?.workflowId ||
       selected[0]?.executionProfile !== selected[1]?.executionProfile);
   return (
-    <section className="run-comparison-panel" aria-label="Compare ordinary runs">
-      <header>
-        <div>
-          <div className="eyebrow">RUN COMPARISON</div>
-          <h2>Compare two runs</h2>
-          <p>Select any two runs. The comparison is pinned to their current journal revisions.</p>
-        </div>
-        <button className="primary-button" disabled={selectedIds.length !== 2} onClick={onCompare}>
-          Compare selected
-        </button>
-      </header>
-      <div className="comparison-run-picker">
-        {runs.slice(0, 16).map((run) => (
-          <label key={run.id}>
-            <input
-              type="checkbox"
-              checked={selectedIds.includes(run.id)}
-              disabled={!selectedIds.includes(run.id) && selectedIds.length >= 2}
-              onChange={(event) =>
-                onSelectionChange(
-                  event.target.checked
-                    ? [...selectedIds, run.id].slice(-2)
-                    : selectedIds.filter((id) => id !== run.id),
-                )
-              }
+    <Paper component="section" className="run-comparison-panel" aria-label="Compare ordinary runs">
+      <Stack gap="md">
+        <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+          <Stack gap="xs">
+            <Stack gap="xs" className="eyebrow">
+              RUN COMPARISON
+            </Stack>
+            <Title order={2}>Compare two runs</Title>
+            <Text size="sm">
+              Select any two runs. The comparison is pinned to their current journal revisions.
+            </Text>
+          </Stack>
+          <Button
+            variant="filled"
+            className="primary-button"
+            disabled={selectedIds.length !== 2}
+            onClick={onCompare}
+          >
+            Compare selected
+          </Button>
+        </Group>
+        <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+          {[0, 1].map((index) => (
+            <NativeSelect
+              key={index}
+              label={`Run ${index === 0 ? "A" : "B"}`}
+              disabled={index === 1 && !selectedIds[0]}
+              value={selectedIds[index] ?? ""}
+              onChange={(event) => {
+                const next = [...selectedIds];
+                next[index] = event.currentTarget.value;
+                onSelectionChange(index === 0 && !next[0] ? [] : next.filter(Boolean));
+              }}
+              data={[
+                { value: "", label: "Choose a run" },
+                ...runs
+                  .filter((run) => run.id !== selectedIds[1 - index])
+                  .map((run) => ({
+                    value: run.id,
+                    label: `${run.task?.slice(0, 45) || run.workflowId} · ${run.state} · ${run.id.slice(0, 12)}`,
+                  })),
+              ]}
             />
-            <span>
-              <strong>{run.task || run.workflowId}</strong>
-              <small>
-                {run.workflowId} · {run.state} · {run.id.slice(0, 12)}
-              </small>
-            </span>
-          </label>
-        ))}
-      </div>
-      {incompatible && (
-        <p className="comparison-warning">
-          These runs use different workflow or execution-profile settings. Stage alignment is
-          best-effort; outputs may not be directly equivalent.
-        </p>
-      )}
-      {error && (
-        <p className="notice error" role="alert">
-          {error}
-        </p>
-      )}
-      {timeline && (
-        <div className="comparison-result" aria-live="polite">
-          <h3>Stages · {timeline.rows.length}</h3>
-          {timeline.rows.map((row) => (
-            <div key={row.anchorId}>
-              <strong>{row.label}</strong>
-              <span>
-                {row.spans
-                  .map((span) =>
-                    span ? String(span.status ?? span.label ?? "observed") : "missing",
-                  )
-                  .join(" · ")}
-              </span>
-            </div>
           ))}
-        </div>
-      )}
-    </section>
+        </SimpleGrid>
+        {incompatible && (
+          <Text size="sm" className="comparison-warning">
+            These runs use different workflow or execution-profile settings. Stage alignment is
+            best-effort; outputs may not be directly equivalent.
+          </Text>
+        )}
+        {error && (
+          <Text size="sm" className="notice error" role="alert">
+            {error}
+          </Text>
+        )}
+        {timeline && (
+          <Stack gap="xs" className="comparison-result" aria-live="polite">
+            <Title order={3}>Stages · {timeline.rows.length}</Title>
+            {timeline.rows.map((row) => (
+              <Stack gap="xs" key={row.anchorId}>
+                <Text component="span" size="sm" fw={600}>
+                  {row.label}
+                </Text>
+                <Text component="span" size="sm">
+                  {row.spans
+                    .map((span) =>
+                      span ? String(span.status ?? span.label ?? "observed") : "missing",
+                    )
+                    .join(" · ")}
+                </Text>
+              </Stack>
+            ))}
+          </Stack>
+        )}
+      </Stack>
+    </Paper>
   );
 }
 
@@ -1966,22 +2400,21 @@ function RunDeletionDialog({
   busy,
   onClose,
   onConfirm,
+  onRefresh,
+  onConfirmShutdown,
+  onStop,
 }: {
+  onStop: () => void;
+  onRefresh: () => void;
+  onConfirmShutdown: (shutdownId: string) => void;
   preview: Record<string, unknown>;
   error?: string;
   busy: boolean;
   onClose: () => void;
   onConfirm: () => void;
 }) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const element = dialog.current;
-    if (!element) return;
-    element.showModal();
-    return () => {
-      if (element.open) element.close();
-    };
-  }, []);
+  const [verifiedStopped, setVerifiedStopped] = useState(false);
+  useEffect(() => setVerifiedStopped(false), [preview.revision]);
   const workspaces = Array.isArray(preview.workspaces) ? preview.workspaces : [];
   const blockers = Array.isArray(preview.blockers) ? preview.blockers : [];
   const removes = (preview.removes ?? {}) as Record<string, unknown>;
@@ -1989,106 +2422,199 @@ function RunDeletionDialog({
     typeof preview.task === "string" && preview.task.trim() ? preview.task : "Untitled task";
   const runId = typeof preview.runId === "string" ? preview.runId : "unknown";
   const canDelete = preview.canDelete === true;
+  const needsRecovery = preview.status === "recovery-required";
   return (
-    <dialog
-      ref={dialog}
-      className="run-deletion-dialog"
-      aria-labelledby="run-deletion-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
+    <Modal
+      opened
       onClose={onClose}
+      closeOnEscape={!busy}
+      closeOnClickOutside={!busy}
+      withCloseButton={!busy}
+      title={needsRecovery ? "Stop recovery run" : "Delete this run?"}
+      size="lg"
+      className="run-deletion-dialog"
     >
-      <header>
-        <div>
-          <div className="eyebrow">REMOVE FINISHED RUN</div>
-          <h2 id="run-deletion-title">Delete this run?</h2>
-        </div>
-        <button type="button" className="subtle-button" onClick={onClose} disabled={busy}>
-          Close
-        </button>
-      </header>
-      <p className="deletion-task">{task}</p>
-      <p className="deletion-run-id">{runId}</p>
-      <div className="deletion-summary">
-        <span>{String(removes.historyEvents ?? 0)} history events</span>
-        <span>{String(removes.attempts ?? 0)} attempts</span>
-        <span>{String(removes.artifacts ?? 0)} artifacts</span>
-        <span>{String(removes.workspaces ?? workspaces.length)} owned worktrees</span>
-      </div>
-      {workspaces.length > 0 && (
-        <section>
-          <h3>Owned worktrees to remove</h3>
-          <ul>
-            {workspaces.map((item, index) => {
-              const workspace = item as Record<string, unknown>;
-              return (
-                <li key={`${String(workspace.workspaceId ?? index)}`}>
-                  {String(workspace.path ?? "worktree")}
-                </li>
-              );
-            })}
-          </ul>
-        </section>
-      )}
-      {blockers.length > 0 && (
-        <section>
-          <h3>Retained references</h3>
-          <ul>
-            {blockers.map((item, index) => (
-              <li key={index}>
-                {String((item as Record<string, unknown>).message ?? "Referenced by retained data")}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-      {preview.workspaceAdapterMissing === true && (
-        <p className="notice error">
-          The workspace adapter is unavailable, so owned worktrees cannot be safely removed.
-        </p>
-      )}
-      {error && (
-        <p className="notice error" role="alert">
-          {error}
-        </p>
-      )}
-      <footer>
-        <button type="button" className="subtle-button" onClick={onClose} disabled={busy}>
-          Cancel
-        </button>
-        <button
-          type="button"
-          className="danger-button"
-          onClick={onConfirm}
-          disabled={
-            !(
-              canDelete ||
-              [
-                "workspace-cleanup-failed",
-                "workspace-cleaned",
-                "purge-failed",
-                "database-purged",
-                "blob-cleanup-failed",
-              ].includes(String(preview.deletionStatus))
-            ) || busy
-          }
-        >
-          {busy
-            ? "Removing run…"
-            : [
+      <Stack gap="md">
+        <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+          <Stack gap="xs">
+            <Stack gap="xs" className="eyebrow">
+              {needsRecovery ? "RESOLVE RECOVERY" : "REMOVE FINISHED RUN"}
+            </Stack>
+            <Title order={2} id="run-deletion-title">
+              {needsRecovery ? "Stop recovery run" : "Delete this run?"}
+            </Title>
+          </Stack>
+          <Button type="button" className="subtle-button" onClick={onClose} disabled={busy}>
+            Close
+          </Button>
+        </Group>
+        <Text size="sm" className="deletion-task">
+          {task}
+        </Text>
+        <Text size="sm" className="deletion-run-id">
+          {runId}
+        </Text>
+        <SimpleGrid cols={{ base: 1, md: 2 }} spacing="md" className="deletion-summary">
+          <Text component="span" size="sm">
+            {String(removes.historyEvents ?? 0)} history events
+          </Text>
+          <Text component="span" size="sm">
+            {String(removes.attempts ?? 0)} attempts
+          </Text>
+          <Text component="span" size="sm">
+            {String(removes.artifacts ?? 0)} artifacts
+          </Text>
+          <Text component="span" size="sm">
+            {String(removes.workspaces ?? workspaces.length)} owned worktrees
+          </Text>
+        </SimpleGrid>
+        {workspaces.length > 0 && (
+          <Stack gap="xs" component="section">
+            <Title order={3}>Owned worktrees to remove</Title>
+            <List>
+              {workspaces.map((item, index) => {
+                const workspace = item as Record<string, unknown>;
+                return (
+                  <List.Item key={`${String(workspace.workspaceId ?? index)}`}>
+                    {String(workspace.path ?? "worktree")}
+                  </List.Item>
+                );
+              })}
+            </List>
+          </Stack>
+        )}
+        {blockers.length > 0 && (
+          <Stack gap="xs" component="section">
+            <Title order={3}>What blocks deletion</Title>
+            <List>
+              {blockers.map((item, index) => (
+                <List.Item key={index}>
+                  {String(
+                    (item as Record<string, unknown>).message ?? "Referenced by retained data",
+                  )}
+                </List.Item>
+              ))}
+            </List>
+          </Stack>
+        )}
+        {preview.drained === false && (
+          <Alert color="yellow" title="Agent shutdown is not confirmed">
+            {String(
+              preview.drainReason ?? "The host has not confirmed that all execution has stopped.",
+            )}
+          </Alert>
+        )}
+        {preview.terminal === false && (
+          <Alert color="yellow">Stop the active run before deleting its history.</Alert>
+        )}
+        {preview.status === "recovery-required" &&
+          blockers.some(
+            (item) => (item as Record<string, unknown>).kind === "unconfirmed-harness-shutdown",
+          ) && (
+            <Paper>
+              <Stack gap="sm">
+                <Text size="sm" fw={600}>
+                  Resolve an abandoned agent
+                </Text>
+                <Text size="sm">
+                  A host restart left this agent’s outcome unknown. Stop its external process or
+                  verify that it has exited, then acknowledge its shutdown. This preserves the
+                  recovery record, cancels the run once all agents are confirmed stopped, and
+                  enables deletion once all blockers are resolved.
+                </Text>
+                <Checkbox
+                  checked={verifiedStopped}
+                  onChange={(event) => setVerifiedStopped(event.currentTarget.checked)}
+                  label="I verified that this run’s external agent has stopped"
+                />
+                {blockers
+                  .filter(
+                    (item) =>
+                      (item as Record<string, unknown>).kind === "unconfirmed-harness-shutdown",
+                  )
+                  .map((item) => {
+                    const blocker = item as Record<string, unknown>;
+                    return (
+                      <Button
+                        key={String(blocker.id)}
+                        disabled={!verifiedStopped || busy}
+                        onClick={() => onConfirmShutdown(String(blocker.id))}
+                      >
+                        Confirm agent stopped
+                      </Button>
+                    );
+                  })}
+              </Stack>
+            </Paper>
+          )}
+        {preview.status === "recovery-required" && preview.drained === true && (
+          <Alert color="teal">
+            <Stack gap="sm">
+              <Text size="sm">
+                Agent execution has stopped. Cancel the recovery run while retaining its history.
+              </Text>
+              <Button onClick={onStop} disabled={busy}>
+                Stop run
+              </Button>
+            </Stack>
+          </Alert>
+        )}
+        {preview.status === "cancelled" && preview.drained === true && (
+          <Alert color="teal" title="Run stopped">
+            Its history is retained. Close this dialog to keep it, or delete it below.
+          </Alert>
+        )}
+        {preview.workspaceAdapterMissing === true && (
+          <Text size="sm" className="notice error">
+            The workspace adapter is unavailable, so owned worktrees cannot be safely removed.
+          </Text>
+        )}
+        {error && (
+          <Text size="sm" className="notice error" role="alert">
+            {error}
+          </Text>
+        )}
+        <Group gap="xs" justify="space-between" wrap="wrap" component="footer">
+          <Button type="button" className="subtle-button" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button onClick={onRefresh} disabled={busy}>
+            Refresh blockers
+          </Button>
+          <Button
+            color="red"
+            variant="filled"
+            type="button"
+            className="danger-button"
+            onClick={onConfirm}
+            disabled={
+              !(
+                canDelete ||
+                [
                   "workspace-cleanup-failed",
                   "workspace-cleaned",
                   "purge-failed",
                   "database-purged",
                   "blob-cleanup-failed",
                 ].includes(String(preview.deletionStatus))
-              ? "Retry cleanup"
-              : "Delete run and owned history"}
-        </button>
-      </footer>
-    </dialog>
+              ) || busy
+            }
+          >
+            {busy
+              ? "Removing run…"
+              : [
+                    "workspace-cleanup-failed",
+                    "workspace-cleaned",
+                    "purge-failed",
+                    "database-purged",
+                    "blob-cleanup-failed",
+                  ].includes(String(preview.deletionStatus))
+                ? "Retry cleanup"
+                : "Delete run and owned history"}
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
   );
 }
 
@@ -2136,10 +2662,8 @@ function Topbar({
   workflows: WorkflowSummary[];
   workflowId: string;
   setWorkflowId: (id: string) => void;
-  surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints";
-  setSurface: (
-    surface: "runs" | "new-run" | "evals" | "swarm" | "development" | "checkpoints",
-  ) => void;
+  surface: Surface;
+  setSurface: (surface: Surface) => void;
 }) {
   const now = useServerNow(view?.servedAt, 250);
   const start = isoMs(view?.startedAt ?? run?.startedAt ?? view?.serverClock, now);
@@ -2147,121 +2671,55 @@ function Topbar({
   const elapsed = Math.max(0, end - start);
   const state = view?.state ?? run?.state;
   return (
-    <header className="topbar">
-      <div className="crumb">
-        Kouro <span>/</span> Local workbench
-      </div>
-      <div className="topbar-run">
-        {run ? (
-          <>
-            <StatusDot state={state} />
-            <span className="run-id">{run.id}</span>
-            {run.task && (
-              <span className="topbar-task" title={run.task}>
-                {run.task}
-              </span>
-            )}
-            <RoleBadge label="operator" />
-          </>
-        ) : (
-          <span className="muted">No active run</span>
-        )}
-      </div>
-      <div className="top-actions">
-        <ApprovalInbox items={pendingApprovals} onOpen={onOpenApproval} />
-        <RunDeletionInbox items={pendingRunDeletions} onOpen={onOpenDeletion} />
-        <label className="compact-run-picker">
-          <span>RUN</span>
-          <select
-            aria-label="Selected run"
-            value={selectedRunId ?? ""}
-            onChange={(event) => onSelectRun(event.target.value)}
+    <Paper radius={0} withBorder={false} p="md" className="topbar">
+      <Group justify="space-between" gap="sm">
+        <Group gap="sm" wrap="nowrap" miw={0} flex={1}>
+          <Text size="sm" c="dimmed" visibleFrom="sm">
+            Local workbench /
+          </Text>
+          <Text
+            size="sm"
+            fw={600}
+            truncate
+            maw={{ base: 140, md: 440 }}
+            title={run?.task ?? run?.workflowId}
           >
-            <option value="">Choose a run</option>
-            {runs.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.task || item.workflowId} · {item.id.slice(0, 8)}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button
-          className={`subtle-button surface-switch ${surface === "swarm" ? "active" : ""}`}
-          disabled={!run}
-          onClick={() => setSurface(surface === "swarm" ? "runs" : "swarm")}
-        >
-          Collaboration
-        </button>
-        <button
-          className={`subtle-button surface-switch ${surface === "checkpoints" ? "active" : ""}`}
-          onClick={() => setSurface(surface === "checkpoints" ? "runs" : "checkpoints")}
-          disabled={!run}
-          aria-label="Toggle checkpoints and forks"
-        >
-          <span aria-hidden="true">⌘</span> Checkpoints
-        </button>
-        <button
-          className={`subtle-button surface-switch ${surface === "evals" ? "active" : ""}`}
-          onClick={() => setSurface(surface === "evals" ? "runs" : "evals")}
-        >
-          Evaluations
-        </button>
-        <button
-          className={`subtle-button surface-switch ${surface === "development" ? "active" : ""}`}
-          onClick={() => setSurface(surface === "development" ? "runs" : "development")}
-        >
-          Developer tools
-        </button>
-        <label className="compact-workflow-picker">
-          <span>WORKFLOW</span>
-          <select
-            aria-label="Workflow"
-            value={workflowId}
-            onChange={(event) => setWorkflowId(event.target.value)}
+            {run?.task ?? run?.workflowId ?? "Choose a run"}
+          </Text>
+          {run && <Code visibleFrom="lg">{run.id.slice(0, 16)}</Code>}
+        </Group>
+        <Group gap="sm">
+          <Text
+            size="xs"
+            c={store.status === "live" ? "teal" : "yellow"}
+            className={`stream-state ${store.status}`}
           >
-            {workflows.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name ?? item.id}
-              </option>
-            ))}
-          </select>
-        </label>
-        <span className={`stream-state ${store.status}`}>
-          <i />
-          {store.status === "live" ? "LIVE" : store.status.toUpperCase()}
-        </span>
-        {run && <span className="elapsed">{formatDuration(elapsed)}</span>}
-        {run && view && (
-          <RunControlBar view={view} pendingAction={pendingAction} onControl={onControl} />
-        )}
-        <span data-testid="run-status" className="sr-only">
-          {state ?? "idle"}
-        </span>
-        {run && (
-          <button
-            className="subtle-button"
-            aria-label="New run with different input"
-            onClick={onNewRun}
-          >
-            New run
-          </button>
-        )}
-        <button
-          data-testid="start-run"
-          className="launch-button"
-          disabled={launching || !canLaunch}
-          onClick={onLaunch}
-        >
-          <span>＋</span>
-          {launching ? "Starting" : "Run workflow"}
-        </button>
-      </div>
+            {store.status === "live" ? "● connected" : store.status}
+          </Text>
+          {run && (
+            <Text size="xs" ff="monospace" c="teal" className="elapsed">
+              {formatDuration(elapsed)}
+            </Text>
+          )}
+          {run && view && (
+            <RunControlBar view={view} pendingAction={pendingAction} onControl={onControl} />
+          )}
+          {run && state === "recovery-required" && (
+            <Button color="red" onClick={() => onOpenDeletion(run.id)}>
+              Stop recovery run
+            </Button>
+          )}
+          <Badge variant="light" color={stateColor(state)} data-testid="run-status">
+            {state ?? "idle"}
+          </Badge>
+        </Group>
+      </Group>
       {actionNotice && (
-        <div className="action-notice" role="status">
+        <Alert mt="sm" role="status">
           {actionNotice}
-        </div>
+        </Alert>
       )}
-    </header>
+    </Paper>
   );
 }
 
@@ -2281,7 +2739,8 @@ function RunControlBar({
   const running = view.state === "running";
   const paused = (view.state as string) === "paused";
   const action = (name: string, capability: keyof UiRunView["capabilities"], label: string) => (
-    <button
+    <Button
+      color={name === "cancel" ? "red" : undefined}
       className={`control-button ${name === "cancel" ? "danger" : ""}`}
       disabled={pendingAction !== undefined || !allowed(view, capability)}
       title={
@@ -2291,10 +2750,16 @@ function RunControlBar({
       onClick={() => onControl(name)}
     >
       {pendingAction === name ? `${label}…` : label}
-    </button>
+    </Button>
   );
   return (
-    <div className="run-controls" aria-label="Run controls">
+    <Group
+      gap="xs"
+      justify="space-between"
+      wrap="wrap"
+      className="run-controls"
+      aria-label="Run controls"
+    >
       {running && allowed(view, "pause") && action("pause", "pause", "Pause")}
       {paused && allowed(view, "resume") && action("resume", "resume", "Resume")}
       {running && allowed(view, "interrupt") && action("interrupt", "interrupt", "Interrupt")}
@@ -2303,11 +2768,13 @@ function RunControlBar({
         !paused &&
         allowed(view, "reattach") &&
         action("reattach", "reattach", "Reattach")}
-    </div>
+    </Group>
   );
 }
 
 function Preview({
+  workflows,
+  onSelectWorkflow,
   workflow,
   nodeSettings,
   setNodeSettings,
@@ -2320,6 +2787,8 @@ function Preview({
   onLaunch,
   launching,
 }: {
+  workflows: WorkflowSummary[];
+  onSelectWorkflow: (id: string) => void;
   workflow?: WorkflowSummary;
   nodeSettings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>;
   setNodeSettings: (
@@ -2359,165 +2828,231 @@ function Preview({
     update: { harness?: string; modelId?: string; capabilities?: string[] },
   ) => setNodeSettings({ ...nodeSettings, [nodeId]: { ...nodeSettings[nodeId], ...update } });
   return (
-    <section className="preview">
-      <div className="preview-kicker">
-        WORKFLOW PREVIEW <span>UNEXECUTED</span>
-      </div>
-      {editableNodes.length > 0 && (
-        <section className="node-settings">
-          <h2>Node settings</h2>
-          <p>
-            Choose the harness and model for each parent and child. Use a model your provider
-            account can access.
-          </p>
-          {editableNodes.map(({ node, definitionId, key, readOnly }) => {
-            const settings = nodeSettings[key] ?? {};
-            const capabilities = settings.capabilities ?? node.capabilities ?? [];
-            return (
-              <fieldset key={key} className="node-setting">
-                <legend>
-                  {definitionId} / {node.id} · {readOnly ? "read-only subagent" : node.kind}
-                </legend>
-                {node.kind === "agent" && (
-                  <>
-                    <label>
-                      Harness
-                      <select
-                        value={settings.harness ?? node.harness ?? ""}
-                        onChange={(event) =>
-                          updateNode(key, { harness: event.target.value || undefined })
-                        }
-                      >
-                        <option value="">Host default</option>
-                        <option value="codex">Codex</option>
-                        <option value="pi">Pi</option>
-                        <option value="claude">Claude</option>
-                        <option value="opencode">OpenCode</option>
-                      </select>
-                    </label>
-                    <label>
-                      Model
-                      <input
-                        value={settings.modelId ?? node.modelId ?? ""}
-                        placeholder="Harness default"
-                        onChange={(event) =>
-                          updateNode(key, { modelId: event.target.value || undefined })
-                        }
-                      />
-                    </label>
-                  </>
-                )}
-                <label className="node-capability">
-                  <input
-                    type="checkbox"
-                    checked={capabilities.includes("repository.read")}
-                    onChange={(event) =>
-                      updateNode(key, {
-                        capabilities: event.target.checked
-                          ? [...capabilities, "repository.read"]
-                          : capabilities.filter((item) => item !== "repository.read"),
-                      })
-                    }
-                  />
-                  Repository read
-                </label>
-                <label className="node-capability">
-                  <input
-                    type="checkbox"
-                    disabled={readOnly}
-                    checked={capabilities.includes("repository.write")}
-                    onChange={(event) =>
-                      updateNode(key, {
-                        capabilities: event.target.checked
-                          ? [...capabilities, "repository.write"]
-                          : capabilities.filter((item) => item !== "repository.write"),
-                      })
-                    }
-                  />
-                  Repository write
-                </label>
-                {node.kind === "command" && (
-                  <label className="node-capability">
-                    <input
-                      type="checkbox"
-                      checked={capabilities.includes("terminal.execute")}
-                      onChange={(event) =>
-                        updateNode(key, {
-                          capabilities: event.target.checked
-                            ? [...capabilities, "terminal.execute"]
-                            : capabilities.filter((item) => item !== "terminal.execute"),
-                        })
-                      }
-                    />
-                    Run command outside the sandbox
-                  </label>
-                )}
-              </fieldset>
-            );
-          })}
-        </section>
-      )}
-      <h1>{workflow?.name ?? workflow?.id ?? "Select a workflow"}</h1>
-      <p className="preview-desc">
-        Review the compiled execution path before admitting a local run.
-      </p>
-      {workflow?.validation && !workflow.validation.valid && (
-        <div className="validation-warning">
-          Bundle validation failed: {workflow.validation.errors?.join(", ")}
-        </div>
-      )}
-      {taskInput && (
-        <label className="task-input">
-          <span>WORK ITEM / TASK{taskRequired ? " · REQUIRED" : ""}</span>
-          <textarea
-            value={task}
-            onChange={(event) => setTask(event.target.value)}
-            placeholder="Describe what this workflow should accomplish…"
-            rows={4}
-          />
-          <small>The task is delivered as the workflow's typed root input.</small>
-        </label>
-      )}
-      <WorkflowInputs
-        bundle={workflow?.bundle}
-        drafts={inputDrafts}
-        onChange={setInputDrafts}
-        errors={inputs.errors}
-      />
-      <label className="task-input">
-        <span>
-          REPOSITORY / WORKSPACE <small>OPTIONAL</small>
-        </span>
-        <input
-          value={workspacePath}
-          onChange={(event) => setWorkspacePath(event.target.value)}
-          placeholder="/path/to/a git repository"
-        />
-        <small>Workspace effects run in an isolated managed worktree.</small>
-      </label>
-      <div className="preview-map">
-        {workflow?.graph?.nodes?.map((node, index) => (
-          <div className="preview-node" key={node.id}>
-            <span>{String(index + 1).padStart(2, "0")}</span>
-            <div>
-              <strong>{node.label}</strong>
-              <em>
-                {node.kind}
-                {node.role ? ` · ${node.role}` : ""}
-              </em>
-            </div>
-          </div>
-        )) ?? <div className="empty-inline">The host did not return a compiled graph.</div>}
-      </div>
-      <button
-        className="primary-cta"
-        disabled={!workflow || launching || !inputs.valid}
-        onClick={onLaunch}
+    <Stack gap={0} className="preview">
+      <PageHeader
+        actions={
+          <Text size="xs" c="dimmed" ff="monospace">
+            Launch preview · next run uses v{workflow?.version ?? "local"}
+          </Text>
+        }
       >
-        {launching ? "Starting run…" : taskRequired ? "Run workflow" : "Start demo run"}
-        <span>→</span>
-      </button>
-    </section>
+        Workflows /{" "}
+        <Text component="span" fw={600}>
+          {workflow?.name ?? workflow?.id ?? "Select a workflow"}
+        </Text>
+      </PageHeader>
+      <Tabs value="launch">
+        <Tabs.List px="lg">
+          <Tabs.Tab value="launch">Launch</Tabs.Tab>
+        </Tabs.List>
+      </Tabs>
+      <Grid gap={0}>
+        <Grid.Col span={{ base: 12, lg: 3, xl: 3 }}>
+          <Paper radius={0} h="100%" withBorder={false} p="lg">
+            <Stack gap="sm">
+              <Text size="xs" c="dimmed">
+                DISCOVERED WORKFLOWS
+              </Text>
+              <Text size="xs" c="dimmed">
+                Local workflow bundles
+              </Text>
+              {workflows.map((item) => (
+                <NavLink
+                  component="button"
+                  type="button"
+                  key={item.id}
+                  active={item.id === workflow?.id}
+                  label={item.name ?? item.id}
+                  description={item.version ? `v${item.version}` : "Local bundle"}
+                  onClick={() => onSelectWorkflow(item.id)}
+                />
+              ))}
+            </Stack>
+          </Paper>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 9, xl: 5 }}>
+          <Stack gap="md">
+            <Paper radius={0} p="lg" withBorder={false}>
+              <Stack gap="md">
+                <Group justify="space-between">
+                  <Title order={3}>Compiled workflow</Title>
+                  <Badge variant="light">{workflow?.graph?.nodes.length ?? 0} nodes</Badge>
+                </Group>
+                <WorkflowPreviewGraph
+                  graph={workflow?.graph}
+                  rootDefinitionId={workflow?.bundle?.rootDefinitionId}
+                />
+                <Group>
+                  <Code>{workflow?.id ?? "No workflow selected"}</Code>
+                  {workflow?.version && <Badge variant="outline">v{workflow.version}</Badge>}
+                  <Text size="xs" c="dimmed">
+                    {workflow?.digest?.slice(0, 16) ?? ""}
+                  </Text>
+                </Group>
+                {workflow?.validation && !workflow.validation.valid ? (
+                  <Alert color="red" title="Bundle validation failed">
+                    {workflow.validation.errors?.join(", ")}
+                  </Alert>
+                ) : (
+                  workflow && (
+                    <Paper p="sm">
+                      <Text size="sm">
+                        No validation failures. Review required inputs before starting.
+                      </Text>
+                    </Paper>
+                  )
+                )}
+              </Stack>
+            </Paper>
+          </Stack>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, xl: 4 }}>
+          <Paper radius={0} p="lg" withBorder={false}>
+            <Stack gap="md">
+              <Title order={3}>Launch run</Title>
+              {taskInput && (
+                <Textarea
+                  label="Work item / task"
+                  aria-label="Work item / task"
+                  required={taskRequired}
+                  value={task}
+                  onChange={(event) => setTask(event.currentTarget.value)}
+                  placeholder="Describe what this workflow should accomplish…"
+                  minRows={4}
+                  autosize
+                  maxRows={10}
+                  description="Delivered as the workflow's typed root input."
+                />
+              )}
+              <WorkflowInputs
+                bundle={workflow?.bundle}
+                drafts={inputDrafts}
+                onChange={setInputDrafts}
+                errors={inputs.errors}
+              />
+              <TextInput
+                label="Repository / workspace"
+                value={workspacePath}
+                onChange={(event) => setWorkspacePath(event.currentTarget.value)}
+                placeholder="/path/to/a git repository"
+                description="Optional. Effects run in an isolated managed worktree."
+              />
+              {editableNodes.length > 0 && (
+                <Stack gap="md">
+                  <Stack gap={4}>
+                    <Title order={2}>Node settings</Title>
+                    <Text size="sm" c="dimmed">
+                      Choose harnesses and models for parent and child agents. Read-only subagents
+                      cannot write to the repository.
+                    </Text>
+                  </Stack>
+                  <Stack gap="md">
+                    {editableNodes.map(({ node, definitionId, key, readOnly }) => {
+                      const settings = nodeSettings[key] ?? {};
+                      const capabilities = settings.capabilities ?? node.capabilities ?? [];
+                      return (
+                        <Fieldset
+                          key={key}
+                          legend={`${definitionId} / ${node.id} · ${readOnly ? "read-only subagent" : node.kind}`}
+                        >
+                          <Stack gap="md">
+                            {node.kind === "agent" && (
+                              <SimpleGrid cols={{ base: 1, sm: 2 }}>
+                                <NativeSelect
+                                  label="Harness"
+                                  value={settings.harness ?? node.harness ?? ""}
+                                  onChange={(event) =>
+                                    updateNode(key, {
+                                      harness: event.currentTarget.value || undefined,
+                                    })
+                                  }
+                                  data={[
+                                    { value: "", label: "Host default" },
+                                    { value: "codex", label: "Codex" },
+                                    { value: "pi", label: "Pi" },
+                                    { value: "claude", label: "Claude" },
+                                    { value: "opencode", label: "OpenCode" },
+                                  ]}
+                                />
+                                <TextInput
+                                  label="Model"
+                                  value={settings.modelId ?? node.modelId ?? ""}
+                                  placeholder="Harness default"
+                                  onChange={(event) =>
+                                    updateNode(key, {
+                                      modelId: event.currentTarget.value || undefined,
+                                    })
+                                  }
+                                />
+                              </SimpleGrid>
+                            )}
+                            <Group gap="md">
+                              <Checkbox
+                                label="Repository read"
+                                checked={capabilities.includes("repository.read")}
+                                onChange={(event) =>
+                                  updateNode(key, {
+                                    capabilities: event.currentTarget.checked
+                                      ? [...capabilities, "repository.read"]
+                                      : capabilities.filter((item) => item !== "repository.read"),
+                                  })
+                                }
+                              />
+                              <Checkbox
+                                label="Repository write"
+                                disabled={readOnly}
+                                checked={capabilities.includes("repository.write")}
+                                onChange={(event) =>
+                                  updateNode(key, {
+                                    capabilities: event.currentTarget.checked
+                                      ? [...capabilities, "repository.write"]
+                                      : capabilities.filter((item) => item !== "repository.write"),
+                                  })
+                                }
+                              />
+                              {node.kind === "command" && (
+                                <Checkbox
+                                  label="Run command outside the sandbox"
+                                  checked={capabilities.includes("terminal.execute")}
+                                  onChange={(event) =>
+                                    updateNode(key, {
+                                      capabilities: event.currentTarget.checked
+                                        ? [...capabilities, "terminal.execute"]
+                                        : capabilities.filter(
+                                            (item) => item !== "terminal.execute",
+                                          ),
+                                    })
+                                  }
+                                />
+                              )}
+                            </Group>
+                          </Stack>
+                        </Fieldset>
+                      );
+                    })}
+                  </Stack>
+                </Stack>
+              )}
+              <Button
+                fullWidth
+                variant="filled"
+                size="sm"
+                data-testid="start-run"
+                className="primary-cta"
+                disabled={
+                  !workflow || launching || !inputs.valid || workflow.validation?.valid === false
+                }
+                loading={launching}
+                onClick={onLaunch}
+                rightSection={<IconArrowRight size={16} />}
+              >
+                {launching ? "Starting run…" : taskRequired ? "Run workflow" : "Start demo run"}
+              </Button>
+            </Stack>
+          </Paper>
+        </Grid.Col>
+      </Grid>
+    </Stack>
   );
 }
 
@@ -2528,23 +3063,36 @@ function Workbench({
   setSelectedInvocationId,
   onControl,
   pendingAction,
-  onInspectorResizeStart,
+  inspectorWidth,
+  setInspectorWidth,
+  taskLabel,
+  requestedWorkspace,
 }: {
+  requestedWorkspace?: { tab: "session" | "review"; nonce: number };
+  taskLabel?: string;
   workflow?: WorkflowSummary;
   view: UiRunView;
   selectedInvocationId?: string;
   setSelectedInvocationId: (id: string) => void;
   onControl: ControlAction;
   pendingAction?: string;
-  onInspectorResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  inspectorWidth: number;
+  setInspectorWidth: (width: number) => void;
 }) {
   const [scoutRequests, setScoutRequests] = useState<ScoutTimelineRequest[]>([]);
   const [mode, setMode] = useState<"graph" | "split" | "timeline">(() => {
     const saved = readPreference("kouro.view.mode", "split");
     return saved === "graph" || saved === "timeline" ? saved : "split";
   });
+  const [evidenceScope, setEvidenceScope] = useState<"invocation" | "run">("invocation");
+  const [focusedEvidenceAttempt, setFocusedEvidenceAttempt] = useState<string>();
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [sessionRequest, setSessionRequest] = useState(0);
+  const mobile = useMediaQuery("(max-width: 61.99em)");
+  const [workspaceTab, setWorkspaceTab] = useState<string>(requestedWorkspace?.tab ?? "workbench");
+  useEffect(() => {
+    if (requestedWorkspace) setWorkspaceTab(requestedWorkspace.tab);
+  }, [requestedWorkspace]);
   const selectInvocation = useCallback(
     (id: string) => {
       setSelectedInvocationId(id);
@@ -2561,6 +3109,10 @@ function Workbench({
     agentInvocations.find((item) => item.invocationId === selectedInvocationId) ??
     agentInvocations.find((item) => item.state === "running") ??
     agentInvocations.at(-1);
+  useEffect(() => {
+    if (requestedWorkspace?.tab === "session" && sessionTarget)
+      setSelectedInvocationId(sessionTarget.invocationId);
+  }, [requestedWorkspace]);
   useEffect(() => writePreference("kouro.view.mode", mode), [mode]);
   useEffect(() => {
     let cancelled = false;
@@ -2589,81 +3141,290 @@ function Workbench({
       cancelled = true;
     };
   }, [view.runId, view.state]);
-  return (
-    <section className={`workbench ${mobileInspectorOpen ? "inspector-open" : ""}`}>
-      <div className="view-toolbar">
-        <div className="view-tabs">
-          <button
-            data-testid="split-view"
-            className={mode === "split" ? "active" : ""}
-            onClick={() => setMode("split")}
-          >
-            SPLIT VIEW
-          </button>
-          <button
-            data-testid="graph-view"
-            className={mode === "graph" ? "active" : ""}
-            onClick={() => setMode("graph")}
-          >
-            GRAPH
-          </button>
-          <button
-            data-testid="timeline-view"
-            className={mode === "timeline" ? "active" : ""}
-            onClick={() => setMode("timeline")}
-          >
-            TIMELINE
-          </button>
-        </div>
-        <span className="toolbar-rule" />
-        <span className="toolbar-caption">
-          compiled graph <b>{workflow?.digest?.slice(0, 8) ?? "local"}</b>
-        </span>
-        <span className="toolbar-caption">rev {view.revision}</span>
-        <button
-          className="subtle-button"
-          disabled={!sessionTarget}
-          onClick={() => {
-            if (!sessionTarget) return;
-            setSelectedInvocationId(sessionTarget.invocationId);
-            setSessionRequest((value) => value + 1);
-          }}
-        >
-          Agent session
-        </button>
-        <button
-          className="mobile-inspector-toggle"
-          onClick={() => setMobileInspectorOpen((open) => !open)}
-        >
-          {mobileInspectorOpen ? "Close inspector" : "Inspector"}
-        </button>
-      </div>
-      <div className={`work-area ${mode}`}>
-        <GraphPanel
-          graph={workflow?.graph}
-          view={view}
-          selectedId={selectedInvocationId}
-          onSelect={selectInvocation}
-        />
-        <Timeline
-          view={view}
-          scoutRequests={scoutRequests}
-          selectedId={selectedInvocationId}
-          onSelect={selectInvocation}
-        />
-      </div>
-      <Inspector
-        view={view}
-        scoutRequests={scoutRequests}
-        graph={workflow?.graph}
-        selectedId={selectedInvocationId}
-        onSelect={selectInvocation}
-        sessionRequest={sessionRequest}
-        onControl={onControl}
-        pendingAction={pendingAction}
-        onResizeStart={onInspectorResizeStart}
+  const inspector = (
+    <Inspector
+      view={view}
+      scoutRequests={scoutRequests}
+      graph={workflow?.graph}
+      selectedId={selectedInvocationId}
+      onSelect={selectInvocation}
+      sessionRequest={sessionRequest}
+      onControl={onControl}
+      pendingAction={pendingAction}
+      sessionEmbedded={workspaceTab === "session"}
+      requestedAttemptId={focusedEvidenceAttempt}
+      requestedTab={
+        workspaceTab === "attempts"
+          ? "attempts"
+          : workspaceTab === "usage"
+            ? "usage"
+            : workspaceTab === "logs"
+              ? "logs"
+              : undefined
+      }
+    />
+  );
+  const selected = asArray(view.invocations).find(
+    (item) => item.invocationId === selectedInvocationId,
+  );
+  const title = taskLabel?.split("\n")[0] || workflow?.name || workflow?.id || "Run workbench";
+  const header = (
+    <Group p="lg" justify="space-between" wrap="nowrap" miw={0}>
+      <Text fz={{ base: 20, md: 30 }} fw={650} truncate title={title} flex={1}>
+        {title}
+      </Text>
+      <Text visibleFrom="md" size="xs" c="dimmed">
+        {workflow?.id?.toUpperCase()} {workflow?.version ? `· V${workflow.version}` : ""}
+      </Text>
+      <Popover position="bottom-end" withArrow>
+        <Popover.Target>
+          <Button size="compact-xs" variant="subtle">
+            View
+          </Button>
+        </Popover.Target>
+        <Popover.Dropdown>
+          <Stack>
+            <SegmentedControl
+              size="xs"
+              value={mode}
+              onChange={(value) => setMode(value as typeof mode)}
+              data={[
+                { value: "split", label: "Split" },
+                { value: "graph", label: "Graph" },
+                { value: "timeline", label: "Timeline" },
+              ]}
+            />
+            <Button
+              size="xs"
+              disabled={!sessionTarget}
+              onClick={() => {
+                if (!sessionTarget) return;
+                setSelectedInvocationId(sessionTarget.invocationId);
+                setSessionRequest((value) => value + 1);
+              }}
+            >
+              Open agent session
+            </Button>
+          </Stack>
+        </Popover.Dropdown>
+      </Popover>
+      <Button size="xs" hiddenFrom="md" onClick={() => setMobileInspectorOpen(true)}>
+        Inspector
+      </Button>
+    </Group>
+  );
+  const visual = (
+    <Stack gap={0} miw={0}>
+      {header}
+      <Divider />
+      {mobile ? (
+        <Paper radius={0}>
+          <Stack>
+            <Title order={3}>Execution steps</Title>
+            {asArray(view.invocations).map((item) => (
+              <NavLink
+                component="button"
+                type="button"
+                key={item.invocationId}
+                active={item.invocationId === selectedInvocationId}
+                label={item.sourceNodeId}
+                description={`${item.scopeId} · ${item.state}`}
+                leftSection={<StatusDot state={item.state} />}
+                onClick={() => selectInvocation(item.invocationId)}
+              />
+            ))}
+          </Stack>
+        </Paper>
+      ) : (
+        mode !== "timeline" && (
+          <GraphPanel
+            graph={workflow?.graph}
+            view={view}
+            scoutRequests={scoutRequests}
+            selectedId={selectedInvocationId}
+            onSelect={selectInvocation}
+          />
+        )
+      )}
+      {mode !== "graph" && (
+        <>
+          <Divider />
+          <Timeline
+            view={view}
+            scoutRequests={scoutRequests}
+            selectedId={selectedInvocationId}
+            onSelect={selectInvocation}
+          />
+        </>
+      )}
+    </Stack>
+  );
+  const belongs = (item: { invocationId?: string; attemptId?: string }) =>
+    evidenceScope === "run" ||
+    Boolean(selectedInvocationId && evidenceBelongsTo(view, selectedInvocationId, item));
+  const evidenceArtifacts = asArray(view.artifacts).filter(
+    (artifact) =>
+      evidenceScope === "run" ||
+      artifactIdentity(view, artifact.artifactId).owners.some(
+        (owner) => owner.invocationId === selectedInvocationId,
+      ),
+  );
+  const evidence = (
+    <Stack gap="md" p="lg" miw={0}>
+      <Group justify="space-between">
+        <Title order={2}>
+          {workspaceTab === "attempts"
+            ? "Attempt history"
+            : workspaceTab === "usage"
+              ? "Usage & artifacts"
+              : "Logs & events"}
+        </Title>
+        <Button size="xs" hiddenFrom="md" onClick={() => setMobileInspectorOpen(true)}>
+          Inspector
+        </Button>
+      </Group>
+      <SegmentedControl
+        aria-label="Evidence scope"
+        value={evidenceScope}
+        onChange={(value) => setEvidenceScope(value as typeof evidenceScope)}
+        data={[
+          { value: "invocation", label: "Selected invocation" },
+          { value: "run", label: "Whole run" },
+        ]}
       />
-    </section>
+      <InvocationPicker
+        items={asArray(view.invocations)}
+        selectedId={selectedInvocationId ?? ""}
+        onSelect={selectInvocation}
+      />
+      <Text size="xs" c="dimmed">
+        {evidenceScope === "run"
+          ? "Showing all invocations in this run"
+          : selectedInvocationId
+            ? invocationLabel(view, selectedInvocationId)
+            : "Select an invocation to inspect its evidence"}
+      </Text>
+      {workspaceTab === "usage" && (
+        <Grid gap="lg">
+          <Grid.Col span={{ base: 12, xl: 6 }}>
+            <Stack gap="sm">
+              <Text size="xs" c="dimmed">
+                USAGE BY ATTEMPT
+              </Text>
+              <UsagePanel items={view.usage.filter(belongs)} view={view} />
+            </Stack>
+          </Grid.Col>
+          <Grid.Col span={{ base: 12, xl: 6 }}>
+            <Stack gap="sm">
+              <Text size="xs" c="dimmed">
+                ARTIFACTS & PRODUCERS
+              </Text>
+              <ArtifactPanel artifacts={evidenceArtifacts} view={view} />
+            </Stack>
+          </Grid.Col>
+        </Grid>
+      )}
+      {workspaceTab === "logs" && (
+        <>
+          <LogPanel items={view.logs.filter(belongs)} />
+          <EventHistoryPanel
+            runId={view.runId}
+            invocationId={evidenceScope === "invocation" ? selectedInvocationId : undefined}
+            attemptIds={
+              evidenceScope === "invocation"
+                ? asArray(view.attempts)
+                    .filter((attempt) => attempt.invocationId === selectedInvocationId)
+                    .map((attempt) => attempt.attemptId)
+                : undefined
+            }
+          />
+        </>
+      )}
+      {workspaceTab === "attempts" && (
+        <EvidencePanel
+          attempts={asArray(view.attempts).filter(belongs)}
+          view={view}
+          focusedAttemptId={focusedEvidenceAttempt}
+          onFocus={(attemptId) => {
+            setFocusedEvidenceAttempt(attemptId);
+            const attempt = view.attempts[attemptId];
+            if (attempt) selectInvocation(attempt.invocationId);
+          }}
+        />
+      )}
+    </Stack>
+  );
+  return (
+    <Stack gap={0} className="workbench">
+      <Tabs value={workspaceTab} onChange={(value) => setWorkspaceTab(value ?? "workbench")}>
+        <Tabs.List px="lg" aria-label="Run views">
+          <Tabs.Tab value="workbench">Workbench</Tabs.Tab>
+          <Tabs.Tab
+            value="session"
+            onClick={() => {
+              if (sessionTarget) setSelectedInvocationId(sessionTarget.invocationId);
+            }}
+          >
+            Session
+          </Tabs.Tab>
+          <Tabs.Tab value="attempts">Attempts</Tabs.Tab>
+          <Tabs.Tab value="usage">Usage & artifacts</Tabs.Tab>
+          <Tabs.Tab value="logs">Logs & events</Tabs.Tab>
+          <Tabs.Tab value="review">Review</Tabs.Tab>
+          <Tabs.Tab value="delivery">Delivery</Tabs.Tab>
+        </Tabs.List>
+      </Tabs>
+      {workspaceTab === "session" ? (
+        <Box p={{ base: "sm", md: "lg" }}>{inspector}</Box>
+      ) : workspaceTab === "delivery" ? (
+        <Box p="lg">
+          <DiffPanel runId={view.runId} revision={view.revision} showDelivery />
+        </Box>
+      ) : workspaceTab === "review" ? (
+        <Grid gap={0}>
+          <Grid.Col span={{ base: 12, lg: 8 }}>
+            <Box p="lg">
+              <DiffPanel runId={view.runId} revision={view.revision} />
+            </Box>
+          </Grid.Col>
+          <Grid.Col span={{ base: 12, lg: 4 }}>{inspector}</Grid.Col>
+        </Grid>
+      ) : workspaceTab === "usage" || workspaceTab === "logs" ? (
+        evidence
+      ) : mobile ? (
+        <>
+          {workspaceTab === "workbench" ? visual : evidence}
+          <Drawer
+            opened={mobileInspectorOpen}
+            onClose={() => setMobileInspectorOpen(false)}
+            title="Invocation inspector"
+            position="bottom"
+            size="85%"
+            keepMounted
+          >
+            {inspector}
+          </Drawer>
+        </>
+      ) : (
+        <Splitter
+          sizes={[100, `${inspectorWidth}px`]}
+          onSizeChange={(sizes) => {
+            const size = sizes[1];
+            if (typeof size === "string" && size.endsWith("px"))
+              setInspectorWidth(Math.round(parseFloat(size)));
+          }}
+          withHandle
+          lineSize={1}
+        >
+          <Splitter.Pane defaultSize={100} min="40%">
+            {workspaceTab === "workbench" ? visual : evidence}
+          </Splitter.Pane>
+          <Splitter.Pane defaultSize={`${inspectorWidth}px`} min="280px" max="560px">
+            {inspector}
+          </Splitter.Pane>
+        </Splitter>
+      )}
+    </Stack>
   );
 }
 
@@ -2672,17 +3433,29 @@ function WorkNode({ data, selected }: NodeProps) {
   const node = data.node as WorkflowNode;
   const state = data.state as string | undefined;
   return (
-    <div className={`work-node ${selected ? "selected" : ""} ${state ?? ""}`}>
+    <Paper
+      p="sm"
+      radius={0}
+      w={176}
+      mih={64}
+      bg={selected ? "var(--mantine-primary-color-light)" : "var(--mantine-color-default)"}
+      className={`work-node ${selected ? "selected" : ""} ${state ?? ""}`}
+    >
       <Handle type="target" position={Position.Left} />
-      <div className="node-top">
-        <span className="node-kind">{node.kind}</span>
-        <StatusDot state={state} />
-      </div>
-      <strong>{node.label}</strong>
-      <span className="sr-only">{state ?? "not started"}</span>
-      {node.role && <em>{node.role}</em>}
+      <Stack gap={3}>
+        <Text size="sm" fw={600}>
+          {node.definitionId &&
+          node.definitionId !== data.rootDefinitionId &&
+          node.id === "subagent"
+            ? node.definitionId
+            : node.id}
+        </Text>
+        <Text size="xs" c={stateColor(state)}>
+          {state ?? "not started"}
+        </Text>
+      </Stack>
       <Handle type="source" position={Position.Right} />
-    </div>
+    </Paper>
   );
 }
 
@@ -2690,8 +3463,14 @@ function ScopeNode({ data }: NodeProps) {
   const scope = data.scope as GraphScope;
   const toggle = data.onToggle as ((id: string) => void) | undefined;
   return (
-    <div className="scope-node" data-testid={`scope-${scope.id}`}>
-      <button
+    <Paper
+      p="xs"
+      h="100%"
+      bg="var(--mantine-color-default-hover)"
+      className="scope-node"
+      data-testid={`scope-${scope.id}`}
+    >
+      <Button
         type="button"
         className="scope-toggle"
         data-collapsed={scope.collapsed ? "true" : "false"}
@@ -2700,10 +3479,14 @@ function ScopeNode({ data }: NodeProps) {
           toggle?.(scope.id);
         }}
       >
-        <span>{scope.label}</span>
-        <small>{scope.collapsed ? "collapsed" : "scope"}</small>
-      </button>
-    </div>
+        <Text component="span" size="sm">
+          {scope.label}
+        </Text>
+        <Text component="span" size="xs" c="dimmed">
+          {scope.collapsed ? "collapsed" : "scope"}
+        </Text>
+      </Button>
+    </Paper>
   );
 }
 
@@ -2712,8 +3495,10 @@ const GraphPanel = memo(function GraphPanel({
   view,
   selectedId,
   onSelect,
+  scoutRequests,
 }: {
   graph?: WorkflowGraph;
+  scoutRequests: ScoutTimelineRequest[];
   view: UiRunView;
   selectedId?: string;
   onSelect: (id: string) => void;
@@ -2721,6 +3506,7 @@ const GraphPanel = memo(function GraphPanel({
   const reactFlow = useReactFlow();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const [showOutline, setShowOutline] = useState(false);
+  const graphAppearance = useComputedColorScheme("dark");
   const invocations = asArray(view.invocations);
   const runningNodeIds = useMemo(
     () =>
@@ -2729,10 +3515,33 @@ const GraphPanel = memo(function GraphPanel({
       ),
     [invocations],
   );
-  const projection = useMemo(
-    () => projectHierarchicalGraph(graph, view, collapsed),
-    [graph, view, collapsed],
-  );
+  const projection = useMemo(() => {
+    const layout = layoutWorkbenchGraph(
+      projectHierarchicalGraph(graph, view, collapsed),
+      view.bundle.rootDefinitionId,
+      showOutline,
+    );
+    return {
+      ...layout,
+      nodes: layout.nodes.map((node) => {
+        if (node.type !== "work" || node.data.invocationId) return node;
+        const source = node.data.node as WorkflowNode;
+        const request = [...scoutRequests]
+          .reverse()
+          .find((request) => request.scoutId === source.definitionId);
+        return request
+          ? {
+              ...node,
+              data: {
+                ...node.data,
+                state: request.state,
+                parentInvocationId: request.parentInvocationId,
+              },
+            }
+          : node;
+      }),
+    };
+  }, [graph, view, collapsed, showOutline, scoutRequests]);
   const breadcrumbs = useMemo(
     () => graphSelectionBreadcrumbs(graph, view, selectedId),
     [graph, view, selectedId],
@@ -2777,8 +3586,14 @@ const GraphPanel = memo(function GraphPanel({
           type: "smoothstep",
           animated: Boolean(runningNodeIds.has(edge.source)),
           className: edge.className ? `work-edge ${edge.className}` : "work-edge",
-          labelStyle: { fill: "#71809a", fontSize: 10 },
-          labelBgStyle: { fill: "#111824", fillOpacity: 0.92 },
+          style: {
+            stroke: edge.className?.includes("repair")
+              ? "var(--mantine-color-yellow-5)"
+              : "var(--mantine-color-dark-2)",
+            strokeWidth: 1.5,
+          },
+          labelStyle: { fill: "var(--mantine-color-dimmed)", fontSize: 10 },
+          labelBgStyle: { fill: "var(--mantine-color-body)", fillOpacity: 0.92 },
           labelBgPadding: [5, 3] as [number, number],
         })),
     [projection.edges, runningNodeIds],
@@ -2796,100 +3611,131 @@ const GraphPanel = memo(function GraphPanel({
     );
     const id =
       projectedId ??
+      (node.data.parentInvocationId as string | undefined) ??
       nodeInvocations.find((item) => item.invocationId === selectedId)?.invocationId ??
       invokeId(node.data.node as WorkflowNode, invocations);
     if (id) onSelect(id);
   };
   return (
-    <div className="graph-panel" data-testid="workflow-graph">
-      <div className="panel-heading">
-        <span>EXECUTION GRAPH</span>
-        <div>
-          {breadcrumbs.length > 0 && (
-            <span className="graph-breadcrumb" data-testid="graph-breadcrumb">
-              root / {breadcrumbs.join(" / ")}
-            </span>
-          )}
-          {(() => {
-            const source = invocations.find(
-              (item) => item.invocationId === selectedId,
-            )?.sourceNodeId;
-            const instances = projection.instances.filter((item) => item.sourceNodeId === source);
-            return instances.length > 1 ? (
-              <select
-                aria-label="Invocation instance"
-                value={selectedId ?? ""}
-                onChange={(event) => onSelect(event.target.value)}
+    <Paper
+      radius={0}
+      p={0}
+      withBorder={false}
+      h={{ base: 390, md: "calc(100dvh - 520px)" }}
+      mih={320}
+      className="graph-panel"
+      data-testid="workflow-graph"
+    >
+      <Stack gap={0} h="100%">
+        <Group gap="xs" justify="space-between" wrap="wrap" className="panel-heading" p="sm">
+          <Text size="sm" fw={600}>
+            Execution graph
+          </Text>
+          <Group gap="xs">
+            {breadcrumbs.length > 0 && (
+              <Text
+                component="span"
+                size="sm"
+                className="graph-breadcrumb"
+                data-testid="graph-breadcrumb"
               >
-                {instances.map((item) => (
-                  <option key={item.invocationId} value={item.invocationId}>
-                    instance {item.ordinal} · {item.scopeId}
-                  </option>
+                root / {breadcrumbs.join(" / ")}
+              </Text>
+            )}
+            {(() => {
+              const source = invocations.find(
+                (item) => item.invocationId === selectedId,
+              )?.sourceNodeId;
+              const instances = projection.instances.filter((item) => item.sourceNodeId === source);
+              return instances.length > 1 ? (
+                <NativeSelect
+                  aria-label="Invocation instance"
+                  value={selectedId ?? ""}
+                  onChange={(event) => onSelect(event.target.value)}
+                >
+                  {instances.map((item) => (
+                    <option key={item.invocationId} value={item.invocationId}>
+                      instance {item.ordinal} · {item.scopeId}
+                    </option>
+                  ))}
+                </NativeSelect>
+              ) : null;
+            })()}
+            <Button
+              aria-label={showOutline ? "Hide workflow outline" : "Show workflow outline"}
+              aria-expanded={showOutline}
+              onClick={() => setShowOutline((value) => !value)}
+            >
+              Outline
+            </Button>
+            <Button
+              aria-label="Fit graph to view"
+              onClick={() => reactFlow.fitView({ duration: 500, padding: 0.25 })}
+            >
+              Fit
+            </Button>
+            <Button aria-label="Zoom graph in" onClick={() => reactFlow.zoomIn({ duration: 180 })}>
+              +
+            </Button>
+            <Button
+              aria-label="Zoom graph out"
+              onClick={() => reactFlow.zoomOut({ duration: 180 })}
+            >
+              −
+            </Button>
+          </Group>
+        </Group>
+        <Box flex={1} mih={200} miw={0} className="graph-canvas">
+          {graph?.nodes?.length ? (
+            <ReactFlow
+              colorMode={graphAppearance}
+              style={{ backgroundColor: "var(--mantine-color-body)" }}
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={nodeTypes}
+              onNodeClick={handleNode}
+              fitView
+              minZoom={0.1}
+              maxZoom={1.8}
+              proOptions={{ hideAttribution: true }}
+            >
+              <Controls showInteractive={false} />
+            </ReactFlow>
+          ) : (
+            <Stack gap="xs" className="empty-inline">
+              No compiled graph returned for this workflow.
+            </Stack>
+          )}
+        </Box>
+        {showOutline && (
+          <Box
+            maw="100%"
+            mah={400}
+            style={{ overflow: "auto" }}
+            className="graph-outline"
+            role="region"
+            aria-label="Workflow outline"
+          >
+            <List type="ordered">
+              {[...invocations]
+                .sort((a, b) => a.ordinal - b.ordinal)
+                .map((invocation) => (
+                  <List.Item key={invocation.invocationId}>
+                    <Button
+                      type="button"
+                      aria-current={selectedId === invocation.invocationId ? "true" : undefined}
+                      onClick={() => onSelect(invocation.invocationId)}
+                    >
+                      {invocation.sourceNodeId} · {invocation.state} · {invocation.scopeId}
+                    </Button>
+                  </List.Item>
                 ))}
-              </select>
-            ) : null;
-          })()}
-          <button
-            aria-label={showOutline ? "Hide workflow outline" : "Show workflow outline"}
-            aria-expanded={showOutline}
-            onClick={() => setShowOutline((value) => !value)}
-          >
-            OUTLINE
-          </button>
-          <button
-            aria-label="Fit graph to view"
-            onClick={() => reactFlow.fitView({ duration: 500, padding: 0.25 })}
-          >
-            FIT
-          </button>
-          <button aria-label="Zoom graph in" onClick={() => reactFlow.zoomIn({ duration: 180 })}>
-            +
-          </button>
-          <button aria-label="Zoom graph out" onClick={() => reactFlow.zoomOut({ duration: 180 })}>
-            −
-          </button>
-        </div>
-      </div>
-      <div className="graph-canvas">
-        {graph?.nodes?.length ? (
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            nodeTypes={nodeTypes}
-            onNodeClick={handleNode}
-            fitView
-            minZoom={0.1}
-            maxZoom={1.8}
-            proOptions={{ hideAttribution: true }}
-          >
-            <Background color="#172131" gap={24} size={1} />
-            <Controls showInteractive={false} />
-          </ReactFlow>
-        ) : (
-          <div className="empty-inline">No compiled graph returned for this workflow.</div>
+            </List>
+            {!invocations.length && <Text size="sm">No invocations have started.</Text>}
+          </Box>
         )}
-      </div>
-      {showOutline && (
-        <div className="graph-outline" role="region" aria-label="Workflow outline">
-          <ol>
-            {[...invocations]
-              .sort((a, b) => a.ordinal - b.ordinal)
-              .map((invocation) => (
-                <li key={invocation.invocationId}>
-                  <button
-                    type="button"
-                    aria-current={selectedId === invocation.invocationId ? "true" : undefined}
-                    onClick={() => onSelect(invocation.invocationId)}
-                  >
-                    {invocation.sourceNodeId} · {invocation.state} · {invocation.scopeId}
-                  </button>
-                </li>
-              ))}
-          </ol>
-          {!invocations.length && <p>No invocations have started.</p>}
-        </div>
-      )}
-    </div>
+      </Stack>
+    </Paper>
   );
 });
 
@@ -2957,7 +3803,10 @@ function Timeline({
       .sort((a, b) => a.ordinal - b.ordinal || a.invocationId.localeCompare(b.invocationId))
       .map((invocation) => {
         const related = attemptsByInvocation.get(invocation.invocationId) ?? [];
-        const start = isoMs(invocation.startedAt, fallback);
+        const start = isoMs(
+          invocation.startedAt,
+          isoMs(invocation.endedAt, isoMs(view.finishedAt, fallback)),
+        );
         const end = isoMs(invocation.endedAt, start + 1);
         return {
           key: invocation.invocationId,
@@ -3040,157 +3889,212 @@ function Timeline({
   );
   const nowX = gutter + scale.x(Math.min(visible.end, Math.max(visible.start, now)));
   return (
-    <div className="timeline-panel" ref={ref} data-testid="execution-timeline">
-      <div className="panel-heading">
-        <span>
-          EXECUTION TIMELINE <small>continuous wall time</small>
-        </span>
-        <div className="timeline-tools">
-          <div className="timeline-legend">
-            <span>
-              <i className="legend-agent" /> agent
-            </span>
-            <span>
-              <i className="legend-command" /> command
-            </span>
-            <span>
-              <i className="legend-subagent" /> subagent
-            </span>
-          </div>
-          <button
-            data-testid="timeline-fit"
-            aria-label="Fit timeline to run"
-            onClick={() => setZoom(1)}
-          >
-            FIT
-          </button>
-          <button
-            aria-label="Zoom timeline out"
-            onClick={() => setZoom((value) => Math.max(1, value / 1.5))}
-          >
-            −
-          </button>
-          <button
-            data-testid="timeline-zoom-in"
-            aria-label="Zoom timeline in"
-            onClick={() => setZoom((value) => Math.min(12, value * 1.5))}
-          >
-            +
-          </button>
-        </div>
-      </div>
-      <div
-        className="timeline-scroll"
-        ref={scrollRef}
-        onScroll={(event) =>
-          setViewport({
-            top: event.currentTarget.scrollTop,
-            height: event.currentTarget.clientHeight,
-          })
-        }
-      >
-        <div style={{ height: graphHeight, width: canvasWidth }}>
-          <svg
-            data-testid="timeline-canvas"
-            width={canvasWidth}
-            height={viewport.height}
-            style={{ position: "sticky", top: 0, display: "block" }}
-            className="timeline-svg"
-          >
-            {scale.ticks.map((tick) => (
-              <g key={tick} transform={`translate(${gutter + scale.x(tick)},0)`}>
-                <line y2={viewport.height} />
-                <text y={18}>{scale.tickFormat(tick)}</text>
-              </g>
-            ))}
-            {hasActive && (
-              <line className="timeline-now" x1={nowX} x2={nowX} y1={20} y2={viewport.height} />
-            )}
-            {rows
-              .slice(firstVisibleRow, lastVisibleRow)
-              .map(
-                (
-                  {
-                    key,
-                    invocationId,
-                    label,
-                    state,
-                    start,
-                    end: persistedEnd,
-                    depth,
-                    attempts: related,
-                    kind,
-                  },
-                  visibleIndex,
-                ) => {
-                  const index = firstVisibleRow + visibleIndex;
-                  const end = state === "running" || state === "accepted" ? now : persistedEnd;
-                  const x = gutter + scale.x(start);
-                  const w = Math.max(3, scale.x(end) - scale.x(start));
-                  const active = state === "running" || state === "accepted";
-                  return (
-                    <g
-                      key={key}
-                      className={`timeline-row ${kind === "scout" ? "scout-row" : ""} ${selectedId === invocationId ? "selected" : ""}`}
-                      onClick={() => onSelect(invocationId)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          onSelect(invocationId);
-                        }
-                      }}
-                      tabIndex={0}
-                      role="button"
-                      aria-label={`${kind === "scout" ? "Subagent" : "Invocation"} ${label}, ${state}`}
-                      transform={`translate(0,${28 + index * rowHeight - viewport.top})`}
-                    >
-                      <text className="timeline-label" x={8 + depth * 14} y={18}>
-                        {depth > 0 ? "↳ " : ""}
-                        {label}
-                      </text>
-                      <rect
-                        data-testid="timeline-bar"
-                        data-invocation-id={invocationId}
-                        data-source-node-id={label}
-                        data-active={active ? "true" : "false"}
-                        data-duration-ms={Math.max(0, Math.round(end - start))}
-                        className={`invocation-bar state-${state} ${kind === "scout" ? "subagent-bar" : ""}`}
-                        x={x}
-                        y={6}
-                        width={w}
-                        height={11}
-                        rx={2}
-                      />
-                      <text className="bar-time" x={Math.min(canvasWidth - 34, x + w + 6)} y={16}>
-                        {formatDuration(end - start)}
-                      </text>
-                      {related.map((attempt, attemptIndex) => {
-                        const aStart = isoMs(attempt.startedAt, start);
-                        const aEnd = isoMs(
-                          attempt.endedAt,
-                          attempt.state === "running" ? now : aStart + 1,
-                        );
-                        return (
-                          <rect
-                            key={attempt.attemptId}
-                            className={`attempt-bar ${attempt.state}`}
-                            x={gutter + scale.x(aStart)}
-                            y={22 + attemptIndex * 5}
-                            width={Math.max(2, scale.x(aEnd) - scale.x(aStart))}
-                            height={3}
-                            rx={1}
-                          />
-                        );
-                      })}
-                    </g>
-                  );
-                },
+    <Paper
+      radius={0}
+      p={0}
+      withBorder={false}
+      className="timeline-panel"
+      ref={ref}
+      data-testid="execution-timeline"
+    >
+      <Stack gap={0}>
+        <Group gap="xs" justify="space-between" wrap="wrap" p="sm" className="panel-heading">
+          <Text component="span" size="sm">
+            Timeline{" "}
+            <Text component="span" size="xs" c="dimmed">
+              continuous wall time
+            </Text>
+          </Text>
+          <Group gap="xs" justify="space-between" wrap="wrap" className="timeline-tools">
+            <Group gap="xs" justify="space-between" wrap="wrap" className="timeline-legend">
+              <Text component="span" size="sm">
+                <Text component="span" size="sm" className="legend-agent" /> agent
+              </Text>
+              <Text component="span" size="sm">
+                <Text component="span" size="sm" className="legend-command" /> command
+              </Text>
+              <Text component="span" size="sm">
+                <Text component="span" size="sm" className="legend-subagent" /> subagent
+              </Text>
+            </Group>
+            <Button
+              data-testid="timeline-fit"
+              aria-label="Fit timeline to run"
+              onClick={() => setZoom(1)}
+            >
+              FIT
+            </Button>
+            <Button
+              aria-label="Zoom timeline out"
+              onClick={() => setZoom((value) => Math.max(1, value / 1.5))}
+            >
+              −
+            </Button>
+            <Button
+              data-testid="timeline-zoom-in"
+              aria-label="Zoom timeline in"
+              onClick={() => setZoom((value) => Math.min(12, value * 1.5))}
+            >
+              +
+            </Button>
+          </Group>
+        </Group>
+        <Box
+          h={180}
+          style={{ overflow: "auto" }}
+          className="timeline-scroll"
+          ref={scrollRef}
+          onScroll={(event) =>
+            setViewport({
+              top: event.currentTarget.scrollTop,
+              height: event.currentTarget.clientHeight,
+            })
+          }
+        >
+          <Box h={graphHeight} w={canvasWidth}>
+            <svg
+              data-testid="timeline-canvas"
+              width={canvasWidth}
+              height={viewport.height}
+              style={{ position: "sticky", top: 0, display: "block" }}
+              className="timeline-svg"
+            >
+              {scale.ticks.map((tick) => (
+                <g key={tick} transform={`translate(${gutter + scale.x(tick)},0)`}>
+                  <line y2={viewport.height} stroke="var(--mantine-color-default-border)" />
+                  <text y={18} fill="var(--mantine-color-dimmed)" fontSize={10}>
+                    {scale.tickFormat(tick)}
+                  </text>
+                </g>
+              ))}
+              {hasActive && (
+                <line
+                  stroke="var(--mantine-color-indigo-4)"
+                  strokeDasharray="4 4"
+                  className="timeline-now"
+                  x1={nowX}
+                  x2={nowX}
+                  y1={20}
+                  y2={viewport.height}
+                />
               )}
-          </svg>
-        </div>
-        {!rows.length && <div className="empty-inline">Waiting for the first invocation…</div>}
-      </div>
-    </div>
+              {rows
+                .slice(firstVisibleRow, lastVisibleRow)
+                .map(
+                  (
+                    {
+                      key,
+                      invocationId,
+                      label,
+                      state,
+                      start,
+                      end: persistedEnd,
+                      depth,
+                      attempts: related,
+                      kind,
+                    },
+                    visibleIndex,
+                  ) => {
+                    const index = firstVisibleRow + visibleIndex;
+                    const end = state === "running" || state === "accepted" ? now : persistedEnd;
+                    const x = gutter + scale.x(start);
+                    const w = Math.max(3, scale.x(end) - scale.x(start));
+                    const active = state === "running" || state === "accepted";
+                    return (
+                      <g
+                        key={key}
+                        className={`timeline-row ${kind === "scout" ? "scout-row" : ""} ${selectedId === invocationId ? "selected" : ""}`}
+                        onClick={() => onSelect(invocationId)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            onSelect(invocationId);
+                          }
+                        }}
+                        tabIndex={0}
+                        role="button"
+                        aria-label={`${kind === "scout" ? "Subagent" : "Invocation"} ${label}, ${state}`}
+                        transform={`translate(0,${28 + index * rowHeight - viewport.top})`}
+                      >
+                        <text
+                          fill="var(--mantine-color-text)"
+                          fontSize={11}
+                          className="timeline-label"
+                          x={8 + depth * 14}
+                          y={18}
+                        >
+                          {depth > 0 ? "↳ " : ""}
+                          {label}
+                        </text>
+                        <rect
+                          fill={
+                            invocationId === selectedId
+                              ? "var(--mantine-color-indigo-4)"
+                              : state === "failed"
+                                ? "var(--mantine-color-red-5)"
+                                : active
+                                  ? "var(--mantine-color-indigo-4)"
+                                  : kind === "scout"
+                                    ? "var(--mantine-color-dark-3)"
+                                    : "var(--mantine-color-dark-1)"
+                          }
+                          stroke={
+                            selectedId === invocationId ? "var(--mantine-color-text)" : "none"
+                          }
+                          data-testid="timeline-bar"
+                          data-invocation-id={invocationId}
+                          data-source-node-id={label}
+                          data-active={active ? "true" : "false"}
+                          data-duration-ms={Math.max(0, Math.round(end - start))}
+                          className={`invocation-bar state-${state} ${kind === "scout" ? "subagent-bar" : ""}`}
+                          x={x}
+                          y={6}
+                          width={w}
+                          height={11}
+                          rx={2}
+                        />
+                        <text
+                          fill="var(--mantine-color-dimmed)"
+                          fontSize={10}
+                          className="bar-time"
+                          x={Math.min(canvasWidth - 34, x + w + 6)}
+                          y={16}
+                        >
+                          {formatDuration(end - start)}
+                        </text>
+                        {related.map((attempt, attemptIndex) => {
+                          const aStart = isoMs(attempt.startedAt, start);
+                          const aEnd = isoMs(
+                            attempt.endedAt,
+                            attempt.state === "running" ? now : aStart + 1,
+                          );
+                          return (
+                            <rect
+                              key={attempt.attemptId}
+                              fill={`var(--mantine-color-${stateColor(attempt.state)}-4)`}
+                              className={`attempt-bar ${attempt.state}`}
+                              x={gutter + scale.x(aStart)}
+                              y={22 + attemptIndex * 5}
+                              width={Math.max(2, scale.x(aEnd) - scale.x(aStart))}
+                              height={3}
+                              rx={1}
+                            />
+                          );
+                        })}
+                      </g>
+                    );
+                  },
+                )}
+            </svg>
+          </Box>
+          {!rows.length && (
+            <Stack gap="xs" className="empty-inline">
+              Waiting for the first invocation…
+            </Stack>
+          )}
+        </Box>
+      </Stack>
+    </Paper>
   );
 }
 
@@ -3226,11 +4130,11 @@ function InvocationPicker({
   const selected = items.find((item) => item.invocationId === selectedId);
   const options = selected && !visible.includes(selected) ? [selected, ...visible] : visible;
   return (
-    <div className="invocation-picker">
+    <Stack gap="xs" className="invocation-picker">
       {items.length > size && (
-        <label>
+        <Stack gap={4} component="label">
           Find invocation
-          <input
+          <TextInput
             aria-label="Search invocations"
             value={search}
             onChange={(event) => {
@@ -3238,11 +4142,11 @@ function InvocationPicker({
               setPage(0);
             }}
           />
-        </label>
+        </Stack>
       )}
-      <label>
+      <Stack gap={4} component="label">
         Invocation
-        <select
+        <NativeSelect
           aria-label="Inspect invocation"
           value={selectedId}
           onChange={(event) => onSelect(event.target.value)}
@@ -3252,27 +4156,31 @@ function InvocationPicker({
               {item.sourceNodeId} · {item.state} · #{item.ordinal + 1}
             </option>
           ))}
-        </select>
-      </label>
+        </NativeSelect>
+      </Stack>
       {matches.length > size && (
-        <div className="lane-navigation">
-          <button disabled={current === 0} onClick={() => setPage(current - 1)}>
+        <Group gap="xs" justify="space-between" wrap="wrap" className="lane-navigation">
+          <Button disabled={current === 0} onClick={() => setPage(current - 1)}>
             Previous invocations
-          </button>
-          <span>
+          </Button>
+          <Text component="span" size="sm">
             {current * size + 1}–{Math.min(matches.length, (current + 1) * size)} of{" "}
             {matches.length}
-          </span>
-          <button
+          </Text>
+          <Button
             disabled={(current + 1) * size >= matches.length}
             onClick={() => setPage(current + 1)}
           >
             Next invocations
-          </button>
-        </div>
+          </Button>
+        </Group>
       )}
-      {search && !matches.length && <small>No matching invocations.</small>}
-    </div>
+      {search && !matches.length && (
+        <Text component="span" size="xs" c="dimmed">
+          No matching invocations.
+        </Text>
+      )}
+    </Stack>
   );
 }
 
@@ -3285,7 +4193,9 @@ function Inspector({
   sessionRequest,
   onControl,
   pendingAction,
-  onResizeStart,
+  requestedTab,
+  requestedAttemptId,
+  sessionEmbedded = false,
 }: {
   view: UiRunView;
   scoutRequests?: ScoutTimelineRequest[];
@@ -3295,7 +4205,9 @@ function Inspector({
   sessionRequest: number;
   onControl: ControlAction;
   pendingAction?: string;
-  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  requestedTab?: "attempts" | "usage" | "logs";
+  requestedAttemptId?: string;
+  sessionEmbedded?: boolean;
 }) {
   const [tab, setTab] = useState<
     | "output"
@@ -3309,6 +4221,9 @@ function Inspector({
     | "diff"
     | "events"
   >("output");
+  useEffect(() => {
+    if (requestedTab) setTab(requestedTab);
+  }, [requestedTab]);
   const [activityOpen, setActivityOpen] = useState(() =>
     Boolean(new URLSearchParams(window.location.search).get("attempt")),
   );
@@ -3316,6 +4231,21 @@ function Inspector({
   const [focusedAttemptId, setFocusedAttemptId] = useState<string | undefined>(
     () => new URLSearchParams(window.location.search).get("attempt") ?? undefined,
   );
+  useEffect(() => {
+    const linked = new URLSearchParams(window.location.search).get("attempt");
+    setFocusedAttemptId((previous) =>
+      previous === linked &&
+      asArray(view.attempts).some(
+        (attempt) => attempt.attemptId === previous && attempt.invocationId === selectedId,
+      )
+        ? previous
+        : undefined,
+    );
+  }, [selectedId]);
+  useEffect(() => {
+    if (requestedAttemptId && view.attempts[requestedAttemptId]?.invocationId === selectedId)
+      setFocusedAttemptId(requestedAttemptId);
+  }, [requestedAttemptId, selectedId]);
   const invocation = asArray(view.invocations).find((item) => item.invocationId === selectedId);
   const node = graph?.nodes.find(
     (candidate) =>
@@ -3329,9 +4259,16 @@ function Inspector({
   const attempts = asArray(view.attempts).filter((attempt) => attempt.invocationId === selectedId);
   const artifacts = asArray(view.artifacts);
   const selectedArtifacts = artifacts.filter((artifact) =>
-    [...(invocation?.outputArtifactIds ?? []), ...(invocation?.evidenceArtifactIds ?? [])].includes(
-      artifact.artifactId,
-    ),
+    [
+      ...(invocation?.outputArtifactIds ?? []),
+      ...(invocation?.evidenceArtifactIds ?? []),
+      ...(invocation?.artifactIds ?? []),
+      ...attempts.flatMap((attempt) => [
+        ...attempt.artifactIds,
+        ...(attempt.outputArtifactIds ?? []),
+        ...(attempt.evidenceArtifactIds ?? []),
+      ]),
+    ].includes(artifact.artifactId),
   );
   const latest =
     attempts.find((attempt) => attempt.attemptId === focusedAttemptId) ??
@@ -3371,270 +4308,372 @@ function Inspector({
     "diff",
     "events",
   ] as const;
+  const session =
+    latest && invocation ? (
+      <AgentSessionModal
+        embedded={sessionEmbedded}
+        key={`${view.runId}:${latest.attemptId}`}
+        runId={view.runId}
+        initialSpeaker={sessionSpeaker}
+        subagents={selectedScouts
+          .filter((scout) => scout.parentAttemptId === latest?.attemptId)
+          .map((scout) => ({
+            scoutId: scout.scoutId,
+            requestId: scout.requestId,
+            harness: scout.effectiveHarness,
+            modelId: scout.modelId,
+            state: scout.state,
+          }))}
+        invocationId={invocation!.invocationId}
+        attemptId={latest.attemptId}
+        nodeId={node?.label ?? invocation!.sourceNodeId}
+        harness={`${String(execution.harness ?? "Harness")}${execution.modelId ? ` · ${String(execution.modelId)}` : ""}`}
+        events={sessionEvents}
+        live={latest.state === "running"}
+        steerable={canSteer}
+        canStop={Boolean(view.capabilities.cancel)}
+        stopPending={pendingAction === "cancel"}
+        onStop={() => onControl("cancel")}
+        canInterrupt={
+          latest.state === "running" &&
+          Boolean(view.interruptibleInvocationIds?.includes(invocation!.invocationId))
+        }
+        interruptPending={pendingAction === "interrupt-attempt"}
+        onInterrupt={() =>
+          onControl("interrupt-attempt", invocation!.invocationId, undefined, latest.attemptId)
+        }
+        onSteer={async (message) =>
+          (await onControl("steer", invocation!.invocationId, message, latest.attemptId)) !== false
+        }
+        loadActivity={fetchActivityPage}
+        onClose={() => setActivityOpen(false)}
+      />
+    ) : null;
+  if (sessionEmbedded)
+    return (
+      <Stack gap="md">
+        <InvocationPicker
+          items={asArray(view.invocations)}
+          selectedId={selectedId ?? ""}
+          onSelect={onSelect}
+        />
+        {session ?? (
+          <Paper>
+            <Text c="dimmed" size="sm">
+              Select an agent invocation with a retained attempt to view its session.
+            </Text>
+          </Paper>
+        )}
+      </Stack>
+    );
   return (
-    <aside
+    <Paper
+      radius={0}
+      bg="var(--mantine-color-body)"
+      withBorder={false}
+      miw={0}
+      maw="100%"
+      h={{ base: "calc(85dvh - 80px)", md: "calc(100dvh - 154px)" }}
+      component="aside"
       className="inspector"
       data-testid="node-inspector"
       data-invocation-id={invocation?.invocationId}
     >
-      <ResizeHandle label="Resize inspector drawer" onStart={onResizeStart} />
-      <div className="inspector-header">
-        <span>INSPECTOR</span>
-        <span className="inspector-rev">r{view.revision}</span>
-      </div>
-      <InvocationPicker
-        items={asArray(view.invocations)}
-        selectedId={selectedId ?? ""}
-        onSelect={onSelect}
-      />
-      {invocation ? (
-        <>
-          <div className="inspector-title">
-            <StatusDot state={invocation.state} />
-            <div>
-              <strong>{invocation.sourceNodeId}</strong>
-              <em>workflow invocation</em>
-            </div>
-          </div>
-          {node?.kind === "agent" && attempts.length > 0 && (
-            <div className="session-launch-row">
-              <button
-                className="open-agent-session"
-                onClick={() => {
-                  setSessionSpeaker("all");
-                  setActivityOpen(true);
-                }}
-                type="button"
-              >
-                <span aria-hidden="true">●</span>{" "}
-                {invocation.state === "running" ? "Watch agent live" : "View agent session"}
-              </button>
-            </div>
-          )}
-          {latest && (
-            <div className="session-identity">
-              {String(execution.harness ?? node?.kind ?? "")}
-              {execution.modelId ? ` · ${String(execution.modelId)}` : ""} · attempt{" "}
-              {latest.ordinal + 1}
-              {latest.error && <p className="session-error">{latest.error}</p>}
-            </div>
-          )}
-          <div className="detail-grid">
-            <span>INVOCATION</span>
-            <b data-testid="selected-invocation">{invocation.invocationId.slice(0, 18)}</b>
-            <span>STATE</span>
-            <b className={`text-${invocation.state}`}>{invocation.state}</b>
-            <span>ATTEMPTS</span>
-            <b>{attempts.length || "—"}</b>
-          </div>
-          <LifecycleNotice invocation={invocation} view={view} />
-          {selectedScouts.length > 0 && (
-            <section className="scout-activity" aria-label="Subagent activity">
-              <div className="section-label">SUBAGENTS</div>
-              {selectedScouts.map((scout) => (
-                <details key={`${scout.parentAttemptId}:${scout.requestId}`}>
-                  <summary>
-                    <strong>{scout.scoutId}</strong>
-                    <span className={`scout-state ${scout.state}`}>{scout.state}</span>
-                    {scout.modelId && <small>{scout.modelId}</small>}
-                  </summary>
-                  {scout.question && <p>{scout.question}</p>}
-                  <small>
-                    {scout.effectiveHarness ?? "Host default"} · {scout.requestId}
-                  </small>
-                  {scout.result !== undefined && <ActivityValue value={scout.result} />}
-                  {scout.error && <p className="session-error">{scout.error}</p>}
-                  <button
-                    className="subtle-button"
-                    onClick={() => {
-                      setSessionSpeaker(scout.scoutId);
-                      setActivityOpen(true);
-                    }}
-                  >
-                    View subagent activity
-                  </button>
-                </details>
-              ))}
-            </section>
-          )}
-          <ApprovalPanel
-            invocation={invocation}
-            nodeKind={node?.kind}
-            view={view}
-            pendingAction={pendingAction}
-            onControl={onControl}
-          />
-          {latest?.state === "running" &&
-            view.interruptibleInvocationIds?.includes(invocation.invocationId) && (
-              <button
-                className="control-button"
-                disabled={pendingAction !== undefined}
-                onClick={() =>
-                  onControl(
-                    "interrupt-attempt",
-                    invocation.invocationId,
-                    undefined,
-                    latest.attemptId,
-                  )
-                }
-              >
-                Interrupt agent
-              </button>
-            )}
-          {invocation.state === "failed" &&
-            view.capabilities.retry === true &&
-            (view.retryableInvocationIds?.includes(invocation.invocationId) ?? true) && (
-              <section className="invocation-recovery" aria-label="Failed invocation recovery">
-                <p>
-                  This invocation ended in failure. Retry starts another attempt for this
-                  invocation.
-                </p>
-                <button
-                  className="control-button"
-                  disabled={pendingAction !== undefined}
-                  onClick={() => onControl("retry", invocation.invocationId)}
+      <Stack gap="sm" h="100%" miw={0}>
+        <Group gap="xs" justify="space-between" wrap="wrap" className="inspector-header">
+          <Text component="span" size="sm">
+            INSPECTOR
+          </Text>
+          <Text component="span" size="sm" className="inspector-rev">
+            r{view.revision}
+          </Text>
+        </Group>
+
+        {invocation ? (
+          <>
+            <Stack gap={4}>
+              <Title order={2}>{invocation.sourceNodeId}</Title>
+              <Text size="xs" c={stateColor(invocation.state)}>
+                {invocation.state} · attempt {latest ? latest.ordinal + 1 : "—"} ·{" "}
+                {String(execution.harness ?? node?.kind ?? "unknown")}
+              </Text>
+            </Stack>
+            <NativeSelect
+              aria-label="Inspect invocation"
+              value={selectedId ?? ""}
+              onChange={(event) => onSelect(event.currentTarget.value)}
+              data={asArray(view.invocations).map((item) => ({
+                value: item.invocationId,
+                label: `${item.sourceNodeId} · ${item.state} · #${item.ordinal + 1}`,
+              }))}
+            />
+            {node?.kind === "agent" && attempts.length > 0 && (
+              <Stack gap="xs" className="session-launch-row">
+                <Button
+                  variant="filled"
+                  className="open-agent-session"
+                  onClick={() => {
+                    setSessionSpeaker("all");
+                    setActivityOpen(true);
+                  }}
+                  type="button"
                 >
-                  {pendingAction === "retry" ? "Retrying…" : "Retry invocation"}
-                </button>
-              </section>
+                  {view.state === "running" &&
+                  invocation.state === "running" &&
+                  latest?.state === "running"
+                    ? "Watch agent live"
+                    : "View agent session"}
+                </Button>
+              </Stack>
             )}
-          <div className="inspector-tabs">
-            {tabs.map((name) => (
-              <button
-                key={name}
-                className={tab === name ? "active" : ""}
-                onClick={() => setTab(name)}
-              >
-                {name}
-              </button>
-            ))}
-          </div>
-          <div className="inspector-content">
-            {tab === "output" && (
-              <OutputPanel
-                attempt={latest}
-                invocation={invocation}
-                steerable={canSteer}
-                pendingAction={pendingAction}
-                liveActivity={(view.liveActivity ?? []).filter(
-                  (item) => item.attemptId === latest?.attemptId,
+            <Tabs value={tab} onChange={(value) => setTab(value as typeof tab)}>
+              <Tabs.List>
+                {tabs.map((name) => (
+                  <Tabs.Tab px="xs" key={name} value={name}>
+                    {name.charAt(0).toUpperCase() + name.slice(1)}
+                  </Tabs.Tab>
+                ))}
+              </Tabs.List>
+            </Tabs>
+            <ScrollArea flex={1} mih={0} miw={0} scrollbars="y" type="auto" offsetScrollbars="y">
+              <Stack gap="sm" miw={0}>
+                <Disclosure>
+                  <DisclosureTitle>Invocation & attempt details</DisclosureTitle>{" "}
+                  {latest && (
+                    <Stack gap="xs" className="session-identity">
+                      {String(execution.harness ?? node?.kind ?? "")}
+                      {execution.modelId ? ` · ${String(execution.modelId)}` : ""} · attempt{" "}
+                      {latest.ordinal + 1}
+                      {latest.error && (
+                        <Text size="sm" className="session-error">
+                          {latest.error}
+                        </Text>
+                      )}
+                    </Stack>
+                  )}
+                  <SimpleGrid cols={2} spacing="xs" className="detail-grid">
+                    <Text component="span" size="sm">
+                      INVOCATION
+                    </Text>
+                    <Text component="span" size="sm" fw={600} data-testid="selected-invocation">
+                      {invocation.invocationId.slice(0, 18)}
+                    </Text>
+                    <Text component="span" size="sm">
+                      STATE
+                    </Text>
+                    <Text
+                      component="span"
+                      size="sm"
+                      fw={600}
+                      className={`text-${invocation.state}`}
+                    >
+                      {invocation.state}
+                    </Text>
+                    <Text component="span" size="sm">
+                      ATTEMPTS
+                    </Text>
+                    <Text component="span" size="sm" fw={600}>
+                      {attempts.length || "—"}
+                    </Text>
+                  </SimpleGrid>
+                </Disclosure>
+                <LifecycleNotice invocation={invocation} view={view} />
+                {selectedScouts.length > 0 && (
+                  <Stack
+                    gap="xs"
+                    component="section"
+                    className="scout-activity"
+                    aria-label="Subagent activity"
+                  >
+                    <Stack gap="xs" className="section-label">
+                      SUBAGENTS
+                    </Stack>
+                    {selectedScouts.map((scout) => (
+                      <Disclosure key={`${scout.parentAttemptId}:${scout.requestId}`}>
+                        <DisclosureTitle>
+                          <Text component="span" size="sm" fw={600}>
+                            {scout.scoutId}
+                          </Text>
+                          <Text component="span" size="sm" className={`scout-state ${scout.state}`}>
+                            {scout.state}
+                          </Text>
+                          {scout.modelId && (
+                            <Text component="span" size="xs" c="dimmed">
+                              {scout.modelId}
+                            </Text>
+                          )}
+                        </DisclosureTitle>
+                        {scout.question && <Text size="sm">{scout.question}</Text>}
+                        <Text component="span" size="xs" c="dimmed">
+                          {scout.effectiveHarness ?? "Host default"} · {scout.requestId}
+                        </Text>
+                        {scout.result !== undefined && <ActivityValue value={scout.result} />}
+                        {scout.error && (
+                          <Text size="sm" className="session-error">
+                            {scout.error}
+                          </Text>
+                        )}
+                        <Button
+                          className="subtle-button"
+                          onClick={() => {
+                            setSessionSpeaker(scout.scoutId);
+                            setActivityOpen(true);
+                          }}
+                        >
+                          View subagent activity
+                        </Button>
+                      </Disclosure>
+                    ))}
+                  </Stack>
                 )}
-                onSteer={(message) =>
-                  onControl("steer", invocation.invocationId, message, latest?.attemptId)
-                }
-              />
-            )}
-            {tab === "context" && <ContextPanel items={context} />}
-            {tab === "tools" && <ToolPanel items={tools} />}
-            {tab === "logs" && <LogPanel items={logs} />}
-            {tab === "usage" && <UsagePanel items={usage} />}
-            {tab === "artifacts" && (
-              <ArtifactPanel artifacts={selectedArtifacts.length ? selectedArtifacts : artifacts} />
-            )}
-            {tab === "attempts" && (
-              <EvidencePanel
-                attempts={attempts}
-                focusedAttemptId={focusedAttemptId}
-                onFocus={setFocusedAttemptId}
-              />
-            )}
-            {tab === "diagnostics" && <DiagnosticPanel items={diagnostics} />}
-            {tab === "diff" && <DiffPanel runId={view.runId} revision={view.revision} />}
-            {tab === "events" && <EventHistoryPanel runId={view.runId} />}
-          </div>
-          {activityOpen &&
-            latest &&
-            createPortal(
-              <AgentSessionModal
-                key={`${view.runId}:${latest.attemptId}`}
-                runId={view.runId}
-                initialSpeaker={sessionSpeaker}
-                subagents={selectedScouts
-                  .filter((scout) => scout.parentAttemptId === latest?.attemptId)
-                  .map((scout) => ({
-                    scoutId: scout.scoutId,
-                    requestId: scout.requestId,
-                    harness: scout.effectiveHarness,
-                    modelId: scout.modelId,
-                    state: scout.state,
-                  }))}
-                invocationId={invocation.invocationId}
-                attemptId={latest.attemptId}
-                nodeId={node?.label ?? invocation.sourceNodeId}
-                harness={`${String(execution.harness ?? "Harness")}${execution.modelId ? ` · ${String(execution.modelId)}` : ""}`}
-                events={sessionEvents}
-                live={latest.state === "running"}
-                steerable={canSteer}
-                canStop={Boolean(view.capabilities.cancel)}
-                stopPending={pendingAction === "cancel"}
-                onStop={() => onControl("cancel")}
-                canInterrupt={
-                  latest.state === "running" &&
-                  Boolean(view.interruptibleInvocationIds?.includes(invocation.invocationId))
-                }
-                interruptPending={pendingAction === "interrupt-attempt"}
-                onInterrupt={() =>
-                  onControl(
-                    "interrupt-attempt",
-                    invocation.invocationId,
-                    undefined,
-                    latest.attemptId,
-                  )
-                }
-                onSteer={async (message) =>
-                  (await onControl("steer", invocation.invocationId, message, latest.attemptId)) !==
-                  false
-                }
-                loadActivity={fetchActivityPage}
-                onClose={() => setActivityOpen(false)}
-              />,
-              document.body,
-            )}
-        </>
-      ) : (
-        <div className="inspector-empty">
-          <span>⌁</span>
-          <strong>Select an invocation</strong>
-          <p>Graph and timeline selection stay linked to this panel.</p>
-        </div>
-      )}
-    </aside>
+                <ApprovalPanel
+                  invocation={invocation}
+                  nodeKind={node?.kind}
+                  view={view}
+                  pendingAction={pendingAction}
+                  onControl={onControl}
+                />
+                {latest?.state === "running" &&
+                  view.interruptibleInvocationIds?.includes(invocation.invocationId) && (
+                    <Button
+                      className="control-button"
+                      disabled={pendingAction !== undefined}
+                      onClick={() =>
+                        onControl(
+                          "interrupt-attempt",
+                          invocation.invocationId,
+                          undefined,
+                          latest.attemptId,
+                        )
+                      }
+                    >
+                      Interrupt agent
+                    </Button>
+                  )}
+                {invocation.state === "failed" &&
+                  view.capabilities.retry === true &&
+                  (view.retryableInvocationIds?.includes(invocation.invocationId) ?? true) && (
+                    <Paper
+                      component="section"
+                      className="invocation-recovery"
+                      aria-label="Failed invocation recovery"
+                    >
+                      <Stack gap="md">
+                        <Text size="sm">
+                          This invocation ended in failure. Retry starts another attempt for this
+                          invocation.
+                        </Text>
+                        <Button
+                          className="control-button"
+                          disabled={pendingAction !== undefined}
+                          onClick={() => onControl("retry", invocation.invocationId)}
+                        >
+                          {pendingAction === "retry" ? "Retrying…" : "Retry invocation"}
+                        </Button>
+                      </Stack>
+                    </Paper>
+                  )}
+
+                <Stack gap="xs" className="inspector-content">
+                  {tab === "output" && (
+                    <OutputPanel
+                      attempt={latest}
+                      invocation={invocation}
+                      steerable={canSteer}
+                      pendingAction={pendingAction}
+                      liveActivity={(view.liveActivity ?? []).filter(
+                        (item) => item.attemptId === latest?.attemptId,
+                      )}
+                      onSteer={(message) =>
+                        onControl("steer", invocation.invocationId, message, latest?.attemptId)
+                      }
+                    />
+                  )}
+                  {tab === "context" && <ContextPanel items={context} />}
+                  {tab === "tools" && <ToolPanel items={tools} />}
+                  {tab === "logs" && <LogPanel items={logs} />}
+                  {tab === "usage" && <UsagePanel items={usage} view={view} />}
+                  {tab === "artifacts" && (
+                    <ArtifactPanel artifacts={selectedArtifacts} view={view} />
+                  )}
+                  {tab === "attempts" && (
+                    <EvidencePanel
+                      attempts={attempts}
+                      focusedAttemptId={focusedAttemptId}
+                      onFocus={setFocusedAttemptId}
+                    />
+                  )}
+                  {tab === "diagnostics" && <DiagnosticPanel items={diagnostics} />}
+                  {tab === "diff" && <DiffPanel runId={view.runId} revision={view.revision} />}
+                  {tab === "events" && (
+                    <EventHistoryPanel
+                      runId={view.runId}
+                      invocationId={selectedId}
+                      attemptIds={attempts.map((attempt) => attempt.attemptId)}
+                    />
+                  )}
+                </Stack>
+              </Stack>
+            </ScrollArea>
+            {activityOpen && session && createPortal(session, document.body)}
+          </>
+        ) : (
+          <Stack gap="xs" className="inspector-empty">
+            <Text component="span" size="sm">
+              ⌁
+            </Text>
+            <Text component="span" size="sm" fw={600}>
+              Select an invocation
+            </Text>
+            <Text size="sm">Graph and timeline selection stay linked to this panel.</Text>
+          </Stack>
+        )}
+      </Stack>
+    </Paper>
   );
 }
 
 function ContextPanel({ items }: { items: ContextSegment[] }) {
   return (
-    <div className="evidence-panel">
+    <Stack gap="xs" className="evidence-panel">
       {items.length ? (
         items.map((item) => (
-          <div className="evidence-card" key={item.id}>
-            <div>
-              <strong>{item.source}</strong>
-              <span>{item.availability}</span>
-            </div>
-            <p>
+          <Stack gap="xs" className="evidence-card" key={item.id}>
+            <Stack gap="xs">
+              <Text component="span" size="sm" fw={600}>
+                {item.source}
+              </Text>
+              <Text component="span" size="sm">
+                {item.availability}
+              </Text>
+            </Stack>
+            <Text size="sm">
               {item.reason ?? item.detail ?? "No reason recorded."}
               {item.tokenEstimate === undefined
                 ? " · tokens unavailable"
                 : ` · ~${item.tokenEstimate} tokens`}
-            </p>
-          </div>
+            </Text>
+          </Stack>
         ))
       ) : (
-        <div className="pending-copy">Context manifest unavailable from this harness.</div>
+        <Stack gap="xs" className="pending-copy">
+          Context manifest unavailable from this harness.
+        </Stack>
       )}
-    </div>
+    </Stack>
   );
 }
 function ToolPanel({ items }: { items: ToolCallView[] }) {
   return (
-    <div className="evidence-panel">
+    <Stack gap="xs" className="evidence-panel">
       {items.length ? (
         items.map((item) => <ToolActivity key={item.id} tool={item} />)
       ) : (
-        <div className="pending-copy">No declared tool calls for this attempt.</div>
+        <Stack gap="xs" className="pending-copy">
+          No declared tool calls for this attempt.
+        </Stack>
       )}
-    </div>
+    </Stack>
   );
 }
 function LogPanel({ items }: { items: LogEntryView[] }) {
@@ -3648,17 +4687,25 @@ function LogPanel({ items }: { items: LogEntryView[] }) {
     if (follow && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [follow, items.length, query]);
   return (
-    <div className="log-panel">
-      <div className="log-toolbar">
-        <label>
+    <Stack gap="xs" className="log-panel">
+      <Group gap="xs" justify="space-between" wrap="wrap" className="log-toolbar">
+        <Stack gap={4} component="label">
           Search logs{" "}
-          <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} />
-        </label>
-        <button type="button" aria-pressed={follow} onClick={() => setFollow((value) => !value)}>
+          <TextInput
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </Stack>
+        <Button type="button" aria-pressed={follow} onClick={() => setFollow((value) => !value)}>
           {follow ? "Following" : "Follow logs"}
-        </button>
-      </div>
-      <div
+        </Button>
+      </Group>
+      <Stack
+        gap="xs"
+        mah={420}
+        miw={0}
+        style={{ overflowY: "auto" }}
         className="evidence-panel log-results"
         ref={listRef}
         role="log"
@@ -3666,80 +4713,146 @@ function LogPanel({ items }: { items: LogEntryView[] }) {
       >
         {visible.length ? (
           visible.map((item) => (
-            <div className="log-line" key={item.id}>
-              <span>{item.level}</span>
+            <Stack gap="xs" className="log-line" key={item.id}>
+              <Text component="span" size="sm">
+                {item.level}
+              </Text>
               <ActivityValue value={item.message} />
-            </div>
+            </Stack>
           ))
         ) : (
-          <div className="pending-copy">
+          <Stack gap="xs" className="pending-copy">
             {items.length ? "No logs match the search." : "No readable logs were published."}
-          </div>
+          </Stack>
         )}
-      </div>
-    </div>
+      </Stack>
+    </Stack>
   );
 }
-function UsagePanel({ items }: { items: UsageView[] }) {
-  if (!items.length)
-    return (
-      <div className="pending-copy">Usage unavailable; the provider did not declare telemetry.</div>
-    );
+function UsagePanel({ items, view }: { items: UsageView[]; view?: UiRunView }) {
+  const [billing, setBilling] = useState(() =>
+    readPreference("kouro.usage.billing", "subscription"),
+  );
   return (
-    <div className="evidence-panel">
+    <Stack gap="sm" miw={0}>
+      <NativeSelect
+        label="Billing context"
+        value={billing}
+        onChange={(event) => {
+          setBilling(event.currentTarget.value);
+          writePreference("kouro.usage.billing", event.currentTarget.value);
+        }}
+        data={[
+          { value: "subscription", label: "Subscription" },
+          { value: "api", label: "API / pay as you go" },
+          { value: "unknown", label: "Unknown" },
+        ]}
+      />
+      <Text size="xs" c="dimmed">
+        {billing === "subscription"
+          ? "Your subscription is billed for the plan. Tokens below measure usage; a provider cost figure is not a per-run subscription charge. Extra usage or credits are not reported here."
+          : "Cost figures below are reported by the provider. Your provider invoice remains the billing source."}
+      </Text>
+      {!items.length && (
+        <Text size="sm" c="dimmed">
+          This invocation has no reported usage telemetry.
+        </Text>
+      )}
       {items.map((item, index) => (
-        <div className="evidence-card" key={`${item.attemptId ?? "run"}-${index}`}>
-          <div>
-            <strong>{item.totalTokens ?? "—"} tokens</strong>
-            <span>{item.completeness}</span>
-          </div>
-          <p>
-            {item.inputTokens ?? "—"} in · {item.outputTokens ?? "—"} out
-            {item.estimated ? " · estimated" : ""}
-            {item.cost === undefined
-              ? " · cost unavailable"
-              : ` · ${item.currency ?? ""}${item.cost}`}
-          </p>
-        </div>
+        <Paper key={`${item.attemptId ?? "run"}-${index}`} p="sm" miw={0}>
+          <Stack gap="xs">
+            <Text size="sm" fw={600}>
+              {view
+                ? invocationLabel(view, item.invocationId, item.attemptId)
+                : (item.attemptId ?? item.invocationId ?? "Run-level usage")}
+            </Text>
+            <Group justify="space-between">
+              <Text size="sm" fw={600}>
+                {item.totalTokens === undefined
+                  ? "Tokens not reported"
+                  : `${item.totalTokens.toLocaleString()} tokens`}
+              </Text>
+              <Badge variant="light" color={item.completeness === "complete" ? "teal" : "gray"}>
+                {item.completeness}
+              </Badge>
+            </Group>
+            {(item.inputTokens !== undefined || item.outputTokens !== undefined) && (
+              <Text size="xs" c="dimmed">
+                Input {item.inputTokens?.toLocaleString() ?? "not reported"} · output{" "}
+                {item.outputTokens?.toLocaleString() ?? "not reported"}
+                {item.estimated ? " · estimated" : ""}
+              </Text>
+            )}
+            <Text size="xs" c="dimmed">
+              {item.cost === undefined
+                ? billing === "subscription"
+                  ? "Per-run subscription charge is not reported"
+                  : "Provider cost is not reported"
+                : `Provider-reported value: ${item.currency ?? ""}${item.cost}${billing === "subscription" ? " · not your subscription bill" : ""}`}
+            </Text>
+            {item.detail && (
+              <Text size="xs" c="dimmed">
+                {item.detail}
+              </Text>
+            )}
+            {item.attemptId && (
+              <Text size="xs" c="dimmed">
+                {item.attemptId}
+              </Text>
+            )}
+          </Stack>
+        </Paper>
       ))}
-    </div>
+      <Disclosure>
+        <DisclosureTitle>How subscription estimates work</DisclosureTitle>
+        <Text size="sm">
+          An API-equivalent estimate needs the exact model, billable input, output and cache token
+          counts, and the provider’s rates. It is a comparison value. Allocating a monthly
+          subscription fee to this run would also require usage across the entire billing period,
+          including other apps. Kouro does not receive that billing history, so it cannot calculate
+          an actual subscription cost per run.
+        </Text>
+      </Disclosure>
+    </Stack>
   );
 }
 function DiagnosticPanel({ items }: { items: DiagnosticView[] }) {
   return (
-    <div className="evidence-panel">
+    <Stack gap="xs" className="evidence-panel">
       {items.length ? (
         items.map((item) => (
-          <div className="evidence-card" key={item.id}>
-            <div>
-              <strong>{item.severity}</strong>
-            </div>
-            <p>{item.message}</p>
-            {item.detail && <code>{item.detail}</code>}
-          </div>
+          <Stack gap="xs" className="evidence-card" key={item.id}>
+            <Stack gap="xs">
+              <Text component="span" size="sm" fw={600}>
+                {item.severity}
+              </Text>
+            </Stack>
+            <Text size="sm">{item.message}</Text>
+            {item.detail && <Code>{item.detail}</Code>}
+          </Stack>
         ))
       ) : (
-        <div className="pending-copy">
+        <Stack gap="xs" className="pending-copy">
           No warnings or errors recorded for this invocation. Open Agent session for live messages,
           thinking and tool activity.
-        </div>
+        </Stack>
       )}
-    </div>
+    </Stack>
   );
 }
 
 function LifecycleNotice({ invocation, view }: { invocation: UiInvocation; view: UiRunView }) {
   if (invocation.state === "running" && view.state !== "running")
     return (
-      <div className="stale-action" role="alert">
+      <Alert color="yellow" className="stale-action" role="alert">
         This invocation is not live in the current run revision. Refresh before acting.
-      </div>
+      </Alert>
     );
   if (invocation.state === "failed" && invocation.error)
     return (
-      <div className="stale-action failure" role="status">
+      <Alert color="red" className="stale-action failure" role="status">
         Last attempt failed: {invocation.error}
-      </div>
+      </Alert>
     );
   return null;
 }
@@ -3763,78 +4876,124 @@ function ApprovalPanel({
   const pending =
     invocation.approval?.status === "pending" || (invocation.state as string) === "waiting";
   return (
-    <section
+    <Paper
+      component="section"
       className="approval-card"
       data-testid="approval-panel"
       aria-labelledby="approval-heading"
     >
-      <div className="approval-heading">
-        <strong id="approval-heading">Human approval</strong>
-        <span>{invocation.approval?.status ?? invocation.state}</span>
-      </div>
-      <p>
-        {pending
-          ? "This gate is waiting for an operator decision. The request is durable; no optimistic transition is shown."
-          : "Decision recorded in the execution journal."}
-      </p>
-      {invocation.approval?.feedback && (
-        <p className="approval-feedback">{invocation.approval.feedback}</p>
-      )}
-      {pending && (invocation.approval?.repairsRemaining ?? 0) > 0 && (
-        <label className="task-input">
-          <span>
-            Changes to request · {invocation.approval?.repairsRemaining} repairs remaining
-          </span>
-          <textarea
-            aria-label="Requested changes"
-            value={feedback}
-            maxLength={20000}
-            onChange={(event) => setFeedback(event.target.value)}
-            rows={3}
-            placeholder="Describe what the agent should change before another review…"
-          />
-        </label>
-      )}
-      {pending && (
-        <div className="approval-actions">
-          {(invocation.approval?.repairsRemaining ?? 0) > 0 && (
-            <button
-              className="control-button"
-              disabled={pendingAction !== undefined || !feedback.trim()}
-              onClick={async () => {
-                if (
-                  (await onControl("request-changes", invocation.invocationId, feedback)) !== false
-                )
-                  setFeedback("");
-              }}
+      <Stack gap="md">
+        <Group gap="xs" justify="space-between" wrap="wrap" className="approval-heading">
+          <Text component="span" size="sm" fw={600} id="approval-heading">
+            Human approval
+          </Text>
+          <Text component="span" size="sm">
+            {invocation.approval?.status ?? invocation.state}
+          </Text>
+        </Group>
+        <Text size="sm">
+          {pending
+            ? "This gate is waiting for an operator decision. The request is durable; no optimistic transition is shown."
+            : "Decision recorded in the execution journal."}
+        </Text>
+        {invocation.approval?.feedback && (
+          <Text size="sm" className="approval-feedback">
+            {invocation.approval.feedback}
+          </Text>
+        )}
+        {pending && (invocation.approval?.repairsRemaining ?? 0) > 0 && (
+          <Stack gap={4} component="label" className="task-input">
+            <Text component="span" size="sm">
+              Changes to request · {invocation.approval?.repairsRemaining} repairs remaining
+            </Text>
+            <Textarea
+              aria-label="Requested changes"
+              value={feedback}
+              maxLength={20000}
+              onChange={(event) => setFeedback(event.target.value)}
+              rows={3}
+              placeholder="Describe what the agent should change before another review…"
+            />
+          </Stack>
+        )}
+        {pending && (
+          <Group gap="xs" justify="space-between" wrap="wrap" className="approval-actions">
+            {(invocation.approval?.repairsRemaining ?? 0) > 0 && (
+              <Button
+                className="control-button"
+                disabled={pendingAction !== undefined || !feedback.trim()}
+                onClick={async () => {
+                  if (
+                    (await onControl("request-changes", invocation.invocationId, feedback)) !==
+                    false
+                  )
+                    setFeedback("");
+                }}
+              >
+                {" "}
+                {pendingAction === "request-changes" ? "Requesting changes…" : "Request changes"}
+              </Button>
+            )}
+            <Button
+              data-testid="approve-run"
+              color="teal"
+              variant="light"
+              className="control-button approve"
+              disabled={pendingAction !== undefined || view.capabilities.approve !== true}
+              onClick={() => onControl("approve", invocation.invocationId)}
             >
-              {" "}
-              {pendingAction === "request-changes" ? "Requesting changes…" : "Request changes"}
-            </button>
-          )}
-          <button
-            data-testid="approve-run"
-            className="control-button approve"
-            disabled={pendingAction !== undefined || view.capabilities.approve !== true}
-            onClick={() => onControl("approve", invocation.invocationId)}
-          >
-            {pendingAction === "approve" ? "Approve…" : "Approve"}
-          </button>
-          <button
-            data-testid="reject-run"
-            className="control-button danger"
-            disabled={pendingAction !== undefined || view.capabilities.reject !== true}
-            onClick={() => onControl("reject", invocation.invocationId)}
-          >
-            {pendingAction === "reject" ? "Reject…" : "Reject"}
-          </button>
-        </div>
-      )}
-    </section>
+              {pendingAction === "approve" ? "Approve…" : "Approve"}
+            </Button>
+            <Button
+              data-testid="reject-run"
+              color="red"
+              variant="light"
+              className="control-button danger"
+              disabled={pendingAction !== undefined || view.capabilities.reject !== true}
+              onClick={() => onControl("reject", invocation.invocationId)}
+            >
+              {pendingAction === "reject" ? "Reject…" : "Reject"}
+            </Button>
+          </Group>
+        )}
+      </Stack>
+    </Paper>
   );
 }
 
-function DiffPanel({ runId, revision }: { runId: string; revision: number }) {
+function patchPreview(patch: string, path?: string): string {
+  let value = patch || "(empty diff)";
+  if (path) {
+    const chunks = patch.split(/(?=^diff --git )/m);
+    value =
+      chunks
+        .filter(
+          (chunk) =>
+            chunk.startsWith(`diff --git a/${path} b/${path}\n`) ||
+            chunk.includes(`\n+++ b/${path}\n`) ||
+            chunk.includes(`\n--- a/${path}\n`) ||
+            chunk.startsWith(
+              `diff --git ${JSON.stringify(`a/${path}`)} ${JSON.stringify(`b/${path}`)}\n`,
+            ),
+        )
+        .join("") ||
+      "A file-specific text preview is unavailable for this Git path. Choose All files or open the complete Git diff.";
+  }
+  return value.length > 250000
+    ? `${value.slice(0, 250000)}\n… preview truncated; open the complete Git diff for the full patch.`
+    : value;
+}
+
+function DiffPanel({
+  runId,
+  revision,
+  showDelivery = false,
+}: {
+  runId: string;
+  revision: number;
+  showDelivery?: boolean;
+}) {
+  const [selectedPath, setSelectedPath] = useState<string | undefined>();
   const [state, setState] = useState<
     | { kind: "loading" }
     | { kind: "none"; message: string }
@@ -3856,6 +5015,7 @@ function DiffPanel({ runId, revision }: { runId: string; revision: number }) {
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [commitMessage, setCommitMessage] = useState(`Deliver ${runId}`);
   useEffect(() => {
+    setSelectedPath(undefined);
     setCommitMessage(`Deliver ${runId}`);
     setDelivery({ kind: "idle" });
   }, [runId]);
@@ -3999,118 +5159,320 @@ function DiffPanel({ runId, revision }: { runId: string; revision: number }) {
     }
   };
   return (
-    <div className="diff-panel" data-testid="diff-panel">
-      <div className="section-label">
-        WORKTREE DIFF <span>authoritative</span>
-        <button type="button" onClick={refresh}>
+    <Stack gap="xs" className="diff-panel" data-testid="diff-panel">
+      <Stack gap="xs" className="section-label">
+        {showDelivery ? "LOCAL DELIVERY" : "WORKTREE DIFF"}{" "}
+        <Text component="span" size="sm">
+          authoritative
+        </Text>
+        <Button type="button" onClick={refresh}>
           Refresh reviewed diff
-        </button>
-      </div>
-      <p className="pending-copy">
+        </Button>
+      </Stack>
+      <Text size="sm" className="pending-copy">
         The diff is read from the run worktree, not inferred from agent output.
-      </p>
-      <a
+      </Text>
+      <Anchor
         className="diff-link"
         href={`/api/runs/${encodeURIComponent(runId)}/diff`}
         target="_blank"
         rel="noreferrer"
       >
         Open complete Git diff ↗
-      </a>
+      </Anchor>
       {state.kind === "loading" && (
-        <div className="diff-placeholder">Loading authoritative workspace state…</div>
+        <Stack gap="xs" className="diff-placeholder">
+          Loading authoritative workspace state…
+        </Stack>
       )}
       {state.kind === "none" && (
-        <div className="diff-placeholder" data-testid="diff-no-workspace">
+        <Stack gap="xs" className="diff-placeholder" data-testid="diff-no-workspace">
           {state.message}
-        </div>
+        </Stack>
       )}
       {state.kind === "error" && (
-        <div className="diff-placeholder diff-error" role="alert">
+        <Stack gap="xs" className="diff-placeholder diff-error" role="alert">
           {state.message}
-        </div>
+        </Stack>
       )}
       {state.kind === "snapshot" && (
         <>
-          <div className="diff-summary" data-testid="diff-summary">
-            <strong>
+          <Stack gap="xs" className="diff-summary" data-testid="diff-summary">
+            <Text component="span" size="sm" fw={600}>
               {state.changedPaths.length
                 ? `${state.changedPaths.length} changed path${state.changedPaths.length === 1 ? "" : "s"}`
                 : "No changed paths"}
-            </strong>
-            <span>patch {state.patchDigest.slice(0, 12)}</span>
-          </div>
-          {state.changedPaths.length > 0 && (
-            <ul className="diff-paths">
-              {state.changedPaths.map((item) => (
-                <li key={`${item.status}:${item.path}`}>
-                  <code>{item.status}</code>
-                  <span>
-                    {item.path}
-                    {item.binary ? " · binary" : ""}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            </Text>
+            <Text component="span" size="sm">
+              patch {state.patchDigest.slice(0, 12)}
+            </Text>
+          </Stack>
+          {showDelivery ? (
+            <Grid gap="lg">
+              <Grid.Col span={{ base: 12, lg: 5 }}>
+                <Paper>
+                  <Stack gap="md">
+                    <Title order={3}>Local delivery</Title>
+                    <Stepper
+                      size="xs"
+                      active={
+                        delivery.kind === "action"
+                          ? delivery.status === "committed"
+                            ? 3
+                            : delivery.status === "approved"
+                              ? 2
+                              : 1
+                          : 0
+                      }
+                      allowNextStepsSelect={false}
+                    >
+                      <Stepper.Step label="Prepare" description="Exact tree & message" />
+                      <Stepper.Step label="Approve" description="Durable decision" />
+                      <Stepper.Step label="Commit" description="Local repository effect" />
+                      <Stepper.Completed>
+                        <Text size="sm" c="teal">
+                          Approved tree committed.
+                        </Text>
+                      </Stepper.Completed>
+                    </Stepper>
+                    <Stack gap="md" className="delivery-actions" data-testid="delivery-actions">
+                      <Stack gap="xs" className="section-label">
+                        DELIVERY{" "}
+                        <Text component="span" size="sm">
+                          {delivery.kind === "action" ? delivery.status : "pending"}
+                        </Text>
+                      </Stack>
+                      <Text size="sm" className="pending-copy">
+                        Prepare this exact tree for a durable approval before the local commit
+                        effect.
+                      </Text>
+                      <Stack gap={4} component="label" className="task-input">
+                        <Text component="span" size="sm">
+                          Commit message
+                        </Text>
+                        <Textarea
+                          aria-label="Commit message"
+                          rows={2}
+                          maxLength={4000}
+                          value={commitMessage}
+                          disabled={delivery.kind !== "idle" && delivery.kind !== "error"}
+                          onChange={(event) => setCommitMessage(event.target.value)}
+                        />
+                      </Stack>
+                      {delivery.kind === "idle" && (
+                        <Button
+                          color="teal"
+                          variant="light"
+                          className="control-button approve"
+                          disabled={!commitMessage.trim()}
+                          onClick={() => void prepare()}
+                        >
+                          Prepare delivery
+                        </Button>
+                      )}
+                      {delivery.kind === "working" && (
+                        <Stack gap="xs" className="diff-placeholder">
+                          Updating delivery action…
+                        </Stack>
+                      )}
+                      {delivery.kind === "error" && (
+                        <Stack gap="xs" className="diff-placeholder diff-error">
+                          {delivery.message}
+                        </Stack>
+                      )}
+                      {delivery.kind === "action" && delivery.status === "pending" && (
+                        <Group
+                          gap="xs"
+                          justify="space-between"
+                          wrap="wrap"
+                          className="approval-actions"
+                        >
+                          <Button
+                            color="teal"
+                            variant="light"
+                            className="control-button approve"
+                            onClick={() => void decide("approved")}
+                          >
+                            Approve delivery
+                          </Button>
+                          <Button
+                            color="red"
+                            variant="light"
+                            className="control-button danger"
+                            onClick={() => void decide("rejected")}
+                          >
+                            Reject delivery
+                          </Button>
+                        </Group>
+                      )}
+                      {delivery.kind === "action" && delivery.status === "approved" && (
+                        <Button
+                          color="teal"
+                          variant="light"
+                          className="control-button approve"
+                          onClick={() => void commit()}
+                        >
+                          Commit approved tree
+                        </Button>
+                      )}
+                      {delivery.kind === "action" && delivery.status === "committed" && (
+                        <Stack gap="xs" className="diff-placeholder">
+                          Delivery committed.
+                        </Stack>
+                      )}
+                    </Stack>
+                  </Stack>
+                </Paper>
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, lg: 7 }}>
+                {" "}
+                <Grid gap="md">
+                  <Grid.Col span={{ base: 12, lg: 4 }}>
+                    <Stack gap="sm">
+                      <Title order={3}>Changed files</Title>
+                      <ScrollArea.Autosize mah={460}>
+                        <Stack gap={2}>
+                          <NavLink
+                            active={!selectedPath}
+                            label="All files"
+                            description={`${state.changedPaths.length} changed paths`}
+                            onClick={() => setSelectedPath(undefined)}
+                          />
+                          {state.changedPaths.map((item) => (
+                            <NavLink
+                              key={`${item.status}:${item.path}`}
+                              active={selectedPath === item.path}
+                              label={item.path}
+                              description={`${item.status}${item.binary ? " · binary" : ""}`}
+                              onClick={() => setSelectedPath(item.path)}
+                            />
+                          ))}
+                        </Stack>
+                      </ScrollArea.Autosize>
+                    </Stack>
+                  </Grid.Col>
+                  <Grid.Col span={{ base: 12, lg: 8 }}>
+                    <Stack gap="sm">
+                      <Group justify="space-between">
+                        <Title order={3}>{selectedPath ?? "Complete patch"}</Title>
+                        <Badge variant="light">Git worktree</Badge>
+                      </Group>
+                      <Code
+                        block
+                        mah={460}
+                        style={{ overflow: "auto" }}
+                        className="diff-content"
+                        data-testid="diff-content"
+                      >
+                        {patchPreview(state.patch, selectedPath)
+                          .split("\n")
+                          .map((line, index) => (
+                            <Text
+                              key={index}
+                              component="span"
+                              display="block"
+                              ff="monospace"
+                              size="xs"
+                              c={
+                                line.startsWith("+") && !line.startsWith("+++")
+                                  ? "teal"
+                                  : line.startsWith("-") && !line.startsWith("---")
+                                    ? "red"
+                                    : line.startsWith("@@")
+                                      ? "indigo"
+                                      : undefined
+                              }
+                            >
+                              {line || " "}
+                            </Text>
+                          ))}
+                      </Code>
+                      {selectedPath &&
+                        state.changedPaths.find((item) => item.path === selectedPath)?.binary && (
+                          <Alert color="yellow">
+                            This file is binary. Git reports the change without a textual patch.
+                          </Alert>
+                        )}
+                    </Stack>
+                  </Grid.Col>
+                </Grid>
+              </Grid.Col>
+            </Grid>
+          ) : (
+            <Grid gap="md">
+              <Grid.Col span={{ base: 12, lg: 4 }}>
+                <Stack gap="sm">
+                  <Title order={3}>Changed files</Title>
+                  <ScrollArea.Autosize mah={460}>
+                    <Stack gap={2}>
+                      <NavLink
+                        active={!selectedPath}
+                        label="All files"
+                        description={`${state.changedPaths.length} changed paths`}
+                        onClick={() => setSelectedPath(undefined)}
+                      />
+                      {state.changedPaths.map((item) => (
+                        <NavLink
+                          key={`${item.status}:${item.path}`}
+                          active={selectedPath === item.path}
+                          label={item.path}
+                          description={`${item.status}${item.binary ? " · binary" : ""}`}
+                          onClick={() => setSelectedPath(item.path)}
+                        />
+                      ))}
+                    </Stack>
+                  </ScrollArea.Autosize>
+                </Stack>
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, lg: 8 }}>
+                <Stack gap="sm">
+                  <Group justify="space-between">
+                    <Title order={3}>{selectedPath ?? "Complete patch"}</Title>
+                    <Badge variant="light">Git worktree</Badge>
+                  </Group>
+                  <Code
+                    block
+                    mah={460}
+                    style={{ overflow: "auto" }}
+                    className="diff-content"
+                    data-testid="diff-content"
+                  >
+                    {patchPreview(state.patch, selectedPath)
+                      .split("\n")
+                      .map((line, index) => (
+                        <Text
+                          key={index}
+                          component="span"
+                          display="block"
+                          ff="monospace"
+                          size="xs"
+                          c={
+                            line.startsWith("+") && !line.startsWith("+++")
+                              ? "teal"
+                              : line.startsWith("-") && !line.startsWith("---")
+                                ? "red"
+                                : line.startsWith("@@")
+                                  ? "indigo"
+                                  : undefined
+                          }
+                        >
+                          {line || " "}
+                        </Text>
+                      ))}
+                  </Code>
+                  {selectedPath &&
+                    state.changedPaths.find((item) => item.path === selectedPath)?.binary && (
+                      <Alert color="yellow">
+                        This file is binary. Git reports the change without a textual patch.
+                      </Alert>
+                    )}
+                </Stack>
+              </Grid.Col>
+            </Grid>
           )}
-          <pre className="diff-content" data-testid="diff-content">
-            {state.patch || "(empty diff)"}
-          </pre>
-          <div className="delivery-actions" data-testid="delivery-actions">
-            <div className="section-label">
-              DELIVERY <span>{delivery.kind === "action" ? delivery.status : "pending"}</span>
-            </div>
-            <p className="pending-copy">
-              Prepare this exact tree for a durable approval before the local commit effect.
-            </p>
-            <label className="task-input">
-              <span>Commit message</span>
-              <textarea
-                aria-label="Commit message"
-                rows={2}
-                maxLength={4000}
-                value={commitMessage}
-                disabled={delivery.kind !== "idle" && delivery.kind !== "error"}
-                onChange={(event) => setCommitMessage(event.target.value)}
-              />
-            </label>
-            {delivery.kind === "idle" && (
-              <button
-                className="control-button approve"
-                disabled={!commitMessage.trim()}
-                onClick={() => void prepare()}
-              >
-                Prepare delivery
-              </button>
-            )}
-            {delivery.kind === "working" && (
-              <div className="diff-placeholder">Updating delivery action…</div>
-            )}
-            {delivery.kind === "error" && (
-              <div className="diff-placeholder diff-error">{delivery.message}</div>
-            )}
-            {delivery.kind === "action" && delivery.status === "pending" && (
-              <div className="approval-actions">
-                <button className="control-button approve" onClick={() => void decide("approved")}>
-                  Approve delivery
-                </button>
-                <button className="control-button danger" onClick={() => void decide("rejected")}>
-                  Reject delivery
-                </button>
-              </div>
-            )}
-            {delivery.kind === "action" && delivery.status === "approved" && (
-              <button className="control-button approve" onClick={() => void commit()}>
-                Commit approved tree
-              </button>
-            )}
-            {delivery.kind === "action" && delivery.status === "committed" && (
-              <div className="diff-placeholder">Delivery committed.</div>
-            )}
-          </div>
         </>
       )}
-    </div>
+    </Stack>
   );
 }
 
@@ -4154,23 +5516,32 @@ function OutputPanel({
     });
   const [steeringText, setSteeringText] = useState("");
   return (
-    <div className="output-panel">
+    <Stack gap="xs" className="output-panel">
       {(invocation.state === "running" || liveActivity.length > 0) && (
-        <section className="live-agent-activity" aria-live="polite">
-          <div className="section-label">
-            AGENT ACTIVITY <span>{invocation.state === "running" ? "live" : "captured"}</span>
-          </div>
-          <p>{activityLabels.at(-1) ?? "Thinking"}</p>
+        <Stack gap="xs" component="section" className="live-agent-activity" aria-live="polite">
+          <Stack gap="xs" className="section-label">
+            AGENT ACTIVITY{" "}
+            <Text component="span" size="sm">
+              {invocation.state === "running" ? "live" : "captured"}
+            </Text>
+          </Stack>
+          <Text size="sm">{activityLabels.at(-1) ?? "Thinking"}</Text>
           {activityLabels.length > 1 && (
-            <ul>
+            <List>
               {activityLabels.slice(-8).map((label, index) => (
-                <li key={`${index}:${label}`}>{label}</li>
+                <List.Item key={`${index}:${label}`}>{label}</List.Item>
               ))}
-            </ul>
+            </List>
           )}
-          {liveText && <pre className="live-agent-reply">{liveText}</pre>}
+          {liveText && (
+            <Code block mah={380} style={{ overflow: "auto" }} className="live-agent-reply">
+              {liveText}
+            </Code>
+          )}
           {steerable ? (
-            <form
+            <Stack
+              gap="xs"
+              component="form"
               className="steer-form"
               onSubmit={(event) => {
                 event.preventDefault();
@@ -4182,97 +5553,141 @@ function OutputPanel({
                 }
               }}
             >
-              <textarea
+              <Textarea
+                minRows={3}
+                autosize
+                maxRows={12}
                 aria-label="Steer active agent"
                 placeholder="Send an instruction to the active agent"
                 value={steeringText}
                 onChange={(event) => setSteeringText(event.target.value)}
                 maxLength={4000}
               />
-              <button type="submit" disabled={!steeringText.trim() || Boolean(pendingAction)}>
+              <Button type="submit" disabled={!steeringText.trim() || Boolean(pendingAction)}>
                 Steer agent
-              </button>
-            </form>
+              </Button>
+            </Stack>
           ) : (
-            <small>This harness accepts input after its current turn.</small>
+            <Text component="span" size="xs" c="dimmed">
+              This harness accepts input after its current turn.
+            </Text>
           )}
-        </section>
+        </Stack>
       )}
-      <div className="section-label">
-        STRUCTURED OUTPUT <span>{captured ? "captured" : "none"}</span>
-      </div>
+      <Stack gap="xs" className="section-label">
+        STRUCTURED OUTPUT{" "}
+        <Text component="span" size="sm">
+          {captured ? "captured" : "none"}
+        </Text>
+      </Stack>
       {captured ? (
         Array.isArray(output) &&
         output.every((item) => item && typeof item === "object" && "id" in item) ? (
           <ArtifactPanel artifacts={output as ArtifactView[]} initiallyOpen />
         ) : (
-          <pre>{JSON.stringify(output, null, 2)}</pre>
+          <Code block mah={380} style={{ overflow: "auto" }}>
+            {JSON.stringify(output, null, 2)}
+          </Code>
         )
       ) : (
-        <div className="pending-copy">
+        <Stack gap="xs" className="pending-copy">
           {invocation.state === "running"
             ? "No typed output has been published yet."
             : "No structured output was published for this invocation."}
-        </div>
+        </Stack>
       )}
-      <div className="section-label command-label">
-        NODE <span>{invocation.sourceNodeId}</span>
-      </div>
+      <Stack gap="xs" className="section-label command-label">
+        NODE{" "}
+        <Text component="span" size="sm">
+          {invocation.sourceNodeId}
+        </Text>
+      </Stack>
       {attempt?.command?.stderrArtifactId && (
         <ArtifactContent artifactId={attempt.command.stderrArtifactId} />
       )}
-    </div>
+    </Stack>
   );
 }
 function EvidencePanel({
   attempts,
   focusedAttemptId,
   onFocus,
+  view,
 }: {
+  view?: UiRunView;
   attempts: UiAttempt[];
   focusedAttemptId?: string;
   onFocus: (attemptId: string) => void;
 }) {
   return (
-    <div className="evidence-panel">
+    <Stack gap="xs" className="evidence-panel">
       {attempts.length ? (
         attempts.map((attempt) => (
-          <button
+          <Paper
+            p="sm"
             className={`evidence-card attempt-card ${focusedAttemptId === attempt.attemptId ? "focused" : ""}`}
             key={attempt.attemptId}
-            onClick={() => onFocus(attempt.attemptId)}
             aria-label={`Inspect attempt ${attempt.ordinal + 1}`}
           >
-            <div>
+            <Stack gap="xs">
+              <Group justify="space-between">
+                <Text size="sm" fw={600}>
+                  {view
+                    ? invocationLabel(view, attempt.invocationId, attempt.attemptId)
+                    : `Attempt ${attempt.ordinal + 1}`}
+                </Text>
+                <Button size="xs" onClick={() => onFocus(attempt.attemptId)}>
+                  Inspect attempt {attempt.ordinal + 1}
+                </Button>
+              </Group>
               <StatusDot state={attempt.state} />
-              <strong>attempt {attempt.ordinal + 1}</strong>
-              <span>{attempt.state}</span>
-            </div>
-            <small className="repair-label">
+              <Text component="span" size="sm" fw={600}>
+                attempt {attempt.ordinal + 1}
+              </Text>
+              <Text component="span" size="sm">
+                {attempt.state}
+              </Text>
+              <Text size="xs" c="dimmed">
+                {attempt.attemptId}
+              </Text>
+            </Stack>
+            <Text component="span" size="xs" c="dimmed" className="repair-label">
               {attempt.ordinal > 0 ? "additional attempt" : "initial attempt"}
-            </small>
+            </Text>
             {attempt.command && (
-              <code>
+              <Code>
                 {attempt.command.executable} {(attempt.command.args ?? []).join(" ")}
-              </code>
+              </Code>
             )}
             {attempt.command?.executionMode === "trusted-unrestricted" && (
-              <small>TRUSTED UNRESTRICTED COMMAND</small>
+              <Text component="span" size="xs" c="dimmed">
+                TRUSTED UNRESTRICTED COMMAND
+              </Text>
             )}
             {attempt.result && (
-              <p>
+              <Text size="sm">
                 exit {attempt.result.exitCode ?? "—"} · {attempt.result.status ?? attempt.state}
-              </p>
+              </Text>
             )}
-          </button>
+          </Paper>
         ))
       ) : (
-        <div className="pending-copy">No attempt evidence yet.</div>
+        <Stack gap="xs" className="pending-copy">
+          No attempt evidence yet.
+        </Stack>
       )}
-    </div>
+    </Stack>
   );
 }
-function EventHistoryPanel({ runId }: { runId: string }) {
+function EventHistoryPanel({
+  runId,
+  invocationId,
+  attemptIds,
+}: {
+  runId: string;
+  invocationId?: string;
+  attemptIds?: string[];
+}) {
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
   const [cursor, setCursor] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -4307,65 +5722,88 @@ function EventHistoryPanel({ runId }: { runId: string }) {
     void loadPage(0, true);
   }, [loadPage]);
   const term = search.trim().toLocaleLowerCase();
-  const visible = events.filter(
-    (event) => !term || JSON.stringify(event).toLocaleLowerCase().includes(term),
-  );
+  const visible = events.filter((event) => {
+    const payload = (event.payload ?? {}) as Record<string, unknown>;
+    const matchesScope =
+      attemptIds === undefined ||
+      payload.invocationId === invocationId ||
+      (typeof payload.attemptId === "string" && attemptIds.includes(payload.attemptId));
+    return matchesScope && (!term || JSON.stringify(event).toLocaleLowerCase().includes(term));
+  });
   return (
-    <div className="event-history-panel">
-      <div className="event-history-controls">
-        <input
+    <Stack gap="xs" className="event-history-panel">
+      <Group gap="xs" justify="space-between" wrap="wrap" className="event-history-controls">
+        <TextInput
           aria-label="Filter run events"
           placeholder="Filter event type or payload"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
         />
-        <span>{visible.length} shown</span>
-      </div>
+        <Text component="span" size="sm">
+          {visible.length} shown
+        </Text>
+      </Group>
       {error && (
-        <p className="notice error" role="alert">
-          {error} <button onClick={() => void loadPage(cursor, events.length === 0)}>Retry</button>
-        </p>
+        <Text size="sm" className="notice error" role="alert">
+          {error} <Button onClick={() => void loadPage(cursor, events.length === 0)}>Retry</Button>
+        </Text>
       )}
       {visible.map((event, index) => (
-        <details
+        <Disclosure
           className="event-history-row"
           key={`${String(event.sequence ?? index)}:${String(event.eventId ?? "")}`}
         >
-          <summary>
-            <span>r{String(event.sequence ?? "?")}</span>
-            <strong>{String(event.type ?? "unknown event")}</strong>
-            <small>{String(event.recordedAt ?? "")}</small>
-          </summary>
-          <div className="event-history-meta">
+          <DisclosureTitle>
+            <Text component="span" size="sm">
+              r{String(event.sequence ?? "?")}
+            </Text>
+            <Text component="span" size="sm" fw={600}>
+              {String(event.type ?? "unknown event")}
+            </Text>
+            <Text component="span" size="xs" c="dimmed">
+              {String(event.recordedAt ?? "")}
+            </Text>
+          </DisclosureTitle>
+          <Group gap="xs" justify="space-between" wrap="wrap" className="event-history-meta">
             {String(event.actor ?? "system")}
             {event.causationId ? ` · caused by ${String(event.causationId)}` : ""}
-          </div>
-          <pre>{boundedActivity(event.payload)}</pre>
-        </details>
+          </Group>
+          <Code block mah={380} style={{ overflow: "auto" }}>
+            {boundedActivity(event.payload)}
+          </Code>
+        </Disclosure>
       ))}
       {hasMore && (
-        <button
+        <Button
           className="older-runs-button"
           disabled={loading}
           onClick={() => void loadPage(cursor, false)}
         >
           {loading ? "Loading…" : "Load more journal events"}
-        </button>
+        </Button>
       )}
-      {!events.length && !loading && !error && <p className="pending-copy">No journal events.</p>}
-    </div>
+      {!visible.length && !loading && !error && (
+        <Text size="sm" c="dimmed">
+          {attemptIds === undefined
+            ? "No matching journal events."
+            : "No matching events for this invocation in the loaded history."}
+        </Text>
+      )}
+    </Stack>
   );
 }
 
 function ArtifactPanel({
   artifacts,
   initiallyOpen = false,
+  view,
 }: {
+  view?: UiRunView;
   artifacts: Array<ArtifactView | { artifactId: string; contentType?: string }>;
   initiallyOpen?: boolean;
 }) {
   return (
-    <div className="artifact-panel">
+    <Stack gap="xs" className="artifact-panel">
       {artifacts.length ? (
         artifacts.map((artifact) => {
           const id = "id" in artifact ? artifact.id : artifact.artifactId;
@@ -4376,13 +5814,21 @@ function ArtifactPanel({
                 ? artifact.contentType
                 : undefined;
           return (
-            <ArtifactRow key={id} id={id} mediaType={mediaType} initiallyOpen={initiallyOpen} />
+            <ArtifactRow
+              key={id}
+              id={id}
+              mediaType={mediaType}
+              initiallyOpen={initiallyOpen}
+              identity={view ? artifactIdentity(view, id) : undefined}
+            />
           );
         })
       ) : (
-        <div className="pending-copy">No artifacts attached.</div>
+        <Stack gap="xs" className="pending-copy">
+          No artifacts attached.
+        </Stack>
       )}
-    </div>
+    </Stack>
   );
 }
 
@@ -4390,27 +5836,37 @@ function ArtifactRow({
   id,
   mediaType,
   initiallyOpen,
+  identity,
 }: {
+  identity?: ReturnType<typeof artifactIdentity>;
   id: string;
   mediaType?: string;
   initiallyOpen: boolean;
 }) {
   const [open, setOpen] = useState(initiallyOpen);
   return (
-    <details
-      className="artifact-row"
-      open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-    >
-      <summary>
-        <span className="artifact-icon">◇</span>
-        <span>
-          <strong>{id.slice(0, 14)}</strong>
-          <em>artifact · {mediaType ?? "application/json"}</em>
-        </span>
-      </summary>
+    <Disclosure className="artifact-row" open={open} onToggle={setOpen}>
+      <DisclosureTitle>
+        <Text component="span" display="block" size="sm" fw={600}>
+          {identity?.name ?? "Artifact"}
+        </Text>
+        {identity?.owners.map((owner) => (
+          <Text
+            component="span"
+            display="block"
+            key={`${owner.invocationId}:${owner.attemptId ?? ""}`}
+            size="xs"
+            c="dimmed"
+          >
+            {owner.label}
+          </Text>
+        ))}
+        <Text component="span" display="block" size="xs" c="dimmed">
+          {id} · {mediaType ?? "media type not reported"}
+        </Text>
+      </DisclosureTitle>
       {open && <ArtifactContent artifactId={id} />}
-    </details>
+    </Disclosure>
   );
 }
 
@@ -4482,32 +5938,40 @@ function ArtifactContent({ artifactId }: { artifactId: string }) {
     };
   }, [artifactId, retry]);
   return (
-    <section className="artifact-preview">
-      <a
+    <Stack gap="xs" component="section" className="artifact-preview">
+      <Anchor
         href={`/api/artifacts/${encodeURIComponent(artifactId)}/content`}
         target="_blank"
         rel="noreferrer"
       >
         Open full artifact
-      </a>
+      </Anchor>
       {error ? (
-        <p role="alert">
-          {error} <button onClick={() => setRetry((value) => value + 1)}>Retry</button>
-        </p>
+        <Text size="sm" role="alert">
+          {error} <Button onClick={() => setRetry((value) => value + 1)}>Retry</Button>
+        </Text>
       ) : content === undefined ? (
-        <p>Loading artifact…</p>
+        <Text size="sm">Loading artifact…</Text>
       ) : mediaType.includes("markdown") ? (
         <SafeMarkdown text={content} />
       ) : (
-        <pre>{content}</pre>
+        <Code block mah={380} style={{ overflow: "auto" }}>
+          {content}
+        </Code>
       )}
-      {truncated && <p>Preview limited to 256 KiB. Open the full artifact to read the rest.</p>}
-    </section>
+      {truncated && (
+        <Text size="sm">Preview limited to 256 KiB. Open the full artifact to read the rest.</Text>
+      )}
+    </Stack>
   );
 }
 
 function RoleBadge({ label }: { label: string }) {
-  return <span className="role-badge">{label}</span>;
+  return (
+    <Text component="span" size="sm" className="role-badge">
+      {label}
+    </Text>
+  );
 }
 function formatDuration(ms: number) {
   if (!Number.isFinite(ms) || ms < 0) return "0.0s";

@@ -160,7 +160,7 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       if (next.status !== "paused") throw new Error(`Run cannot resume from ${next.status}`);
       return { ...next, status: "running" };
     case "run.cancel.requested":
-      if (!["running", "paused"].includes(next.status))
+      if (!["running", "paused", "recovery-required"].includes(next.status))
         throw new Error(`Run cannot cancel from ${next.status}`);
       return { ...next, control: "cancel-requested" };
     case "run.interrupt.requested":
@@ -570,7 +570,14 @@ function runCompleted(
   state: ExecutionState,
   event: Extract<LifecycleEvent, { type: "run.completed" }>,
 ): ExecutionState {
-  if (state.status !== "running" && state.status !== "paused")
+  const stoppedRecovery =
+    state.status === "recovery-required" &&
+    event.payload.status === "cancelled" &&
+    state.control === "cancel-requested" &&
+    Object.values(state.attempts).every(
+      (attempt) => !["reserved", "running"].includes(attempt.status),
+    );
+  if (state.status !== "running" && state.status !== "paused" && !stoppedRecovery)
     throw new Error(`Run cannot complete from ${state.status}`);
   const invocations = Object.values(state.invocations);
   if (

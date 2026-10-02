@@ -1,3 +1,17 @@
+import { Modal, Paper, Badge, Divider } from "@mantine/core";
+import {
+  Anchor,
+  Button,
+  Code,
+  Group,
+  NativeSelect,
+  SimpleGrid,
+  Stack,
+  Text,
+  TextInput,
+  Textarea,
+  Title,
+} from "@mantine/core";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ActivityValue, ToolActivity } from "./ActivityValue";
 import { projectSession, type SessionObservation, type SessionEntry } from "../session";
@@ -9,6 +23,7 @@ export interface ActivityPage {
 }
 
 export function AgentSessionModal({
+  embedded = false,
   runId,
   invocationId,
   attemptId,
@@ -29,6 +44,7 @@ export function AgentSessionModal({
   initialSpeaker,
   subagents = [],
 }: {
+  embedded?: boolean;
   runId: string;
   invocationId: string;
   attemptId: string;
@@ -71,11 +87,6 @@ export function AgentSessionModal({
   const [selectedChild, setSelectedChild] = useState<string>();
   const [newActivity, setNewActivity] = useState(false);
   const streamRef = useRef<HTMLDivElement>(null);
-  const dialogRef = useRef<HTMLElement>(null);
-  const closeButtonRef = useRef<HTMLButtonElement>(null);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
   const stickToBottom = useRef(true);
   const activeEntries = useMemo(() => projectSession([...history, ...events]), [history, events]);
   const summariesOnly =
@@ -160,51 +171,6 @@ export function AgentSessionModal({
     };
   }, [runId, attemptId, loadActivity]);
   useEffect(() => {
-    previousFocusRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    closeButtonRef.current?.focus();
-    const handleDialogKeys = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCloseRef.current();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const dialog = dialogRef.current;
-      if (!dialog) return;
-      const focusable = Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-        ),
-      );
-      if (!focusable.length) {
-        event.preventDefault();
-        dialog.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable.at(-1)!;
-      if (
-        event.shiftKey &&
-        (document.activeElement === first || !dialog.contains(document.activeElement))
-      ) {
-        event.preventDefault();
-        last.focus();
-      } else if (
-        !event.shiftKey &&
-        (document.activeElement === last || !dialog.contains(document.activeElement))
-      ) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", handleDialogKeys);
-    return () => {
-      window.removeEventListener("keydown", handleDialogKeys);
-      previousFocusRef.current?.focus();
-    };
-  }, []);
-  useEffect(() => {
     const stream = streamRef.current;
     if (stream && stickToBottom.current) {
       if (!search && speaker === "all")
@@ -248,168 +214,169 @@ export function AgentSessionModal({
       setSteering(false);
     }
   };
-  return (
-    <div
-      className={`agent-session-backdrop${fullscreen ? " session-fullscreen" : ""}`}
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <section
-        ref={dialogRef}
-        tabIndex={-1}
-        className="agent-session-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agent-session-title"
+  const content = (
+    <Stack gap="md">
+      <Group
+        gap="xs"
+        justify="space-between"
+        wrap="wrap"
+        component="header"
+        className="agent-session-header"
       >
-        <header className="agent-session-header">
-          <div>
-            <span>{live ? "LIVE AGENT SESSION" : "AGENT SESSION"}</span>
-            <h2 id="agent-session-title">{nodeId}</h2>
-            <small>
-              {harness} · invocation {invocationId.slice(0, 12)} · attempt {attemptId.slice(0, 12)}
-            </small>
-            <button
-              type="button"
-              className="session-copy-link"
-              onClick={() => {
-                const url = new URL(window.location.href);
-                url.searchParams.set("run", runId);
-                url.searchParams.set("invocation", invocationId);
-                url.searchParams.set("attempt", attemptId);
-                void navigator.clipboard?.writeText(url.toString());
-              }}
-            >
-              Copy session link
-            </button>
-          </div>
-          <div className="session-window-controls">
-            <button
-              type="button"
-              className="session-size-toggle"
-              aria-pressed={fullscreen}
-              onClick={() => setFullscreen((current) => !current)}
-            >
-              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            </button>
-            <button
-              ref={closeButtonRef}
-              type="button"
-              aria-label="Close agent session"
-              onClick={onClose}
-            >
-              ×
-            </button>
-          </div>
-        </header>
-        {summariesOnly && (
-          <p className="session-provider-note">
-            The provider has supplied reasoning summaries; full thinking text has not been provided.
-            Assistant messages appear as they arrive.
-          </p>
-        )}
-        {hasMoreHistory && (
-          <button
+        <Stack gap="xs">
+          <Text component="span" size="sm">
+            {live ? "LIVE AGENT SESSION" : "AGENT SESSION"}
+          </Text>
+          <Title order={2} id="agent-session-title">
+            {nodeId}
+          </Title>
+          <Text component="span" size="xs" c="dimmed">
+            {harness} · invocation {invocationId.slice(0, 12)} · attempt {attemptId.slice(0, 12)}
+          </Text>
+          <Button
             type="button"
-            className="session-history-more"
-            onClick={() => void loadMore()}
-            disabled={historyLoading}
+            className="session-copy-link"
+            onClick={() => {
+              const url = new URL(window.location.href);
+              url.searchParams.set("run", runId);
+              url.searchParams.set("invocation", invocationId);
+              url.searchParams.set("attempt", attemptId);
+              void navigator.clipboard?.writeText(url.toString());
+            }}
           >
-            {historyLoading ? "Loading history…" : "Load more session history"}
-          </button>
-        )}
-        {historyError && (
-          <p className="session-history-error" role="status">
-            {historyError}{" "}
-            <button type="button" onClick={() => void loadMore()}>
-              Retry
-            </button>
-          </p>
-        )}
-        <div className="session-search-row">
-          <button
+            Copy session link
+          </Button>
+        </Stack>
+        <Group gap="xs" justify="space-between" wrap="wrap" className="session-window-controls">
+          <Button
             type="button"
-            aria-pressed={showSplit}
-            disabled={!child}
-            onClick={() => setSplit((value) => !value)}
+            className="session-size-toggle"
+            aria-pressed={fullscreen}
+            onClick={() => setFullscreen((current) => !current)}
           >
-            {showSplit ? "Combined view" : "Split parent and subagent"}
-          </button>
-          {!showSplit && (
-            <select
-              aria-label="Session speaker"
-              value={speaker}
-              onChange={(event) => {
-                stickToBottom.current = false;
-                setWindowStart(0);
-                setSpeaker(event.target.value);
-              }}
-            >
-              <option value="all">Parent and subagents</option>
-              <option value="parent">Parent only</option>
-              {[
-                ...new Set(
-                  activeEntries.flatMap((entry) => (entry.scoutId ? [entry.scoutId] : [])),
-                ),
-              ].map((id) => (
-                <option key={id} value={id}>
-                  {id}
-                </option>
-              ))}
-            </select>
-          )}
-          <input
-            aria-label="Search agent session"
-            placeholder="Search this session"
-            value={search}
+            {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+          </Button>
+        </Group>
+      </Group>
+      {summariesOnly && (
+        <Text size="sm" className="session-provider-note">
+          The provider has supplied reasoning summaries; full thinking text has not been provided.
+          Assistant messages appear as they arrive.
+        </Text>
+      )}
+      {hasMoreHistory && (
+        <Button
+          type="button"
+          className="session-history-more"
+          onClick={() => void loadMore()}
+          disabled={historyLoading}
+        >
+          {historyLoading ? "Loading history…" : "Load more session history"}
+        </Button>
+      )}
+      {historyError && (
+        <Text size="sm" className="session-history-error" role="status">
+          {historyError}{" "}
+          <Button type="button" onClick={() => void loadMore()}>
+            Retry
+          </Button>
+        </Text>
+      )}
+      <Group gap="xs" justify="space-between" wrap="wrap" className="session-search-row">
+        <Button
+          type="button"
+          aria-pressed={showSplit}
+          disabled={!child}
+          onClick={() => setSplit((value) => !value)}
+        >
+          {showSplit ? "Combined view" : "Split parent and subagent"}
+        </Button>
+        {!showSplit && (
+          <NativeSelect
+            aria-label="Session speaker"
+            value={speaker}
             onChange={(event) => {
               stickToBottom.current = false;
               setWindowStart(0);
-              setSearch(event.target.value);
+              setSpeaker(event.target.value);
             }}
-          />
-          {!showSplit && visibleStart > 0 && (
-            <button
-              type="button"
-              onClick={() => {
-                stickToBottom.current = false;
-                setWindowStart(Math.max(0, windowStart - windowSize));
-              }}
-            >
-              Earlier messages
-            </button>
-          )}
-          {!showSplit && visibleStart + windowSize < filteredEntries.length && (
-            <button
-              type="button"
-              onClick={() =>
-                setWindowStart(
-                  Math.min(filteredEntries.length - windowSize, windowStart + windowSize),
-                )
-              }
-            >
-              Newer messages
-            </button>
-          )}
-          {search && <span>{filteredEntries.length} matches</span>}
-        </div>
-        {showSplit && child ? (
-          <div className="session-split" data-testid="session-split">
-            <section className="session-lane" aria-label="Main model session">
-              <header>
-                <strong>Main model</strong>
-                <small>
+          >
+            <option value="all">Parent and subagents</option>
+            <option value="parent">Parent only</option>
+            {[
+              ...new Set(activeEntries.flatMap((entry) => (entry.scoutId ? [entry.scoutId] : []))),
+            ].map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </NativeSelect>
+        )}
+        <TextInput
+          aria-label="Search agent session"
+          placeholder="Search this session"
+          value={search}
+          onChange={(event) => {
+            stickToBottom.current = false;
+            setWindowStart(0);
+            setSearch(event.target.value);
+          }}
+        />
+        {!showSplit && visibleStart > 0 && (
+          <Button
+            type="button"
+            onClick={() => {
+              stickToBottom.current = false;
+              setWindowStart(Math.max(0, windowStart - windowSize));
+            }}
+          >
+            Earlier messages
+          </Button>
+        )}
+        {!showSplit && visibleStart + windowSize < filteredEntries.length && (
+          <Button
+            type="button"
+            onClick={() =>
+              setWindowStart(
+                Math.min(filteredEntries.length - windowSize, windowStart + windowSize),
+              )
+            }
+          >
+            Newer messages
+          </Button>
+        )}
+        {search && (
+          <Text component="span" size="sm">
+            {filteredEntries.length} matches
+          </Text>
+        )}
+      </Group>
+      {showSplit && child ? (
+        <SimpleGrid
+          cols={{ base: 1, md: 2 }}
+          spacing="md"
+          className="session-split"
+          data-testid="session-split"
+        >
+          <Paper component="section" className="session-lane" aria-label="Main model session">
+            <Stack gap="md">
+              <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+                <Text component="span" size="sm" fw={600}>
+                  Main model
+                </Text>
+                <Text component="span" size="xs" c="dimmed">
                   {harness} · {live ? "live" : "completed"}
-                </small>
-              </header>
+                </Text>
+              </Group>
               <SessionLane entries={parentEntries} search={search} />
-            </section>
-            <section className="session-lane" aria-label="Subagent model session">
-              <header>
-                <label>
+            </Stack>
+          </Paper>
+          <Paper component="section" className="session-lane" aria-label="Subagent model session">
+            <Stack gap="md">
+              <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+                <Stack gap={4} component="label">
                   Subagent{" "}
-                  <select
+                  <NativeSelect
                     aria-label="Live subagent"
                     value={child.key}
                     onChange={(event) => setSelectedChild(event.target.value)}
@@ -419,146 +386,179 @@ export function AgentSessionModal({
                         {lane.scoutId} · {lane.requestId || "retained"}
                       </option>
                     ))}
-                  </select>
-                </label>
-                <small>
+                  </NativeSelect>
+                </Stack>
+                <Text component="span" size="xs" c="dimmed">
                   {child.harness ?? "Harness not recorded"}
                   {child.modelId ? ` · ${child.modelId}` : ""} · {child.state}
-                </small>
-              </header>
+                </Text>
+              </Group>
               <SessionLane key={child.key} entries={childEntries} search={search} />
-            </section>
-          </div>
-        ) : (
-          <>
-            {" "}
-            <div
-              className="agent-session-stream"
-              ref={streamRef}
-              onScroll={(event) => {
-                const el = event.currentTarget;
-                stickToBottom.current =
-                  !search &&
-                  speaker === "all" &&
-                  visibleStart + windowSize >= filteredEntries.length &&
-                  el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-                if (stickToBottom.current) setNewActivity(false);
-              }}
-            >
-              {visibleEntries.length === 0 && (
-                <p className="agent-session-empty">
-                  {live
-                    ? "Waiting for agent activity…"
-                    : "No provider activity was retained for this attempt."}
-                </p>
-              )}
-              {visibleEntries.map((entry) => (
-                <SessionEntryView key={entry.id} entry={entry} />
-              ))}
-            </div>
-          </>
-        )}
-        {!showSplit && newActivity && (
-          <button
-            type="button"
-            className="session-jump-latest"
-            onClick={() => {
-              stickToBottom.current = true;
-              setSearch("");
-              setSpeaker("all");
-              setWindowStart(Math.max(0, activeEntries.length - windowSize));
-              streamRef.current?.scrollTo({
-                top: streamRef.current.scrollHeight,
-                behavior: "smooth",
-              });
-              setNewActivity(false);
+            </Stack>
+          </Paper>
+        </SimpleGrid>
+      ) : (
+        <>
+          {" "}
+          <Stack
+            gap="sm"
+            h="min(50dvh, 600px)"
+            p="sm"
+            style={{ overflow: "auto" }}
+            className="agent-session-stream"
+            ref={streamRef}
+            onScroll={(event) => {
+              const el = event.currentTarget;
+              stickToBottom.current =
+                !search &&
+                speaker === "all" &&
+                visibleStart + windowSize >= filteredEntries.length &&
+                el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+              if (stickToBottom.current) setNewActivity(false);
             }}
           >
-            New activity · Jump to latest
-          </button>
-        )}
-        {live && (
-          <form className="session-composer" onSubmit={(event) => void sendSteering(event)}>
-            <textarea
-              aria-label="Steer active agent"
-              placeholder={
-                steerable
-                  ? "Send an instruction while it is running…"
-                  : "This harness cannot be steered mid-turn"
+            {visibleEntries.length === 0 && (
+              <Text size="sm" className="agent-session-empty">
+                {live
+                  ? "Waiting for agent activity…"
+                  : "No provider activity was retained for this attempt."}
+              </Text>
+            )}
+            {visibleEntries.map((entry) => (
+              <SessionEntryView key={entry.id} entry={entry} />
+            ))}
+          </Stack>
+        </>
+      )}
+      {!showSplit && newActivity && (
+        <Button
+          type="button"
+          className="session-jump-latest"
+          onClick={() => {
+            stickToBottom.current = true;
+            setSearch("");
+            setSpeaker("all");
+            setWindowStart(Math.max(0, activeEntries.length - windowSize));
+            streamRef.current?.scrollTo({
+              top: streamRef.current.scrollHeight,
+              behavior: "smooth",
+            });
+            setNewActivity(false);
+          }}
+        >
+          New activity · Jump to latest
+        </Button>
+      )}
+      {live && (
+        <Stack
+          gap="xs"
+          component="form"
+          className="session-composer"
+          onSubmit={(event) => void sendSteering(event as unknown as FormEvent<HTMLFormElement>)}
+        >
+          <Textarea
+            minRows={3}
+            autosize
+            maxRows={12}
+            aria-label="Steer active agent"
+            placeholder={
+              steerable
+                ? "Send an instruction while it is running…"
+                : "This harness cannot be steered mid-turn"
+            }
+            disabled={!steerable}
+            value={message}
+            maxLength={4000}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
               }
-              disabled={!steerable}
-              value={message}
-              maxLength={4000}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  event.currentTarget.form?.requestSubmit();
-                }
-              }}
-              onChange={(event) => setMessage(event.target.value)}
-            />
-            <button type="submit" disabled={!steerable || !message.trim() || steering}>
-              {steering ? "Sending…" : "Send instruction"}
-            </button>
-            {canInterrupt && (
-              <button
-                type="button"
-                className="control-button"
-                disabled={interruptPending || stopPending}
-                onClick={onInterrupt}
-              >
-                {interruptPending ? "Interrupting…" : "Interrupt agent"}
-              </button>
-            )}
-            {canStop && (
-              <button
-                className="session-stop"
-                type="button"
-                onClick={onStop}
-                disabled={stopPending}
-              >
-                {stopPending ? "Cancelling…" : "Cancel run"}
-              </button>
-            )}
-          </form>
-        )}
-        {steeringError && (
-          <p className="session-error" role="alert">
-            {steeringError}
-          </p>
-        )}
-      </section>
-    </div>
+            }}
+            onChange={(event) => setMessage(event.target.value)}
+          />
+          <Button type="submit" disabled={!steerable || !message.trim() || steering}>
+            {steering ? "Sending…" : "Send instruction"}
+          </Button>
+          {canInterrupt && (
+            <Button
+              type="button"
+              className="control-button"
+              disabled={interruptPending || stopPending}
+              onClick={onInterrupt}
+            >
+              {interruptPending ? "Interrupting…" : "Interrupt agent"}
+            </Button>
+          )}
+          {canStop && (
+            <Button className="session-stop" type="button" onClick={onStop} disabled={stopPending}>
+              {stopPending ? "Cancelling…" : "Cancel run"}
+            </Button>
+          )}
+        </Stack>
+      )}
+      {steeringError && (
+        <Text size="sm" className="session-error" role="alert">
+          {steeringError}
+        </Text>
+      )}
+    </Stack>
+  );
+  return embedded && !fullscreen ? (
+    <Paper>{content}</Paper>
+  ) : (
+    <Modal
+      opened
+      onClose={embedded ? () => setFullscreen(false) : onClose}
+      fullScreen={fullscreen}
+      size="min(1320px, 95vw)"
+      title={`${live ? "Live agent session" : "Agent session"} · ${nodeId}`}
+      closeButtonProps={{ "aria-label": "Close agent session" }}
+      className="agent-session-modal"
+    >
+      {content}
+    </Modal>
   );
 }
 
 function SessionEntryView({ entry }: { entry: SessionEntry }) {
   if (entry.kind === "tool") return <ToolActivity tool={entry} />;
-  if (entry.kind === "status") return <p className="session-status">{entry.message}</p>;
+  if (entry.kind === "status")
+    return (
+      <Text size="sm" className="session-status">
+        {entry.message}
+      </Text>
+    );
   return (
-    <article className={`session-message ${entry.channel ?? "agent"}-message`}>
-      <span>
-        {entry.scoutId ? `${entry.scoutId} · ` : ""}
-        {entry.channel === "thinking"
-          ? entry.thinkingKind === "content"
-            ? "THINKING"
-            : "THINKING SUMMARY"
-          : entry.channel === "operator"
-            ? `YOU · ${entry.status ?? "requested"}`
-            : "AGENT"}
-        <button
-          type="button"
-          onClick={() => void navigator.clipboard?.writeText(entry.text).catch(() => {})}
-        >
-          Copy
-        </button>
-      </span>
-      {entry.channel !== "thinking" && /^\s*[[{]/.test(entry.text) ? (
-        <ActivityValue value={entry.text} />
-      ) : (
-        <SafeMarkdown text={entry.text} />
-      )}
-    </article>
+    <Paper
+      p="sm"
+      component="article"
+      className={`session-message ${entry.channel ?? "agent"}-message`}
+    >
+      <Stack gap="md">
+        <Text component="span" size="sm">
+          {entry.scoutId ? `${entry.scoutId} · ` : ""}
+          {entry.channel === "thinking"
+            ? entry.thinkingKind === "content"
+              ? "THINKING"
+              : "THINKING SUMMARY"
+            : entry.channel === "operator"
+              ? `YOU · ${entry.status ?? "requested"}`
+              : "AGENT"}
+          <Button
+            type="button"
+            onClick={() => void navigator.clipboard?.writeText(entry.text).catch(() => {})}
+          >
+            Copy
+          </Button>
+        </Text>
+        {entry.channel !== "thinking" && /^\s*[[{]/.test(entry.text) ? (
+          <ActivityValue value={entry.text} />
+        ) : (
+          <SafeMarkdown text={entry.text} />
+        )}
+      </Stack>
+    </Paper>
   );
 }
 
@@ -585,29 +585,29 @@ function SessionLane({ entries, search }: { entries: SessionEntry[]; search: str
   }, [entries, search]);
   return (
     <>
-      <div className="lane-navigation">
+      <Group gap="xs" justify="space-between" wrap="wrap" className="lane-navigation">
         {offset > 0 && (
-          <button
+          <Button
             onClick={() => {
               following.current = false;
               setStart(Math.max(0, offset - size));
             }}
           >
             Earlier messages
-          </button>
+          </Button>
         )}
         {offset + size < entries.length && (
-          <button
+          <Button
             onClick={() => {
               following.current = false;
               setStart(offset + size);
             }}
           >
             Newer messages
-          </button>
+          </Button>
         )}
         {newActivity && (
-          <button
+          <Button
             onClick={() => {
               following.current = true;
               setStart(Math.max(0, entries.length - size));
@@ -616,10 +616,14 @@ function SessionLane({ entries, search }: { entries: SessionEntry[]; search: str
             }}
           >
             Jump to latest
-          </button>
+          </Button>
         )}
-      </div>
-      <div
+      </Group>
+      <Stack
+        gap="sm"
+        h="min(50dvh, 600px)"
+        p="sm"
+        style={{ overflow: "auto" }}
         ref={stream}
         className="agent-session-stream"
         onScroll={(event) => {
@@ -634,11 +638,11 @@ function SessionLane({ entries, search }: { entries: SessionEntry[]; search: str
           <SessionEntryView key={entry.id} entry={entry} />
         ))}
         {!entries.length && (
-          <p className="agent-session-empty">
+          <Text size="sm" className="agent-session-empty">
             {search ? "No activity matches the search." : "Waiting for activity…"}
-          </p>
+          </Text>
         )}
-      </div>
+      </Stack>
     </>
   );
 }
@@ -669,53 +673,81 @@ export function SafeMarkdown({ text }: { text: string }) {
         if (/^\s{0,3}#{1,4}\s/.test(line)) {
           const heading = line.replace(/^\s{0,3}#{1,4}\s/, "");
           rendered.push(
-            <strong className="session-markdown-heading" key={`h-${index}-${lineIndex}`}>
+            <Text
+              component="span"
+              size="sm"
+              fw={600}
+              className="session-markdown-heading"
+              key={`h-${index}-${lineIndex}`}
+            >
               {inlineMarkdown(heading)}
-            </strong>,
+            </Text>,
           );
         } else {
           rendered.push(
-            <span key={`p-${index}-${lineIndex}`}>
+            <Text component="span" size="sm" key={`p-${index}-${lineIndex}`}>
               {inlineMarkdown(line)}
               {lineIndex < plain!.split("\n").length - 1 ? <br /> : null}
-            </span>,
+            </Text>,
           );
         }
       });
     }
     if (parts[index + 2] !== undefined)
       rendered.push(
-        <pre className="session-code-block" key={`c-${index}`}>
-          <code>{parts[index + 2]}</code>
-        </pre>,
+        <Code
+          block
+          mah={380}
+          style={{ overflow: "auto" }}
+          className="session-code-block"
+          key={`c-${index}`}
+        >
+          <Code>{parts[index + 2]}</Code>
+        </Code>,
       );
   }
-  return <div className="session-markdown">{rendered}</div>;
+  return (
+    <Stack gap="xs" className="session-markdown">
+      {rendered}
+    </Stack>
+  );
 }
 
 function inlineMarkdown(line: string): ReactNode[] {
   const tokens = line.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g);
   return tokens.map((token, index) => {
     if (token.startsWith("**") && token.endsWith("**"))
-      return <strong key={index}>{token.slice(2, -2)}</strong>;
+      return (
+        <Text component="span" size="sm" fw={600} key={index}>
+          {token.slice(2, -2)}
+        </Text>
+      );
     if (token.startsWith("*") && token.endsWith("*"))
-      return <em key={index}>{token.slice(1, -1)}</em>;
+      return (
+        <Text component="span" size="sm" c="dimmed" key={index}>
+          {token.slice(1, -1)}
+        </Text>
+      );
     if (token.startsWith("`") && token.endsWith("`"))
-      return <code key={index}>{token.slice(1, -1)}</code>;
+      return <Code key={index}>{token.slice(1, -1)}</Code>;
     const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
     if (link) {
       try {
         const url = new URL(link[2]!, window.location.href);
         if (url.protocol === "http:" || url.protocol === "https:")
           return (
-            <a key={index} href={url.href} target="_blank" rel="noreferrer">
+            <Anchor key={index} href={url.href} target="_blank" rel="noreferrer">
               {link[1]}
-            </a>
+            </Anchor>
           );
       } catch {
         // Invalid and unsafe links stay visible as text.
       }
     }
-    return <span key={index}>{token}</span>;
+    return (
+      <Text component="span" size="sm" key={index}>
+        {token}
+      </Text>
+    );
   });
 }

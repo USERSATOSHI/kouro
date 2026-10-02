@@ -824,11 +824,13 @@ export class ApplicationService {
     const artifactCount = this.countRows("artifacts", runId);
     const eventCount = this.countRows("run_events", runId);
     const checkpointCount = this.countRows("checkpoints", runId, "source_run_id");
+    let drainReason: string | undefined;
     const active = (() => {
       try {
         this.coordinator.assertRunDrained(runId);
         return false;
-      } catch {
+      } catch (cause) {
+        drainReason = cause instanceof Error ? cause.message : String(cause);
         return true;
       }
     })();
@@ -848,6 +850,7 @@ export class ApplicationService {
         run.status,
       ),
       drained: !active,
+      drainReason,
       workspaceAdapterMissing,
       workspaces: claims.map((claim) => ({ workspaceId: claim.workspaceId, path: claim.path })),
       removes: {
@@ -870,6 +873,19 @@ export class ApplicationService {
         ),
     };
     return { ...preview, viewStatus: view?.state.status };
+  }
+
+  async confirmAbandonedHarnessShutdown(input: {
+    runId: string;
+    shutdownId: string;
+    expectedRevision: number;
+    actor: string;
+    verifiedStopped: boolean;
+  }): Promise<RunDeletionPreview> {
+    if (input.verifiedStopped !== true)
+      throw new Error("Verify the external agent has stopped before confirming shutdown.");
+    this.coordinator.confirmAbandonedHarnessShutdown(input);
+    return this.previewRunDeletion(input.runId);
   }
 
   incompleteRunDeletions() {

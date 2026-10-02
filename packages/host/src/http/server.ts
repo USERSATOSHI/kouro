@@ -272,6 +272,29 @@ export function createHostServer(
       };
     }
   });
+  app.post("/api/runs/:id/confirm-harness-shutdown", async ({ request, set, params, body }) => {
+    if (!checked(request, set, true)) return denied(set);
+    try {
+      const input = bodyObject(body);
+      if (typeof input.shutdownId !== "string" || !input.shutdownId.trim())
+        throw new Error("shutdownId is required");
+      if (!Number.isSafeInteger(input.expectedRevision))
+        throw new Error("expectedRevision is required");
+      return await service.confirmAbandonedHarnessShutdown({
+        runId: params.id,
+        shutdownId: input.shutdownId,
+        expectedRevision: Number(input.expectedRevision),
+        verifiedStopped: input.verifiedStopped === true,
+        actor: typeof input.actor === "string" && input.actor.trim() ? input.actor : "operator",
+      });
+    } catch (cause) {
+      set.status = 409;
+      return {
+        error: "shutdown-confirmation-rejected",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+  });
   app.post("/api/runs/:id/delete", async ({ request, set, params, body }) => {
     if (!checked(request, set, true)) return denied(set);
     try {

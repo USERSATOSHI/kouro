@@ -468,6 +468,74 @@ export class Coordinator {
     if (activeAttempts.length) throw new Error("run deletion is blocked by active attempts");
   }
 
+  confirmAbandonedHarnessShutdown(input: {
+    runId: string;
+    shutdownId: string;
+    expectedRevision: number;
+    actor: string;
+  }): void {
+    if (this.active.has(input.runId) || (this.aborters.get(input.runId)?.size ?? 0) > 0)
+      throw new Error(
+        "An execution is still controlled by this host. Stop it before confirming shutdown.",
+      );
+    this.journal.transaction(() => {
+      const view = this.journal.getView(input.runId);
+      if (!view || view.revision !== input.expectedRevision)
+        throw new Error("Run changed. Refresh the deletion preview before confirming shutdown.");
+      if (view.state.status !== "recovery-required")
+        throw new Error("Manual shutdown confirmation is only available for recovery runs.");
+      if (
+        Object.values(view.state.attempts).some((attempt) =>
+          ["reserved", "running"].includes(attempt.status),
+        )
+      )
+        throw new Error("Active attempts must finish before confirming an abandoned shutdown.");
+      const shutdown = this.journal.db
+        .query(
+          "SELECT attempt_id FROM unconfirmed_harness_shutdowns WHERE shutdown_id = ?1 AND run_id = ?2",
+        )
+        .get(input.shutdownId, input.runId) as { attempt_id: string } | null;
+      if (!shutdown)
+        throw new Error("This shutdown is no longer awaiting confirmation. Refresh the preview.");
+      this.journal.append({
+        runId: input.runId,
+        type: "harness.activity",
+        actor: input.actor,
+        subjectId: input.shutdownId,
+        payload: {
+          attemptId: shutdown.attempt_id,
+          event: {
+            type: "status",
+            data: {
+              status: "shutdown-confirmed",
+              text: "Operator verified the abandoned external agent has stopped.",
+              shutdownId: input.shutdownId,
+            },
+          },
+        },
+      });
+      this.journal.confirmHarnessShutdown(input.shutdownId);
+      const remaining = this.journal.db
+        .query("SELECT 1 FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 LIMIT 1")
+        .get(input.runId);
+      if (!remaining) {
+        this.assertRunDrained(input.runId);
+        this.stopDrainedRecoveryRun(input.runId, input.actor);
+      }
+    });
+  }
+
+  private stopDrainedRecoveryRun(runId: string, actor: string): void {
+    this.journal.append({
+      runId,
+      type: "run.cancel.requested",
+      payload: { reason: "Operator confirmed agent shutdown" },
+      actor,
+    });
+    this.cancelUnstartedWork(runId, "Agent shutdown confirmed; recovery run stopped by operator");
+    this.journal.append({ runId, type: "run.completed", payload: { status: "cancelled" }, actor });
+  }
+
   async cleanupRunWorkspaces(runId: string): Promise<void> {
     this.assertRunDrained(runId);
     const claims = await this.workspaceClaims(runId);
@@ -1134,6 +1202,14 @@ export class Coordinator {
       throw new Error(
         `stale-action: expected revision ${input.expectedRevision}, current revision ${view.revision}`,
       );
+    if (view.state.status === "recovery-required") {
+      if (input.action !== "cancel")
+        throw new Error("Resolve or stop the recovery run before taking this action.");
+      this.assertRunDrained(input.runId);
+      this.journal.transaction(() => this.stopDrainedRecoveryRun(input.runId, input.actor));
+      const stopped = this.journal.getView(input.runId)!;
+      return { revision: stopped.revision, status: stopped.state.status };
+    }
     const active = Object.values(view.state.attempts).some(
       (attempt) => attempt.status === "running",
     );

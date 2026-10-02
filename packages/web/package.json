@@ -10,11 +10,15 @@
   },
   "dependencies": {
     "@kouro/core": "workspace:*",
+    "@mantine/core": "9.6.3",
+    "@mantine/form": "9.6.3",
+    "@mantine/hooks": "9.6.3",
+    "@tabler/icons-react": "3.48.0",
     "@xyflow/react": "^12.8.1",
     "d3-array": "^3.2.4",
     "d3-scale": "^4.0.2",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
   },
   "devDependencies": {
     "@types/d3-array": "^3.2.2",

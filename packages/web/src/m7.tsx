@@ -1,3 +1,19 @@
+import {
+  Table,
+  Badge,
+  Box,
+  Button,
+  Group,
+  List,
+  Paper,
+  SimpleGrid,
+  Stack,
+  Text,
+  TextInput,
+  Textarea,
+  Title,
+} from "@mantine/core";
+import { Disclosure, DisclosureTitle } from "./components/Disclosure";
 import { useEffect, useState, type FormEvent } from "react";
 
 /** Web-facing M7 DTOs. These deliberately do not import host storage types. */
@@ -384,6 +400,7 @@ export const M7_ENDPOINTS = {
 };
 
 export type M7WorkbenchProps = {
+  compact?: boolean;
   runId: string;
   revision?: number;
   fetchView: (runId: string) => Promise<unknown>;
@@ -404,6 +421,7 @@ export function M7Workbench({
   fetchView,
   createCheckpoint,
   forkCheckpoint,
+  compact = false,
 }: M7WorkbenchProps) {
   const [view, setView] = useState<M7View>();
   const [error, setError] = useState<string>();
@@ -431,17 +449,31 @@ export function M7Workbench({
   }, [fetchView, runId, revision]);
   if (error)
     return (
-      <section className="m7-workbench" role="status">
-        <span className="eyebrow">CHECKPOINTS</span>
-        <h1>Checkpoint data unavailable</h1>
-        <p>{error}</p>
-      </section>
+      <Stack
+        gap="xs"
+        component="section"
+        p={compact ? 0 : { base: "sm", md: "lg" }}
+        className="m7-workbench"
+        role="status"
+      >
+        <Text component="span" size="sm" c="dimmed" className="eyebrow">
+          CHECKPOINTS
+        </Text>
+        <Title order={1}>Checkpoint data unavailable</Title>
+        <Text size="sm">{error}</Text>
+      </Stack>
     );
   if (!view)
     return (
-      <section className="m7-workbench" role="status">
-        <span className="loader" /> Loading checkpoint state…
-      </section>
+      <Stack
+        gap="xs"
+        component="section"
+        p={compact ? 0 : { base: "sm", md: "lg" }}
+        className="m7-workbench"
+        role="status"
+      >
+        <Text component="span" size="sm" className="loader" /> Loading checkpoint state…
+      </Stack>
     );
   const eligible = view.eligibility.eligible;
   const checkpoint = view.checkpoint;
@@ -483,206 +515,303 @@ export function M7Workbench({
     }
   };
   return (
-    <main className="m7-workbench">
-      <header className="m7-header">
-        <div>
-          <span className="eyebrow">M7 · CHECKPOINTS & FORKS</span>
-          <h1>Safe cut and genealogy</h1>
-          <p>Inspect the retained frontier before reusing work in a child run.</p>
-        </div>
-        <div
-          className={`m7-eligibility-badge ${eligible ? "eligible" : "ineligible"}`}
-          role="status"
+    <Stack
+      gap="xs"
+      component="section"
+      p={compact ? 0 : { base: "sm", md: "lg" }}
+      className="m7-workbench"
+    >
+      {!compact && (
+        <Group
+          gap="xs"
+          justify="space-between"
+          wrap="wrap"
+          component="header"
+          className="m7-header"
         >
-          {eligible ? "eligible" : "ineligible"}
-        </div>
-      </header>
-      {notice && (
-        <div className="notice" role="status">
-          {notice}
-        </div>
-      )}
-      <section className="m7-grid">
-        <article className="m7-panel m7-eligibility">
-          <div className="m7-panel-heading">
-            <strong>CHECKPOINT ELIGIBILITY</strong>
-            <span>
-              {eligible
-                ? "All host predicates satisfied"
-                : "Resolve every predicate before capture"}
-            </span>
-          </div>
-          <ul>
-            {view.eligibility.predicates.map((predicate) => (
-              <li key={predicate.id} className={predicate.satisfied ? "satisfied" : "blocked"}>
-                <span aria-hidden="true">{predicate.satisfied ? "✓" : "×"}</span>
-                <div>
-                  <b>{predicate.label}</b>
-                  <small>{predicate.detail}</small>
-                </div>
-              </li>
-            ))}
-          </ul>
-          {view.eligibility.reasons.length > 0 && (
-            <p className="m7-hint">
-              Blocked by: {view.eligibility.reasons.map(humanReason).join(", ")}
-            </p>
-          )}
-          <button
-            className="primary-button"
-            disabled={!eligible || !createCheckpoint || busy}
-            onClick={() => void onCheckpoint()}
+          <Stack gap="xs">
+            <Text component="span" size="sm" c="dimmed" className="eyebrow">
+              CHECKPOINTS & FORKS
+            </Text>
+            <Title order={1}>Safe cut and genealogy</Title>
+            <Text size="sm">Inspect the retained frontier before reusing work in a child run.</Text>
+          </Stack>
+          <Stack
+            gap="xs"
+            className={`m7-eligibility-badge ${eligible ? "eligible" : "ineligible"}`}
+            role="status"
           >
-            Capture checkpoint
-          </button>
-        </article>
-        <article className="m7-panel">
-          <div className="m7-panel-heading">
-            <strong>FORK FROM CHECKPOINT</strong>
-            <span>{checkpoint ? `source ${checkpoint.id}` : "Capture a checkpoint first"}</span>
-          </div>
-          <form className="m7-fork-form" onSubmit={(event) => void onFork(event)}>
-            <label>
-              Child run name
-              <input
-                value={name}
-                onChange={(event) => setName(event.target.value)}
-                placeholder="e.g. approach-b"
-                disabled={!eligible || !checkpoint || busy}
-              />
-            </label>
-            <details className="m7-prompt-variant">
-              <summary>Change an unexecuted agent prompt</summary>
-              <p className="m7-hint">
-                Enter a node ID from the compiled graph. Completed nodes and graph changes are
-                rejected before the fork is created.
-              </p>
-              <label>
-                Agent node ID
-                <input
-                  value={promptNodeId}
-                  onChange={(event) => setPromptNodeId(event.target.value)}
-                  placeholder="implement"
-                  disabled={!eligible || !checkpoint || busy}
-                />
-              </label>
-              <label>
-                Replacement prompt
-                <textarea
-                  value={promptText}
-                  onChange={(event) => setPromptText(event.target.value)}
-                  disabled={!eligible || !checkpoint || busy}
-                />
-              </label>
-            </details>
-            <button
+            {eligible ? "eligible" : "ineligible"}
+          </Stack>
+        </Group>
+      )}
+      {notice && (
+        <Stack gap="xs" className="notice" role="status">
+          {notice}
+        </Stack>
+      )}
+      <SimpleGrid
+        cols={{ base: 1, md: compact ? 1 : 2 }}
+        spacing="md"
+        component="section"
+        className="m7-grid"
+      >
+        <Paper component="article" className="m7-panel m7-eligibility">
+          <Stack gap="md">
+            <Group gap="sm" justify="space-between" mb="md" className="m7-panel-heading">
+              <Text component="span" size="sm" fw={600}>
+                CHECKPOINT ELIGIBILITY
+              </Text>
+              <Text component="span" size="sm">
+                {eligible
+                  ? "All host predicates satisfied"
+                  : "Resolve every predicate before capture"}
+              </Text>
+            </Group>
+            <List>
+              {view.eligibility.predicates.map((predicate) => (
+                <List.Item
+                  key={predicate.id}
+                  className={predicate.satisfied ? "satisfied" : "blocked"}
+                >
+                  <Text component="span" size="sm" aria-hidden="true">
+                    {predicate.satisfied ? "✓" : "×"}
+                  </Text>
+                  <Stack gap="xs">
+                    <Text component="span" size="sm" fw={600}>
+                      {predicate.label}
+                    </Text>
+                    <Text component="span" size="xs" c="dimmed">
+                      {predicate.detail}
+                    </Text>
+                  </Stack>
+                </List.Item>
+              ))}
+            </List>
+            {view.eligibility.reasons.length > 0 && (
+              <Text size="sm" className="m7-hint">
+                Blocked by: {view.eligibility.reasons.map(humanReason).join(", ")}
+              </Text>
+            )}
+            <Button
+              variant="filled"
               className="primary-button"
-              type="submit"
-              disabled={!eligible || !checkpoint || !forkCheckpoint || !name.trim() || busy}
+              disabled={!eligible || !createCheckpoint || busy}
+              onClick={() => void onCheckpoint()}
             >
-              Create isolated fork
-            </button>
-            <p className="m7-hint">
-              Approvals and provider sessions are fresh; inherited results have no authority.
-            </p>
-          </form>
-        </article>
-      </section>
-      <section className="m7-panel m7-genealogy">
-        <div className="m7-panel-heading">
-          <strong>GENEALOGY</strong>
-          <span>Parent → checkpoint → child runs</span>
-        </div>
-        <div className="m7-tree" role="tree">
-          {view.genealogy.nodes.map((node) => (
-            <div
-              className={`m7-tree-node ${node.runId === runId ? "current" : ""}`}
-              key={node.runId}
-              role="treeitem"
-              aria-level={node.parentRunId ? 2 : 1}
+              Capture checkpoint
+            </Button>
+          </Stack>
+        </Paper>
+        <Paper component="article" className="m7-panel">
+          <Stack gap="md">
+            <Group gap="sm" justify="space-between" mb="md" className="m7-panel-heading">
+              <Text component="span" size="sm" fw={600}>
+                FORK FROM CHECKPOINT
+              </Text>
+              <Text component="span" size="sm">
+                {checkpoint ? `source ${checkpoint.id}` : "Capture a checkpoint first"}
+              </Text>
+            </Group>
+            <Stack
+              gap="xs"
+              component="form"
+              className="m7-fork-form"
+              onSubmit={(event) => void onFork(event)}
             >
-              <span className="m7-tree-marker">{node.parentRunId ? "└" : "●"}</span>
-              <div>
-                <b>{node.label}</b>
-                <small>
-                  {node.runId}
-                  {node.checkpointId ? ` · via ${node.checkpointId}` : ""}
-                </small>
-              </div>
-              <em>{node.inheritedInvocationIds.length} inherited</em>
-            </div>
-          ))}
-        </div>
-      </section>
-      <section className="m7-panel m7-comparison">
-        <div className="m7-panel-heading">
-          <strong>INHERITED PREFIX VS NEW WORK</strong>
-          <span>Inherited work is lineage evidence, not new spend.</span>
-        </div>
-        <div className="m7-metrics">
-          <div>
-            <small>Inherited</small>
-            <b>
-              {view.comparison.inheritedCount} · {metric(view.comparison.inheritedDurationMs, "ms")}{" "}
-              · {metric(view.comparison.inheritedCost, " cost")}
-            </b>
-          </div>
-          <div>
-            <small>New</small>
-            <b>
-              {view.comparison.newCount} · {metric(view.comparison.newDurationMs, "ms")} ·{" "}
-              {metric(view.comparison.newCost, " cost")}
-            </b>
-          </div>
-          <div>
-            <small>Unresolved</small>
-            <b>{view.comparison.missingCount + view.comparison.unknownCount}</b>
-          </div>
-        </div>
-        <div className="m7-table" role="table">
-          <div className="m7-row m7-row-head" role="row">
-            <span>Stage</span>
-            <span>Provenance</span>
-            <span>Duration</span>
-            <span>Cost</span>
-          </div>
-          {view.comparison.entries.map((entry) => (
-            <div className={`m7-row m7-${entry.status}`} role="row" key={entry.invocationId}>
-              <span>{entry.label}</span>
-              <span>{statusText(entry)}</span>
-              <span>{metric(entry.durationMs, "ms")}</span>
-              <span>{metric(entry.cost, "")}</span>
-            </div>
-          ))}
-        </div>
-      </section>
-      <section className="m7-panel m7-timeline">
-        <div className="m7-panel-heading">
-          <strong>TIMELINE</strong>
-          <span>Unknown and missing host telemetry remain visible.</span>
-        </div>
-        <div className="m7-timeline-list">
-          {view.timeline.items.map((item) => (
-            <div className={`m7-timeline-item m7-${item.phase}`} key={item.id}>
-              <span className="m7-timeline-dot" />
-              <b>{item.label}</b>
-              <span>
-                {statusText({
-                  ...item,
-                  status: item.phase,
-                  invocationId: item.id,
-                  durationKnown: item.durationMs !== undefined,
-                  costKnown: item.cost !== undefined,
-                })}
-              </span>
-              <small>
-                {metric(item.durationMs, "ms")} · {metric(item.cost, " cost")}
-                {item.detail ? ` · ${item.detail}` : ""}
-              </small>
-            </div>
-          ))}
-        </div>
-      </section>
-    </main>
+              <Stack gap={4} component="label">
+                Child run name
+                <TextInput
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="e.g. approach-b"
+                  disabled={!eligible || !checkpoint || busy}
+                />
+              </Stack>
+              <Disclosure className="m7-prompt-variant">
+                <DisclosureTitle>Change an unexecuted agent prompt</DisclosureTitle>
+                <Text size="sm" className="m7-hint">
+                  Enter a node ID from the compiled graph. Completed nodes and graph changes are
+                  rejected before the fork is created.
+                </Text>
+                <Stack gap={4} component="label">
+                  Agent node ID
+                  <TextInput
+                    value={promptNodeId}
+                    onChange={(event) => setPromptNodeId(event.target.value)}
+                    placeholder="implement"
+                    disabled={!eligible || !checkpoint || busy}
+                  />
+                </Stack>
+                <Stack gap={4} component="label">
+                  Replacement prompt
+                  <Textarea
+                    minRows={3}
+                    autosize
+                    maxRows={12}
+                    value={promptText}
+                    onChange={(event) => setPromptText(event.target.value)}
+                    disabled={!eligible || !checkpoint || busy}
+                  />
+                </Stack>
+              </Disclosure>
+              <Button
+                variant="filled"
+                className="primary-button"
+                type="submit"
+                disabled={!eligible || !checkpoint || !forkCheckpoint || !name.trim() || busy}
+              >
+                Create isolated fork
+              </Button>
+              <Text size="sm" className="m7-hint">
+                Approvals and provider sessions are fresh; inherited results have no authority.
+              </Text>
+            </Stack>
+          </Stack>
+        </Paper>
+      </SimpleGrid>
+      {!compact && (
+        <>
+          <Paper component="section" className="m7-panel m7-genealogy">
+            <Stack gap="md">
+              <Group gap="sm" justify="space-between" mb="md" className="m7-panel-heading">
+                <Text component="span" size="sm" fw={600}>
+                  GENEALOGY
+                </Text>
+                <Text component="span" size="sm">
+                  Parent → checkpoint → child runs
+                </Text>
+              </Group>
+              <Stack gap="xs" className="m7-tree" role="tree">
+                {view.genealogy.nodes.map((node) => (
+                  <Stack
+                    gap="xs"
+                    className={`m7-tree-node ${node.runId === runId ? "current" : ""}`}
+                    key={node.runId}
+                    role="treeitem"
+                    aria-level={node.parentRunId ? 2 : 1}
+                  >
+                    <Text component="span" size="sm" className="m7-tree-marker">
+                      {node.parentRunId ? "└" : "●"}
+                    </Text>
+                    <Stack gap="xs">
+                      <Text component="span" size="sm" fw={600}>
+                        {node.label}
+                      </Text>
+                      <Text component="span" size="xs" c="dimmed">
+                        {node.runId}
+                        {node.checkpointId ? ` · via ${node.checkpointId}` : ""}
+                      </Text>
+                    </Stack>
+                    <Text component="span" size="sm" c="dimmed">
+                      {node.inheritedInvocationIds.length} inherited
+                    </Text>
+                  </Stack>
+                ))}
+              </Stack>
+            </Stack>
+          </Paper>
+          <Paper component="section" className="m7-panel m7-comparison">
+            <Stack gap="md">
+              <Group gap="sm" justify="space-between" mb="md" className="m7-panel-heading">
+                <Text component="span" size="sm" fw={600}>
+                  INHERITED PREFIX VS NEW WORK
+                </Text>
+                <Text component="span" size="sm">
+                  Inherited work is lineage evidence, not new spend.
+                </Text>
+              </Group>
+              <SimpleGrid cols={{ base: 1, md: 3 }} spacing="md" className="m7-metrics">
+                <Stack gap="xs">
+                  <Text component="span" size="xs" c="dimmed">
+                    Inherited
+                  </Text>
+                  <Text component="span" size="sm" fw={600}>
+                    {view.comparison.inheritedCount} ·{" "}
+                    {metric(view.comparison.inheritedDurationMs, "ms")} ·{" "}
+                    {metric(view.comparison.inheritedCost, " cost")}
+                  </Text>
+                </Stack>
+                <Stack gap="xs">
+                  <Text component="span" size="xs" c="dimmed">
+                    New
+                  </Text>
+                  <Text component="span" size="sm" fw={600}>
+                    {view.comparison.newCount} · {metric(view.comparison.newDurationMs, "ms")} ·{" "}
+                    {metric(view.comparison.newCost, " cost")}
+                  </Text>
+                </Stack>
+                <Stack gap="xs">
+                  <Text component="span" size="xs" c="dimmed">
+                    Unresolved
+                  </Text>
+                  <Text component="span" size="sm" fw={600}>
+                    {view.comparison.missingCount + view.comparison.unknownCount}
+                  </Text>
+                </Stack>
+              </SimpleGrid>
+              <Table.ScrollContainer minWidth={450}>
+                <Table>
+                  <Table.Thead>
+                    <Table.Tr>
+                      {["Stage", "Provenance", "Duration", "Provider cost"].map((label) => (
+                        <Table.Th key={label}>{label}</Table.Th>
+                      ))}
+                    </Table.Tr>
+                  </Table.Thead>
+                  <Table.Tbody>
+                    {view.comparison.entries.map((entry) => (
+                      <Table.Tr key={entry.invocationId}>
+                        <Table.Td>{entry.label}</Table.Td>
+                        <Table.Td>
+                          <Badge variant="light">{statusText(entry)}</Badge>
+                        </Table.Td>
+                        <Table.Td>{metric(entry.durationMs, "ms")}</Table.Td>
+                        <Table.Td>{metric(entry.cost, "")}</Table.Td>
+                      </Table.Tr>
+                    ))}
+                  </Table.Tbody>
+                </Table>
+              </Table.ScrollContainer>
+            </Stack>
+          </Paper>
+          <Paper component="section" className="m7-panel m7-timeline">
+            <Stack gap="md">
+              <Group gap="sm" justify="space-between" mb="md" className="m7-panel-heading">
+                <Text component="span" size="sm" fw={600}>
+                  TIMELINE
+                </Text>
+                <Text component="span" size="sm">
+                  Unknown and missing host telemetry remain visible.
+                </Text>
+              </Group>
+              <Stack gap="xs" className="m7-timeline-list">
+                {view.timeline.items.map((item) => (
+                  <Stack gap="xs" className={`m7-timeline-item m7-${item.phase}`} key={item.id}>
+                    <Text component="span" size="sm" className="m7-timeline-dot" />
+                    <Text component="span" size="sm" fw={600}>
+                      {item.label}
+                    </Text>
+                    <Text component="span" size="sm">
+                      {statusText({
+                        ...item,
+                        status: item.phase,
+                        invocationId: item.id,
+                        durationKnown: item.durationMs !== undefined,
+                        costKnown: item.cost !== undefined,
+                      })}
+                    </Text>
+                    <Text component="span" size="xs" c="dimmed">
+                      {metric(item.durationMs, "ms")} · {metric(item.cost, " cost")}
+                      {item.detail ? ` · ${item.detail}` : ""}
+                    </Text>
+                  </Stack>
+                ))}
+              </Stack>
+            </Stack>
+          </Paper>
+        </>
+      )}
+    </Stack>
   );
 }

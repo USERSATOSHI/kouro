@@ -130,6 +130,8 @@ export interface UiAttempt {
   startedAt?: string;
   endedAt?: string;
   artifactIds: string[];
+  outputArtifactIds?: string[];
+  evidenceArtifactIds?: string[];
   output?: unknown;
   error?: string;
   command?: {
@@ -372,6 +374,8 @@ export function viewFromCore(view: CoreRunView): UiRunView {
       startedAt: item.startedAt ?? undefined,
       endedAt: item.finishedAt ?? undefined,
       artifactIds: item.artifacts.map((ref) => ref.id),
+      outputArtifactIds: item.output.map((ref) => ref.id),
+      evidenceArtifactIds: item.evidence.map((ref) => ref.id),
       error: item.error,
       output: item.output,
       command: item.commandEvidence

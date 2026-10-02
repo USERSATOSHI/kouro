@@ -1,3 +1,4 @@
+import { Fieldset, NativeSelect, Stack, Text, TextInput, Textarea } from "@mantine/core";
 import { validateJsonSchema, type Bundle, type JsonValue } from "@kouro/core";
 
 type Schema = {
@@ -56,11 +57,15 @@ function SchemaField({
       /* Preserve invalid input in the complex editor. */
     }
     return (
-      <fieldset className="workflow-input-object">
-        <legend>
-          {name}
-          {required ? " · required" : " · optional"}
-        </legend>
+      <Fieldset
+        legend={
+          <>
+            {name}
+            {required ? " · required" : " · optional"}
+          </>
+        }
+        className="workflow-input-object"
+      >
         {Object.entries(shape.properties).map(([key, property]) => (
           <SchemaField
             key={key}
@@ -89,15 +94,21 @@ function SchemaField({
             }}
           />
         ))}
-      </fieldset>
+      </Fieldset>
     );
   }
   const label = `${name}${required ? " · required" : " · optional"}`;
   return (
-    <label className="task-input">
-      <span>{label}</span>
+    <Stack gap={4} component="label" className="task-input">
+      <Text component="span" size="sm">
+        {label}
+      </Text>
       {shape.enum ? (
-        <select aria-label={name} value={raw} onChange={(event) => onChange(event.target.value)}>
+        <NativeSelect
+          aria-label={name}
+          value={raw}
+          onChange={(event) => onChange(event.target.value)}
+        >
           <option value="">Choose a value…</option>
           {shape.enum.map((value, index) => (
             <option
@@ -107,15 +118,19 @@ function SchemaField({
               {String(value)}
             </option>
           ))}
-        </select>
+        </NativeSelect>
       ) : shape.type === "boolean" ? (
-        <select aria-label={name} value={raw} onChange={(event) => onChange(event.target.value)}>
+        <NativeSelect
+          aria-label={name}
+          value={raw}
+          onChange={(event) => onChange(event.target.value)}
+        >
           <option value="">Choose a value…</option>
           <option value="true">Yes</option>
           <option value="false">No</option>
-        </select>
+        </NativeSelect>
       ) : ["number", "integer"].includes(shape.type ?? "") ? (
-        <input
+        <TextInput
           aria-label={name}
           type="number"
           step={shape.type === "integer" ? 1 : "any"}
@@ -123,7 +138,7 @@ function SchemaField({
           onChange={(event) => onChange(event.target.value)}
         />
       ) : (
-        <textarea
+        <Textarea
           aria-label={name}
           rows={shape.type === "string" ? 2 : 4}
           value={raw}
@@ -133,8 +148,12 @@ function SchemaField({
           }
         />
       )}
-      {shape.description && <small>{shape.description}</small>}
-    </label>
+      {shape.description && (
+        <Text component="span" size="xs" c="dimmed">
+          {shape.description}
+        </Text>
+      )}
+    </Stack>
   );
 }
 
@@ -150,11 +169,11 @@ export function WorkflowInputs({
   errors: Record<string, string>;
 }) {
   return (
-    <section className="workflow-inputs" aria-label="Workflow inputs">
+    <Stack gap="xs" component="section" className="workflow-inputs" aria-label="Workflow inputs">
       {(bundle?.definitions[bundle.rootDefinitionId]?.inputPorts ?? [])
         .filter((port) => port.name !== "task")
         .map((port) => (
-          <div key={port.name}>
+          <Stack gap="xs" key={port.name}>
             <SchemaField
               name={port.name}
               schema={bundle!.schemas[port.schemaDigest] ?? {}}
@@ -163,12 +182,12 @@ export function WorkflowInputs({
               onChange={(value) => onChange({ ...drafts, [port.name]: value })}
             />
             {drafts[port.name] && errors[port.name] && (
-              <p role="alert" className="session-error">
+              <Text size="sm" role="alert" className="session-error">
                 {port.name}: {errors[port.name]}
-              </p>
+              </Text>
             )}
-          </div>
+          </Stack>
         ))}
-    </section>
+    </Stack>
   );
 }

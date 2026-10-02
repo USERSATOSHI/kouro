@@ -1,3 +1,21 @@
+import { Grid, SimpleGrid } from "@mantine/core";
+import { PageHeader } from "./components/WorkbenchPrimitives";
+import type { ReactNode } from "react";
+import { Badge, Drawer, Tabs, Tooltip } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
+import { stateColor } from "./theme";
+import {
+  Box,
+  Button,
+  Code,
+  Group,
+  NativeSelect,
+  Paper,
+  Stack,
+  Table,
+  Text,
+  Title,
+} from "@mantine/core";
 import { useEffect, useMemo, useState } from "react";
 
 export type EvalCellStatus =
@@ -79,7 +97,7 @@ export interface ComparisonTimeline {
   comparisonId: string;
   rows: Array<{ anchorId: string; label: string; spans: Array<Record<string, unknown> | null> }>;
   runs: Array<{ runId: string }>;
-  scale: { durationMs: number | null };
+  scale: { durationMs: number | null; startAt?: string | null; endAt?: string | null };
 }
 
 export const M5_FIXTURE: EvalExperiment = {
@@ -369,7 +387,11 @@ export function M5Workbench({
   experiments,
   onSelectExperiment,
   onCompare,
+  comparisonPicker,
+  creator,
 }: {
+  comparisonPicker?: ReactNode;
+  creator?: ReactNode;
   experiment: EvalExperiment;
   onOpenRun?: (runId: string) => void;
   onResume?: () => void;
@@ -384,7 +406,6 @@ export function M5Workbench({
   onSelectExperiment?: (id: string) => void;
   onCompare?: () => void;
 }) {
-  const [tab, setTab] = useState<"matrix" | "timeline" | "pairwise">("matrix");
   const [selected, setSelected] = useState<EvalCell>();
   const [reveal, setReveal] = useState(false);
   const [showDataset, setShowDataset] = useState(false);
@@ -419,140 +440,125 @@ export function M5Workbench({
     };
   }, [selected, onLoadEvidence, loadedEvidence]);
   return (
-    <section className="m5-workbench" data-testid="eval-workbench">
-      <header className="m5-header">
-        <div>
-          <div className="eyebrow">EVALUATION WORKBENCH</div>
-          <h1>{experiment.name}</h1>
-          <p>
-            {experiment.dataset} <span>·</span>{" "}
-            {new Date(experiment.createdAt).toLocaleDateString()}
-          </p>
-          {experiments && experiments.length > 1 && (
-            <label className="experiment-picker">
-              EXPERIMENT
-              <select
-                value={experiment.id}
-                onChange={(event) => onSelectExperiment?.(event.target.value)}
+    <Stack gap={0} component="section" data-testid="eval-workbench">
+      <PageHeader
+        actions={
+          <Group gap="sm">
+            <Button onClick={() => setShowDataset((value) => !value)}>
+              {showDataset ? "Hide dataset" : "Inspect dataset"}
+            </Button>
+            {experiment.status === "running" && onCancel ? (
+              <Button onClick={onCancel}>Cancel</Button>
+            ) : onResume ? (
+              <Button variant="filled" onClick={onResume}>
+                Run pending cells
+              </Button>
+            ) : null}
+          </Group>
+        }
+      >
+        Evaluations / {experiment.name}
+      </PageHeader>
+      <Grid p="lg" gap="lg">
+        <Grid.Col span={{ base: 12, xl: 7 }}>
+          <Stack gap="lg">
+            <Group justify="space-between">
+              <Text size="xs" c="dimmed">
+                RESULT MATRIX
+              </Text>
+              {experiments && experiments.length > 1 && (
+                <NativeSelect
+                  aria-label="Experiment"
+                  value={experiment.id}
+                  onChange={(event) => onSelectExperiment?.(event.currentTarget.value)}
+                  data={experiments.map((item) => ({ value: item.id, label: item.name }))}
+                />
+              )}
+            </Group>
+            <Text size="xs" c="dimmed">
+              {experiment.dataset} · {new Date(experiment.createdAt).toLocaleDateString()}
+            </Text>
+            <Group gap="xs" aria-label="experiment status">
+              {Object.entries(summary).map(([status, count]) => (
+                <Badge key={status} color={stateColor(status)} variant="light">
+                  {count} {status}
+                </Badge>
+              ))}
+            </Group>
+            <Text size="xs" c="dimmed" aria-label="evaluation outcome summary">
+              {evaluation.executionSucceeded} execution succeeded · {evaluation.acceptance.passed}{" "}
+              acceptance passed · {evaluation.acceptance.failed} acceptance failed ·{" "}
+              {evaluation.acceptance.missing + evaluation.acceptance.unavailable} acceptance
+              unavailable · {evaluation.evaluatorErrors} evaluator errors
+            </Text>
+            <MatrixView
+              experiment={experiment}
+              selected={selected}
+              onSelect={setSelected}
+              onOpenRun={onOpenRun}
+            />
+            {selected ? (
+              <EvidenceDetail
+                embedded
+                cell={{ ...selected, evidence: loadedEvidence[selected.id] ?? selected.evidence }}
+                onOpenRun={onOpenRun}
+                loading={evidenceLoading}
+                error={evidenceError}
+                onClose={() => setSelected(undefined)}
+              />
+            ) : (
+              <Paper>
+                <Text size="sm" c="dimmed">
+                  Select a matrix cell to inspect execution, acceptance checks and evidence
+                  separately.
+                </Text>
+              </Paper>
+            )}
+            {showDataset && (
+              <Paper>
+                <Stack>
+                  <Title order={3}>Dataset cases & acceptance</Title>
+                  <Code block>{JSON.stringify(experiment.cases, null, 2)}</Code>
+                </Stack>
+              </Paper>
+            )}
+            {creator}
+          </Stack>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, xl: 5 }}>
+          <Stack gap="lg">
+            <Text size="xs" c="dimmed">
+              TIMELINE COMPARE
+            </Text>
+            {comparisonPicker}
+            {onCompare && (
+              <Button
+                disabled={
+                  new Set(
+                    experiment.cells
+                      .filter((cell) => cell.status === "succeeded" && cell.runId)
+                      .map((cell) => cell.runId),
+                  ).size < 2
+                }
+                onClick={onCompare}
               >
-                {experiments.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-        </div>
-        <div className="m5-header-actions">
-          <button className="subtle-button" onClick={() => setShowDataset((value) => !value)}>
-            {showDataset ? "Hide dataset" : "Inspect dataset"}
-          </button>
-          {experiment.status === "running" && onCancel ? (
-            <button className="subtle-button" onClick={onCancel}>
-              Cancel
-            </button>
-          ) : onResume ? (
-            <button className="primary-cta compact" onClick={onResume}>
-              Run pending cells <span>→</span>
-            </button>
-          ) : null}
-        </div>
-      </header>
-      {showDataset && (
-        <section className="dataset-inspector" aria-label="Experiment dataset">
-          <h2>{experiment.dataset}</h2>
-          <p>Cases and declared acceptance checks used by this experiment.</p>
-          <pre>{JSON.stringify(experiment.cases, null, 2)}</pre>
-        </section>
-      )}
-      <div className="m5-summary" aria-label="experiment status">
-        {Object.entries(summary).map(([status, count]) => (
-          <span key={status} className={`m5-stat ${status}`}>
-            <b>{count}</b> {status === "evaluator-error" ? "eval errors" : status}
-          </span>
-        ))}
-      </div>
-      <div className="m5-summary m5-evaluation-summary" aria-label="evaluation outcome summary">
-        <span>
-          <b>{evaluation.executionSucceeded}</b> execution succeeded
-        </span>
-        <span>
-          <b>{evaluation.acceptance.passed}</b> acceptance passed
-        </span>
-        <span>
-          <b>{evaluation.acceptance.failed}</b> acceptance failed
-        </span>
-        <span>
-          <b>{evaluation.acceptance.missing + evaluation.acceptance.unavailable}</b> acceptance
-          unavailable
-        </span>
-        <span>
-          <b>{evaluation.evaluatorErrors}</b> evaluator errors
-        </span>
-      </div>
-      <nav className="m5-tabs" aria-label="Evaluation views">
-        {(
-          [
-            ["matrix", "RESULT MATRIX"],
-            ["timeline", "TIMELINE COMPARE"],
-            ["pairwise", "PAIRWISE REVIEW"],
-          ] as const
-        ).map(([id, label]) => (
-          <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>
-            {label}
-          </button>
-        ))}
-      </nav>
-      {tab === "matrix" && (
-        <MatrixView
-          experiment={experiment}
-          selected={selected}
-          onSelect={setSelected}
-          onOpenRun={onOpenRun}
-        />
-      )}
-      {tab === "timeline" && (
-        <>
-          {onCompare && (
-            <button
-              className="subtle-button"
-              disabled={
-                new Set(
-                  experiment.cells
-                    .filter((cell) => cell.status === "succeeded" && cell.runId)
-                    .map((cell) => cell.runId),
-                ).size < 2
-              }
-              onClick={onCompare}
-            >
-              Compare completed cells
-            </button>
-          )}
-          <TimelineCompare timeline={comparisonTimeline} error={comparisonTimelineError} />
-        </>
-      )}
-      {tab === "pairwise" && (
-        <PairwiseReview
-          experiment={experiment}
-          reveal={reveal || pairwise?.revealed === true}
-          setReveal={setReveal}
-          pairwise={pairwise}
-          onStart={onPairwiseStart}
-          onChoice={onPairwiseChoice}
-          onOpenRun={onOpenRun}
-        />
-      )}
-      {selected && (
-        <EvidenceDetail
-          cell={{ ...selected, evidence: loadedEvidence[selected.id] ?? selected.evidence }}
-          onOpenRun={onOpenRun}
-          loading={evidenceLoading}
-          error={evidenceError}
-          onClose={() => setSelected(undefined)}
-        />
-      )}
-    </section>
+                Compare completed cells
+              </Button>
+            )}
+            <TimelineCompare timeline={comparisonTimeline} error={comparisonTimelineError} />
+            <PairwiseReview
+              experiment={experiment}
+              reveal={reveal || pairwise?.revealed === true}
+              setReveal={setReveal}
+              pairwise={pairwise}
+              onStart={onPairwiseStart}
+              onChoice={onPairwiseChoice}
+              onOpenRun={onOpenRun}
+            />
+          </Stack>
+        </Grid.Col>
+      </Grid>
+    </Stack>
   );
 }
 
@@ -567,85 +573,116 @@ function MatrixView({
   onSelect: (cell: EvalCell) => void;
   onOpenRun?: (runId: string) => void;
 }) {
+  const [repetition, setRepetition] = useState(1);
   return (
-    <div className="m5-panel matrix-panel">
-      <div className="m5-panel-heading">
-        <div>
-          <strong>EXPERIMENT MATRIX</strong>
-          <span>click a cell to inspect evidence</span>
-        </div>
-        <label className="compact-select">
-          REPETITIONS{" "}
-          <select defaultValue="1">
-            <option>1</option>
-            <option>3</option>
-            <option>5</option>
-          </select>
-        </label>
-      </div>
-      <div className="matrix-scroll">
-        <table className="eval-matrix">
-          <thead>
-            <tr>
-              <th>CASE</th>
-              {experiment.variants.map((variant) => (
-                <th key={variant.id}>
-                  <strong>{variant.label}</strong>
-                  <small>{variant.profile}</small>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {experiment.cases.map((testCase) => (
-              <tr key={testCase.id}>
-                <th>
-                  <strong>{testCase.label}</strong>
-                  <small>{testCase.description}</small>
-                </th>
-                {experiment.variants.map((variant) => {
-                  const cell = cellFor(experiment, testCase.id, variant.id);
-                  return (
-                    <td key={variant.id}>
-                      {cell ? (
-                        <button
-                          className={`eval-cell ${cell.status} ${selected?.id === cell.id ? "selected" : ""}`}
-                          onClick={() => onSelect(cell)}
-                        >
-                          {cell.runId && onOpenRun ? (
-                            <span
-                              className="cell-run"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                onOpenRun(cell.runId!);
-                              }}
+    <Paper className="m5-panel matrix-panel">
+      <Stack gap="md">
+        <Group gap="sm" justify="space-between" mb="md" className="m5-panel-heading">
+          <Stack gap="xs">
+            <Text component="span" size="sm" fw={600}>
+              EXPERIMENT MATRIX
+            </Text>
+            <Text component="span" size="sm">
+              click a cell to inspect evidence
+            </Text>
+          </Stack>
+          <Stack gap={4} component="label" className="compact-select">
+            REPETITIONS{" "}
+            <NativeSelect
+              aria-label="Repetition"
+              value={repetition}
+              onChange={(event) => setRepetition(Number(event.currentTarget.value))}
+            >
+              {[...new Set(experiment.cells.map((cell) => cell.repetition))]
+                .sort((a, b) => a - b)
+                .map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+            </NativeSelect>
+          </Stack>
+        </Group>
+        <Box maw="100%" mah={400} style={{ overflow: "auto" }} className="matrix-scroll">
+          <Table className="eval-matrix">
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>CASE</Table.Th>
+                {experiment.variants.map((variant) => (
+                  <Table.Th key={variant.id}>
+                    <Text size="sm" fw={600}>
+                      {variant.label}
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      {variant.profile}
+                    </Text>
+                  </Table.Th>
+                ))}
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {experiment.cases.map((testCase) => (
+                <Table.Tr key={testCase.id}>
+                  <Table.Th>
+                    <Text component="span" size="sm" fw={600}>
+                      {testCase.label}
+                    </Text>
+                    <Text component="span" size="xs" c="dimmed">
+                      {testCase.description}
+                    </Text>
+                  </Table.Th>
+                  {experiment.variants.map((variant) => {
+                    const cell = cellFor(experiment, testCase.id, variant.id, repetition);
+                    return (
+                      <Table.Td key={variant.id}>
+                        {cell ? (
+                          <Stack gap={5}>
+                            <Button
+                              h="auto"
+                              py="sm"
+                              fullWidth
+                              variant={selected?.id === cell.id ? "light" : "default"}
+                              color={stateColor(cell.status)}
+                              className={`eval-cell ${cell.status} ${selected?.id === cell.id ? "selected" : ""}`}
+                              onClick={() => onSelect(cell)}
                             >
-                              {STATUS_ICON[cell.status]} {STATUS_LABEL[cell.status]}
-                            </span>
-                          ) : (
-                            <span>
-                              {STATUS_ICON[cell.status]} {STATUS_LABEL[cell.status]}
-                            </span>
-                          )}
-                          <small>
-                            {cell.score === undefined
-                              ? (cell.error ??
-                                (cell.status === "running" ? "in progress" : "not started"))
-                              : `${Math.round(cell.score * 100)}% · ${duration(cell.durationMs)}`}
-                          </small>
-                        </button>
-                      ) : (
-                        <span className="empty-cell">—</span>
-                      )}
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
+                              <Stack gap={4}>
+                                <Text size="sm" fw={600}>
+                                  {STATUS_ICON[cell.status]} {STATUS_LABEL[cell.status]}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                  {cell.score === undefined
+                                    ? (cell.error ??
+                                      (cell.status === "running" ? "in progress" : "not started"))
+                                    : `${Math.round(cell.score * 100)}% · ${duration(cell.durationMs)}`}
+                                </Text>
+                              </Stack>
+                            </Button>
+                            {cell.runId && onOpenRun && (
+                              <Button
+                                variant="subtle"
+                                size="compact-xs"
+                                onClick={() => onOpenRun(cell.runId!)}
+                              >
+                                Open run ↗
+                              </Button>
+                            )}
+                          </Stack>
+                        ) : (
+                          <Text component="span" size="sm" className="empty-cell">
+                            —
+                          </Text>
+                        )}
+                      </Table.Td>
+                    );
+                  })}
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        </Box>
+      </Stack>
+    </Paper>
   );
 }
 
@@ -655,13 +692,16 @@ function EvidenceDetail({
   onClose,
   loading,
   error,
+  embedded = false,
 }: {
+  embedded?: boolean;
   cell: EvalCell;
   onOpenRun?: (runId: string) => void;
   onClose: () => void;
   loading?: boolean;
   error?: string;
 }) {
+  const mobile = useMediaQuery("(max-width: 48em)");
   const grouped = useMemo(
     () =>
       (cell.evidence ?? []).reduce<Record<EvidenceKind, EvalEvidence[]>>(
@@ -673,103 +713,187 @@ function EvidenceDetail({
       ),
     [cell.evidence],
   );
-  return (
-    <aside className="m5-detail" data-testid="evidence-detail">
-      <div className="m5-detail-heading">
-        <div>
-          <span className={`m5-status ${cell.status}`}>{STATUS_ICON[cell.status]}</span>
-          <strong>
+  const contents = (
+    <Stack gap="md" className="m5-detail" data-testid="evidence-detail">
+      <Group gap="xs" justify="space-between" wrap="wrap" className="m5-detail-heading">
+        <Stack gap="xs">
+          <Text component="span" size="sm" className={`m5-status ${cell.status}`}>
+            {STATUS_ICON[cell.status]}
+          </Text>
+          <Text component="span" size="sm" fw={600}>
             {cell.caseId} / {cell.variantId}
-          </strong>
-          <small>
+          </Text>
+          <Text component="span" size="xs" c="dimmed">
             repetition {cell.repetition} · {STATUS_LABEL[cell.status]}
-          </small>
-        </div>
-        <button aria-label="Close evidence" onClick={onClose}>
+          </Text>
+        </Stack>
+        <Button aria-label="Close evidence" onClick={onClose}>
           ×
-        </button>
-      </div>
-      {cell.error && <div className="m5-error">{cell.error}</div>}
+        </Button>
+      </Group>
+      {cell.error && (
+        <Stack gap="xs" className="m5-error">
+          {cell.error}
+        </Stack>
+      )}
       {error && (
-        <div className="m5-error" role="alert">
+        <Stack gap="xs" className="m5-error" role="alert">
           {error}
-        </div>
+        </Stack>
       )}
       {(["deterministic", "workflow", "efficiency", "judge", "human"] as EvidenceKind[]).map(
         (kind) => (
-          <section className={`evidence-group ${kind}`} key={kind}>
-            <h3>
-              {kind} <span>{kind === "judge" || kind === "human" ? "subjective" : "recorded"}</span>
-            </h3>
+          <Stack gap="xs" component="section" className={`evidence-group ${kind}`} key={kind}>
+            <Title order={3}>
+              {kind}{" "}
+              <Text component="span" size="sm">
+                {kind === "judge" || kind === "human" ? "subjective" : "recorded"}
+              </Text>
+            </Title>
             {grouped[kind].length ? (
               grouped[kind].map((item) => (
-                <div className="m5-evidence-row" key={`${item.label}-${item.value}`}>
-                  <span>{item.label}</span>
-                  <strong>{formatEvidenceValue(item.value)}</strong>
-                  {item.detail && <small>{item.detail}</small>}
-                </div>
+                <Stack gap="xs" className="m5-evidence-row" key={`${item.label}-${item.value}`}>
+                  <Text component="span" size="sm">
+                    {item.label}
+                  </Text>
+                  <Text component="span" size="sm" fw={600}>
+                    {formatEvidenceValue(item.value)}
+                  </Text>
+                  {item.detail && (
+                    <Text component="span" size="xs" c="dimmed">
+                      {item.detail}
+                    </Text>
+                  )}
+                </Stack>
               ))
             ) : (
-              <p className="pending-copy">
+              <Text size="sm" className="pending-copy">
                 {loading ? "Loading evidence…" : `No ${kind} evidence recorded.`}
-              </p>
+              </Text>
             )}
-          </section>
+          </Stack>
         ),
       )}
       {cell.runId && (
-        <button className="subtle-button" onClick={() => onOpenRun?.(cell.runId!)}>
+        <Button className="subtle-button" onClick={() => onOpenRun?.(cell.runId!)}>
           Open normal run {cell.runId.slice(0, 14)} ↗
-        </button>
+        </Button>
       )}
-    </aside>
+    </Stack>
+  );
+  return embedded && !mobile ? (
+    <Paper>{contents}</Paper>
+  ) : (
+    <Drawer
+      opened
+      onClose={onClose}
+      title="Evaluation evidence"
+      position="right"
+      size={mobile ? "100%" : 480}
+    >
+      {contents}
+    </Drawer>
   );
 }
 
 function TimelineCompare({ timeline, error }: { timeline?: ComparisonTimeline; error?: string }) {
   const max = Math.max(timeline?.scale.durationMs ?? 0, 1);
+  const dates = (timeline?.rows ?? [])
+    .flatMap((row) =>
+      row.spans.flatMap((span) =>
+        span && typeof span.startAt === "string" ? [Date.parse(span.startAt)] : [],
+      ),
+    )
+    .filter(Number.isFinite);
+  const start = timeline?.scale.startAt
+    ? Date.parse(timeline.scale.startAt)
+    : dates.length
+      ? Math.min(...dates)
+      : 0;
   return (
-    <div className="m5-panel compare-panel">
-      <div className="m5-panel-heading">
-        <div>
-          <strong>SHARED-SCALE TIMELINE</strong>
-          <span>durable aligned stages · {timeline?.runs.length ?? 0} selected runs</span>
-        </div>
-        <span className="timeline-fit-state">Scale fits the selected runs</span>
-      </div>
-      <div className="compare-axis">
-        <span>0s</span>
-        <span>{duration(max / 2)}</span>
-        <span>{duration(max)}</span>
-      </div>
-      {error && <p className="m5-error">{error}</p>}
-      {(timeline?.rows ?? []).map((row) => (
-        <div className="compare-row" key={row.anchorId}>
-          <label>
-            {row.label}
-            <small>{row.anchorId}</small>
-          </label>
-          <div className="compare-track">
-            {row.spans.map((span, index) =>
-              span ? (
-                <div
-                  className={`compare-bar ${String(span.status ?? "succeeded")}`}
-                  key={`${row.anchorId}-${index}`}
-                >
-                  <span>
-                    {String(span.label ?? "stage")} · {String(span.status ?? "observed")}
-                  </span>
-                </div>
-              ) : (
-                <div className="compare-missing" key={`${row.anchorId}-${index}`}>
-                  missing stage
-                </div>
-              ),
-            )}
-          </div>
-        </div>
-      ))}
-    </div>
+    <Paper className="m5-panel compare-panel">
+      <Stack gap="md">
+        <Group justify="space-between">
+          <Stack gap={4}>
+            <Title order={3}>Shared-scale timeline</Title>
+            <Text size="xs" c="dimmed">
+              Durable aligned stages · {timeline?.runs.length ?? 0} selected runs
+            </Text>
+          </Stack>
+          <Badge variant="light">{duration(max)}</Badge>
+        </Group>
+        {error && (
+          <Text c="red" size="sm">
+            {error}
+          </Text>
+        )}
+        <Group justify="space-between">
+          <Text size="xs" c="dimmed">
+            0s
+          </Text>
+          <Text size="xs" c="dimmed">
+            {duration(max / 2)}
+          </Text>
+          <Text size="xs" c="dimmed">
+            {duration(max)}
+          </Text>
+        </Group>
+        {(timeline?.rows ?? []).map((row) => (
+          <Paper key={row.anchorId} p="sm">
+            <Stack gap="sm">
+              <Group>
+                <Text fw={600} size="sm">
+                  {row.label}
+                </Text>
+                <Code>{row.anchorId}</Code>
+              </Group>
+              {row.spans.map((span, index) => {
+                const from =
+                  span && typeof span.startAt === "string" ? Date.parse(span.startAt) : NaN;
+                const to = span && typeof span.endAt === "string" ? Date.parse(span.endAt) : NaN;
+                const known = Number.isFinite(from) && Number.isFinite(to);
+                return (
+                  <Group key={`${row.anchorId}-${index}`} wrap="nowrap">
+                    <Text size="xs" c="dimmed" w={80} truncate title={timeline?.runs[index]?.runId}>
+                      Run {index + 1}
+                    </Text>
+                    <Box flex={1} pos="relative" h={34} bg="var(--mantine-color-default-hover)">
+                      {span && known ? (
+                        <Tooltip
+                          label={`${String(span.label ?? row.label)} · ${String(span.status ?? "observed")} · ${duration(to - from)}`}
+                        >
+                          <Paper
+                            p={4}
+                            pos="absolute"
+                            left={`${Math.max(0, ((from - start) / max) * 100)}%`}
+                            w={`${Math.max(0.5, Math.min(100, ((to - from) / max) * 100))}%`}
+                            h={34}
+                            bg={`var(--mantine-color-${stateColor(String(span.status))}-light)`}
+                          >
+                            <Text size="xs" truncate>
+                              {String(span.status ?? "observed")}
+                            </Text>
+                          </Paper>
+                        </Tooltip>
+                      ) : (
+                        <Text size="xs" c="dimmed" p={8}>
+                          {span ? "Timing unavailable" : "Missing stage"}
+                        </Text>
+                      )}
+                    </Box>
+                  </Group>
+                );
+              })}
+            </Stack>
+          </Paper>
+        ))}
+        {!timeline && (
+          <Text size="sm" c="dimmed">
+            Compare at least two completed runs to load aligned stages.
+          </Text>
+        )}
+      </Stack>
+    </Paper>
   );
 }
 
@@ -792,106 +916,124 @@ function PairwiseReview({
 }) {
   const options = experiment.variants.slice(0, 2);
   const testCase = experiment.cases[0];
+  if (!testCase)
+    return (
+      <Paper>
+        <Text c="dimmed" size="sm">
+          Pairwise review requires a dataset case.
+        </Text>
+      </Paper>
+    );
   return (
-    <div className="m5-panel pairwise-panel">
-      <div className="m5-panel-heading">
-        <div>
-          <strong>BLINDED PAIRWISE REVIEW</strong>
-          <span>{testCase.label} · identities remain hidden until a durable decision</span>
-        </div>
-        {pairwise ? (
-          <button
-            className="subtle-button"
-            disabled={!pairwise.decision}
-            onClick={() => setReveal(!reveal)}
+    <Paper className="m5-panel pairwise-panel">
+      <Stack gap="md">
+        <Group gap="sm" justify="space-between" mb="md" className="m5-panel-heading">
+          <Stack gap="xs">
+            <Text component="span" size="sm" fw={600}>
+              BLINDED PAIRWISE REVIEW
+            </Text>
+            <Text component="span" size="sm">
+              {testCase.label} · identities remain hidden until a durable decision
+            </Text>
+          </Stack>
+          {pairwise ? (
+            <Button
+              className="subtle-button"
+              disabled={!pairwise.decision}
+              onClick={() => setReveal(!reveal)}
+            >
+              {reveal ? "Hide identities" : "Reveal identities"}
+            </Button>
+          ) : (
+            <Button variant="filled" className="primary-cta compact" onClick={onStart}>
+              Start review
+            </Button>
+          )}
+        </Group>
+        <Stack gap="xs" className="blind-note">
+          Choose based on evidence, diff, and tests. Variant/model names are withheld to reduce
+          preference bias.
+        </Stack>
+        <SimpleGrid cols={{ base: 1, md: 2 }} className="pair-cards">
+          {options.map((variant, index) => {
+            const sideId = pairwise?.sides?.[index] ?? `side-redacted-${index + 1}`;
+            const assignedVariant = reveal ? pairwise?.revealMap?.[sideId] : undefined;
+            const revealedVariant = experiment.variants.find((item) => item.id === assignedVariant);
+            const cell = assignedVariant
+              ? cellFor(experiment, testCase.id, assignedVariant)
+              : pairwise
+                ? undefined
+                : cellFor(experiment, testCase.id, variant.id);
+            const evidence = pairwise?.evidence?.find((item) => item.side === sideId)?.items;
+            return (
+              <Paper component="article" className="pair-card" key={variant.id}>
+                <Stack gap="md">
+                  <Group gap="xs" justify="space-between" wrap="wrap" component="header">
+                    <Text component="span" size="sm">
+                      OPTION {index === 0 ? "A" : "B"}
+                    </Text>
+                    {revealedVariant && (
+                      <Text component="span" size="xs" c="dimmed">
+                        {revealedVariant.label} · {revealedVariant.profile}
+                      </Text>
+                    )}
+                  </Group>
+                  <Text component="span" size="sm" fw={600}>
+                    {pairwise && !cell
+                      ? "Blinded run"
+                      : cell?.status === "succeeded"
+                        ? `Run ${STATUS_LABEL[cell.status]}`
+                        : STATUS_LABEL[cell?.status ?? "pending"]}
+                  </Text>
+                  <Text size="sm">
+                    {evidence
+                      ?.map((item) => `${item.label}: ${formatEvidenceValue(item.value)}`)
+                      .join(" · ") ??
+                      cell?.evidence
+                        ?.map((item) => `${item.label}: ${formatEvidenceValue(item.value)}`)
+                        .join(" · ") ??
+                      "No evidence available"}
+                  </Text>
+                  <Text component="span" size="xs" c="dimmed" className="pair-acceptance">
+                    {pairwise && !cell
+                      ? "Pinned evidence snapshot"
+                      : `Acceptance: ${acceptanceLabel(cell ? acceptanceStatus(cell) : "missing")}`}
+                  </Text>
+                  {cell?.runId && (
+                    <Button className="diff-link" onClick={() => onOpenRun?.(cell.runId!)}>
+                      Inspect run ↗
+                    </Button>
+                  )}
+                </Stack>
+              </Paper>
+            );
+          })}
+        </SimpleGrid>
+        <Group gap="xs" justify="space-between" wrap="wrap" className="pair-actions">
+          <Button className="pair-choice" disabled={!pairwise} onClick={() => onChoice?.("a")}>
+            A better
+          </Button>
+          <Button className="pair-choice" disabled={!pairwise} onClick={() => onChoice?.("tie")}>
+            Tie
+          </Button>
+          <Button className="pair-choice" disabled={!pairwise} onClick={() => onChoice?.("b")}>
+            B better
+          </Button>
+          <Button
+            className="pair-choice muted-choice"
+            disabled={!pairwise}
+            onClick={() => onChoice?.("abstain")}
           >
-            {reveal ? "Hide identities" : "Reveal identities"}
-          </button>
-        ) : (
-          <button className="primary-cta compact" onClick={onStart}>
-            Start review
-          </button>
-        )}
-      </div>
-      <div className="blind-note">
-        Choose based on evidence, diff, and tests. Variant/model names are withheld to reduce
-        preference bias.
-      </div>
-      <div className="pair-cards">
-        {options.map((variant, index) => {
-          const sideId = pairwise?.sides?.[index] ?? `side-redacted-${index + 1}`;
-          const assignedVariant = reveal ? pairwise?.revealMap?.[sideId] : undefined;
-          const revealedVariant = experiment.variants.find((item) => item.id === assignedVariant);
-          const cell = assignedVariant
-            ? cellFor(experiment, testCase.id, assignedVariant)
-            : pairwise
-              ? undefined
-              : cellFor(experiment, testCase.id, variant.id);
-          const evidence = pairwise?.evidence?.find((item) => item.side === sideId)?.items;
-          return (
-            <article className="pair-card" key={variant.id}>
-              <header>
-                <span>OPTION {index === 0 ? "A" : "B"}</span>
-                {revealedVariant && (
-                  <small>
-                    {revealedVariant.label} · {revealedVariant.profile}
-                  </small>
-                )}
-              </header>
-              <strong>
-                {pairwise && !cell
-                  ? "Blinded run"
-                  : cell?.status === "succeeded"
-                    ? `Run ${STATUS_LABEL[cell.status]}`
-                    : STATUS_LABEL[cell?.status ?? "pending"]}
-              </strong>
-              <p>
-                {evidence
-                  ?.map((item) => `${item.label}: ${formatEvidenceValue(item.value)}`)
-                  .join(" · ") ??
-                  cell?.evidence
-                    ?.map((item) => `${item.label}: ${formatEvidenceValue(item.value)}`)
-                    .join(" · ") ??
-                  "No evidence available"}
-              </p>
-              <small className="pair-acceptance">
-                {pairwise && !cell
-                  ? "Pinned evidence snapshot"
-                  : `Acceptance: ${acceptanceLabel(cell ? acceptanceStatus(cell) : "missing")}`}
-              </small>
-              {cell?.runId && (
-                <button className="diff-link" onClick={() => onOpenRun?.(cell.runId!)}>
-                  Inspect run ↗
-                </button>
-              )}
-            </article>
-          );
-        })}
-      </div>
-      <div className="pair-actions">
-        <button className="pair-choice" disabled={!pairwise} onClick={() => onChoice?.("a")}>
-          A better
-        </button>
-        <button className="pair-choice" disabled={!pairwise} onClick={() => onChoice?.("tie")}>
-          Tie
-        </button>
-        <button className="pair-choice" disabled={!pairwise} onClick={() => onChoice?.("b")}>
-          B better
-        </button>
-        <button
-          className="pair-choice muted-choice"
-          disabled={!pairwise}
-          onClick={() => onChoice?.("abstain")}
-        >
-          Abstain
-        </button>
-      </div>
-      <p className="pending-copy">
-        {pairwise?.decision
-          ? `Decision recorded: ${pairwise.decision.choice}.`
-          : "Your decision is saved as human evidence and reveals identity only after the journal accepts it."}
-      </p>
-    </div>
+            Abstain
+          </Button>
+        </Group>
+        <Text size="sm" className="pending-copy">
+          {pairwise?.decision
+            ? `Decision recorded: ${pairwise.decision.choice}.`
+            : "Your decision is saved as human evidence and reveals identity only after the journal accepts it."}
+        </Text>
+      </Stack>
+    </Paper>
   );
 }
 

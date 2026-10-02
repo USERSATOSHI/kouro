@@ -114,15 +114,15 @@ Workflow starters are distributed with the CLI and copied into `.kouro/<name>`;
 their `kouro.ts`, `prompts/`, and `schemas/schema.ts` remain project-owned source.
 The Pi RPC adapter has contract tests and a verified local-model tiny workflow run;
 collaboration is still tested with scripted participants, not a live Pi swarm.
-M7 fork acceptance and M8 hardening are complete for the documented local
-reference fixture. Do not use checkpoints as magical rewind of external side
-effects; nested/arbitrary historical rewind and live provider authority remain
-outside the supported scope. See the milestone document for exact verified scope.
+Checkpoints do not rewind external side effects. Nested/arbitrary historical
+rewind and transfer of live provider sessions remain outside the supported scope.
+See the operator guide for checkpoint and recovery limits.
 
-## Design and progress
+## Documentation
 
-Read [the architecture plan](plan.md), [milestone status and acceptance criteria](docs/v2/milestones.md),
-[operator/recovery guide](docs/v2/operator-guide.md), [protocol contracts](docs/v2/contracts.md),
-and [the v1 review](docs/v2/v1-review.md).
-The implementation is reviewed against these documents; unsupported behavior must
-be rejected or labeled unavailable rather than simulated as real capability.
+- [Local workflow use](docs/v2/local-workflow-use.md): starter workflows, permissions,
+  bounded subagents, and access over SSH.
+- [Operator guide](docs/v2/operator-guide.md): inspecting runs, recovery, checkpoints,
+  backups, and evaluations.
+- [Protocol contracts](docs/v2/contracts.md): contributor reference for identity,
+  execution, persistence, and authority semantics.
