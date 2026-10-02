@@ -1,3 +1,4 @@
+import { FusionSessions, fusionGroups } from "./components/FusionSessions";
 import { artifactIdentity, evidenceBelongsTo, invocationLabel } from "./data/evidenceIdentity";
 import { layoutWorkbenchGraph } from "./data/workbenchLayout";
 import { PageHeader, WorkbenchPanel } from "./components/WorkbenchPrimitives";
@@ -2893,6 +2894,12 @@ function Preview({
     ([definitionId, definition]) =>
       definition.nodes
         .filter((node) => node.kind === "agent" || node.kind === "command")
+        .filter(
+          (node) =>
+            node.kind !== "agent" ||
+            !node.fusion ||
+            ["draft", "synthesis"].includes(node.fusion.stage),
+        )
         .map((node) => ({
           node,
           definitionId,
@@ -3033,6 +3040,12 @@ function Preview({
                           legend={`${definitionId} / ${node.id} · ${readOnly ? "read-only subagent" : node.kind}`}
                         >
                           <Stack gap="md">
+                            {node.kind === "agent" && node.fusion?.stage === "draft" && (
+                              <Text size="sm" c="dimmed">
+                                This model selection also applies to every review and revision
+                                round.
+                              </Text>
+                            )}
                             {node.kind === "agent" && (
                               <SimpleGrid cols={{ base: 1, sm: 2 }}>
                                 <NativeSelect
@@ -3157,6 +3170,11 @@ function Workbench({
   setInspectorWidth: (width: number) => void;
 }) {
   const [scoutRequests, setScoutRequests] = useState<ScoutTimelineRequest[]>([]);
+  const hasFusion = fusionGroups(view).length > 0;
+  const [sessionMode, setSessionMode] = useState(() =>
+    readPreference("kouro.session.mode", "fusion"),
+  );
+  useEffect(() => writePreference("kouro.session.mode", sessionMode), [sessionMode]);
   const [mode, setMode] = useState<"graph" | "split" | "timeline">(() => {
     const saved = readPreference("kouro.view.mode", "split");
     return saved === "graph" || saved === "timeline" ? saved : "split";
@@ -3452,7 +3470,31 @@ function Workbench({
         </Tabs.List>
       </Tabs>
       {workspaceTab === "session" ? (
-        <Box p={{ base: "sm", md: "lg" }}>{inspector}</Box>
+        <Box p={{ base: "sm", md: "lg" }}>
+          <Stack>
+            {hasFusion && (
+              <SegmentedControl
+                aria-label="Session view"
+                value={sessionMode}
+                onChange={setSessionMode}
+                data={[
+                  { value: "single", label: "Single session" },
+                  { value: "fusion", label: "Fusion split" },
+                ]}
+              />
+            )}
+            {hasFusion && sessionMode === "fusion" ? (
+              <FusionSessions
+                view={view}
+                onControl={onControl}
+                pendingAction={pendingAction}
+                loadActivity={fetchActivityPage}
+              />
+            ) : (
+              inspector
+            )}
+          </Stack>
+        </Box>
       ) : workspaceTab === "delivery" ? (
         <Box p="lg">
           <DiffPanel runId={view.runId} revision={view.revision} showDelivery />

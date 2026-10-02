@@ -1,5 +1,7 @@
 export * from "./contracts";
 export * from "./builder";
+export { MAX_FUSION_ROUNDS, validateFusionRounds } from "./fusion";
+export type { FusionOptions } from "./fusion";
 export * from "./compiler";
 export * from "./execution";
 export { canonicalize, sha256Hex } from "./canonical";

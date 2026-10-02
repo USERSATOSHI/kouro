@@ -677,7 +677,16 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
         continue;
       }
       if (node?.kind === "complete") {
-        intents.push({ kind: "complete", invocationId: invocation.id, outcome: node.result });
+        const refs = Object.values(state.invocations).flatMap((candidate) => candidate.output);
+        const output = Object.values(invocation.inputBindings).flatMap((binding) =>
+          binding.artifactId ? refs.filter((ref) => ref.id === binding.artifactId).slice(0, 1) : [],
+        );
+        intents.push({
+          kind: "complete",
+          invocationId: invocation.id,
+          outcome: node.result,
+          ...(output.length ? { output } : {}),
+        });
         continue;
       }
       if (node?.kind === "call") {
@@ -702,7 +711,14 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
               ["succeeded", "failed", "recovery-required"].includes(candidate.status),
             )
           ) {
-            const output = childInvocations.flatMap((candidate) => candidate.output);
+            const terminals = childInvocations.filter((candidate) =>
+              bundle.definitions[childScope.definitionId]?.nodes.some(
+                (child) => child.id === candidate.nodeId && child.kind === "complete",
+              ),
+            );
+            const output = bundle.definitions[childScope.definitionId]?.outputPorts.length
+              ? terminals.flatMap((candidate) => candidate.output)
+              : childInvocations.flatMap((candidate) => candidate.output);
             const evidence = childInvocations.flatMap((candidate) => candidate.evidence);
             const artifacts = childInvocations.flatMap((candidate) => candidate.artifacts);
             intents.push({
@@ -1031,7 +1047,7 @@ export function decide(bundle: Bundle, state: ExecutionState): readonly Decision
         // A failed fork branch is evidence for its join, not a terminal run.
         // The fork's structural activation will admit the join (including
         // fail-fast joins) once this fact is durable.
-        if (owningFork) continue;
+        if (owningFork || invocation.scopeId !== state.rootScopeId) continue;
         intents.push({ kind: "finish", status: "failed" });
         return intents;
       }
@@ -1193,8 +1209,9 @@ function invocationLineage(state: ExecutionState, invocationId: string): Set<str
     // Materialized checkpoint prefixes retain source invocation IDs as
     // external lineage tokens. Keep the token even when its parent envelope
     // is intentionally absent from the child run.
-    lineage.add(current.sourceInvocationId);
-    current = state.invocations[current.sourceInvocationId];
+    const sourceId: string = current.sourceInvocationId;
+    current = state.invocations[sourceId];
+    if (!current) lineage.add(sourceId);
   }
   return lineage;
 }

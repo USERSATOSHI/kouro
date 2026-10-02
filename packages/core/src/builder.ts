@@ -1,3 +1,4 @@
+import { buildFusionStages, validateFusionRounds, type FusionOptions } from "./fusion";
 import type {
   ArtifactType,
   Binding,
@@ -27,6 +28,7 @@ import type {
   ScoutDefinition,
   ScoutPolicy,
   WorkflowCapability,
+  FusionStageIdentity,
 } from "./contracts";
 
 export type SchemaInput<T = unknown> = ArtifactType<T> | JsonValue;
@@ -91,6 +93,7 @@ export interface AgentOptions<T = unknown> {
   readonly harness?: Harness;
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
+  readonly fusion?: FusionStageIdentity;
   readonly workspaceAccess?: "read-only" | "workspace-write";
   readonly capabilities?: readonly WorkflowCapability[];
   readonly input?: Readonly<Record<string, ValueBinding>>;
@@ -209,6 +212,42 @@ type InternalNode = (
   readonly outputPorts: readonly InternalPort[];
 };
 
+function scopeDefinition(
+  source: WorkflowDefinitionSource,
+  prefix: string,
+): WorkflowDefinitionSource {
+  const scopedId = (id: string) => `${prefix}:${id}`;
+  return {
+    ...source,
+    id: scopedId(source.id),
+    nodes: source.nodes.map((node) =>
+      node.kind === "call" && "definitionId" in node
+        ? { ...node, definitionId: scopedId(node.definitionId) }
+        : node.kind === "forEach" && "templateDefinitionId" in node
+          ? { ...node, templateDefinitionId: scopedId(node.templateDefinitionId) }
+          : node,
+    ),
+    ...(source.scouts
+      ? {
+          scouts: source.scouts.map((scout) => ({
+            ...scout,
+            definitionId: scopedId(scout.definitionId),
+          })),
+        }
+      : {}),
+    ...(source.definitions
+      ? {
+          definitions: Object.fromEntries(
+            Object.entries(source.definitions).map(([id, child]) => [
+              scopedId(id),
+              scopeDefinition(child, prefix),
+            ]),
+          ),
+        }
+      : {}),
+  };
+}
+
 /** A small authoring handle. Handles are owned by one WorkflowBuilder. */
 export class NodeHandle<T = unknown, HasOutput extends boolean = true> {
   readonly workflowId: string;
@@ -229,6 +268,22 @@ export class NodeHandle<T = unknown, HasOutput extends boolean = true> {
 
   on(outcome: string): EdgeBuilder {
     return new EdgeBuilder(this.owner, this.id, outcome);
+  }
+}
+
+/** Composition consumes unwired agent declarations and returns a normal call handle. */
+export class FusionBuilder<Plan> {
+  private composed = false;
+  constructor(
+    private readonly compose: (
+      members: readonly NodeHandle<Plan, true>[],
+    ) => NodeHandle<Plan, true>,
+  ) {}
+  use(...members: readonly NodeHandle<Plan, true>[]): NodeHandle<Plan, true> {
+    if (this.composed) throw new Error("Fusion members have already been composed");
+    const handle = this.compose(members);
+    this.composed = true;
+    return handle;
   }
 }
 
@@ -452,6 +507,7 @@ export class WorkflowBuilder {
   readonly version: string;
   private readonly limits: WorkflowDefinitionSource["limits"];
   private readonly nodeMap = new Map<string, InternalNode>();
+  private readonly agentOptions = new Map<string, AgentOptions>();
   private readonly edgeList: ControlEdge[] = [];
   private readonly inputMap = new Map<string, InputHandle>();
   private readonly counterMap = new Map<string, CounterDefinition>();
@@ -506,6 +562,7 @@ export class WorkflowBuilder {
       prompt: options.prompt,
       ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+      ...(options.fusion === undefined ? {} : { fusion: options.fusion }),
       ...(options.workspaceAccess === undefined
         ? {}
         : { workspaceAccess: options.workspaceAccess }),
@@ -537,6 +594,7 @@ export class WorkflowBuilder {
       ...(options.resources ? { resources: options.resources } : {}),
     } as InternalNode;
     this.addNode(node);
+    this.agentOptions.set(id, options);
     return this.handle(id, output);
   }
 
@@ -673,6 +731,109 @@ export class WorkflowBuilder {
     this.addNode(node as InternalNode);
     this.sourceMap.set(id, { sourceId: id });
     return this.handle<T>(id, output);
+  }
+
+  /** Compose agents declared with agent(); each cycle reviews and revises in parallel. */
+  fusion<Plan, Review>(id: string, options: FusionOptions<Plan, Review>): FusionBuilder<Plan> {
+    validateFusionRounds(options.rounds);
+    return new FusionBuilder((members) => this.composeFusion(id, options, members));
+  }
+
+  private composeFusion<Plan, Review>(
+    id: string,
+    options: FusionOptions<Plan, Review>,
+    members: readonly NodeHandle<Plan, true>[],
+  ): NodeHandle<Plan, true> {
+    if (members.length < 2) throw new Error("Fusion requires at least two model agents");
+    const handles = [...members, options.synthesis];
+    const ids = new Set(handles.map((handle) => handle.id));
+    if (ids.size !== handles.length)
+      throw new Error("Fusion requires distinct member and synthesis agents");
+    for (const handle of handles) {
+      assertHandleOwner(handle, this);
+      const node = this.nodeMap.get(handle.id);
+      if (node?.kind !== "agent" || !this.agentOptions.get(handle.id)?.produces)
+        throw new Error(`Fusion ${handle.id} must be an agent with a declared output`);
+      if (
+        node.fusion ||
+        this.entryId === handle.id ||
+        this.edgeList.some(
+          (edge) => edge.sourceNodeId === handle.id || edge.targetNodeId === handle.id,
+        ) ||
+        [...this.nodeMap.values()].some(
+          (other) =>
+            !ids.has(other.id) &&
+            other.bindings.some(
+              (binding) =>
+                binding.source.kind === "producer" && binding.source.sourceId === handle.id,
+            ),
+        )
+      )
+        throw new Error(`Fusion agent ${handle.id} must be unwired before composition`);
+    }
+    if (this.nodeMap.has(id) && !ids.has(id)) throw new Error(`Duplicate node ${id}`);
+    const child = new WorkflowBuilder({ id: `${this.id}:${id}` });
+    const task = child.input("task", this.schemaOf(options.task));
+    const inputs: Record<string, ValueBinding> = { task: options.task };
+    const inherit = (handle: NodeHandle<Plan, true>) => {
+      const member = this.agentOptions.get(handle.id)! as AgentOptions<Plan>;
+      const memberInputs = Object.fromEntries(
+        Object.entries(member.input ?? {})
+          .filter(([name]) => name !== "task")
+          .map(([name, value]) => {
+            if (isOutputHandle(value) && ids.has(value.sourceId))
+              throw new Error(
+                "Fusion declarations cannot depend on one another before composition",
+              );
+            const portName = `${handle.id}:${name}`;
+            inputs[portName] = value;
+            return [name, child.input(portName, this.schemaOf(value))];
+          }),
+      );
+      return {
+        ...member,
+        id: handle.id,
+        input: memberInputs,
+        ...(member.uses
+          ? {
+              uses: member.uses.map((scout) => {
+                assertScoutOwner(scout, this);
+                const declaration = this.scoutList.find((item) => item.id === scout.id)!;
+                if (!child.scoutList.some((item) => item.id === scout.id)) {
+                  const scoped = scopeDefinition(
+                    this.childDefinitions.get(declaration.definitionId)!,
+                    child.id,
+                  );
+                  child.scoutList.push({ ...declaration, definitionId: scoped.id });
+                  child.childDefinitions.set(scoped.id, scoped);
+                }
+                return Object.freeze({
+                  ...scout,
+                  workflowId: child.id,
+                  ownerToken: child.ownerToken,
+                });
+              }),
+            }
+          : {}),
+      };
+    };
+    const stages = buildFusionStages(child, id, {
+      ...options,
+      task,
+      members: members.map(inherit),
+      synthesis: inherit(options.synthesis),
+      produces: this.agentOptions.get(options.synthesis.id)!.produces as ArtifactType<Plan>,
+    });
+    child.output(stages.result.output);
+    const done = child.complete("done", { output: stages.result.output });
+    child.startAt(stages.entry);
+    stages.result.on("success").to(done);
+    // The supplied declarations belong to this composite rather than the root graph.
+    for (const handle of handles) {
+      this.nodeMap.delete(handle.id);
+      this.agentOptions.delete(handle.id);
+    }
+    return this.call<Plan>(id, child, { input: inputs });
   }
 
   /** Declare a child definition that agents may invoke through the subagent tool. */
@@ -1100,6 +1261,7 @@ function stripInternal(node: InternalNode): Node {
       prompt: node.prompt,
       ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
+      ...(node.fusion === undefined ? {} : { fusion: node.fusion }),
       ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
       ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),
       ...(node.timeoutMs === undefined ? {} : { timeoutMs: node.timeoutMs }),

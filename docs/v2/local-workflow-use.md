@@ -31,6 +31,51 @@ requires the corresponding harness to be installed and authenticated. The local
 test suite exercises the MCP and extension bridges; it does not make a live
 provider call.
 
+## Fusion planning
+
+The `feature-fusion` and `refactor-fusion` starters draft plans with two models
+in parallel, then run two cross-review/revision cycles before synthesis. Edit
+`reviewRounds` in the generated `kouro.ts` to choose 0–10 cycles. Zero combines
+the initial drafts directly. Each stage waits for both models to finish.
+
+Declare every model with `workflow.agent`, and declare its optional subagents
+with `workflow.subagent`. Fusion composes the agent handles:
+
+```ts
+const repositoryScout = workflow.subagent("repositoryScout", {
+  prompt: scoutPrompt,
+  produces: Summary,
+});
+const plannerA = workflow.agent("planner-a", {
+  modelId: "model-a", prompt: firstPrompt, produces: Summary,
+  uses: [repositoryScout],
+});
+const plannerB = workflow.agent("planner-b", {
+  modelId: "model-b", prompt: secondPrompt, produces: Summary,
+});
+const synthesizer = workflow.agent("synthesis", {
+  modelId: "model-fusion", prompt: fusionPrompt, produces: Summary,
+});
+const fusion = workflow.fusion("planning", {
+  task, rounds: 2, reviewProduces: Summary,
+  reviewPrompt, revisionPrompt, synthesis: synthesizer,
+}).use(plannerA, plannerB);
+workflow.startAt(fusion);
+fusion.on("success").to(workflow.complete("done", { output: fusion.output }));
+```
+
+Supply unwired agents; composition moves their declarations into a child workflow.
+Use `fusion.output` for the synthesized result. Model choices, permissions and
+subagents follow each member through its reviews and revisions. In the web
+launch form, choose each member's model once; that choice applies to every round.
+
+Open the run's **Session** tab and select **Fusion split** to compare model
+sessions side by side. **Planning stage** follows the latest stage or replays
+initial drafts and individual review/revision rounds. The combined plan appears
+below the sessions. On narrow screens, sessions stack vertically. Steering and
+interrupt controls target the agent shown in that panel; cancellation stops the
+whole run.
+
 ## Agent swarm
 
 Open **Agent swarm** in the sidebar, list 1–8 models with their harnesses, then

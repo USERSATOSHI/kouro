@@ -1395,6 +1395,22 @@ export async function configureBundle(
       throw new Error(`Duplicate settings for workflow node ${key}`);
     resolved.set(matches[0]!.node, setting);
   }
+  // A model is chosen once on its draft; reviews and revisions keep that selection.
+  for (const [node, setting] of resolved) {
+    if (node.kind !== "agent" || node.fusion?.stage !== "draft") continue;
+    const definitionId = targets.find((target) => target.node === node)!.definitionId;
+    for (const target of targets) {
+      const peer = target.node;
+      if (
+        target.definitionId === definitionId &&
+        peer.kind === "agent" &&
+        peer.fusion?.groupId === node.fusion.groupId &&
+        peer.fusion?.memberId === node.fusion.memberId &&
+        !resolved.has(peer)
+      )
+        resolved.set(peer, setting);
+    }
+  }
   const childDefinitions = new Set(
     Object.values(source.definitions).flatMap((definition) =>
       (definition.scouts ?? []).map((scout) => scout.definitionId),

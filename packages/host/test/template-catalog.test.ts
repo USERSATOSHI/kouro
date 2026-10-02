@@ -63,12 +63,27 @@ describe("workflow template catalog", () => {
     );
     const fusion = catalog.find((entry) => entry.id === "catalog-fusion")!;
     expect(fusion.bundle.definitions[fusion.bundle.rootDefinitionId].nodes).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "planners", kind: "call" })]),
+    );
+    const fusionStages = fusion.bundle.definitions["catalog-fusion:planners"]!;
+    expect(fusionStages.nodes.filter((node) => node.kind === "agent")).toHaveLength(11);
+    expect(fusionStages.nodes).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "planners", kind: "fork" }),
-        expect.objectContaining({ id: "planner-a", kind: "agent", modelId: "model-a" }),
-        expect.objectContaining({ id: "planner-b", kind: "agent", modelId: "model-b" }),
-        expect.objectContaining({ id: "fusion", kind: "agent", modelId: "model-fusion" }),
-        expect.objectContaining({ id: "join-planners", kind: "join" }),
+        expect.objectContaining({
+          id: "planner-a-review-2",
+          modelId: "model-a",
+          fusion: expect.objectContaining({ stage: "review", round: 2 }),
+        }),
+        expect.objectContaining({
+          id: "planner-b-revise-2",
+          modelId: "model-b",
+          fusion: expect.objectContaining({ stage: "revision", round: 2 }),
+        }),
+        expect.objectContaining({
+          id: "fusion",
+          modelId: "model-fusion",
+          fusion: expect.objectContaining({ stage: "synthesis", round: 2 }),
+        }),
       ]),
     );
     await service.close();

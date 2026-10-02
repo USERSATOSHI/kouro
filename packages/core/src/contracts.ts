@@ -110,6 +110,13 @@ export interface ControlEdge {
   readonly feedbackBindings?: readonly Binding[];
 }
 
+export interface FusionStageIdentity {
+  readonly groupId: string;
+  readonly memberId: string;
+  readonly stage: "draft" | "review" | "revision" | "synthesis";
+  readonly round: number;
+}
+
 export interface AgentNode {
   readonly id: string;
   readonly kind: "agent";
@@ -118,6 +125,8 @@ export interface AgentNode {
   /** Optional per-agent harness override. Defaults to the run execution profile. */
   readonly harness?: Harness;
   readonly modelId?: string;
+  /** Identifies a model's stages in an authored fusion workflow. */
+  readonly fusion?: FusionStageIdentity;
   readonly workspaceAccess?: "read-only" | "workspace-write";
   /** Node-scoped authority requested from the selected harness. */
   readonly capabilities?: readonly WorkflowCapability[];

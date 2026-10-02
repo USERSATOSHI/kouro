@@ -31,8 +31,11 @@ kouro create template my-feature --template feature
 This writes `.kouro/my-feature/manifest.json`, `kouro.ts`, `prompts/`, and
 `schemas/schema.ts`. Kouro discovers those project packages at startup. Fusion
 packages run multiple model-selected specialist agents in parallel, then pass
-their outputs to a model-selected fusion agent for one canonical result. They do
-not imply live agent-to-agent messaging.
+their latest revised outputs to a model-selected synthesis agent for one
+canonical result. Each fusion starter defaults to two parallel cross-review and
+revision rounds; edit `reviewRounds` in `kouro.ts` to select 0–10 rounds. The
+Session tab offers a Fusion split view with shared stage selection and the
+combined plan below both model sessions.
 
 ## Recovery choices
 

@@ -17,11 +17,12 @@ import {
 const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-browser-data");
 await mkdir(dataDir, { recursive: true });
 process.env.KOURO_OPENCODE_BIN = await prepareSwarmProviderFixture(dataDir);
+const sessionHarness = new BrowserSessionHarness();
 const service = new ApplicationService({
   dataDir,
   templateRoot: await prepareLaunchTemplate(dataDir),
   scriptedDelayMs: 5_000,
-  harness: new BrowserSessionHarness(),
+  harness: sessionHarness,
 });
 await service.start();
 const run = await service.createRun({
@@ -66,7 +67,7 @@ gateway.send(planner.grantId, {
   idempotencyKey: "browser-blackboard-entry",
 });
 
-await seedSessionFixtures(service);
+await seedSessionFixtures(service, sessionHarness);
 
 const host = createHostServer(service, {
   staticRoot: resolve("packages/web/dist"),

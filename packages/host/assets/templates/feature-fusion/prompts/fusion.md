@@ -1,1 +1,1 @@
-Combine the planner outputs into one canonical implementation plan. Resolve conflicts explicitly and return JSON matching the summary schema.
+Combine the latest revised plans in member1 and member2 into one canonical implementation plan. Use the latest reviews to check unresolved concerns. Resolve conflicts explicitly, preserve uncertainties, and return JSON matching the summary schema.

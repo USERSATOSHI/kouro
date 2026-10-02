@@ -1,3 +1,4 @@
+import { FusionFixtureHarness, fusionFixture } from "./fusion-fixture";
 import {
   WorkflowBuilder,
   artifactType,
@@ -17,6 +18,8 @@ export class BrowserSessionHarness implements HarnessAdapter {
   readonly id = "scripted";
   readonly adapterVersion = "browser-fixture";
   private scripted = new ScriptedHarnessAdapter();
+  private fusion = new FusionFixtureHarness();
+  private liveFusion = new FusionFixtureHarness("slow-review");
   capabilities() {
     return this.scripted.capabilities();
   }
@@ -24,10 +27,14 @@ export class BrowserSessionHarness implements HarnessAdapter {
     string,
     { input: Parameters<HarnessAdapter["run"]>[0]; finished: boolean }
   >();
+  liveFusionRunId?: string;
   private failedTurns = 0;
   private interruptedTurns = 0;
 
   async steer({ invocationId, message }: { invocationId: string; message: string }) {
+    if (this.fusion.canSteer({ invocationId })) return this.fusion.steer({ invocationId, message });
+    if (this.liveFusion.canSteer({ invocationId }))
+      return this.liveFusion.steer({ invocationId, message });
     const turn = this.active.get(invocationId);
     if (!turn) throw new Error("fixture turn is not active");
     turn.input.onEvent?.({
@@ -49,6 +56,8 @@ export class BrowserSessionHarness implements HarnessAdapter {
   }
 
   async run(input: Parameters<HarnessAdapter["run"]>[0]): ReturnType<HarnessAdapter["run"]> {
+    if (input.role.startsWith("fusion-fixture-"))
+      return (input.runId === this.liveFusionRunId ? this.liveFusion : this.fusion).run(input);
     if (!input.role.startsWith("web-session-")) return this.scripted.run(input);
     const emit = (type: HarnessEvent["type"], data: JsonValue) =>
       input.onEvent?.({ type, at: new Date().toISOString(), data });
@@ -276,7 +285,19 @@ export async function prepareLaunchTemplate(dataDir: string): Promise<string> {
   return root;
 }
 
-export async function seedSessionFixtures(service: ApplicationService) {
+export async function seedSessionFixtures(
+  service: ApplicationService,
+  harness?: BrowserSessionHarness,
+) {
+  for (const id of ["browser-fusion", "browser-fusion-live"]) {
+    const run = await service.coordinator.createRun({
+      workflowId: id,
+      bundle: await fusionFixture(id),
+      input: { task: "Compare approaches" },
+      idempotencyKey: id,
+    });
+    if (id === "browser-fusion-live" && harness) harness.liveFusionRunId = run.run.runId;
+  }
   const report = artifactType<{ summary: string }>("web-session-report", {
     type: "object",
     required: ["summary"],

@@ -1690,30 +1690,31 @@ export class Coordinator {
       }
       const executions = intents.filter((candidate) => candidate.kind === "execute");
       if (executions.length > 1) {
-        const definition = view.bundle.definitions[view.bundle.rootDefinitionId];
-        const groups = definition
-          ? definition.nodes
-              .filter((candidate): candidate is ForkNode => candidate.kind === "fork")
-              .map((fork) => {
-                const join = definition.nodes.find(
-                  (candidate) =>
-                    candidate.kind === "join" && (candidate as JoinNode).groupId === fork.groupId,
-                ) as JoinNode | undefined;
-                return {
-                  id: fork.groupId,
-                  expectedBranchIds: executions
-                    .filter((intent) =>
-                      fork.branchIds.includes(
-                        view.state.invocations[intent.invocationId]?.nodeId ?? "",
-                      ),
-                    )
-                    .map((intent) => intent.invocationId),
-                  mode:
-                    join?.mode === "fail-fast" ? ("fail-fast" as const) : ("all-settled" as const),
-                };
-              })
-              .filter((group) => group.expectedBranchIds.length > 0)
-          : [];
+        const groups = Object.values(view.state.scopes).flatMap((scope) => {
+          const definition = view.bundle.definitions[scope.definitionId];
+          return (definition?.nodes ?? [])
+            .filter((candidate): candidate is ForkNode => candidate.kind === "fork")
+            .map((fork) => {
+              const join = definition!.nodes.find(
+                (candidate) =>
+                  candidate.kind === "join" && (candidate as JoinNode).groupId === fork.groupId,
+              ) as JoinNode | undefined;
+              return {
+                id: `${scope.id}:${fork.groupId}`,
+                expectedBranchIds: executions
+                  .filter((intent) => {
+                    const invocation = view.state.invocations[intent.invocationId];
+                    return (
+                      invocation?.scopeId === scope.id && fork.branchIds.includes(invocation.nodeId)
+                    );
+                  })
+                  .map((intent) => intent.invocationId),
+                mode:
+                  join?.mode === "fail-fast" ? ("fail-fast" as const) : ("all-settled" as const),
+              };
+            })
+            .filter((group) => group.expectedBranchIds.length > 0);
+        });
         const scheduler = new ReadySetScheduler({
           maxConcurrency: Math.max(
             1,
@@ -1872,11 +1873,17 @@ export class Coordinator {
         return;
       }
       if (intent.kind === "complete") {
-        const node = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find(
+        const completion = view.state.invocations[intent.invocationId];
+        const definition =
+          view.bundle.definitions[
+            view.state.scopes[completion?.scopeId ?? ""]?.definitionId ??
+              view.bundle.rootDefinitionId
+          ];
+        const node = definition?.nodes.find(
           (candidate) => candidate.id === view.state.invocations[intent.invocationId]?.nodeId,
         );
         if (node?.kind === "join" && (node as JoinNode).mode === "fail-fast") {
-          const fork = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find(
+          const fork = definition?.nodes.find(
             (candidate) =>
               candidate.kind === "fork" &&
               (candidate as ForkNode).groupId === (node as import("@kouro/core").JoinNode).groupId,
@@ -1886,6 +1893,7 @@ export class Coordinator {
             Object.values(view.state.invocations).some(
               (candidate) =>
                 (fork as ForkNode).branchIds.includes(candidate.nodeId) &&
+                candidate.scopeId === completion?.scopeId &&
                 ["reserved", "running"].includes(candidate.status),
             );
           if (activeBranch) {
@@ -1894,7 +1902,7 @@ export class Coordinator {
           }
         }
         if (node?.kind === "join") {
-          const fork = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find(
+          const fork = definition?.nodes.find(
             (candidate) =>
               candidate.kind === "fork" &&
               (candidate as ForkNode).groupId === (node as JoinNode).groupId,
@@ -1911,7 +1919,8 @@ export class Coordinator {
               branchStatuses: Object.fromEntries(
                 (fork?.kind === "fork" ? (fork as ForkNode).branchIds : []).map((branchId) => {
                   const branch = Object.values(view.state.invocations).find(
-                    (candidate) => candidate.nodeId === branchId,
+                    (candidate) =>
+                      candidate.scopeId === completion?.scopeId && candidate.nodeId === branchId,
                   );
                   return [
                     branchId,
@@ -1993,9 +2002,22 @@ export class Coordinator {
     if (duplicate) return;
     const row = this.journal.getRunRow(runId);
     const runInput = row ? parseJson<Record<string, unknown>>(row.input_json) : {};
+    const parentCall = Object.values(state.invocations).find(
+      (candidate) => `${candidate.id}:scope` === intent.scopeId,
+    );
     const inputBindings = Object.fromEntries(
       Object.entries(intent.bindings).map(([name, binding]) => {
         if (binding.source.kind !== "input") return [name, binding];
+        const inherited = parentCall?.inputBindings[binding.source.sourceId];
+        if (inherited)
+          return [
+            name,
+            {
+              ...binding,
+              ...(inherited.value === undefined ? {} : { value: inherited.value }),
+              ...(inherited.artifactId ? { artifactId: inherited.artifactId } : {}),
+            },
+          ];
         const value = runInput[binding.source.sourceId];
         if (value === undefined && binding.missing === "error")
           throw new Error(`Missing required workflow input ${binding.source.sourceId}`);
