@@ -9,8 +9,9 @@ import {
   renderPromptFixture,
   isHarness,
   CAPABILITY,
+  validateReasoningEffort,
 } from "@kouro/core";
-import type { Bundle, WorkflowDefinitionSource } from "@kouro/core";
+import type { Bundle, WorkflowDefinitionSource, NodeRuntimeSettings } from "@kouro/core";
 import type { PromptFixture } from "@kouro/core";
 import type { CheckpointInput, CheckpointEligibility, CheckpointCertificate } from "@kouro/core";
 import { Coordinator, type CoordinatorOptions } from "../coordinator/coordinator.ts";
@@ -657,7 +658,7 @@ export class ApplicationService {
     idempotencyKey: string;
     actor?: string;
     input?: Record<string, unknown>;
-    nodeSettings?: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>;
+    nodeSettings?: Record<string, NodeRuntimeSettings>;
     /** Legacy callers may still send this; new run settings belong to workflow nodes. */
     executionProfile?: ExecutionProfileId;
     allowUnrestrictedCommands?: boolean;
@@ -1448,7 +1449,7 @@ export class ApplicationService {
 
 export async function configureBundle(
   source: Bundle,
-  settings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>,
+  settings: Record<string, NodeRuntimeSettings>,
 ): Promise<Bundle> {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("nodeSettings must be an object keyed by workflow node ID");
@@ -1508,6 +1509,16 @@ export async function configureBundle(
             (typeof setting.modelId !== "string" || setting.modelId.length > 200)
           )
             throw new Error(`Invalid model for node ${node.id}`);
+          if (setting.effort !== undefined && node.kind !== "agent")
+            throw new Error(`Only agent nodes can set reasoning effort: ${node.id}`);
+          if (node.kind === "agent") {
+            const effort = setting.effort === null ? undefined : (setting.effort ?? node.effort);
+            const effortError = validateReasoningEffort(
+              effort,
+              (setting.harness ?? node.harness) as typeof node.harness,
+            );
+            if (effortError) throw new Error(`${effortError} for node ${node.id}`);
+          }
           const allowed = Object.values(CAPABILITY) as string[];
           if (
             setting.capabilities !== undefined &&
@@ -1522,14 +1533,17 @@ export async function configureBundle(
             setting.capabilities?.some((capability) => capability !== CAPABILITY.REPOSITORY_READ)
           )
             throw new Error(`Subagent ${definitionId} must remain read-only`);
-          return {
+          const configured = {
             ...node,
             ...(setting.harness === undefined ? {} : { harness: setting.harness }),
             ...(setting.modelId === undefined ? {} : { modelId: setting.modelId }),
+            ...(setting.effort === undefined ? {} : { effort: setting.effort }),
             ...(setting.capabilities === undefined
               ? {}
               : { capabilities: [...new Set(setting.capabilities)].sort() }),
           };
+          if (configured.effort === null) delete configured.effort;
+          return configured;
         }),
       },
     ]),

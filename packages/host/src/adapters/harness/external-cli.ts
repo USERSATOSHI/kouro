@@ -1,6 +1,7 @@
 import {
   unavailableUsage,
   validateJsonSchema,
+  validateReasoningEffort,
   type HarnessDescriptor,
   type HarnessEvent,
   type JsonValue,
@@ -231,6 +232,9 @@ export class ExternalCliHarnessAdapter implements HarnessAdapter {
         events: [],
       };
     const config = input.nativeConfig ?? {};
+    const effortError = validateReasoningEffort(config.effort, "opencode");
+    if (effortError)
+      return { status: "failed", error: effortError, usage: unavailable(), events: [] };
     const command = binary();
     const args = [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
     if (typeof config.model === "string" && config.model) args.push("--model", config.model);

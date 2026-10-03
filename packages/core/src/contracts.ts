@@ -18,6 +18,31 @@ export const HARNESS_ID = Object.freeze({
 export type Harness = (typeof HARNESS)[number];
 export type RuntimeHarness = Harness | "scripted";
 
+/** Explicit reasoning effort; omit it to use the harness default. */
+export enum ReasoningEffort {
+  MINIMAL = "minimal",
+  LOW = "low",
+  MEDIUM = "medium",
+  HIGH = "high",
+  XHIGH = "xhigh",
+  MAX = "max",
+  ULTRA = "ultra",
+  PERSISTENT = "persistent",
+}
+/** Serialized values also accept existing string-based workflow definitions. */
+export type ReasoningEffortValue = `${ReasoningEffort}`;
+export const REASONING_EFFORTS: readonly ReasoningEffortValue[] = Object.freeze(
+  Object.values(ReasoningEffort),
+);
+
+/** Per-node launch overrides. null clears an authored effort to the harness default. */
+export interface NodeRuntimeSettings {
+  readonly harness?: string;
+  readonly modelId?: string;
+  readonly effort?: ReasoningEffortValue | null;
+  readonly capabilities?: string[];
+}
+
 /** Stable capability identifiers for workflow authors and host adapters. */
 export const CAPABILITY = Object.freeze({
   REPOSITORY_READ: "repository.read",
@@ -126,6 +151,7 @@ export interface AgentNode {
   /** Optional per-agent harness override. Defaults to the run execution profile. */
   readonly harness?: Harness;
   readonly modelId?: string;
+  readonly effort?: ReasoningEffortValue;
   /** Identifies a model's stages in an authored fusion workflow. */
   readonly fusion?: FusionStageIdentity;
   readonly workspaceAccess?: "read-only" | "workspace-write";
@@ -435,6 +461,7 @@ export interface ResolvedExecution {
   readonly harness: RuntimeHarness;
   readonly adapterVersion: string;
   readonly modelId?: string;
+  readonly effort?: ReasoningEffortValue;
   readonly nativeConfigDigest?: string;
 }
 

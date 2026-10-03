@@ -539,10 +539,7 @@ export function createHostServer(
               : undefined,
           nodeSettings:
             input.nodeSettings && typeof input.nodeSettings === "object"
-              ? (input.nodeSettings as Record<
-                  string,
-                  { harness?: string; modelId?: string; capabilities?: string[] }
-                >)
+              ? (input.nodeSettings as Record<string, import("@kouro/core").NodeRuntimeSettings>)
               : undefined,
           workspace:
             typeof input.workspace === "object" &&

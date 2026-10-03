@@ -92,10 +92,23 @@ when omitted, the run profile selects the harness:
 
 Supported harness values are `codex`, `pi`, `claude`, and `opencode`.
 
+Agent and subagent nodes accept optional `effort`. Omit it to keep the harness
+default. Use the exported string enum, such as `ReasoningEffort.HIGH`; existing
+string values remain accepted. Codex accepts `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`, `ultra`, and `persistent`; Claude accepts `low` through `max`; Pi accepts `minimal`
+through `max`. Individual model support can be narrower. OpenCode effort is not
+wired through Kouro. Fusion reviews and revisions retain the member's effort;
+child agents use their own setting. The workbench's node settings can override
+effort for a run, which is pinned in its bundle. These additions require the
+current source checkout; rebuild the CLI before using them.
+
 ```ts
+import { ReasoningEffort } from "@kouro/core";
+
 workflow.agent("planner", {
   harness: "codex",
   modelId: "gpt-5",
+  effort: ReasoningEffort.HIGH,
   prompt: "Plan the change.",
 });
 workflow.agent("implementer", {

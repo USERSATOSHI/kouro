@@ -13,14 +13,21 @@ function setup(id = "fusion-builder") {
   const a = workflow.agent("a", {
     prompt: "plan a",
     modelId: "a-model",
+    effort: "low",
     produces: report,
     uses: [scout],
     workspaceAccess: "read-only",
   });
-  const b = workflow.agent("b", { prompt: "plan b", modelId: "b-model", produces: report });
+  const b = workflow.agent("b", {
+    prompt: "plan b",
+    modelId: "b-model",
+    effort: "medium",
+    produces: report,
+  });
   const synthesizer = workflow.agent("synthesizer", {
     prompt: "combine",
     modelId: "combine-model",
+    effort: "high",
     produces: report,
   });
   const options: FusionOptions<{ summary: string }, { summary: string }> = {
@@ -49,6 +56,10 @@ test("fusion composes agent handles and subagents with ordinary output and contr
   const child = bundle.definitions["fusion-builder:planning"]!;
   const agents = child.nodes.filter((node) => node.kind === "agent");
   expect(agents).toHaveLength(11);
+  expect(agents.filter((node) => node.fusion?.memberId === "a").map((node) => node.effort)).toEqual(
+    Array(5).fill("low"),
+  );
+  expect(agents.find((node) => node.id === "synthesizer")?.effort).toBe("high");
   expect(
     agents
       .filter((node) => node.fusion?.memberId === "a")

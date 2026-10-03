@@ -17,6 +17,7 @@ The <a href="../examples.html">examples page</a> contains complete, downloadable
 - {@link WorkflowBuilder.fusion | .fusion(...).use(...)}: compose declared agents into parallel drafts, bounded review/revision rounds, and synthesis.
 - {@link WorkflowBuilder.milestones | .milestones(...).use(...)}: schedule supplied workflows according to a validated dependency plan.
 - {@link NodeHandle.on} and {@link EdgeBuilder.repair}: connect outcomes and bound repair attempts.
+- {@link ReasoningEffort}: named reasoning levels for agent and subagent nodes, such as `ReasoningEffort.HIGH`.
 - {@link compileWorkflow}: validate a workflow definition and produce an immutable bundle.
 
 The reference also documents the exported execution, contract, and lifecycle APIs. Use the search to find a type or method.

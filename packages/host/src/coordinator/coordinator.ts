@@ -2865,6 +2865,15 @@ export class Coordinator {
       let resolvedVersion = this.harness.adapterVersion;
       let resolvedModelId: string | undefined;
       let nativeConfig: import("@kouro/core").JsonObject | undefined;
+      const toolPolicy = {
+        write: node.capabilities
+          ? node.capabilities.includes(CAPABILITY.REPOSITORY_WRITE)
+          : (profile === "codex-workspace-write" || profile === "claude-workspace-write") &&
+            node.workspaceAccess === "workspace-write",
+        terminal: node.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE) ?? false,
+        network: node.capabilities?.includes(CAPABILITY.NETWORK_ACCESS) ?? false,
+        child: false,
+      };
       const requestedHarness =
         node.harness ??
         (profile === "codex-readonly" || profile === "codex-workspace-write"
@@ -2920,6 +2929,7 @@ export class Coordinator {
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = {
+          toolPolicy,
           sandbox: (
             node.capabilities
               ? node.capabilities.includes(CAPABILITY.REPOSITORY_WRITE)
@@ -2959,6 +2969,7 @@ export class Coordinator {
         );
         resolvedModelId = piSelection.model;
         nativeConfig = {
+          toolPolicy,
           ...(piSelection.provider ? { provider: piSelection.provider } : {}),
           ...(piSelection.model ? { model: piSelection.model } : {}),
         };
@@ -2968,6 +2979,7 @@ export class Coordinator {
           this.claude = claude;
           selected = claude;
           nativeConfig = {
+            toolPolicy,
             ...(node.modelId ? { model: node.modelId } : {}),
             permissionMode: (
               node.capabilities
@@ -3026,6 +3038,7 @@ export class Coordinator {
         });
         return;
       }
+      if (node.effort !== undefined) nativeConfig = { ...nativeConfig, effort: node.effort };
       if (subagentIds.length) {
         const capabilities = selected.capabilities();
         if (
@@ -3326,6 +3339,7 @@ export class Coordinator {
           adapterVersion: resolvedVersion,
           ...(resolvedModelId ? { modelId: resolvedModelId } : {}),
           ...(nativeConfigDigest ? { nativeConfigDigest } : {}),
+          ...(node.effort === undefined ? {} : { effort: node.effort }),
         },
         harnessEvents: durableEvents,
         usage: harnessResult.usage,
@@ -3704,12 +3718,12 @@ export class Coordinator {
                 : childAdapter.id === input.adapter.id && input.parentModelId
                   ? { modelId: input.parentModelId }
                   : {}),
-              nativeConfig:
-                childAdapter.id === "claude"
-                  ? { permissionMode: "dontAsk" }
-                  : childAdapter.id === "codex"
-                    ? { sandbox: "read-only" }
-                    : {},
+              nativeConfig: {
+                toolPolicy: { write: false, terminal: false, network: false, child: true },
+                ...(childAgent.effort === undefined ? {} : { effort: childAgent.effort }),
+                ...(childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : {}),
+                ...(childAdapter.id === "codex" ? { sandbox: "read-only" } : {}),
+              },
               context,
               signal: childAborter.signal,
               onEvent: () => undefined,

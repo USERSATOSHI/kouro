@@ -2,7 +2,8 @@ import type { Harness, JsonObject, JsonValue, RuntimeHarness } from "./contracts
 import { canonicalize, sha256Hex } from "./canonical";
 import Ajv2020 from "ajv/dist/2020.js";
 
-type BaseCapability =
+/** Harness capabilities that every adapter reports during discovery. */
+export type BaseCapability =
   | "structured-output"
   | "cancel"
   | "resume"

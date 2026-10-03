@@ -7,6 +7,7 @@ export * from "./compiler";
 export * from "./execution";
 export { canonicalize, sha256Hex } from "./canonical";
 export * from "./harness";
+export * from "./effort";
 export * from "./evaluations";
 export * from "./evaluator";
 export * from "./comparison";

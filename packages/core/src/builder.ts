@@ -31,6 +31,7 @@ import type {
   ScoutPolicy,
   WorkflowCapability,
   FusionStageIdentity,
+  ReasoningEffortValue,
 } from "./contracts";
 
 export type SchemaInput<T = unknown> = ArtifactType<T> | JsonValue;
@@ -95,6 +96,8 @@ export interface AgentOptions<T = unknown> {
   readonly harness?: Harness;
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
+  /** Optional reasoning effort. Supported levels depend on the harness and model. */
+  readonly effort?: ReasoningEffortValue;
   readonly fusion?: FusionStageIdentity;
   readonly workspaceAccess?: "read-only" | "workspace-write";
   readonly capabilities?: readonly WorkflowCapability[];
@@ -115,6 +118,8 @@ export interface SubagentOptions<T = unknown> {
   readonly harness?: Harness;
   /** Optional provider/model reference for model-backed execution profiles. */
   readonly modelId?: string;
+  /** Child effort is independent of its parent; omit it for the harness default. */
+  readonly effort?: ReasoningEffortValue;
   /** Input schemas exposed to the subagent. */
   readonly input?: Readonly<Record<string, SchemaInput>>;
   /** The single typed report returned by the subagent. */
@@ -389,6 +394,7 @@ function directSubagentSource<T>(
     prompt: options.prompt,
     ...(options.harness === undefined ? {} : { harness: options.harness }),
     ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+    ...(options.effort === undefined ? {} : { effort: options.effort }),
     inputPorts: inputPorts.map(stripPort),
     outputPorts: [stripPort(output)],
     bindings: inputPorts.map((input) => ({
@@ -573,6 +579,7 @@ export class WorkflowBuilder {
       prompt: options.prompt,
       ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+      ...(options.effort === undefined ? {} : { effort: options.effort }),
       ...(options.fusion === undefined ? {} : { fusion: options.fusion }),
       ...(options.workspaceAccess === undefined
         ? {}
@@ -1320,6 +1327,7 @@ function stripInternal(node: InternalNode): Node {
       prompt: node.prompt,
       ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
+      ...(node.effort === undefined ? {} : { effort: node.effort }),
       ...(node.fusion === undefined ? {} : { fusion: node.fusion }),
       ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
       ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),

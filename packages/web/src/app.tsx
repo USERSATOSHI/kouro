@@ -1,3 +1,10 @@
+import {
+  isHarness,
+  REASONING_EFFORTS,
+  reasoningEffortsForHarness,
+  validateReasoningEffort,
+  type NodeRuntimeSettings,
+} from "@kouro/core";
 import { TaskLauncher, type TaskLaunchRequest } from "./components/TaskLauncher";
 import { readApiJson } from "./data/apiResponse";
 import { MilestonesPanel } from "./components/MilestonesPanel";
@@ -530,9 +537,7 @@ export function App() {
   const [task, setTask] = useState("");
   const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [workspacePath, setWorkspacePath] = useState("");
-  const [nodeSettings, setNodeSettings] = useState<
-    Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>
-  >({});
+  const [nodeSettings, setNodeSettings] = useState<Record<string, NodeRuntimeSettings>>({});
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(
     () => new URLSearchParams(window.location.search).get("run") ?? undefined,
   );
@@ -2904,10 +2909,8 @@ function Preview({
   workflows: WorkflowSummary[];
   onSelectWorkflow: (id: string) => void;
   workflow?: WorkflowSummary;
-  nodeSettings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>;
-  setNodeSettings: (
-    settings: Record<string, { harness?: string; modelId?: string; capabilities?: string[] }>,
-  ) => void;
+  nodeSettings: Record<string, NodeRuntimeSettings>;
+  setNodeSettings: (settings: Record<string, NodeRuntimeSettings>) => void;
   task: string;
   setTask: (task: string) => void;
   inputDrafts: Record<string, string>;
@@ -2943,10 +2946,17 @@ function Preview({
           readOnly: childDefinitions.has(definitionId),
         })),
   );
-  const updateNode = (
-    nodeId: string,
-    update: { harness?: string; modelId?: string; capabilities?: string[] },
-  ) => setNodeSettings({ ...nodeSettings, [nodeId]: { ...nodeSettings[nodeId], ...update } });
+  const effortInvalid = editableNodes.some(({ node, key }) => {
+    if (node.kind !== "agent") return false;
+    const settings = nodeSettings[key];
+    const effort = settings?.effort === null ? undefined : (settings?.effort ?? node.effort);
+    const harness = settings?.harness ?? node.harness;
+    return Boolean(
+      validateReasoningEffort(effort, harness && isHarness(harness) ? harness : undefined),
+    );
+  });
+  const updateNode = (nodeId: string, update: NodeRuntimeSettings) =>
+    setNodeSettings({ ...nodeSettings, [nodeId]: { ...nodeSettings[nodeId], ...update } });
   return (
     <Stack gap={0} className="preview">
       <PageHeader
@@ -3062,14 +3072,28 @@ function Preview({
                   <Stack gap={4}>
                     <Title order={2}>Node settings</Title>
                     <Text size="sm" c="dimmed">
-                      Choose harnesses and models for parent and child agents. Read-only subagents
-                      cannot write to the repository.
+                      Choose harnesses, models, and reasoning effort for parent and child agents.
+                      Read-only subagents cannot write to the repository.
                     </Text>
                   </Stack>
                   <Stack gap="md">
                     {editableNodes.map(({ node, definitionId, key, readOnly }) => {
                       const settings = nodeSettings[key] ?? {};
                       const capabilities = settings.capabilities ?? node.capabilities ?? [];
+                      const harness =
+                        settings.harness ?? (node.kind === "agent" ? node.harness : undefined);
+                      const effort =
+                        settings.effort === null
+                          ? undefined
+                          : (settings.effort ?? (node.kind === "agent" ? node.effort : undefined));
+                      const effortLevels =
+                        harness && isHarness(harness)
+                          ? reasoningEffortsForHarness(harness)
+                          : REASONING_EFFORTS;
+                      const effortError = validateReasoningEffort(
+                        effort,
+                        harness && isHarness(harness) ? harness : undefined,
+                      );
                       return (
                         <Fieldset
                           key={key}
@@ -3078,8 +3102,8 @@ function Preview({
                           <Stack gap="md">
                             {node.kind === "agent" && node.fusion?.stage === "draft" && (
                               <Text size="sm" c="dimmed">
-                                This model selection also applies to every review and revision
-                                round.
+                                These model and effort settings also apply to every review and
+                                revision round.
                               </Text>
                             )}
                             {node.kind === "agent" && (
@@ -3109,6 +3133,28 @@ function Preview({
                                       modelId: event.currentTarget.value || undefined,
                                     })
                                   }
+                                />
+                                <NativeSelect
+                                  label="Reasoning effort"
+                                  description="Model support varies. Leave unset to use the harness default."
+                                  value={effort ?? ""}
+                                  error={effortError}
+                                  onChange={(event) =>
+                                    updateNode(key, {
+                                      effort: event.currentTarget.value
+                                        ? (event.currentTarget.value as NonNullable<
+                                            NodeRuntimeSettings["effort"]
+                                          >)
+                                        : null,
+                                    })
+                                  }
+                                  data={[
+                                    { value: "", label: "Harness default" },
+                                    ...effortLevels.map((value) => ({ value, label: value })),
+                                    ...(effort && !effortLevels.includes(effort)
+                                      ? [{ value: effort, label: `${effort} (unsupported)` }]
+                                      : []),
+                                  ]}
                                 />
                               </SimpleGrid>
                             )}
@@ -3166,7 +3212,11 @@ function Preview({
                 data-testid="start-run"
                 className="primary-cta"
                 disabled={
-                  !workflow || launching || !inputs.valid || workflow.validation?.valid === false
+                  !workflow ||
+                  launching ||
+                  !inputs.valid ||
+                  effortInvalid ||
+                  workflow.validation?.valid === false
                 }
                 loading={launching}
                 onClick={onLaunch}

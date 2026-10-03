@@ -16,6 +16,7 @@ import {
   redactSecrets,
   unavailableUsage,
   validateJsonSchema,
+  reasoningEffortsForHarness,
   type JsonObject,
   type JsonValue,
   type HarnessDescriptor,
@@ -28,6 +29,7 @@ import {
 } from "@kouro/core";
 import type { CollaborationTools, HarnessAdapter } from "../../types.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
+import { nativeToolPolicy, piExcludedTools } from "./tool-policy.ts";
 
 const nativeConfigSchema: JsonValue = {
   type: "object",
@@ -36,8 +38,19 @@ const nativeConfigSchema: JsonValue = {
     provider: { type: "string" },
     model: { type: "string" },
     thinking: { type: "string" },
+    effort: { type: "string", enum: [...reasoningEffortsForHarness("pi")] },
     timeoutMs: { type: "integer", minimum: 1 },
     checksum: { type: "string" },
+    toolPolicy: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        write: { type: "boolean" },
+        terminal: { type: "boolean" },
+        network: { type: "boolean" },
+        child: { type: "boolean" },
+      },
+    },
   },
 };
 
@@ -52,7 +65,10 @@ export async function inspectPi(): Promise<HarnessDescriptor> {
       cancel: { state: "supported" },
       resume: { state: "unsupported", constraints: ["each Kouro invocation is ephemeral"] },
       reattach: { state: "unsupported" },
-      tools: { state: "conditional", constraints: ["read-only built-in tools only"] },
+      tools: {
+        state: "conditional",
+        constraints: ["native tools follow workflow grants; child agents use read-only tools"],
+      },
       usage: { state: "supported" },
       "cost-cap": {
         state: "unsupported",
@@ -246,15 +262,35 @@ export class PiSdkHarness {
       const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
       const subagent = input.collaboration?.subagent;
       const customTools = scoutTool && subagent ? [createSubagentTool(scoutTool, subagent)] : [];
+      const policy = nativeToolPolicy(config);
       const created = await createAgentSessionFromServices({
         services,
         sessionManager: SessionManager.inMemory(input.cwd),
         ...(model ? { model } : {}),
-        ...(typeof config.thinking === "string" ? { thinkingLevel: config.thinking as never } : {}),
-        tools: ["read", "grep", "find", "ls", ...customTools.map((tool) => tool.name)],
+        ...(typeof (config.effort ?? config.thinking) === "string"
+          ? {
+              thinkingLevel: (config.effort ?? config.thinking) as
+                | "minimal"
+                | "low"
+                | "medium"
+                | "high"
+                | "xhigh"
+                | "max"
+                | "off",
+            }
+          : {}),
+        ...(policy.child
+          ? { tools: ["read", "grep", "find", "ls"] }
+          : { excludeTools: piExcludedTools(policy) }),
         customTools,
       });
       session = created.session;
+      if (config.effort !== undefined && session.thinkingLevel !== config.effort)
+        throw new Error(
+          `Reasoning effort ${String(config.effort)} is unsupported by Pi model ${session.model?.id ?? "default"}; effective level would be ${session.thinkingLevel}`,
+        );
+      if (!policy.child)
+        session.setActiveToolsByName(session.getAllTools().map((tool) => tool.name));
       this.activeSessions.set(input.attemptId, session);
       if (session.model)
         emit({

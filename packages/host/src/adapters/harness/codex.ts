@@ -1,4 +1,9 @@
-import { Codex, type CodexOptions, type ThreadEvent } from "@openai/codex-sdk";
+import {
+  Codex,
+  type CodexOptions,
+  type ThreadEvent,
+  type ModelReasoningEffort,
+} from "@openai/codex-sdk";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -6,6 +11,8 @@ import type { JsonValue } from "@kouro/core";
 import {
   unavailableUsage,
   validateJsonSchema,
+  validateReasoningEffort,
+  REASONING_EFFORTS,
   type HarnessDescriptor,
   type HarnessEvent,
   type HarnessResult,
@@ -20,6 +27,7 @@ import { startScoutBridge } from "./scout-bridge.ts";
 import { codexToolEvent } from "./codex-activity.ts";
 import { CodexMessages } from "./codex-messages.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
+import { nativeToolPolicy } from "./tool-policy.ts";
 
 export interface CodexRunInput {
   readonly attemptId: string;
@@ -76,6 +84,7 @@ export async function inspectCodex(): Promise<HarnessDescriptor> {
         model: { type: "string" },
         sandbox: { type: "string" },
         profile: { type: "string" },
+        effort: { type: "string", enum: [...REASONING_EFFORTS] },
       },
     },
   };
@@ -124,6 +133,9 @@ export class CodexSdkHarness implements HarnessPort {
     }
 
     const config = input.selection.nativeConfig ?? {};
+    const effortError = validateReasoningEffort(config.effort, "codex");
+    if (effortError)
+      return { status: "failed", error: effortError, usage: unavailableUsage(), events: [] };
     const scoutTool = input.context?.tools.find((item) => item.name === "subagent");
     const bridge =
       scoutTool && input.collaboration?.subagent
@@ -141,6 +153,9 @@ export class CodexSdkHarness implements HarnessPort {
     }
 
     const codexConfig: NonNullable<CodexOptions["config"]> = {};
+    const policy = nativeToolPolicy(config);
+    codexConfig.web_search = policy.network ? "live" : "disabled";
+    codexConfig.features = { multi_agent: false };
     if (bridge) {
       const sourceEntrypoint = new URL("../../cli.ts", import.meta.url);
       const entrypoint = (await Bun.file(sourceEntrypoint).exists())
@@ -161,10 +176,15 @@ export class CodexSdkHarness implements HarnessPort {
     let thread: ReturnType<Codex["startThread"]>;
     try {
       thread = new Codex(sdkOptions).startThread({
+        ...(config.effort === undefined
+          ? {}
+          : { modelReasoningEffort: config.effort as ModelReasoningEffort }),
         ...(typeof config.model === "string" ? { model: config.model } : {}),
         workingDirectory: input.cwd,
         skipGitRepoCheck: true,
         sandboxMode: config.sandbox === "workspace-write" ? "workspace-write" : "read-only",
+        networkAccessEnabled: policy.network,
+        webSearchMode: policy.network ? "live" : "disabled",
       });
     } catch (cause) {
       await bridge?.close();
@@ -366,9 +386,13 @@ export class CodexAppServerHarness {
   readonly descriptor: HarnessDescriptor;
   private active = new Map<
     string,
-    { transport: CodexAppServerTransport; threadId: string; turnId: string }
+    { transport: CodexAppServerConnection; threadId: string; turnId: string }
   >();
-  constructor(descriptor: HarnessDescriptor) {
+  constructor(
+    descriptor: HarnessDescriptor,
+    private readonly createTransport: (cwd: string) => CodexAppServerConnection = (cwd) =>
+      new CodexAppServerTransport(cwd),
+  ) {
     this.descriptor = descriptor;
   }
   canSteer(invocationId: string): boolean {
@@ -385,7 +409,11 @@ export class CodexAppServerHarness {
     if (!result.ok) throw new Error(`Codex rejected steering message: ${result.error}`);
   }
   async run(input: CodexRunInput): Promise<HarnessResult> {
-    const transport = new CodexAppServerTransport(input.cwd);
+    const effort = input.nativeConfig?.effort ?? input.selection.nativeConfig?.effort;
+    const effortError = validateReasoningEffort(effort, "codex");
+    if (effortError)
+      return { status: "failed", error: effortError, usage: unavailableUsage(), events: [] };
+    const transport = this.createTransport(input.cwd);
     const events: HarnessEvent[] = [];
     let usage = unavailableUsage();
     const emit = (event: HarnessEvent) => {
@@ -417,22 +445,58 @@ export class CodexAppServerHarness {
           ? { model: input.selection.model.id }
           : {}),
         approvalPolicy: "on-request",
+        config: {
+          web_search: nativeToolPolicy(input.nativeConfig).network ? "live" : "disabled",
+          "features.multi_agent": false,
+        },
         ...(dynamicTools ? { dynamicTools } : {}),
       });
       if (!threadResult.ok) throw new Error(threadResult.error);
       const threadId =
         stringAt(threadResult.value, "thread", "id") ?? stringAt(threadResult.value, "id");
       if (!threadId) throw new Error("Codex App Server returned no thread ID");
+      if (typeof effort === "string") {
+        const modelId = stringAt(threadResult.value, "model") ?? input.selection.model.id;
+        let cursor: string | undefined;
+        const cursors = new Set<string>();
+        do {
+          const catalog = await transport.request("model/list", {
+            includeHidden: true,
+            ...(cursor ? { cursor } : {}),
+          });
+          if (!catalog.ok) throw new Error(`Codex model discovery failed: ${catalog.error}`);
+          const page = asObject(catalog.value);
+          const model = (Array.isArray(page.data) ? page.data : [])
+            .map(asObject)
+            .find((entry) => entry.id === modelId || entry.model === modelId);
+          if (model) {
+            if (
+              Array.isArray(model.supportedReasoningEfforts) &&
+              !model.supportedReasoningEfforts.some(
+                (option) => asObject(option).reasoningEffort === effort,
+              )
+            )
+              throw new Error(
+                `Reasoning effort ${effort} is unsupported by Codex model ${modelId}`,
+              );
+            break;
+          }
+          cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+          if (cursor && cursors.has(cursor))
+            throw new Error("Codex model discovery repeated a cursor");
+          if (cursor) cursors.add(cursor);
+        } while (cursor);
+      }
       const policy =
         input.nativeConfig?.sandbox === "workspace-write"
           ? {
               type: "workspaceWrite",
               writableRoots: [input.cwd],
-              networkAccess: false,
+              networkAccess: nativeToolPolicy(input.nativeConfig).network,
               excludeTmpdirEnvVar: false,
               excludeSlashTmp: false,
             }
-          : { type: "readOnly", networkAccess: false };
+          : { type: "readOnly", networkAccess: nativeToolPolicy(input.nativeConfig).network };
       const prompt = input.context
         ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
         : input.role.prompt;
@@ -490,7 +554,7 @@ export class CodexAppServerHarness {
           message.method === "item/commandExecution/requestApproval"
         ) {
           transport.respond(message.id, {
-            decision: input.nativeConfig?.sandbox === "workspace-write" ? "accept" : "decline",
+            decision: nativeToolPolicy(input.nativeConfig).terminal ? "accept" : "decline",
           });
         } else if (
           message.id !== undefined &&
@@ -581,6 +645,7 @@ export class CodexAppServerHarness {
         approvalPolicy: "on-request",
         sandboxPolicy: policy,
         summary: "auto",
+        ...(effort === undefined ? {} : { effort }),
         ...(input.selection.model.id && input.selection.model.id !== "default"
           ? { model: input.selection.model.id }
           : {}),
@@ -665,6 +730,10 @@ export class CodexAppServerHarness {
 }
 
 type RpcResponse = { ok: true; value: unknown } | { ok: false; error: string };
+export type CodexAppServerConnection = Pick<
+  CodexAppServerTransport,
+  "request" | "notify" | "respond" | "subscribe" | "dispose"
+>;
 class CodexAppServerTransport {
   private child: ChildProcessWithoutNullStreams;
   private pending = new Map<number, (result: RpcResponse) => void>();
@@ -723,7 +792,9 @@ class CodexAppServerTransport {
   respond(id: number, result: unknown) {
     this.child.stdin.write(`${JSON.stringify({ id, result })}\n`);
   }
-  subscribe(listener: (message: { id?: number; method?: string; params?: unknown }) => void) {
+  subscribe(
+    listener: (message: { id?: number; method?: string; params?: unknown }) => void,
+  ): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }

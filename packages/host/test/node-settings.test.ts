@@ -13,6 +13,7 @@ test("duplicate child node IDs have independent model settings and retain read-o
   const second = builder.subagent("second", { prompt: "second", produces: report });
   const parent = builder.agent("subagent", {
     prompt: "parent",
+    effort: "medium",
     produces: report,
     uses: [first, second],
   });
@@ -23,10 +24,11 @@ test("duplicate child node IDs have independent model settings and retain read-o
   const firstId = root.scouts!.find((scout) => scout.id === "first")!.definitionId;
   const secondId = root.scouts!.find((scout) => scout.id === "second")!.definitionId;
   const bundle = await configureBundle(source, {
-    [`${source.rootDefinitionId}/subagent`]: { modelId: "parent-model" },
+    [`${source.rootDefinitionId}/subagent`]: { modelId: "parent-model", effort: "high" },
     [`${firstId}/subagent`]: {
       harness: "codex",
       modelId: "first-model",
+      effort: "low",
       capabilities: [CAPABILITY.REPOSITORY_READ],
     },
     [`${secondId}/subagent`]: { harness: "pi", modelId: "second-model" },
@@ -45,6 +47,16 @@ test("duplicate child node IDs have independent model settings and retain read-o
     source.definitions[firstId]!.nodes.find((node) => node.kind === "agent")?.modelId,
   ).toBeUndefined();
   expect(bundle.digest).not.toBe(source.digest);
+  expect(
+    bundle.definitions[source.rootDefinitionId]!.nodes.find((node) => node.kind === "agent")
+      ?.effort,
+  ).toBe("high");
+  expect(bundle.definitions[firstId]!.nodes.find((node) => node.kind === "agent")?.effort).toBe(
+    "low",
+  );
+  expect(
+    bundle.definitions[secondId]!.nodes.find((node) => node.kind === "agent")?.effort,
+  ).toBeUndefined();
   expect(bundle.digest).toBe(
     (
       await configureBundle(source, {
@@ -52,9 +64,10 @@ test("duplicate child node IDs have independent model settings and retain read-o
         [`${firstId}/subagent`]: {
           capabilities: [CAPABILITY.REPOSITORY_READ],
           modelId: "first-model",
+          effort: "low",
           harness: "codex",
         },
-        [`${source.rootDefinitionId}/subagent`]: { modelId: "parent-model" },
+        [`${source.rootDefinitionId}/subagent`]: { modelId: "parent-model", effort: "high" },
       })
     ).digest,
   );
@@ -73,4 +86,18 @@ test("duplicate child node IDs have independent model settings and retain read-o
   expect(
     legacy.definitions[secondId]!.nodes.find((node) => node.kind === "agent")?.modelId,
   ).toBeUndefined();
+  const cleared = await configureBundle(source, {
+    [`${source.rootDefinitionId}/subagent`]: { effort: null },
+  });
+  expect(
+    cleared.definitions[source.rootDefinitionId]!.nodes.find((node) => node.kind === "agent"),
+  ).not.toHaveProperty("effort");
+  for (const setting of [
+    { effort: "invalid" },
+    { harness: "pi", effort: "ultra" },
+    { harness: "opencode", effort: "low" },
+  ])
+    await expect(
+      configureBundle(source, { [`${source.rootDefinitionId}/subagent`]: setting as never }),
+    ).rejects.toThrow(/reasoning effort|Reasoning effort/);
 });

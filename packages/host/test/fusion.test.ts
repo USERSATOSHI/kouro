@@ -22,7 +22,7 @@ test("fusion runs parallel drafts, reviews and revisions with stage barriers, fi
   try {
     const source = await fusionFixture();
     const configured = await configureBundle(source, {
-      "fusion-fixture:planning/planner-a": { modelId: "chosen-a", harness: "pi" },
+      "fusion-fixture:planning/planner-a": { modelId: "chosen-a", harness: "pi", effort: "high" },
     });
     const configuredAgents = configured.definitions["fusion-fixture:planning"]!.nodes.filter(
       (node) => node.kind === "agent",
@@ -30,8 +30,8 @@ test("fusion runs parallel drafts, reviews and revisions with stage barriers, fi
     expect(
       configuredAgents
         .filter((node) => node.fusion?.memberId === "planner-a")
-        .map((node) => [node.modelId, node.harness]),
-    ).toEqual(Array(5).fill(["chosen-a", "pi"]));
+        .map((node) => [node.modelId, node.harness, node.effort]),
+    ).toEqual(Array(5).fill(["chosen-a", "pi", "high"]));
     expect(
       source.definitions["fusion-fixture:planning"]!.nodes.filter(
         (node) => node.kind === "agent",

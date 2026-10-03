@@ -1,7 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 
-test("typed launch inputs and separate parent and child models reach the pinned run bundle", async ({ page }) => {
+test("typed launch inputs and separate parent and child models and efforts reach the pinned run bundle", async ({ page }) => {
   await page.goto("/#token=kouro-browser-test-token");
+  await page.getByRole("button", { name: "New run", exact: true }).first().click();
   await page.getByRole("button", { name: /Typed launch and child settings/ }).click();
   await expect(page.getByTestId("start-run").first()).toBeDisabled();
   const parent = page.getByRole("group", { name: "browser-configured / parent · agent", exact: true });
@@ -10,6 +11,9 @@ test("typed launch inputs and separate parent and child models reach the pinned 
   await parent.getByLabel("Model", { exact: true }).fill("parent-model");
   await first.getByLabel("Model", { exact: true }).fill("first-model");
   await second.getByLabel("Model", { exact: true }).fill("second-model");
+  await parent.getByLabel("Reasoning effort", { exact: true }).selectOption("high");
+  await first.getByLabel("Reasoning effort", { exact: true }).selectOption("low");
+  await second.getByLabel("Reasoning effort", { exact: true }).selectOption("medium");
   await expect(first.getByLabel("Repository write", { exact: true })).toBeDisabled();
   await page.getByLabel("enabled", { exact: true }).selectOption("false");
   await page.getByLabel("count", { exact: true }).fill("1.5");
@@ -17,6 +21,14 @@ test("typed launch inputs and separate parent and child models reach the pinned 
   await expect(page.getByTestId("start-run").first()).toBeDisabled();
   await page.getByLabel("count", { exact: true }).fill("0");
   await expect(page.getByTestId("start-run").first()).toBeEnabled();
+  await parent.getByLabel("Reasoning effort", { exact: true }).selectOption("ultra");
+  await parent.getByLabel("Harness", { exact: true }).selectOption("pi");
+  await expect(parent).toContainText("Reasoning effort ultra is unsupported by pi");
+  await expect(page.getByTestId("start-run").first()).toBeDisabled();
+  await parent.getByLabel("Reasoning effort", { exact: true }).selectOption("");
+  await expect(page.getByTestId("start-run").first()).toBeEnabled();
+  await parent.getByLabel("Harness", { exact: true }).selectOption("");
+  await parent.getByLabel("Reasoning effort", { exact: true }).selectOption("high");
   const createdResponse = page.waitForResponse((response) => response.url().endsWith("/api/runs") && response.request().method() === "POST");
   await page.getByTestId("start-run").first().click();
   const created = await createdResponse;
@@ -28,9 +40,11 @@ test("typed launch inputs and separate parent and child models reach the pinned 
   const definitions = view.bundle.definitions;
   const root = definitions[view.bundle.rootDefinitionId];
   expect(root.nodes.find((node: { id: string }) => node.id === "parent").modelId).toBe("parent-model");
-  for (const [id, model] of [["first", "first-model"], ["second", "second-model"]]) {
+  expect(root.nodes.find((node: { id: string }) => node.id === "parent").effort).toBe("high");
+  for (const [id, model, effort] of [["first", "first-model", "low"], ["second", "second-model", "medium"]]) {
     const childId = root.scouts.find((scout: { id: string }) => scout.id === id).definitionId;
     expect(definitions[childId].nodes.find((node: { kind: string }) => node.kind === "agent").modelId).toBe(model);
+    expect(definitions[childId].nodes.find((node: { kind: string }) => node.kind === "agent").effort).toBe(effort);
   }
 });
 

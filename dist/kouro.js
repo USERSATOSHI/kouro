@@ -51,7 +51,7 @@ var __require = import.meta.require;
 function isHarness(value) {
   return typeof value === "string" && HARNESS.includes(value);
 }
-var PROJECTION_VERSION = 1, BUNDLE_FORMAT_VERSION = 1, HARNESS, HARNESS_ID, CAPABILITY, DEFAULT_LIMITS, CompileError;
+var PROJECTION_VERSION = 1, BUNDLE_FORMAT_VERSION = 1, HARNESS, HARNESS_ID, ReasoningEffort, REASONING_EFFORTS, CAPABILITY, DEFAULT_LIMITS, CompileError;
 var init_contracts = __esm(() => {
   HARNESS = ["codex", "pi", "claude", "opencode"];
   HARNESS_ID = Object.freeze({
@@ -60,6 +60,17 @@ var init_contracts = __esm(() => {
     CLAUDE: "claude",
     OPENCODE: "opencode"
   });
+  ((ReasoningEffort2) => {
+    ReasoningEffort2["MINIMAL"] = "minimal";
+    ReasoningEffort2["LOW"] = "low";
+    ReasoningEffort2["MEDIUM"] = "medium";
+    ReasoningEffort2["HIGH"] = "high";
+    ReasoningEffort2["XHIGH"] = "xhigh";
+    ReasoningEffort2["MAX"] = "max";
+    ReasoningEffort2["ULTRA"] = "ultra";
+    ReasoningEffort2["PERSISTENT"] = "persistent";
+  })(ReasoningEffort ||= {});
+  REASONING_EFFORTS = Object.freeze(Object.values(ReasoningEffort));
   CAPABILITY = Object.freeze({
     REPOSITORY_READ: "repository.read",
     REPOSITORY_WRITE: "repository.write",
@@ -438,6 +449,7 @@ function directSubagentSource(id, options) {
     prompt: options.prompt,
     ...options.harness === undefined ? {} : { harness: options.harness },
     ...options.modelId === undefined ? {} : { modelId: options.modelId },
+    ...options.effort === undefined ? {} : { effort: options.effort },
     inputPorts: inputPorts.map(stripPort),
     outputPorts: [stripPort(output)],
     bindings: inputPorts.map((input) => ({
@@ -587,6 +599,7 @@ class WorkflowBuilder {
       prompt: options.prompt,
       ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
+      ...options.effort === undefined ? {} : { effort: options.effort },
       ...options.fusion === undefined ? {} : { fusion: options.fusion },
       ...options.workspaceAccess === undefined ? {} : { workspaceAccess: options.workspaceAccess },
       ...options.capabilities === undefined ? {} : { capabilities: [...new Set(options.capabilities)].sort() },
@@ -1180,6 +1193,7 @@ function stripInternal(node) {
       prompt: node.prompt,
       ...node.harness === undefined ? {} : { harness: node.harness },
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
+      ...node.effort === undefined ? {} : { effort: node.effort },
       ...node.fusion === undefined ? {} : { fusion: node.fusion },
       ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
       ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
@@ -1312,6 +1326,48 @@ async function sha256Hex(value) {
   const digest = await subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+
+// packages/core/src/effort.ts
+function isReasoningEffort(value) {
+  return REASONING_EFFORTS.some((effort) => effort === value);
+}
+function reasoningEffortsForHarness(harness) {
+  switch (harness) {
+    case "codex":
+    case "scripted":
+      return REASONING_EFFORTS;
+    case "claude":
+      return [
+        "low" /* LOW */,
+        "medium" /* MEDIUM */,
+        "high" /* HIGH */,
+        "xhigh" /* XHIGH */,
+        "max" /* MAX */
+      ];
+    case "pi":
+      return [
+        "minimal" /* MINIMAL */,
+        "low" /* LOW */,
+        "medium" /* MEDIUM */,
+        "high" /* HIGH */,
+        "xhigh" /* XHIGH */,
+        "max" /* MAX */
+      ];
+    case "opencode":
+      return [];
+  }
+}
+function validateReasoningEffort(value, harness) {
+  if (value === undefined)
+    return;
+  if (!isReasoningEffort(value))
+    return `Invalid reasoning effort: ${String(value)}`;
+  if (harness && !reasoningEffortsForHarness(harness).includes(value))
+    return `Reasoning effort ${value} is unsupported by ${harness}`;
+}
+var init_effort = __esm(() => {
+  init_contracts();
+});
 
 // packages/core/src/compiler.ts
 async function compileWorkflow(source) {
@@ -1450,6 +1506,9 @@ async function compileWorkflowDetailed(source) {
       }
     }
     if (node.kind === "agent") {
+      const effortError = validateReasoningEffort(node.effort, node.harness);
+      if (effortError)
+        diagnostics.push(error("INVALID_REASONING_EFFORT", effortError, node.id));
       const uses = node.uses ?? [];
       const seenUses = new Set;
       for (const scoutId of uses) {
@@ -1990,6 +2049,7 @@ function deepFreeze(value) {
 var COMPILER_VERSION = "1.0", EXPRESSION_VERSION = "1.0", SCHEMA_VERSION = "2020-12", SATURATION;
 var init_compiler = __esm(() => {
   init_contracts();
+  init_effort();
   SATURATION = Number.MAX_SAFE_INTEGER;
 });
 
@@ -10632,6 +10692,7 @@ var init_development = __esm(() => {
 var exports_src = {};
 __export(exports_src, {
   validateSchemaFixture: () => validateSchemaFixture,
+  validateReasoningEffort: () => validateReasoningEffort,
   validateNativeConfig: () => validateNativeConfig,
   validateMilestonePlan: () => validateMilestonePlan,
   validateJsonSchema: () => validateJsonSchema,
@@ -10647,11 +10708,13 @@ __export(exports_src, {
   renderPromptFixture: () => renderPromptFixture,
   reduceEvent: () => reduceEvent,
   redactSecrets: () => redactSecrets,
+  reasoningEffortsForHarness: () => reasoningEffortsForHarness,
   promptVersion: () => promptVersion,
   prepareForkProjection: () => prepareForkProjection,
   milestoneScopeId: () => milestoneScopeId,
   milestoneProgress: () => milestoneProgress,
   makeEvidence: () => makeEvidence,
+  isReasoningEffort: () => isReasoningEffort,
   isHarness: () => isHarness,
   invalidateCheckpoint: () => invalidateCheckpoint,
   experimentCellKey: () => experimentCellKey,
@@ -10690,6 +10753,8 @@ __export(exports_src, {
   artifactType: () => artifactType,
   approvalRepairsRemaining: () => approvalRepairsRemaining,
   WorkflowBuilder: () => WorkflowBuilder,
+  ReasoningEffort: () => ReasoningEffort,
+  REASONING_EFFORTS: () => REASONING_EFFORTS,
   PROJECTION_VERSION: () => PROJECTION_VERSION,
   NodeHandle: () => NodeHandle,
   MilestoneResultType: () => MilestoneResultType,
@@ -10740,6 +10805,7 @@ var init_src = __esm(() => {
   init_compiler();
   init_execution();
   init_harness();
+  init_effort();
   init_evaluations();
   init_evaluator();
   init_comparison();
@@ -16995,7 +17061,9 @@ function activityPreview(value) {
 
 // packages/host/src/adapters/harness/codex.ts
 init_src();
-import { Codex } from "@openai/codex-sdk";
+import {
+  Codex
+} from "@openai/codex-sdk";
 import { spawn } from "child_process";
 import { createInterface } from "readline";
 import { fileURLToPath } from "url";
@@ -17136,6 +17204,32 @@ function firstJsonObject(value) {
   return;
 }
 
+// packages/host/src/adapters/harness/tool-policy.ts
+function nativeToolPolicy(config = {}) {
+  const declared = config.toolPolicy;
+  const policy = declared && typeof declared === "object" && !Array.isArray(declared) ? declared : {};
+  const write = typeof policy.write === "boolean" ? policy.write : config.sandbox === "workspace-write" || config.permissionMode === "acceptEdits";
+  const child = policy.child === true;
+  return {
+    write: !child && write,
+    terminal: !child && (policy.terminal === true || policy.terminal === undefined && write),
+    network: !child && policy.network === true,
+    child
+  };
+}
+function claudeDisallowedTools(policy) {
+  return [
+    "Agent",
+    "Task",
+    ...!policy.write ? ["Edit", "Write", "NotebookEdit"] : [],
+    ...!policy.terminal ? ["Bash"] : [],
+    ...!policy.network ? ["WebSearch", "WebFetch"] : []
+  ];
+}
+function piExcludedTools(policy) {
+  return [...!policy.write ? ["edit", "write"] : [], ...!policy.terminal ? ["bash"] : []];
+}
+
 // packages/host/src/adapters/harness/codex.ts
 async function inspectCodex() {
   let detail;
@@ -17176,15 +17270,18 @@ async function inspectCodex() {
       properties: {
         model: { type: "string" },
         sandbox: { type: "string" },
-        profile: { type: "string" }
+        profile: { type: "string" },
+        effort: { type: "string", enum: [...REASONING_EFFORTS] }
       }
     }
   };
 }
 class CodexAppServerHarness {
+  createTransport;
   descriptor;
   active = new Map;
-  constructor(descriptor) {
+  constructor(descriptor, createTransport = (cwd) => new CodexAppServerTransport(cwd)) {
+    this.createTransport = createTransport;
     this.descriptor = descriptor;
   }
   canSteer(invocationId) {
@@ -17203,7 +17300,11 @@ class CodexAppServerHarness {
       throw new Error(`Codex rejected steering message: ${result.error}`);
   }
   async run(input) {
-    const transport = new CodexAppServerTransport(input.cwd);
+    const effort2 = input.nativeConfig?.effort ?? input.selection.nativeConfig?.effort;
+    const effortError = validateReasoningEffort(effort2, "codex");
+    if (effortError)
+      return { status: "failed", error: effortError, usage: unavailableUsage(), events: [] };
+    const transport = this.createTransport(input.cwd);
     const events = [];
     let usage = unavailableUsage();
     const emit = (event) => {
@@ -17231,6 +17332,10 @@ class CodexAppServerHarness {
         cwd: input.cwd,
         ...input.selection.model.id && input.selection.model.id !== "default" ? { model: input.selection.model.id } : {},
         approvalPolicy: "on-request",
+        config: {
+          web_search: nativeToolPolicy(input.nativeConfig).network ? "live" : "disabled",
+          "features.multi_agent": false
+        },
         ...dynamicTools ? { dynamicTools } : {}
       });
       if (!threadResult.ok)
@@ -17238,13 +17343,38 @@ class CodexAppServerHarness {
       const threadId = stringAt(threadResult.value, "thread", "id") ?? stringAt(threadResult.value, "id");
       if (!threadId)
         throw new Error("Codex App Server returned no thread ID");
+      if (typeof effort2 === "string") {
+        const modelId = stringAt(threadResult.value, "model") ?? input.selection.model.id;
+        let cursor;
+        const cursors = new Set;
+        do {
+          const catalog = await transport.request("model/list", {
+            includeHidden: true,
+            ...cursor ? { cursor } : {}
+          });
+          if (!catalog.ok)
+            throw new Error(`Codex model discovery failed: ${catalog.error}`);
+          const page = asObject(catalog.value);
+          const model = (Array.isArray(page.data) ? page.data : []).map(asObject).find((entry) => entry.id === modelId || entry.model === modelId);
+          if (model) {
+            if (Array.isArray(model.supportedReasoningEfforts) && !model.supportedReasoningEfforts.some((option) => asObject(option).reasoningEffort === effort2))
+              throw new Error(`Reasoning effort ${effort2} is unsupported by Codex model ${modelId}`);
+            break;
+          }
+          cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+          if (cursor && cursors.has(cursor))
+            throw new Error("Codex model discovery repeated a cursor");
+          if (cursor)
+            cursors.add(cursor);
+        } while (cursor);
+      }
       const policy = input.nativeConfig?.sandbox === "workspace-write" ? {
         type: "workspaceWrite",
         writableRoots: [input.cwd],
-        networkAccess: false,
+        networkAccess: nativeToolPolicy(input.nativeConfig).network,
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false
-      } : { type: "readOnly", networkAccess: false };
+      } : { type: "readOnly", networkAccess: nativeToolPolicy(input.nativeConfig).network };
       const prompt = input.context ? `${input.role.prompt}
 
 [KOURO_CONTEXT_BEGIN]
@@ -17299,7 +17429,7 @@ ${JSON.stringify(input.context)}
           });
         } else if (message.id !== undefined && message.method === "item/commandExecution/requestApproval") {
           transport.respond(message.id, {
-            decision: input.nativeConfig?.sandbox === "workspace-write" ? "accept" : "decline"
+            decision: nativeToolPolicy(input.nativeConfig).terminal ? "accept" : "decline"
           });
         } else if (message.id !== undefined && message.method === "item/fileChange/requestApproval") {
           transport.respond(message.id, {
@@ -17360,6 +17490,7 @@ ${JSON.stringify(input.context)}
         approvalPolicy: "on-request",
         sandboxPolicy: policy,
         summary: "auto",
+        ...effort2 === undefined ? {} : { effort: effort2 },
         ...input.selection.model.id && input.selection.model.id !== "default" ? { model: input.selection.model.id } : {},
         ...input.outputSchema ? { outputSchema: input.outputSchema } : {}
       });
@@ -17758,6 +17889,9 @@ class ExternalCliHarnessAdapter {
         events: []
       };
     const config = input.nativeConfig ?? {};
+    const effortError = validateReasoningEffort(config.effort, "opencode");
+    if (effortError)
+      return { status: "failed", error: effortError, usage: unavailable(), events: [] };
     const command = binary();
     const args = [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
     if (typeof config.model === "string" && config.model)
@@ -37361,7 +37495,12 @@ var claudeSdkDescriptor = {
     cancel: { state: "supported" },
     resume: { state: "unsupported" },
     reattach: { state: "unsupported" },
-    tools: { state: "conditional", constraints: ["built-in tools are explicitly allowlisted"] },
+    tools: {
+      state: "conditional",
+      constraints: [
+        "native tools follow workflow grants; delegation uses declared Kouro subagents"
+      ]
+    },
     usage: { state: "supported" },
     "cost-cap": { state: "unsupported" },
     "awaited-subagent-tool": { state: "supported" },
@@ -37370,17 +37509,34 @@ var claudeSdkDescriptor = {
   nativeConfigSchema: {
     type: "object",
     additionalProperties: true,
-    properties: { model: { type: "string" }, permissionMode: { type: "string" } }
+    properties: {
+      model: { type: "string" },
+      permissionMode: { type: "string" },
+      effort: { type: "string", enum: [...reasoningEffortsForHarness("claude")] }
+    }
   }
 };
 
 class ClaudeAgentSdkHarnessAdapter {
+  queryProvider;
   id = "claude";
   adapterVersion = claudeSdkDescriptor.adapterVersion;
+  constructor(queryProvider = query) {
+    this.queryProvider = queryProvider;
+  }
   capabilities() {
     return Object.fromEntries(Object.entries(claudeSdkDescriptor.capabilities).map(([name, value]) => [name, value.state]));
   }
   async run(input2) {
+    const effort2 = input2.nativeConfig?.effort;
+    const effortError = validateReasoningEffort(effort2, "claude");
+    if (effortError)
+      return {
+        status: "failed",
+        error: effortError,
+        usage: JSON.parse(JSON.stringify(unavailableUsage())),
+        events: []
+      };
     const abortController = new AbortController;
     const abort = () => abortController.abort(input2.signal?.reason);
     if (input2.signal?.aborted)
@@ -37397,8 +37553,8 @@ class ClaudeAgentSdkHarnessAdapter {
 ${JSON.stringify(input2.context)}
 [/KOURO_CONTEXT]` : "";
     const prompt = `${input2.prompt}${context}`;
-    const writable = input2.nativeConfig?.permissionMode === "acceptEdits";
-    const tools = writable ? ["Read", "Glob", "Grep", "Edit", "Write"] : ["Read", "Glob", "Grep"];
+    const policy = nativeToolPolicy(input2.nativeConfig);
+    const disallowedTools = claudeDisallowedTools(policy);
     const scoutTool = input2.context?.tools.find((candidate) => candidate.name === "subagent");
     const subagent = input2.collaboration?.subagent;
     const allowedSubagentIds = scoutTool?.inputSchema && typeof scoutTool.inputSchema === "object" && !Array.isArray(scoutTool.inputSchema) && "properties" in scoutTool.inputSchema && scoutTool.inputSchema.properties && typeof scoutTool.inputSchema.properties === "object" && !Array.isArray(scoutTool.inputSchema.properties) && "subagentId" in scoutTool.inputSchema.properties && scoutTool.inputSchema.properties.subagentId && typeof scoutTool.inputSchema.properties.subagentId === "object" && !Array.isArray(scoutTool.inputSchema.properties.subagentId) && "enum" in scoutTool.inputSchema.properties.subagentId && Array.isArray(scoutTool.inputSchema.properties.subagentId.enum) ? scoutTool.inputSchema.properties.subagentId.enum.filter((value) => typeof value === "string") : undefined;
@@ -37423,15 +37579,18 @@ ${JSON.stringify(input2.context)}
       })
     } : undefined;
     const options = {
+      ...effort2 === undefined ? {} : { effort: effort2 },
       includePartialMessages: true,
       cwd: input2.cwd ?? process.cwd(),
       ...input2.modelId ? { model: input2.modelId } : {},
       ...typeof input2.nativeConfig?.model === "string" ? { model: input2.nativeConfig.model } : {},
       abortController,
-      permissionMode: writable ? "acceptEdits" : "dontAsk",
-      tools,
-      ...mcpServers ? { mcpServers, allowedTools: ["mcp__kouro__subagent"] } : {},
-      disallowedTools: writable ? ["Bash", "NotebookEdit"] : ["Bash", "Edit", "Write", "NotebookEdit"],
+      permissionMode: "default",
+      tools: { type: "preset", preset: "claude_code" },
+      ...mcpServers ? { mcpServers } : {},
+      allowedTools: ["Read", "Glob", "Grep", ...mcpServers ? ["mcp__kouro__subagent"] : []],
+      disallowedTools,
+      canUseTool: async (name, args) => disallowedTools.includes(name) ? { behavior: "deny", message: "This tool is outside the workflow's declared grants." } : { behavior: "allow", updatedInput: args },
       settings: { permissions: { blockReadsOutsideWorkingDirectories: true } },
       settingSources: [],
       maxTurns: 30,
@@ -37452,7 +37611,7 @@ ${JSON.stringify(input2.context)}
       input2.onEvent?.(event);
     });
     try {
-      for await (const message of query({ prompt, options })) {
+      for await (const message of this.queryProvider({ prompt, options })) {
         messages.push(message);
         activity.consume(message);
         if (message.type === "result")
@@ -37572,8 +37731,19 @@ var nativeConfigSchema = {
     provider: { type: "string" },
     model: { type: "string" },
     thinking: { type: "string" },
+    effort: { type: "string", enum: [...reasoningEffortsForHarness("pi")] },
     timeoutMs: { type: "integer", minimum: 1 },
-    checksum: { type: "string" }
+    checksum: { type: "string" },
+    toolPolicy: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        write: { type: "boolean" },
+        terminal: { type: "boolean" },
+        network: { type: "boolean" },
+        child: { type: "boolean" }
+      }
+    }
   }
 };
 async function inspectPi() {
@@ -37587,7 +37757,10 @@ async function inspectPi() {
       cancel: { state: "supported" },
       resume: { state: "unsupported", constraints: ["each Kouro invocation is ephemeral"] },
       reattach: { state: "unsupported" },
-      tools: { state: "conditional", constraints: ["read-only built-in tools only"] },
+      tools: {
+        state: "conditional",
+        constraints: ["native tools follow workflow grants; child agents use read-only tools"]
+      },
       usage: { state: "supported" },
       "cost-cap": {
         state: "unsupported",
@@ -37739,15 +37912,22 @@ class PiSdkHarness {
       const scoutTool = input2.context?.tools.find((item) => item.name === "subagent");
       const subagent = input2.collaboration?.subagent;
       const customTools = scoutTool && subagent ? [createSubagentTool(scoutTool, subagent)] : [];
+      const policy = nativeToolPolicy(config2);
       const created = await createAgentSessionFromServices({
         services,
         sessionManager: SessionManager.inMemory(input2.cwd),
         ...model ? { model } : {},
-        ...typeof config2.thinking === "string" ? { thinkingLevel: config2.thinking } : {},
-        tools: ["read", "grep", "find", "ls", ...customTools.map((tool2) => tool2.name)],
+        ...typeof (config2.effort ?? config2.thinking) === "string" ? {
+          thinkingLevel: config2.effort ?? config2.thinking
+        } : {},
+        ...policy.child ? { tools: ["read", "grep", "find", "ls"] } : { excludeTools: piExcludedTools(policy) },
         customTools
       });
       session = created.session;
+      if (config2.effort !== undefined && session.thinkingLevel !== config2.effort)
+        throw new Error(`Reasoning effort ${String(config2.effort)} is unsupported by Pi model ${session.model?.id ?? "default"}; effective level would be ${session.thinkingLevel}`);
+      if (!policy.child)
+        session.setActiveToolsByName(session.getAllTools().map((tool2) => tool2.name));
       this.activeSessions.set(input2.attemptId, session);
       if (session.model)
         emit({
@@ -43540,6 +43720,12 @@ ${json(dependencies)}` : "");
       let resolvedVersion = this.harness.adapterVersion;
       let resolvedModelId;
       let nativeConfig;
+      const toolPolicy = {
+        write: node2.capabilities ? node2.capabilities.includes(CAPABILITY.REPOSITORY_WRITE) : (profile === "codex-workspace-write" || profile === "claude-workspace-write") && node2.workspaceAccess === "workspace-write",
+        terminal: node2.capabilities?.includes(CAPABILITY.TERMINAL_EXECUTE) ?? false,
+        network: node2.capabilities?.includes(CAPABILITY.NETWORK_ACCESS) ?? false,
+        child: false
+      };
       const requestedHarness = node2.harness ?? (profile === "codex-readonly" || profile === "codex-workspace-write" ? "codex" : profile === "claude-readonly" || profile === "claude-workspace-write" ? "claude" : profile === "pi-readonly" ? "pi" : toHarness(this.harness.id));
       const suppliedAdapter = isHarness(requestedHarness) ? this.harnessAdapters?.[requestedHarness] : undefined;
       if (suppliedAdapter) {
@@ -43572,6 +43758,7 @@ ${json(dependencies)}` : "");
         resolvedHarness = toHarness(codex.id);
         resolvedVersion = codex.adapterVersion;
         nativeConfig = {
+          toolPolicy,
           sandbox: (node2.capabilities ? node2.capabilities.includes(CAPABILITY.REPOSITORY_WRITE) : profile === "codex-workspace-write" && node2.workspaceAccess === "workspace-write") ? "workspace-write" : "read-only"
         };
       } else if (requestedHarness === "pi") {
@@ -43602,6 +43789,7 @@ ${json(dependencies)}` : "");
         const piSelection = resolvePiSelection({ harness: "pi", model: { id: node2.modelId ?? "" } }, node2.modelId ? { model: node2.modelId } : {});
         resolvedModelId = piSelection.model;
         nativeConfig = {
+          toolPolicy,
           ...piSelection.provider ? { provider: piSelection.provider } : {},
           ...piSelection.model ? { model: piSelection.model } : {}
         };
@@ -43611,6 +43799,7 @@ ${json(dependencies)}` : "");
           this.claude = claude;
           selected = claude;
           nativeConfig = {
+            toolPolicy,
             ...node2.modelId ? { model: node2.modelId } : {},
             permissionMode: (node2.capabilities ? node2.capabilities.includes(CAPABILITY.REPOSITORY_WRITE) : profile === "claude-workspace-write" && node2.workspaceAccess === "workspace-write") ? "acceptEdits" : "dontAsk"
           };
@@ -43662,6 +43851,8 @@ ${json(dependencies)}` : "");
         });
         return;
       }
+      if (node2.effort !== undefined)
+        nativeConfig = { ...nativeConfig, effort: node2.effort };
       if (subagentIds.length) {
         const capabilities = selected.capabilities();
         if (capabilities["awaited-subagent-tool"] !== "supported" || capabilities["child-read-only-envelope"] !== "supported") {
@@ -43880,7 +44071,8 @@ ${json(dependencies)}` : "");
           harness: resolvedHarness,
           adapterVersion: resolvedVersion,
           ...resolvedModelId ? { modelId: resolvedModelId } : {},
-          ...nativeConfigDigest ? { nativeConfigDigest } : {}
+          ...nativeConfigDigest ? { nativeConfigDigest } : {},
+          ...node2.effort === undefined ? {} : { effort: node2.effort }
         },
         harnessEvents: durableEvents,
         usage: harnessResult.usage,
@@ -44164,7 +44356,12 @@ ${json(dependencies)}` : "");
             delayMs: this.scriptedDelayMs,
             cwd: input2.cwd,
             ...childAgent.modelId ? { modelId: childAgent.modelId } : childAdapter.id === input2.adapter.id && input2.parentModelId ? { modelId: input2.parentModelId } : {},
-            nativeConfig: childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : childAdapter.id === "codex" ? { sandbox: "read-only" } : {},
+            nativeConfig: {
+              toolPolicy: { write: false, terminal: false, network: false, child: true },
+              ...childAgent.effort === undefined ? {} : { effort: childAgent.effort },
+              ...childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : {},
+              ...childAdapter.id === "codex" ? { sandbox: "read-only" } : {}
+            },
             context,
             signal: childAborter.signal,
             onEvent: () => {
@@ -46762,17 +46959,29 @@ async function configureBundle(source, settings) {
           throw new Error(`Invalid harness for node ${node2.id}`);
         if (setting.modelId !== undefined && (typeof setting.modelId !== "string" || setting.modelId.length > 200))
           throw new Error(`Invalid model for node ${node2.id}`);
+        if (setting.effort !== undefined && node2.kind !== "agent")
+          throw new Error(`Only agent nodes can set reasoning effort: ${node2.id}`);
+        if (node2.kind === "agent") {
+          const effort2 = setting.effort === null ? undefined : setting.effort ?? node2.effort;
+          const effortError = validateReasoningEffort(effort2, setting.harness ?? node2.harness);
+          if (effortError)
+            throw new Error(`${effortError} for node ${node2.id}`);
+        }
         const allowed = Object.values(CAPABILITY);
         if (setting.capabilities !== undefined && (!Array.isArray(setting.capabilities) || setting.capabilities.some((capability) => typeof capability !== "string" || !allowed.includes(capability))))
           throw new Error(`Invalid capability for node ${node2.id}`);
         if (childDefinitions.has(definitionId) && setting.capabilities?.some((capability) => capability !== CAPABILITY.REPOSITORY_READ))
           throw new Error(`Subagent ${definitionId} must remain read-only`);
-        return {
+        const configured = {
           ...node2,
           ...setting.harness === undefined ? {} : { harness: setting.harness },
           ...setting.modelId === undefined ? {} : { modelId: setting.modelId },
+          ...setting.effort === undefined ? {} : { effort: setting.effort },
           ...setting.capabilities === undefined ? {} : { capabilities: [...new Set(setting.capabilities)].sort() }
         };
+        if (configured.effort === null)
+          delete configured.effort;
+        return configured;
       })
     }
   ]));

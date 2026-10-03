@@ -10,6 +10,8 @@ import { z } from "zod";
 import {
   unavailableUsage,
   validateJsonSchema,
+  validateReasoningEffort,
+  reasoningEffortsForHarness,
   type HarnessDescriptor,
   type HarnessEvent,
   type JsonValue,
@@ -17,6 +19,7 @@ import {
 import type { HarnessAdapter } from "../../types.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
 import { ClaudeMessages } from "./claude-messages.ts";
+import { claudeDisallowedTools, nativeToolPolicy } from "./tool-policy.ts";
 
 export const claudeSdkDescriptor: HarnessDescriptor = {
   id: "claude",
@@ -28,7 +31,12 @@ export const claudeSdkDescriptor: HarnessDescriptor = {
     cancel: { state: "supported" },
     resume: { state: "unsupported" },
     reattach: { state: "unsupported" },
-    tools: { state: "conditional", constraints: ["built-in tools are explicitly allowlisted"] },
+    tools: {
+      state: "conditional",
+      constraints: [
+        "native tools follow workflow grants; delegation uses declared Kouro subagents",
+      ],
+    },
     usage: { state: "supported" },
     "cost-cap": { state: "unsupported" },
     "awaited-subagent-tool": { state: "supported" },
@@ -37,13 +45,19 @@ export const claudeSdkDescriptor: HarnessDescriptor = {
   nativeConfigSchema: {
     type: "object",
     additionalProperties: true,
-    properties: { model: { type: "string" }, permissionMode: { type: "string" } },
+    properties: {
+      model: { type: "string" },
+      permissionMode: { type: "string" },
+      effort: { type: "string", enum: [...reasoningEffortsForHarness("claude")] },
+    },
   },
 };
 
 export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
   readonly id = "claude";
   readonly adapterVersion = claudeSdkDescriptor.adapterVersion;
+
+  constructor(private readonly queryProvider: typeof query = query) {}
 
   capabilities(): Record<string, "supported" | "unsupported" | "conditional"> {
     return Object.fromEntries(
@@ -54,6 +68,15 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
   async run(
     input: Parameters<HarnessAdapter["run"]>[0],
   ): Promise<Awaited<ReturnType<HarnessAdapter["run"]>>> {
+    const effort = input.nativeConfig?.effort;
+    const effortError = validateReasoningEffort(effort, "claude");
+    if (effortError)
+      return {
+        status: "failed",
+        error: effortError,
+        usage: JSON.parse(JSON.stringify(unavailableUsage())),
+        events: [],
+      };
     const abortController = new AbortController();
     const abort = () => abortController.abort(input.signal?.reason);
     if (input.signal?.aborted) abort();
@@ -72,8 +95,8 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
       ? `\n\n[KOURO_CONTEXT]\n${JSON.stringify(input.context)}\n[/KOURO_CONTEXT]`
       : "";
     const prompt = `${input.prompt}${context}`;
-    const writable = input.nativeConfig?.permissionMode === "acceptEdits";
-    const tools = writable ? ["Read", "Glob", "Grep", "Edit", "Write"] : ["Read", "Glob", "Grep"];
+    const policy = nativeToolPolicy(input.nativeConfig);
+    const disallowedTools = claudeDisallowedTools(policy);
     const scoutTool = input.context?.tools.find((candidate) => candidate.name === "subagent");
     const subagent = input.collaboration?.subagent;
     const allowedSubagentIds =
@@ -125,17 +148,21 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
           }
         : undefined;
     const options: Options = {
+      ...(effort === undefined ? {} : { effort: effort as Options["effort"] }),
       includePartialMessages: true,
       cwd: input.cwd ?? process.cwd(),
       ...(input.modelId ? { model: input.modelId } : {}),
       ...(typeof input.nativeConfig?.model === "string" ? { model: input.nativeConfig.model } : {}),
       abortController,
-      permissionMode: writable ? "acceptEdits" : "dontAsk",
-      tools,
-      ...(mcpServers ? { mcpServers, allowedTools: ["mcp__kouro__subagent"] } : {}),
-      disallowedTools: writable
-        ? ["Bash", "NotebookEdit"]
-        : ["Bash", "Edit", "Write", "NotebookEdit"],
+      permissionMode: "default",
+      tools: { type: "preset", preset: "claude_code" },
+      ...(mcpServers ? { mcpServers } : {}),
+      allowedTools: ["Read", "Glob", "Grep", ...(mcpServers ? ["mcp__kouro__subagent"] : [])],
+      disallowedTools,
+      canUseTool: async (name, args) =>
+        disallowedTools.includes(name)
+          ? { behavior: "deny", message: "This tool is outside the workflow's declared grants." }
+          : { behavior: "allow", updatedInput: args },
       settings: { permissions: { blockReadsOutsideWorkingDirectories: true } },
       settingSources: [],
       maxTurns: 30,
@@ -158,7 +185,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
       input.onEvent?.(event);
     });
     try {
-      for await (const message of query({ prompt, options })) {
+      for await (const message of this.queryProvider({ prompt, options })) {
         messages.push(message);
         activity.consume(message);
         if (message.type === "result") resultMessage = message;

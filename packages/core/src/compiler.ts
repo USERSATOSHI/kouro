@@ -17,6 +17,7 @@ import {
   type WorkflowDefinitionSource,
 } from "./contracts";
 import { canonicalize, sha256Hex } from "./canonical";
+import { validateReasoningEffort } from "./effort";
 
 const COMPILER_VERSION = "1.0";
 const EXPRESSION_VERSION = "1.0";
@@ -305,6 +306,8 @@ export async function compileWorkflowDetailed(
       }
     }
     if (node.kind === "agent") {
+      const effortError = validateReasoningEffort(node.effort, node.harness);
+      if (effortError) diagnostics.push(error("INVALID_REASONING_EFFORT", effortError, node.id));
       const uses = node.uses ?? [];
       const seenUses = new Set<string>();
       for (const scoutId of uses) {
