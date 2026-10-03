@@ -27,6 +27,7 @@ Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting
 Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
 Execution prints its dashboard URL to stderr. JSON records include dashboardUrl.
 Without a running host, the dashboard is temporary and lasts until the command returns.
+Provider limits pause tasks. After reset, task resume continues saved Claude/Codex sessions.
 `;
 
 const valueOptions = new Set([
@@ -201,7 +202,7 @@ export async function taskCommand(
       idempotencyKey: args.get("--idempotency-key") ?? randomUUID(),
     });
   }
-  if (args.command === "resume" && view.state.status === "paused")
+  if (args.command === "resume" && ["paused", "failed", "interrupted"].includes(view.state.status))
     service.control({
       runId: runId!,
       action: "resume",
@@ -270,6 +271,28 @@ export function taskReport(service: ApplicationService, runId: string) {
     status: view.state.status,
     revision: view.revision,
     waitingForApproval: approvals.length > 0,
+    resumeAvailable: service.operatorState(runId)?.capabilities.resume ?? false,
+    failedInvocations: Object.values(view.state.invocations)
+      .filter(
+        (item) =>
+          item.status === "failed" &&
+          Object.values(view.state.attempts).some((attempt) => attempt.invocationId === item.id),
+      )
+      .map((item) => {
+        const latest = Object.values(view.state.attempts)
+          .filter((attempt) => attempt.invocationId === item.id)
+          .sort((a, b) => b.ordinal - a.ordinal)[0];
+        const reference = latest?.sessionReference;
+        const session =
+          reference && typeof reference === "object" && !Array.isArray(reference) ? reference : {};
+        return {
+          invocationId: item.id,
+          nodeId: item.nodeId,
+          error: item.error,
+          ...(session.stopReason ? { stopReason: session.stopReason } : {}),
+          ...(session.resumeAfter ? { resumeAfter: session.resumeAfter } : {}),
+        };
+      }),
     approvals,
     ...service.coordinator.milestones(runId),
     result: Object.values(view.state.invocations).find(

@@ -515,6 +515,9 @@ export interface ExecutionState {
   readonly rootScopeId: string;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
+  /** Provider-limit wait time does not consume the active run duration budget. */
+  readonly budgetPausedAt?: string | null;
+  readonly budgetPausedMs?: number;
   readonly scopes: Readonly<Record<string, ScopeState>>;
   readonly forkGroups?: Readonly<Record<string, ForkGroupState>>;
   readonly invocations: Readonly<Record<string, InvocationState>>;
@@ -747,6 +750,10 @@ export interface RunRetryPayload {
   readonly invocationId: string;
   readonly sourceAttemptId: string;
   readonly attemptId: string;
+  readonly reopenedInvocationIds?: readonly string[];
+  readonly discardedInvocationIds?: readonly string[];
+  readonly reopenedScopeIds?: readonly string[];
+  readonly reopenedForkGroupIds?: readonly string[];
 }
 
 export type LifecycleEvent =

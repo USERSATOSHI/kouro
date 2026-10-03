@@ -2185,11 +2185,15 @@ function reduceEvent(state, event) {
     case "run.paused":
       if (next.status !== "running")
         throw new Error(`Run cannot pause from ${next.status}`);
-      return { ...next, status: "paused" };
+      return {
+        ...next,
+        status: "paused",
+        ...["usage-limit", "turn-limit"].includes(event.payload.reason ?? "") ? { budgetPausedAt: event.recordedAt } : {}
+      };
     case "run.resumed":
       if (next.status !== "paused")
         throw new Error(`Run cannot resume from ${next.status}`);
-      return { ...next, status: "running" };
+      return { ...next, ...resumedBudget(next, event.recordedAt), status: "running" };
     case "run.cancel.requested":
       if (!["running", "paused", "recovery-required"].includes(next.status))
         throw new Error(`Run cannot cancel from ${next.status}`);
@@ -2203,7 +2207,7 @@ function reduceEvent(state, event) {
     case "run.retried": {
       if (next.status === "interrupted" && next.control !== "interrupt-requested")
         throw new Error("Interrupted recovery requires a recorded interrupt request");
-      if (!["running", "failed", "interrupted"].includes(next.status) || (next.control ?? "none") !== "none" && !(next.status === "interrupted" && next.control === "interrupt-requested"))
+      if (!["running", "paused", "failed", "interrupted"].includes(next.status) || (next.control ?? "none") !== "none" && !(next.status === "interrupted" && next.control === "interrupt-requested"))
         throw new Error("Only a failed run without a pending control can be retried");
       const invocation = next.invocations[event.payload.invocationId];
       if (!invocation || invocation.status !== "failed")
@@ -2213,17 +2217,50 @@ function reduceEvent(state, event) {
         throw new Error("Retry source attempt is not failed");
       if (next.attempts[event.payload.attemptId])
         throw new Error("Retry attempt already exists");
+      const invocations = { ...next.invocations };
+      for (const id of event.payload.discardedInvocationIds ?? []) {
+        if (!invocations[id] || Object.values(next.attempts).some((attempt) => attempt.invocationId === id))
+          throw new Error("Retry cannot discard an effect invocation");
+        delete invocations[id];
+      }
+      for (const id of event.payload.reopenedInvocationIds ?? []) {
+        const item = invocations[id];
+        if (!item || item.status === "succeeded" || Object.values(next.attempts).some((attempt) => attempt.invocationId === id))
+          throw new Error("Retry cannot reopen a completed effect");
+        invocations[id] = {
+          ...item,
+          status: "pending",
+          completedAt: null,
+          outcome: null,
+          error: undefined,
+          output: [],
+          evidence: [],
+          artifacts: []
+        };
+      }
+      const scopes = { ...next.scopes };
+      for (const id of event.payload.reopenedScopeIds ?? []) {
+        if (!scopes[id])
+          throw new Error("Retry scope is unavailable");
+        scopes[id] = { ...scopes[id], status: "running" };
+      }
+      const forkGroups = { ...next.forkGroups };
+      for (const id of event.payload.reopenedForkGroupIds ?? []) {
+        if (forkGroups[id])
+          forkGroups[id] = { ...forkGroups[id], status: "running", joined: false };
+      }
       return {
         ...next,
+        ...resumedBudget(next, event.recordedAt),
         status: "running",
         control: "none",
         finishedAt: null,
         scopes: {
-          ...next.scopes,
+          ...scopes,
           [next.rootScopeId]: { ...next.scopes[next.rootScopeId], status: "running" }
         },
         invocations: {
-          ...next.invocations,
+          ...invocations,
           [invocation.id]: {
             ...invocation,
             status: "running",
@@ -2234,12 +2271,20 @@ function reduceEvent(state, event) {
             evidence: [],
             artifacts: []
           }
-        }
+        },
+        forkGroups
       };
     }
     default:
       return assertNever(event);
   }
+}
+function resumedBudget(state, resumedAt) {
+  const suspendedAt = state.budgetPausedAt ?? (["failed", "interrupted"].includes(state.status) ? state.finishedAt : null);
+  return {
+    budgetPausedAt: null,
+    budgetPausedMs: (state.budgetPausedMs ?? 0) + (suspendedAt ? Math.max(0, Date.parse(resumedAt) - Date.parse(suspendedAt)) : 0)
+  };
 }
 function approvalRepairsRemaining(bundle, state, invocationId) {
   const invocation = state.invocations[invocationId];
@@ -16641,7 +16686,7 @@ async function compileTask(workflows, planner, executor, maxMilestones = 8, maxC
     limits: {
       maxScopes: 1 + maxMilestones * largest("scopes"),
       maxInvocations: 4 + maxMilestones * largest("invocations"),
-      maxAttempts: 1 + maxMilestones * largest("attempts"),
+      maxAttempts: 1 + maxMilestones * Math.max(...workflows.map((item) => item.bundle.limits.maxAttempts)),
       maxConcurrentEffects: Math.min(4, maxConcurrent),
       maxRunDurationMs: 24 * 60 * 60 * 1000,
       maxTurns: 1 + maxMilestones * Math.max(...workflows.map((item) => item.bundle.limits.maxTurns)),
@@ -17019,6 +17064,82 @@ function harnessEvent(value) {
   return event;
 }
 
+// packages/host/src/adapters/harness/session.ts
+function providerLimit(error2) {
+  if (!error2)
+    return;
+  if (/error_max_turns|maximum.*turns|max[ _-]?turns/i.test(error2))
+    return "turn-limit";
+  if (/usage[ _-]?limit|rate[ _-]?limit|quota|hit your limit|hit.*usage.*limit|limit.*resets|too many requests|\b429\b/i.test(error2))
+    return "usage-limit";
+  return;
+}
+
+// packages/host/src/coordinator/retry-plan.ts
+function retryPlan(bundle, state, invocationId) {
+  const invocations = Object.values(state.invocations);
+  const nodeFor = (id2) => {
+    const invocation = state.invocations[id2];
+    return invocation && bundle.definitions[state.scopes[invocation.scopeId]?.definitionId ?? ""]?.nodes.find((node) => node.id === invocation.nodeId);
+  };
+  const target = state.invocations[invocationId];
+  if (!target || !["agent", "command"].includes(nodeFor(invocationId)?.kind ?? ""))
+    return;
+  const affected = new Set([invocationId]);
+  const reopened = new Set;
+  const discarded = new Set;
+  const scopes = new Set;
+  const groups = new Set;
+  const visit = (id2) => {
+    const item = state.invocations[id2];
+    const node = nodeFor(id2);
+    if (id2 !== invocationId) {
+      if (!node)
+        return false;
+      if (["call", "forEach", "loop", "milestones", "join"].includes(node.kind)) {
+        if (item.status === "succeeded")
+          return false;
+        reopened.add(id2);
+      } else if (node.kind === "complete")
+        discarded.add(id2);
+      else
+        return false;
+    }
+    scopes.add(item.scopeId);
+    const dependants = invocations.filter((candidate) => candidate.scopeId === item.scopeId && candidate.sourceInvocationId === id2);
+    const scope = state.scopes[item.scopeId];
+    const owner = scope?.ownerInvocationId ?? invocations.find((candidate) => candidate.scopeId === scope?.parentScopeId && (scope?.id === `${candidate.id}:scope` || scope?.id.startsWith(`${candidate.id}:item:`) || scope?.id.startsWith(`${candidate.id}:iteration:`)))?.id;
+    if (scope?.parentScopeId && !owner)
+      return false;
+    if (owner)
+      dependants.push(state.invocations[owner]);
+    for (const join of invocations.filter((candidate) => candidate.scopeId === item.scopeId && nodeFor(candidate.id)?.kind === "join")) {
+      const joinNode = nodeFor(join.id);
+      const fork = bundle.definitions[scope.definitionId]?.nodes.find((candidate) => candidate.kind === "fork" && ("groupId" in candidate) && ("groupId" in joinNode) && candidate.groupId === joinNode.groupId);
+      if (fork?.kind === "fork" && "branchIds" in fork && fork.branchIds.includes(item.nodeId)) {
+        dependants.push(join);
+        groups.add(fork.groupId);
+      }
+    }
+    for (const dependant of dependants) {
+      if (!dependant || affected.has(dependant.id))
+        continue;
+      affected.add(dependant.id);
+      if (!visit(dependant.id))
+        return false;
+    }
+    return true;
+  };
+  if (!visit(invocationId))
+    return;
+  return {
+    reopenedInvocationIds: [...reopened],
+    discardedInvocationIds: [...discarded],
+    reopenedScopeIds: [...scopes],
+    reopenedForkGroupIds: [...groups]
+  };
+}
+
 // packages/host/src/adapters/harness/activity-preview.ts
 function activityPreview(value) {
   let remaining = 32000;
@@ -17250,7 +17371,7 @@ async function inspectCodex() {
       "structured-output": supported,
       cancel: supported,
       steer: supported,
-      resume: { state: "unsupported" },
+      resume: supported,
       reattach: { state: "unsupported" },
       tools: {
         state: "conditional",
@@ -17306,6 +17427,8 @@ class CodexAppServerHarness {
       return { status: "failed", error: effortError, usage: unavailableUsage(), events: [] };
     const transport = this.createTransport(input.cwd);
     const events = [];
+    let sessionId = input.resumeSession?.id;
+    const session = () => sessionId ? { session: { id: sessionId } } : {};
     let usage = unavailableUsage();
     const emit = (event) => {
       events.push(event);
@@ -17328,21 +17451,31 @@ class CodexAppServerHarness {
       if (!initialized.ok)
         throw new Error(initialized.error);
       transport.notify("initialized", {});
-      const threadResult = await transport.request("thread/start", {
+      const threadResult = await transport.request(input.resumeSession ? "thread/resume" : "thread/start", {
+        ...input.resumeSession ? { threadId: input.resumeSession.id } : {},
         cwd: input.cwd,
+        ...!input.resumeSession ? { ephemeral: false } : {},
         ...input.selection.model.id && input.selection.model.id !== "default" ? { model: input.selection.model.id } : {},
         approvalPolicy: "on-request",
         config: {
           web_search: nativeToolPolicy(input.nativeConfig).network ? "live" : "disabled",
           "features.multi_agent": false
         },
-        ...dynamicTools ? { dynamicTools } : {}
+        ...dynamicTools && !input.resumeSession ? { dynamicTools } : {}
       });
       if (!threadResult.ok)
         throw new Error(threadResult.error);
       const threadId = stringAt(threadResult.value, "thread", "id") ?? stringAt(threadResult.value, "id");
       if (!threadId)
         throw new Error("Codex App Server returned no thread ID");
+      if (input.resumeSession && threadId !== input.resumeSession.id)
+        throw new Error("Codex resumed a different native session");
+      sessionId = threadId;
+      emit({
+        type: "log",
+        at: new Date().toISOString(),
+        data: { status: "Native session", sessionId }
+      });
       if (typeof effort2 === "string") {
         const modelId = stringAt(threadResult.value, "model") ?? input.selection.model.id;
         let cursor;
@@ -17473,14 +17606,14 @@ ${JSON.stringify(input.context)}
           if (turn2.status === "failed" || turn2.status === "interrupted")
             completed?.({
               ok: false,
-              error: turn2.status === "interrupted" ? "Codex turn was interrupted" : String(asObject(turn2.error).message ?? "Codex turn failed")
+              error: turn2.status === "interrupted" ? "Codex turn was interrupted" : JSON.stringify(turn2.error ?? "Codex turn failed")
             });
           else
             completed?.({ ok: true, value: turn2 });
         } else if (message.method === "turn/failed")
           completed?.({
             ok: false,
-            error: String(asObject(params.error).message ?? "Codex turn failed")
+            error: JSON.stringify(params.error ?? "Codex turn failed")
           });
       });
       const started = await transport.request("turn/start", {
@@ -17525,6 +17658,8 @@ ${JSON.stringify(input.context)}
       unsubscribe();
       if (!result.ok)
         return {
+          ...session(),
+          ...!input.signal?.aborted && providerLimit(result.error) ? { stopReason: providerLimit(result.error) } : {},
           status: input.signal?.aborted ? "cancelled" : "failed",
           error: result.error,
           usage,
@@ -17536,6 +17671,7 @@ ${JSON.stringify(input.context)}
       const final = finalCodexText(turn) ?? messages.lastAssistantText;
       if (!final)
         return {
+          ...session(),
           status: "failed",
           error: "Codex turn has no final agent message",
           usage,
@@ -17546,6 +17682,7 @@ ${JSON.stringify(input.context)}
         const validation = validateJsonSchema(output, input.outputSchema);
         if (!validation.valid)
           return {
+            ...session(),
             status: "failed",
             error: `invalid-output: ${validation.error}`,
             rawOutput: final,
@@ -17553,11 +17690,14 @@ ${JSON.stringify(input.context)}
             events
           };
       }
-      return { status: "succeeded", output, rawOutput: final, usage, events };
+      return { ...session(), status: "succeeded", output, rawOutput: final, usage, events };
     } catch (cause) {
+      const error2 = input.signal?.aborted ? "cancelled" : cause instanceof Error ? cause.message : String(cause);
       return {
+        ...session(),
+        ...!input.signal?.aborted && providerLimit(error2) ? { stopReason: providerLimit(error2) } : {},
         status: input.signal?.aborted ? "cancelled" : "failed",
-        error: input.signal?.aborted ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        error: error2,
         usage,
         events
       };
@@ -17676,6 +17816,7 @@ class CodexHarnessAdapter {
         ...input.outputSchema ? { outputSchema: input.outputSchema } : {}
       },
       nativeConfig: input.nativeConfig,
+      resumeSession: input.resumeSession,
       outputSchema: input.outputSchema,
       selection: {
         harness: this.id,
@@ -37493,7 +37634,7 @@ var claudeSdkDescriptor = {
   capabilities: {
     "structured-output": { state: "supported" },
     cancel: { state: "supported" },
-    resume: { state: "unsupported" },
+    resume: { state: "supported" },
     reattach: { state: "unsupported" },
     tools: {
       state: "conditional",
@@ -37552,7 +37693,13 @@ class ClaudeAgentSdkHarnessAdapter {
 [KOURO_CONTEXT]
 ${JSON.stringify(input2.context)}
 [/KOURO_CONTEXT]` : "";
-    const prompt = `${input2.prompt}${context}`;
+    const prompt = `${input2.resumeSession ? `Continue the existing session's unfinished work. Preserve completed research and outputs.
+
+` : ""}${input2.prompt}${context}`;
+    let sessionId = input2.resumeSession?.id;
+    let usageLimited = false;
+    let resumeAfter;
+    const session = () => sessionId ? { session: { id: sessionId } } : {};
     const policy = nativeToolPolicy(input2.nativeConfig);
     const disallowedTools = claudeDisallowedTools(policy);
     const scoutTool = input2.context?.tools.find((candidate) => candidate.name === "subagent");
@@ -37593,7 +37740,8 @@ ${JSON.stringify(input2.context)}
       canUseTool: async (name, args) => disallowedTools.includes(name) ? { behavior: "deny", message: "This tool is outside the workflow's declared grants." } : { behavior: "allow", updatedInput: args },
       settings: { permissions: { blockReadsOutsideWorkingDirectories: true } },
       settingSources: [],
-      maxTurns: 30,
+      ...input2.resumeSession ? { resume: input2.resumeSession.id } : {},
+      persistSession: true,
       stderr: (data) => {
         stderr += data;
       },
@@ -37613,6 +37761,26 @@ ${JSON.stringify(input2.context)}
     try {
       for await (const message of this.queryProvider({ prompt, options })) {
         messages.push(message);
+        if (message.type === "assistant" && message.error === "rate_limit")
+          usageLimited = true;
+        if (message.type === "rate_limit_event" && message.rate_limit_info.status === "rejected") {
+          usageLimited = true;
+          const resetsAt = message.rate_limit_info.resetsAt;
+          if (resetsAt && Number.isFinite(resetsAt))
+            resumeAfter = new Date(resetsAt * 1000).toISOString();
+        }
+        if ("session_id" in message && typeof message.session_id === "string" && message.session_id) {
+          if (input2.resumeSession && message.session_id !== input2.resumeSession.id)
+            throw new Error("Claude resumed a different native session");
+          if (sessionId !== message.session_id) {
+            sessionId = message.session_id;
+            input2.onEvent?.({
+              type: "log",
+              at: new Date().toISOString(),
+              data: { status: "Native session", sessionId }
+            });
+          }
+        }
         activity.consume(message);
         if (message.type === "result")
           resultMessage = message;
@@ -37622,9 +37790,16 @@ ${JSON.stringify(input2.context)}
         clearTimeout(timer);
       input2.signal?.removeEventListener("abort", abort);
       const cancelled = input2.signal?.aborted === true;
+      const error63 = cancelled ? "cancelled" : resultMessage && resultMessage.subtype !== "success" ? resultMessage.errors.join(`
+`) || `Claude SDK ended with ${resultMessage.subtype}` : cause instanceof Error ? cause.message : String(cause);
       return {
+        ...session(),
+        ...!cancelled && (usageLimited || providerLimit(error63)) ? {
+          stopReason: usageLimited ? "usage-limit" : providerLimit(error63),
+          ...resumeAfter ? { resumeAfter } : {}
+        } : {},
         status: cancelled ? "cancelled" : "failed",
-        error: cancelled ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        error: error63,
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
@@ -37636,6 +37811,7 @@ ${JSON.stringify(input2.context)}
     input2.signal?.removeEventListener("abort", abort);
     if (abortController.signal.aborted) {
       return {
+        ...session(),
         status: input2.signal?.aborted ? "cancelled" : "failed",
         error: input2.signal?.aborted ? "cancelled" : `Claude SDK timed out after ${timeoutMs ?? "configured"}ms`,
         stderr,
@@ -37646,10 +37822,16 @@ ${JSON.stringify(input2.context)}
     }
     if (resultMessage?.subtype !== "success") {
       const errors3 = resultMessage?.errors ?? [];
+      const error63 = errors3.join(`
+`) || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`;
       return {
+        ...session(),
+        ...usageLimited || providerLimit(error63) ? {
+          stopReason: usageLimited ? "usage-limit" : providerLimit(error63),
+          ...resumeAfter ? { resumeAfter } : {}
+        } : {},
         status: "failed",
-        error: errors3.join(`
-`) || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`,
+        error: error63,
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))),
@@ -37662,6 +37844,7 @@ ${JSON.stringify(input2.context)}
       const validation = validateJsonSchema(parsed, input2.outputSchema);
       if (!validation.valid)
         return {
+          ...session(),
           status: "failed",
           error: `invalid-output: ${validation.error}`,
           stderr,
@@ -37671,6 +37854,7 @@ ${JSON.stringify(input2.context)}
         };
     }
     return {
+      ...session(),
       status: "succeeded",
       output: parsed,
       stderr,
@@ -39010,6 +39194,7 @@ function migrate(db) {
       deadline_at TEXT,
       dispatch_id TEXT,
       usage_json TEXT NOT NULL DEFAULT '{}',
+      session_reference_json TEXT,
       ordinal INTEGER NOT NULL,
       optional INTEGER NOT NULL DEFAULT 0,
       state TEXT NOT NULL,
@@ -39134,6 +39319,7 @@ function migrate(db) {
     "ALTER TABLE scout_requests ADD COLUMN deadline_at TEXT",
     "ALTER TABLE scout_requests ADD COLUMN dispatch_id TEXT",
     "ALTER TABLE scout_requests ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE scout_requests ADD COLUMN session_reference_json TEXT",
     "ALTER TABLE scout_requests ADD COLUMN result_digest TEXT"
   ]) {
     try {
@@ -39154,7 +39340,7 @@ function migrate(db) {
         request_digest TEXT NOT NULL, input_digest TEXT NOT NULL DEFAULT '',
         child_definition_id TEXT NOT NULL DEFAULT '', child_agent_id TEXT NOT NULL DEFAULT '',
         effective_harness TEXT, model_id TEXT, workspace_id TEXT, deadline_at TEXT,
-        dispatch_id TEXT, usage_json TEXT NOT NULL DEFAULT '{}', ordinal INTEGER NOT NULL,
+        dispatch_id TEXT, usage_json TEXT NOT NULL DEFAULT '{}', session_reference_json TEXT, ordinal INTEGER NOT NULL,
         optional INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, result_json TEXT,
         result_artifact_id TEXT, result_digest TEXT, error TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -40532,6 +40718,10 @@ class Journal {
   }
   updateEntityTables(event, bundle) {
     if (event.type === "run.retried") {
+      for (const id2 of event.payload.discardedInvocationIds ?? [])
+        this.db.query("DELETE FROM invocations WHERE id = ?1 AND run_id = ?2").run(id2, event.runId);
+      for (const id2 of event.payload.reopenedInvocationIds ?? [])
+        this.db.query("UPDATE invocations SET state = 'pending', ended_at = NULL, error = NULL, output_artifact_ids_json = '[]' WHERE id = ?1 AND run_id = ?2").run(id2, event.runId);
       this.db.query("UPDATE invocations SET state = 'running', ended_at = NULL, error = NULL, output_artifact_ids_json = '[]' WHERE id = ?1 AND run_id = ?2").run(event.payload.invocationId, event.runId);
       return;
     }
@@ -41269,6 +41459,9 @@ class ScoutGateway {
   constructor(journal) {
     this.journal = journal;
   }
+  recordSession(runId, parentAttemptId, requestId, reference, usage) {
+    this.journal.db.query("UPDATE scout_requests SET session_reference_json=?1, usage_json=?2 WHERE run_id=?3 AND parent_attempt_id=?4 AND request_id=?5 AND state='running'").run(json(reference), json(usage), runId, parentAttemptId, requestId);
+  }
   request(input2) {
     if (!input2.requestId.trim())
       throw new Error("scout request ID is required");
@@ -41559,6 +41752,7 @@ function toRequest(row) {
     ...row.deadline_at === null ? {} : { deadlineAt: row.deadline_at },
     ...row.dispatch_id === null ? {} : { dispatchId: row.dispatch_id },
     usage: parseJson(row.usage_json),
+    ...row.session_reference_json ? { sessionReference: parseJson(row.session_reference_json) } : {},
     ...row.error === null ? {} : { error: row.error },
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -42208,18 +42402,71 @@ class Coordinator {
   }
   canRetry(runId, invocationId) {
     const view = this.journal.getView(runId);
-    if (!view || !["failed", "interrupted"].includes(view.state.status) || (view.state.control ?? "none") !== "none" && !(view.state.status === "interrupted" && view.state.control === "interrupt-requested"))
+    if (!view || !["running", "paused", "failed", "interrupted"].includes(view.state.status) || (view.state.control ?? "none") !== "none" && !(view.state.status === "interrupted" && view.state.control === "interrupt-requested"))
       return false;
     if (view.state.status === "interrupted" && view.state.control !== "interrupt-requested")
       return false;
     const invocation = view.state.invocations[invocationId];
-    const node2 = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find((item) => item.id === invocation?.nodeId);
-    if (!invocation || invocation.status !== "failed" || invocation.scopeId !== view.state.rootScopeId || !node2 || !["agent", "command"].includes(node2.kind) || Object.values(view.state.invocations).some((item) => item.sourceInvocationId === invocationId) || view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.some((item) => item.kind === "fork" && item.branchIds.includes(invocation.nodeId)))
+    if (!invocation || invocation.status !== "failed" || !retryPlan(view.bundle, view.state, invocationId))
       return false;
     const latest = Object.values(view.state.attempts).filter((item) => item.invocationId === invocationId).sort((a, b) => b.ordinal - a.ordinal)[0];
     if (!latest || !["failed", "cancelled"].includes(latest.status) || Object.keys(view.state.attempts).length >= view.bundle.limits.maxAttempts)
       return false;
     return !this.journal.db.query("SELECT 1 FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 LIMIT 1").get(runId);
+  }
+  nativeSession(attempt) {
+    const execution2 = attempt.resolvedExecution;
+    if (!execution2 || !["claude", "codex"].includes(execution2.harness))
+      return;
+    const reference = attempt.sessionReference;
+    if (reference && typeof reference === "object" && !Array.isArray(reference) && typeof reference.id === "string" && reference.id)
+      return reference;
+    if (execution2.harness !== "claude")
+      return;
+    for (const artifact of attempt.evidence) {
+      if (artifact.mediaType !== "text/plain; charset=utf-8")
+        continue;
+      try {
+        const messages = JSON.parse(new TextDecoder().decode(this.journal.blobs.read(artifact)));
+        if (!Array.isArray(messages))
+          continue;
+        const message = messages.find((item) => item && typeof item.session_id === "string" && item.session_id);
+        if (message)
+          return {
+            id: message.session_id,
+            harness: "claude",
+            adapterVersion: execution2.adapterVersion
+          };
+      } catch {}
+    }
+    return;
+  }
+  canResume(runId) {
+    const view = this.journal.getView(runId);
+    if (!view)
+      return false;
+    if (view.state.status === "paused" && !Object.values(view.state.invocations).some((item) => item.status === "failed" && this.providerDeferred(view.state, item.id)))
+      return true;
+    const failed = Object.values(view.state.invocations).filter((item) => item.status === "failed" && this.canRetry(runId, item.id));
+    return failed.length > 0 && failed.every((item) => {
+      const latest = Object.values(view.state.attempts).filter((attempt) => attempt.invocationId === item.id).sort((a, b) => b.ordinal - a.ordinal)[0];
+      return !!latest && this.continuationAvailable(runId, latest);
+    });
+  }
+  continuationAvailable(runId, attempt) {
+    if (!this.nativeSession(attempt))
+      return false;
+    return this.scouts.requests(runId).filter((request) => request.parentAttemptId === attempt.id && request.state === "failed" && !request.optional).every((request) => {
+      const reference = request.sessionReference;
+      return reference && typeof reference === "object" && !Array.isArray(reference) && typeof reference.id === "string" && reference.id.length > 0;
+    });
+  }
+  providerDeferred(state, invocationId) {
+    if (providerLimit(state.invocations[invocationId]?.error))
+      return true;
+    const latest = Object.values(state.attempts).filter((item) => item.invocationId === invocationId).sort((a, b) => b.ordinal - a.ordinal)[0];
+    const reference = latest?.sessionReference;
+    return !!reference && typeof reference === "object" && !Array.isArray(reference) && (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit");
   }
   normalizeActivity(runId, event) {
     if (event.type !== "tool" || !event.data || typeof event.data !== "object" || Array.isArray(event.data) || event.data.output === undefined)
@@ -42396,7 +42643,9 @@ class Coordinator {
         log("Attempt budget exhausted", `maximum attempt duration ${timeoutMs}ms reached`);
         return settleAfterStop("budget-exhausted");
       }
-      if (runDeadlineAt !== undefined && now2 >= runDeadlineAt) {
+      const view = this.journal.getView(input2.runId);
+      const currentRunDeadline = view && (view.state.budgetPausedAt || view.state.budgetPausedMs) ? this.runDeadline(view) : runDeadlineAt;
+      if (currentRunDeadline !== undefined && now2 >= currentRunDeadline) {
         log("Run budget exhausted", "maximum run duration reached");
         return settleAfterStop("run-budget-exhausted");
       }
@@ -42405,7 +42654,6 @@ class Coordinator {
         log("Tool operation timed out", `${expiredTool} exceeded ${this.operationTimeoutMs}ms`);
         return settleAfterStop("operation-timeout");
       }
-      const view = this.journal.getView(input2.runId);
       const suspended = view?.state.status === "paused" || Object.values(view?.state.approvals ?? {}).some((approval) => approval.status === "pending");
       if (suspended || runningTools.size > 0) {
         lastProgressAt = now2;
@@ -42462,6 +42710,32 @@ class Coordinator {
       throw new Error(`Run not found: ${input2.runId}`);
     if (view.revision !== input2.expectedRevision)
       throw new Error(`stale-action: expected revision ${input2.expectedRevision}, current revision ${view.revision}`);
+    if (input2.action === "resume") {
+      const failed = Object.values(view.state.invocations).filter((item) => item.status === "failed" && this.canRetry(input2.runId, item.id));
+      if (failed.length) {
+        for (const invocation of failed) {
+          const latest = Object.values(view.state.attempts).filter((item) => item.invocationId === invocation.id).sort((a, b) => b.ordinal - a.ordinal)[0];
+          if (!this.continuationAvailable(input2.runId, latest))
+            throw new Error("Native session continuation is unavailable for this agent or a failed required subagent; a saved session ID is missing.");
+        }
+        if (Object.keys(view.state.attempts).length + failed.length > view.bundle.limits.maxAttempts)
+          throw new Error("Continuation would exceed the workflow attempt budget");
+        this.journal.transaction(() => {
+          for (const invocation of failed) {
+            this.retryOnce({
+              ...input2,
+              invocationId: invocation.id,
+              expectedRevision: this.journal.getView(input2.runId).revision
+            }, false);
+          }
+        });
+        this.schedule(input2.runId);
+        const current = this.journal.getView(input2.runId);
+        return { revision: current.revision, status: current.state.status };
+      }
+      if (Object.values(view.state.invocations).some((item) => item.status === "failed" && this.providerDeferred(view.state, item.id)))
+        throw new Error("Session continuation is blocked: the failed agent is outside its retry budget or has already been consumed.");
+    }
     if (view.state.status === "recovery-required") {
       if (input2.action !== "cancel")
         throw new Error("Resolve or stop the recovery run before taking this action.");
@@ -42502,7 +42776,7 @@ class Coordinator {
       execute: () => this.retryOnce(input2)
     }).result;
   }
-  retryOnce(input2) {
+  retryOnce(input2, schedule = true) {
     const view = this.journal.getView(input2.runId);
     if (!view)
       throw new Error(`Run not found: ${input2.runId}`);
@@ -42520,13 +42794,19 @@ class Coordinator {
       this.journal.append({
         runId: input2.runId,
         type: "run.retried",
-        payload: { invocationId: input2.invocationId, sourceAttemptId: source.id, attemptId },
+        payload: {
+          invocationId: input2.invocationId,
+          sourceAttemptId: source.id,
+          attemptId,
+          ...retryPlan(view.bundle, view.state, input2.invocationId)
+        },
         actor: input2.actor,
         subjectId: input2.invocationId
       });
       this.reserve(input2.runId, this.journal.getView(input2.runId).state, input2.invocationId, attemptId);
     });
-    this.schedule(input2.runId);
+    if (schedule)
+      this.schedule(input2.runId);
     const next = this.journal.getView(input2.runId);
     return { revision: next.revision, status: next.state.status };
   }
@@ -42598,11 +42878,18 @@ class Coordinator {
       });
     }
   }
+  runDeadline(view) {
+    if (view.state.budgetPausedAt)
+      return;
+    const startedAt = view.state.startedAt ? Date.parse(view.state.startedAt) : Date.now();
+    return startedAt + view.bundle.limits.maxRunDurationMs + (view.state.budgetPausedMs ?? 0);
+  }
   armRunBudget(runId, view) {
     if (this.runBudgetTimers.has(runId))
       return;
-    const startedAt = view.state.startedAt ? Date.parse(view.state.startedAt) : Date.now();
-    const deadline = startedAt + view.bundle.limits.maxRunDurationMs;
+    const deadline = this.runDeadline(view);
+    if (deadline === undefined)
+      return;
     const timer = setTimeout(() => this.expireRunBudget(runId), Math.max(1, deadline - Date.now()));
     this.runBudgetTimers.set(runId, timer);
   }
@@ -42611,6 +42898,13 @@ class Coordinator {
     const view = this.journal.getView(runId);
     if (!view || !["running", "paused"].includes(view.state.status))
       return;
+    const deadline = this.runDeadline(view);
+    if (deadline === undefined)
+      return;
+    if (deadline > Date.now()) {
+      this.armRunBudget(runId, view);
+      return;
+    }
     const attemptId = Object.values(view.state.attempts).find((attempt) => attempt.status === "running")?.id;
     this.journal.append({
       runId,
@@ -43125,6 +43419,8 @@ ${json(dependencies)}` : "");
               const current = this.journal.getView(runId)?.state.invocations[intent2.invocationId];
               if (current?.status === "failed") {
                 const currentView = this.journal.getView(runId);
+                if (currentView?.state.status === "paused" && this.providerDeferred(currentView.state, current.id))
+                  return;
                 const owningGroup = groups.find((group) => group.expectedBranchIds.includes(intent2.invocationId));
                 if (owningGroup?.mode === "fail-fast") {
                   for (const sibling of Object.values(currentView?.state.invocations ?? {}).filter((candidate) => candidate.id !== intent2.invocationId && owningGroup.expectedBranchIds.includes(candidate.id) && ["pending", "reserved", "running"].includes(candidate.status)))
@@ -43658,7 +43954,9 @@ ${json(dependencies)}` : "");
         ] : [],
         hiddenNativeContext: "unavailable"
       });
-      if (attempt.ordinal > 0) {
+      const previousAttempt = Object.values(state.attempts).filter((item) => item.invocationId === invocationId && item.ordinal < attempt.ordinal).sort((a, b) => b.ordinal - a.ordinal)[0];
+      const resumeReference = previousAttempt && this.nativeSession(previousAttempt);
+      if (attempt.ordinal > 0 && !resumeReference) {
         const prepared = await prepareAgentHandoff({
           context: contextManifest,
           handoff: {
@@ -43853,6 +44151,20 @@ ${json(dependencies)}` : "");
       }
       if (node2.effort !== undefined)
         nativeConfig = { ...nativeConfig, effort: node2.effort };
+      const nativeConfigDigest = nativeConfig ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}` : undefined;
+      if (resumeReference && (selected.capabilities().resume !== "supported" || previousAttempt?.resolvedExecution?.harness !== resolvedHarness || previousAttempt.resolvedExecution.adapterVersion !== resolvedVersion || resumeReference.cwd !== undefined && resumeReference.cwd !== invocationWorkspaceDir || resumeReference.modelId !== undefined && resumeReference.modelId !== (resolvedModelId ?? node2.modelId) || (resumeReference.nativeConfigDigest ?? previousAttempt.resolvedExecution.nativeConfigDigest) !== undefined && (resumeReference.nativeConfigDigest ?? previousAttempt.resolvedExecution.nativeConfigDigest) !== nativeConfigDigest)) {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [],
+          artifacts: [],
+          evidence: [],
+          output: [],
+          status: "failed",
+          error: "Native session continuation rejected: harness, model, workspace or permissions changed",
+          sessionReference: resumeReference
+        });
+        return;
+      }
       if (subagentIds.length) {
         const capabilities = selected.capabilities();
         if (capabilities["awaited-subagent-tool"] !== "supported" || capabilities["child-read-only-envelope"] !== "supported") {
@@ -43908,8 +44220,7 @@ ${json(dependencies)}` : "");
       const attemptStartedAtText = this.journal.getView(runId)?.state.attempts[attemptId]?.startedAt ?? attempt.startedAt;
       const attemptStartedAt = attemptStartedAtText ? Date.parse(attemptStartedAtText) : Date.now();
       const attemptBudgetRemaining = node2.timeoutMs === undefined ? undefined : Math.max(1, node2.timeoutMs - Math.max(0, Date.now() - attemptStartedAt));
-      const runStartedAt = this.journal.getView(runId)?.state.startedAt;
-      const runDeadlineAt = runStartedAt && Number.isFinite(Date.parse(runStartedAt)) ? Date.parse(runStartedAt) + bundle.limits.maxRunDurationMs : Date.now() + bundle.limits.maxRunDurationMs;
+      const runDeadlineAt = this.runDeadline(this.journal.getView(runId));
       try {
         harnessResult = await this.superviseHarness(trackingAdapter, {
           attemptId,
@@ -43922,6 +44233,7 @@ ${json(dependencies)}` : "");
           delayMs: this.scriptedDelayMs,
           cwd: invocationWorkspaceDir,
           nativeConfig,
+          ...resumeReference ? { resumeSession: { id: String(resumeReference.id) } } : {},
           context: contextManifest,
           ...collaborationGateway && collaborationGrant ? {
             collaboration: {
@@ -43969,6 +44281,10 @@ ${json(dependencies)}` : "");
         this.activityEvents.delete(attemptId);
         return;
       }
+      harnessResult = {
+        ...harnessResult,
+        stopReason: harnessResult.stopReason ?? providerLimit(harnessResult.error)
+      };
       const collaborationSent = Boolean(harnessResult.output && typeof harnessResult.output === "object" && !Array.isArray(harnessResult.output) && "collaboration" in harnessResult.output && typeof harnessResult.output.collaboration === "object" && harnessResult.output.collaboration !== null && "sent" in harnessResult.output.collaboration);
       if (collaborationGateway && collaborationConfig && collaborationConfig.respondLoop && collaborationBatch?.visible.length === 0 && (!collaborationSent || node2.role.toLowerCase().includes("receiver")))
         collaborationGateway.setParticipantStatus(runId, node2.role, "completed");
@@ -43997,6 +44313,19 @@ ${json(dependencies)}` : "");
         if (scoutError) {
           status = "failed";
           error63 = `scout-acceptance: ${scoutError}`;
+        }
+      }
+      harnessResult.stopReason ??= providerLimit(error63);
+      if (status === "failed" && subagentIds.length) {
+        const limitedChild = this.scouts.requests(runId).find((request) => {
+          const reference2 = request.sessionReference;
+          return request.parentAttemptId === attemptId && request.state === "failed" && !request.optional && reference2 && typeof reference2 === "object" && !Array.isArray(reference2) && (reference2.stopReason === "usage-limit" || reference2.stopReason === "turn-limit");
+        });
+        const reference = limitedChild?.sessionReference;
+        if (reference && typeof reference === "object" && !Array.isArray(reference)) {
+          harnessResult.stopReason ??= reference.stopReason;
+          if (typeof reference.resumeAfter === "string")
+            harnessResult.resumeAfter ??= reference.resumeAfter;
         }
       }
       const secretValues = Object.entries(process.env).filter(([key, value]) => value && /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key)).map(([, value]) => value).filter((value) => value.length >= 6);
@@ -44035,7 +44364,7 @@ ${json(dependencies)}` : "");
           mediaType: stderrArtifact.mediaType
         });
       }
-      const retryable = status === "failed" && this.journal.getView(runId)?.state.control === "none" && (harnessResult.status === "unavailable" || error63?.startsWith("invalid-output:") || error63?.startsWith("transport:"));
+      const retryable = status === "failed" && !harnessResult.stopReason && this.journal.getView(runId)?.state.control === "none" && (harnessResult.status === "unavailable" || error63?.startsWith("invalid-output:") || error63?.startsWith("transport:"));
       const ordinal = attempt.ordinal + 1;
       const retry = retryable && ordinal < 2 ? {
         attemptId: id("attempt"),
@@ -44049,42 +44378,59 @@ ${json(dependencies)}` : "");
           operationKey: `${runId}/${invocationId}/${ordinal + 1}`
         }
       } : undefined;
-      const nativeConfigDigest = nativeConfig ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}` : undefined;
       const allEvents = [...harnessResult.events, ...this.activityEvents.get(attemptId) ?? []];
       const uniqueEvents = [...new Map(allEvents.map((event) => [json(event), event])).values()];
       const durableEvents = redactSecrets(uniqueEvents, secretValues);
       if (status === "succeeded" && registeredWorkspace && this.workspaceAdapter)
         this.snapshots.set(runId, await this.workspaceAdapter.snapshot(registeredWorkspace));
-      this.journal.completeEffect({
-        effectId: detail.id,
-        storedArtifacts: storedArtifacts2,
-        artifacts: [],
-        evidence: evidenceRefs2,
-        output: outputRefs2,
-        status,
-        ...safeError ? { error: safeError } : {},
-        diagnostics: [
-          harnessResult.error ? String(redactSecrets(harnessResult.error, secretValues)) : undefined
-        ].filter((item) => Boolean(item)),
-        resolvedExecution: {
-          role: node2.role,
-          harness: resolvedHarness,
-          adapterVersion: resolvedVersion,
-          ...resolvedModelId ? { modelId: resolvedModelId } : {},
-          ...nativeConfigDigest ? { nativeConfigDigest } : {},
-          ...node2.effort === undefined ? {} : { effort: node2.effort }
-        },
-        harnessEvents: durableEvents,
-        usage: harnessResult.usage,
-        contextManifest: JSON.parse(JSON.stringify(contextManifest)),
-        sessionReference: {
-          continuation: "fresh-session",
-          handoff: "fresh",
-          nativeContinuation: "unavailable",
-          ...profile === "codex-readonly" || profile === "codex-workspace-write" ? { reason: "codex-native-resume-unsupported" } : {},
-          capabilities: selected.capabilities()
-        },
-        ...retry ? { retry } : {}
+      this.journal.transaction(() => {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: storedArtifacts2,
+          artifacts: [],
+          evidence: evidenceRefs2,
+          output: outputRefs2,
+          status,
+          ...safeError ? { error: safeError } : {},
+          diagnostics: [
+            harnessResult.error ? String(redactSecrets(harnessResult.error, secretValues)) : undefined
+          ].filter((item) => Boolean(item)),
+          resolvedExecution: {
+            role: node2.role,
+            harness: resolvedHarness,
+            adapterVersion: resolvedVersion,
+            ...resolvedModelId ?? node2.modelId ? { modelId: resolvedModelId ?? node2.modelId } : {},
+            ...nativeConfigDigest ? { nativeConfigDigest } : {},
+            ...node2.effort === undefined ? {} : { effort: node2.effort }
+          },
+          harnessEvents: durableEvents,
+          usage: harnessResult.usage,
+          contextManifest: JSON.parse(JSON.stringify(contextManifest)),
+          sessionReference: {
+            continuation: resumeReference ? "native-resume" : "fresh-session",
+            nativeContinuation: harnessResult.session ? "available" : "unavailable",
+            ...harnessResult.session ? {
+              id: harnessResult.session.id,
+              harness: resolvedHarness,
+              adapterVersion: resolvedVersion,
+              cwd: invocationWorkspaceDir,
+              ...resolvedModelId ?? node2.modelId ? { modelId: resolvedModelId ?? node2.modelId } : {},
+              ...nativeConfigDigest ? { nativeConfigDigest } : {}
+            } : {},
+            ...harnessResult.stopReason ? { stopReason: harnessResult.stopReason } : {},
+            ...harnessResult.resumeAfter ? { resumeAfter: harnessResult.resumeAfter } : {},
+            capabilities: selected.capabilities()
+          },
+          ...retry ? { retry } : {}
+        });
+        if (status === "failed" && harnessResult.stopReason && this.journal.getView(runId)?.state.status === "running" && this.journal.getView(runId)?.state.control === "none") {
+          this.journal.append({
+            runId,
+            type: "run.paused",
+            payload: { reason: harnessResult.stopReason, invocationId },
+            actor: "system"
+          });
+        }
       });
       this.activityEvents.delete(attemptId);
       return;
@@ -44294,6 +44640,35 @@ ${json(dependencies)}` : "");
     return this.scouts.invoke({
       ...input2,
       runner: async (request, signal) => {
+        const previousParent = Object.values(view.state.attempts).filter((attempt) => attempt.invocationId === input2.parentInvocationId && attempt.id !== input2.parentAttemptId).sort((a, b) => b.ordinal - a.ordinal)[0];
+        const continuingParent = previousParent && this.nativeSession(previousParent);
+        const prior = continuingParent ? this.scouts.requests(input2.runId).filter((candidate) => candidate.parentInvocationId === input2.parentInvocationId && candidate.parentAttemptId !== input2.parentAttemptId && candidate.scoutId === input2.scoutId && canonicalize(candidate.input) === canonicalize(request.input)).at(-1) : undefined;
+        if (prior?.state === "succeeded" && prior.result !== undefined) {
+          this.recordHarnessActivity(input2.runId, input2.parentInvocationId, input2.parentAttemptId, {
+            type: "log",
+            at: now(),
+            data: {
+              status: "Reused completed subagent output",
+              scoutId: input2.scoutId,
+              requestId: input2.requestId
+            }
+          });
+          return prior.result;
+        }
+        const reference = prior?.sessionReference;
+        const childResume = reference && typeof reference === "object" && !Array.isArray(reference) && typeof reference.id === "string" ? reference : undefined;
+        if (prior && !childResume)
+          throw new Error("Subagent native session continuation is unavailable; the failed child has no saved session ID");
+        const childNativeConfig = {
+          toolPolicy: { write: false, terminal: false, network: false, child: true },
+          ...childAgent.effort === undefined ? {} : { effort: childAgent.effort },
+          ...childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : {},
+          ...childAdapter.id === "codex" ? { sandbox: "read-only" } : {}
+        };
+        const childModel = childAgent.modelId ?? (childAdapter.id === input2.adapter.id ? input2.parentModelId : undefined);
+        const childConfigDigest = `sha256:${await sha256Hex(canonicalize(childNativeConfig))}`;
+        if (childResume && (childAdapter.capabilities().resume !== "supported" || childResume.harness !== childAdapter.id || childResume.adapterVersion !== childAdapter.adapterVersion || childResume.cwd !== input2.cwd || childResume.modelId !== (childModel ?? null) || childResume.nativeConfigDigest !== childConfigDigest))
+          throw new Error("Subagent session continuation rejected: harness, model, workspace or permissions changed");
         const segments = Object.entries(request.input).map(([name, value]) => {
           const content = JSON.stringify(value);
           return {
@@ -44345,7 +44720,7 @@ ${json(dependencies)}` : "");
             scoutReplyStarted = true;
         }, (event) => this.normalizeActivity(input2.runId, event));
         try {
-          const childRunDeadline = view.state.startedAt && Number.isFinite(Date.parse(view.state.startedAt)) ? Date.parse(view.state.startedAt) + view.bundle.limits.maxRunDurationMs : Date.now() + view.bundle.limits.maxRunDurationMs;
+          const childRunDeadline = this.runDeadline(this.journal.getView(input2.runId));
           const result = await this.superviseHarness(trackedChild, {
             attemptId: childInvocationId,
             runId: input2.runId,
@@ -44355,13 +44730,9 @@ ${json(dependencies)}` : "");
             ...outputSchema ? { outputSchema } : {},
             delayMs: this.scriptedDelayMs,
             cwd: input2.cwd,
+            ...childResume ? { resumeSession: { id: String(childResume.id) } } : {},
             ...childAgent.modelId ? { modelId: childAgent.modelId } : childAdapter.id === input2.adapter.id && input2.parentModelId ? { modelId: input2.parentModelId } : {},
-            nativeConfig: {
-              toolPolicy: { write: false, terminal: false, network: false, child: true },
-              ...childAgent.effort === undefined ? {} : { effort: childAgent.effort },
-              ...childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : {},
-              ...childAdapter.id === "codex" ? { sandbox: "read-only" } : {}
-            },
+            nativeConfig: childNativeConfig,
             context,
             signal: childAborter.signal,
             onEvent: () => {
@@ -44376,6 +44747,17 @@ ${json(dependencies)}` : "");
           });
           if (!result)
             throw new Error("subagent cancellation was not confirmed; parent requires recovery");
+          if (result.session || result.stopReason)
+            this.scouts.recordSession(input2.runId, input2.parentAttemptId, input2.requestId, {
+              ...result.session ? { id: result.session.id } : {},
+              harness: childAdapter.id,
+              adapterVersion: childAdapter.adapterVersion,
+              cwd: input2.cwd,
+              modelId: childModel ?? null,
+              nativeConfigDigest: childConfigDigest,
+              ...result.stopReason ? { stopReason: result.stopReason } : {},
+              ...result.resumeAfter ? { resumeAfter: result.resumeAfter } : {}
+            }, result.usage);
           if (result.status !== "succeeded" || result.output === undefined)
             throw new Error(result.error ?? `scout harness ${result.status}`);
           return result.output;
@@ -45922,13 +46304,13 @@ class ApplicationService {
     if (!view)
       return;
     const invocations = Object.values(view.state.invocations);
-    const retryableInvocationIds = ["failed", "interrupted"].includes(view.state.status) ? invocations.filter((item) => item.status === "failed" && this.coordinator.canRetry(runId, item.id)).map((item) => item.id) : [];
+    const retryableInvocationIds = ["paused", "failed", "interrupted"].includes(view.state.status) ? invocations.filter((item) => item.status === "failed" && this.coordinator.canRetry(runId, item.id)).map((item) => item.id) : [];
     const steerableInvocationIds = invocations.filter((item) => item.status === "running" && this.canSteer(runId, item.id)).map((item) => item.id);
     const interruptibleInvocationIds = invocations.filter((item) => item.status === "running" && this.coordinator.canInterrupt(runId, item.id)).map((item) => item.id);
     return {
       capabilities: {
         pause: view.state.status === "running",
-        resume: view.state.status === "paused",
+        resume: this.coordinator.canResume(runId),
         cancel: view.state.status === "running" || view.state.status === "paused",
         detach: view.state.status === "running" || view.state.status === "paused",
         steer: steerableInvocationIds.length > 0,
@@ -46220,7 +46602,7 @@ class ApplicationService {
         capabilities: {
           "structured-output": "supported",
           cancel: "supported",
-          resume: "unsupported",
+          resume: "supported",
           reattach: "unsupported",
           tools: "conditional",
           usage: "supported",
@@ -46236,7 +46618,7 @@ class ApplicationService {
         capabilities: {
           "structured-output": "supported",
           cancel: "supported",
-          resume: "unsupported",
+          resume: "supported",
           reattach: "unsupported",
           tools: "conditional",
           usage: "supported",
@@ -61644,6 +62026,7 @@ Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting
 Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
 Execution prints its dashboard URL to stderr. JSON records include dashboardUrl.
 Without a running host, the dashboard is temporary and lasts until the command returns.
+Provider limits pause tasks. After reset, task resume continues saved Claude/Codex sessions.
 `;
 var valueOptions = new Set([
   "--task",
@@ -61787,7 +62170,7 @@ async function taskCommand(args, service, write = (value) => process.stdout.writ
       idempotencyKey: args.get("--idempotency-key") ?? randomUUID5()
     });
   }
-  if (args.command === "resume" && view.state.status === "paused")
+  if (args.command === "resume" && ["paused", "failed", "interrupted"].includes(view.state.status))
     service.control({
       runId,
       action: "resume",
@@ -61847,6 +62230,19 @@ function taskReport(service, runId) {
     status: view.state.status,
     revision: view.revision,
     waitingForApproval: approvals.length > 0,
+    resumeAvailable: service.operatorState(runId)?.capabilities.resume ?? false,
+    failedInvocations: Object.values(view.state.invocations).filter((item) => item.status === "failed" && Object.values(view.state.attempts).some((attempt) => attempt.invocationId === item.id)).map((item) => {
+      const latest = Object.values(view.state.attempts).filter((attempt) => attempt.invocationId === item.id).sort((a, b) => b.ordinal - a.ordinal)[0];
+      const reference = latest?.sessionReference;
+      const session = reference && typeof reference === "object" && !Array.isArray(reference) ? reference : {};
+      return {
+        invocationId: item.id,
+        nodeId: item.nodeId,
+        error: item.error,
+        ...session.stopReason ? { stopReason: session.stopReason } : {},
+        ...session.resumeAfter ? { resumeAfter: session.resumeAfter } : {}
+      };
+    }),
     approvals,
     ...service.coordinator.milestones(runId),
     result: Object.values(view.state.invocations).find((item) => item.scopeId === view.state.rootScopeId && item.nodeId === "done")?.output,

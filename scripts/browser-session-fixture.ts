@@ -24,7 +24,7 @@ export class BrowserSessionHarness implements HarnessAdapter {
   private gatedTasks = new TaskFixtureHarness("normal", "task-gated");
   private liveFusion = new FusionFixtureHarness("slow-review");
   capabilities() {
-    return this.scripted.capabilities();
+    return { ...this.scripted.capabilities(), resume: "supported" as const };
   }
   private active = new Map<
     string,
@@ -59,6 +59,30 @@ export class BrowserSessionHarness implements HarnessAdapter {
   }
 
   async run(input: Parameters<HarnessAdapter["run"]>[0]): ReturnType<HarnessAdapter["run"]> {
+    if (input.role === "web-session-limit") {
+      if (!input.resumeSession)
+        return {
+          status: "failed",
+          error: "usage limit exceeded",
+          session: { id: `limit-${input.invocationId}` },
+          events: [],
+          usage: {},
+        };
+      if (input.resumeSession.id !== `limit-${input.invocationId}`)
+        throw new Error("Wrong native session resumed");
+      input.onEvent?.({
+        type: "text",
+        at: new Date().toISOString(),
+        data: "Continued existing research session",
+      });
+      return {
+        status: "succeeded",
+        session: input.resumeSession,
+        output: { summary: "Continued research without starting over" },
+        events: [],
+        usage: {},
+      };
+    }
     if (input.role === "task-decomposer" || input.role.startsWith("task-fixture-")) {
       const catalog =
         input.context?.segments.find((segment) => segment.id.endsWith(":workflows"))?.content ?? "";
@@ -303,6 +327,19 @@ export async function seedSessionFixtures(
   service: ApplicationService,
   harness?: BrowserSessionHarness,
 ) {
+  const continuation = new WorkflowBuilder({ id: "web-session-limit" });
+  const limited = continuation.agent("research", {
+    harness: "codex",
+    role: "web-session-limit",
+    prompt: "Continue research",
+  });
+  continuation.startAt(limited);
+  continuation.sequence(limited, continuation.complete("done"));
+  await service.coordinator.createRun({
+    workflowId: continuation.id,
+    bundle: await compileWorkflow(continuation.build()),
+    idempotencyKey: continuation.id,
+  });
   for (const id of ["browser-fusion", "browser-fusion-live"]) {
     const run = await service.coordinator.createRun({
       workflowId: id,

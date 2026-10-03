@@ -177,19 +177,41 @@ test("real parent and subagent sessions retain tool results, steer, reconnect, a
   await page.screenshot({ path: "test-results/session-desktop.png", fullPage: true });
 });
 
+test("Resume continues a provider-limited native session after dashboard reload", async ({
+  page,
+}) => {
+  await openFixture(page, "web-session-limit");
+  await expect(page.getByTestId("run-status")).toHaveText("paused");
+  await page.reload();
+  await page.getByRole("button", { name: "Resume", exact: true }).click();
+  await expect(page.getByTestId("run-status")).toHaveText("succeeded");
+  const runId = new URL(page.url()).searchParams.get("run")!;
+  const view = await (await page.request.get(`/api/runs/${runId}/view`)).json();
+  const attempts = Object.values(view.state.attempts) as Array<{
+    ordinal: number;
+    sessionReference?: { id?: string; continuation?: string };
+  }>;
+  expect(attempts).toHaveLength(2);
+  const resumed = attempts.find((attempt) => attempt.ordinal === 1)!;
+  expect(resumed.sessionReference?.continuation).toBe("native-resume");
+  expect(resumed.sessionReference?.id).toBe(
+    attempts.find((attempt) => attempt.ordinal === 0)!.sessionReference?.id,
+  );
+});
+
 test("failed invocation recovery starts one attempt and shows its typed output", async ({
   page,
 }) => {
   await openFixture(page, "web-session-failure");
   await expect(page.getByTestId("run-status")).toHaveText("failed");
-  await page.getByRole("button", { name: "diagnostics", exact: true }).click();
+  await page.getByRole("tab", { name: "Diagnostics", exact: true }).click();
   await expect(page.locator(".inspector .evidence-panel")).toContainText("invalid-output");
   await page.getByRole("button", { name: "Retry invocation", exact: true }).click();
   await expect(page.getByTestId("run-status")).toHaveText("succeeded");
   await page.getByLabel("Inspect invocation").selectOption({ label: "parent · succeeded · #1" });
-  await page.getByRole("button", { name: "output", exact: true }).click();
+  await page.getByRole("tab", { name: "Output", exact: true }).click();
   await expect(page.locator(".artifact-preview")).toContainText("Recovered browser session");
-  await page.getByRole("button", { name: "attempts", exact: true }).click();
+  await page.locator(".inspector").getByRole("tab", { name: "Attempts", exact: true }).click();
   await expect(page.locator(".attempt-card")).toHaveCount(3);
 });
 

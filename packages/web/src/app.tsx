@@ -2880,7 +2880,7 @@ function RunControlBar({
       aria-label="Run controls"
     >
       {running && allowed(view, "pause") && action("pause", "pause", "Pause")}
-      {paused && allowed(view, "resume") && action("resume", "resume", "Resume")}
+      {allowed(view, "resume") && action("resume", "resume", "Resume")}
       {running && allowed(view, "interrupt") && action("interrupt", "interrupt", "Interrupt")}
       {(running || paused) && allowed(view, "cancel") && action("cancel", "cancel", "Cancel")}
       {!running &&

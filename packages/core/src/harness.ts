@@ -89,6 +89,10 @@ export interface UsageSummary {
   readonly cost: UsageValue;
 }
 export interface HarnessResult {
+  /** Provider-owned conversation persisted locally by the native harness. */
+  readonly session?: { readonly id: string };
+  readonly stopReason?: "usage-limit" | "turn-limit";
+  readonly resumeAfter?: string;
   readonly status: "succeeded" | "failed" | "cancelled" | "unavailable";
   readonly output?: JsonValue;
   readonly rawOutput?: string;

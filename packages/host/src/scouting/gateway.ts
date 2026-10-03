@@ -26,6 +26,7 @@ interface ScoutRow {
   deadline_at: string | null;
   dispatch_id: string | null;
   usage_json: string;
+  session_reference_json: string | null;
   ordinal: number;
   optional: number;
   state: ScoutRequestState;
@@ -43,6 +44,20 @@ export class ScoutGateway {
   private readonly inFlight = new Map<string, Promise<ScoutResult>>();
 
   constructor(private readonly journal: Journal) {}
+
+  recordSession(
+    runId: string,
+    parentAttemptId: string,
+    requestId: string,
+    reference: JsonValue,
+    usage: JsonValue,
+  ): void {
+    this.journal.db
+      .query(
+        "UPDATE scout_requests SET session_reference_json=?1, usage_json=?2 WHERE run_id=?3 AND parent_attempt_id=?4 AND request_id=?5 AND state='running'",
+      )
+      .run(json(reference), json(usage), runId, parentAttemptId, requestId);
+  }
 
   request(input: {
     runId: string;
@@ -542,6 +557,9 @@ function toRequest(row: ScoutRow): ScoutRequest {
     ...(row.deadline_at === null ? {} : { deadlineAt: row.deadline_at }),
     ...(row.dispatch_id === null ? {} : { dispatchId: row.dispatch_id }),
     usage: parseJson(row.usage_json),
+    ...(row.session_reference_json
+      ? { sessionReference: parseJson<JsonValue>(row.session_reference_json) }
+      : {}),
     ...(row.error === null ? {} : { error: row.error }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,

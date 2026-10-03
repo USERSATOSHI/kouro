@@ -136,7 +136,7 @@ export class ApplicationService {
     const view = this.getView(runId);
     if (!view) return undefined;
     const invocations = Object.values(view.state.invocations);
-    const retryableInvocationIds = ["failed", "interrupted"].includes(view.state.status)
+    const retryableInvocationIds = ["paused", "failed", "interrupted"].includes(view.state.status)
       ? invocations
           .filter((item) => item.status === "failed" && this.coordinator.canRetry(runId, item.id))
           .map((item) => item.id)
@@ -150,7 +150,7 @@ export class ApplicationService {
     return {
       capabilities: {
         pause: view.state.status === "running",
-        resume: view.state.status === "paused",
+        resume: this.coordinator.canResume(runId),
         cancel: view.state.status === "running" || view.state.status === "paused",
         detach: view.state.status === "running" || view.state.status === "paused",
         steer: steerableInvocationIds.length > 0,
@@ -508,7 +508,7 @@ export class ApplicationService {
         capabilities: {
           "structured-output": "supported",
           cancel: "supported",
-          resume: "unsupported",
+          resume: "supported",
           reattach: "unsupported",
           tools: "conditional",
           usage: "supported",
@@ -524,7 +524,7 @@ export class ApplicationService {
         capabilities: {
           "structured-output": "supported",
           cancel: "supported",
-          resume: "unsupported",
+          resume: "supported",
           reattach: "unsupported",
           tools: "conditional",
           usage: "supported",

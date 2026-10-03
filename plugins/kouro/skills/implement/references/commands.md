@@ -88,6 +88,14 @@ kouro task decide RUN_ID INVOCATION_ID --decision approve --revision REV \
   --binding-digest DIGEST --subject-revision SUBJECT_REV --workspace PROJECT
 ```
 
+When a Claude or Codex agent hits a provider limit, keep the run ID and completed
+outputs. After the user indicates quota is available, inspect `task status`, then
+use `task resume` to continue saved native sessions. `resumeAvailable` and
+`failedInvocations` explain recovery state. Do not launch a duplicate task to
+replace a partially completed run. Native continuation requires the original
+host's provider transcript; report an unavailable session instead of describing
+a fresh invocation as continuation.
+
 Use the user's authorization for that specific gate. `request-changes` needs
 `--feedback TEXT`; `reject` follows the original workflow's rejection route.
 Decisions continue until the next gate or terminal state. A stale revision or

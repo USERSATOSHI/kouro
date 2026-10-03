@@ -28,6 +28,7 @@ import { codexToolEvent } from "./codex-activity.ts";
 import { CodexMessages } from "./codex-messages.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
 import { nativeToolPolicy } from "./tool-policy.ts";
+import { providerLimit } from "./session.ts";
 
 export interface CodexRunInput {
   readonly attemptId: string;
@@ -36,6 +37,7 @@ export interface CodexRunInput {
   readonly cwd: string;
   readonly context?: StartTurnRequest["context"];
   readonly nativeConfig?: import("@kouro/core").JsonObject;
+  readonly resumeSession?: { readonly id: string };
   readonly outputSchema?: JsonValue;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
@@ -63,7 +65,7 @@ export async function inspectCodex(): Promise<HarnessDescriptor> {
       "structured-output": supported,
       cancel: supported,
       steer: supported,
-      resume: { state: "unsupported" },
+      resume: supported,
       reattach: { state: "unsupported" },
       tools: {
         state: "conditional",
@@ -175,17 +177,24 @@ export class CodexSdkHarness implements HarnessPort {
     };
     let thread: ReturnType<Codex["startThread"]>;
     try {
-      thread = new Codex(sdkOptions).startThread({
+      const codex = new Codex(sdkOptions);
+      const threadOptions = {
         ...(config.effort === undefined
           ? {}
           : { modelReasoningEffort: config.effort as ModelReasoningEffort }),
         ...(typeof config.model === "string" ? { model: config.model } : {}),
         workingDirectory: input.cwd,
         skipGitRepoCheck: true,
-        sandboxMode: config.sandbox === "workspace-write" ? "workspace-write" : "read-only",
+        sandboxMode:
+          config.sandbox === "workspace-write"
+            ? ("workspace-write" as const)
+            : ("read-only" as const),
         networkAccessEnabled: policy.network,
-        webSearchMode: policy.network ? "live" : "disabled",
-      });
+        webSearchMode: policy.network ? ("live" as const) : ("disabled" as const),
+      };
+      thread = input.resumeSession
+        ? codex.resumeThread(input.resumeSession.id, threadOptions)
+        : codex.startThread(threadOptions);
     } catch (cause) {
       await bridge?.close();
       return {
@@ -335,11 +344,13 @@ export class CodexSdkHarness implements HarnessPort {
     }
 
     const rawOutput = raw.join("\n");
+    const session = thread.id ? { session: { id: thread.id } } : {};
     const timedOut =
       timeoutMs !== undefined && abortController.signal.aborted && !input.signal?.aborted;
     if (input.signal?.aborted || timedOut) {
       const message = timedOut ? `Codex timed out after ${timeoutMs}ms` : "cancelled";
       return {
+        ...session,
         status: input.signal?.aborted ? "cancelled" : "failed",
         error: message,
         rawOutput,
@@ -349,8 +360,10 @@ export class CodexSdkHarness implements HarnessPort {
     }
     if (streamError) {
       return {
+        ...session,
         status: "failed",
         error: streamError,
+        ...(providerLimit(streamError) ? { stopReason: providerLimit(streamError) } : {}),
         rawOutput,
         usage: codexUsage(usageRecord),
         events,
@@ -363,6 +376,7 @@ export class CodexSdkHarness implements HarnessPort {
       const check = validateJsonSchema(parsed, input.role.outputSchema);
       if (!check.valid) {
         return {
+          ...session,
           status: "failed",
           rawOutput,
           error: `invalid-output: ${check.error}`,
@@ -372,6 +386,7 @@ export class CodexSdkHarness implements HarnessPort {
       }
     }
     return {
+      ...session,
       status: "succeeded",
       output: parsed,
       rawOutput,
@@ -415,6 +430,8 @@ export class CodexAppServerHarness {
       return { status: "failed", error: effortError, usage: unavailableUsage(), events: [] };
     const transport = this.createTransport(input.cwd);
     const events: HarnessEvent[] = [];
+    let sessionId = input.resumeSession?.id;
+    const session = () => (sessionId ? { session: { id: sessionId } } : {});
     let usage = unavailableUsage();
     const emit = (event: HarnessEvent) => {
       events.push(event);
@@ -439,22 +456,35 @@ export class CodexAppServerHarness {
       });
       if (!initialized.ok) throw new Error(initialized.error);
       transport.notify("initialized", {});
-      const threadResult = await transport.request("thread/start", {
-        cwd: input.cwd,
-        ...(input.selection.model.id && input.selection.model.id !== "default"
-          ? { model: input.selection.model.id }
-          : {}),
-        approvalPolicy: "on-request",
-        config: {
-          web_search: nativeToolPolicy(input.nativeConfig).network ? "live" : "disabled",
-          "features.multi_agent": false,
+      const threadResult = await transport.request(
+        input.resumeSession ? "thread/resume" : "thread/start",
+        {
+          ...(input.resumeSession ? { threadId: input.resumeSession.id } : {}),
+          cwd: input.cwd,
+          ...(!input.resumeSession ? { ephemeral: false } : {}),
+          ...(input.selection.model.id && input.selection.model.id !== "default"
+            ? { model: input.selection.model.id }
+            : {}),
+          approvalPolicy: "on-request",
+          config: {
+            web_search: nativeToolPolicy(input.nativeConfig).network ? "live" : "disabled",
+            "features.multi_agent": false,
+          },
+          ...(dynamicTools && !input.resumeSession ? { dynamicTools } : {}),
         },
-        ...(dynamicTools ? { dynamicTools } : {}),
-      });
+      );
       if (!threadResult.ok) throw new Error(threadResult.error);
       const threadId =
         stringAt(threadResult.value, "thread", "id") ?? stringAt(threadResult.value, "id");
       if (!threadId) throw new Error("Codex App Server returned no thread ID");
+      if (input.resumeSession && threadId !== input.resumeSession.id)
+        throw new Error("Codex resumed a different native session");
+      sessionId = threadId;
+      emit({
+        type: "log",
+        at: new Date().toISOString(),
+        data: { status: "Native session", sessionId },
+      });
       if (typeof effort === "string") {
         const modelId = stringAt(threadResult.value, "model") ?? input.selection.model.id;
         let cursor: string | undefined;
@@ -629,13 +659,13 @@ export class CodexAppServerHarness {
               error:
                 turn.status === "interrupted"
                   ? "Codex turn was interrupted"
-                  : String(asObject(turn.error).message ?? "Codex turn failed"),
+                  : JSON.stringify(turn.error ?? "Codex turn failed"),
             });
           else completed?.({ ok: true, value: turn });
         } else if (message.method === "turn/failed")
           completed?.({
             ok: false,
-            error: String(asObject(params.error).message ?? "Codex turn failed"),
+            error: JSON.stringify(params.error ?? "Codex turn failed"),
           });
       });
       const started = await transport.request("turn/start", {
@@ -682,6 +712,10 @@ export class CodexAppServerHarness {
       unsubscribe();
       if (!result.ok)
         return {
+          ...session(),
+          ...(!input.signal?.aborted && providerLimit(result.error)
+            ? { stopReason: providerLimit(result.error) }
+            : {}),
           status: input.signal?.aborted ? "cancelled" : "failed",
           error: result.error,
           usage,
@@ -693,6 +727,7 @@ export class CodexAppServerHarness {
       const final = finalCodexText(turn) ?? messages.lastAssistantText;
       if (!final)
         return {
+          ...session(),
           status: "failed",
           error: "Codex turn has no final agent message",
           usage,
@@ -703,6 +738,7 @@ export class CodexAppServerHarness {
         const validation = validateJsonSchema(output, input.outputSchema);
         if (!validation.valid)
           return {
+            ...session(),
             status: "failed",
             error: `invalid-output: ${validation.error}`,
             rawOutput: final,
@@ -710,15 +746,20 @@ export class CodexAppServerHarness {
             events,
           };
       }
-      return { status: "succeeded", output, rawOutput: final, usage, events };
+      return { ...session(), status: "succeeded", output, rawOutput: final, usage, events };
     } catch (cause) {
+      const error = input.signal?.aborted
+        ? "cancelled"
+        : cause instanceof Error
+          ? cause.message
+          : String(cause);
       return {
+        ...session(),
+        ...(!input.signal?.aborted && providerLimit(error)
+          ? { stopReason: providerLimit(error) }
+          : {}),
         status: input.signal?.aborted ? "cancelled" : "failed",
-        error: input.signal?.aborted
-          ? "cancelled"
-          : cause instanceof Error
-            ? cause.message
-            : String(cause),
+        error,
         usage,
         events,
       };
@@ -899,6 +940,7 @@ export class CodexHarnessAdapter implements HarnessAdapter {
         ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
       },
       nativeConfig: input.nativeConfig,
+      resumeSession: input.resumeSession,
       outputSchema: input.outputSchema,
       selection: {
         harness: this.id,

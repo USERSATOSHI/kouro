@@ -142,7 +142,9 @@ export async function compileTask(
     limits: {
       maxScopes: 1 + maxMilestones * largest("scopes"),
       maxInvocations: 4 + maxMilestones * largest("invocations"),
-      maxAttempts: 1 + maxMilestones * largest("attempts"),
+      // Preserve each workflow's declared retry budget, beyond its initial graph effects.
+      maxAttempts:
+        1 + maxMilestones * Math.max(...workflows.map((item) => item.bundle.limits.maxAttempts)),
       maxConcurrentEffects: Math.min(4, maxConcurrent),
       maxRunDurationMs: 24 * 60 * 60 * 1000,
       maxTurns:

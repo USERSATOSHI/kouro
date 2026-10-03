@@ -30,6 +30,8 @@ import type { RuntimeHarness } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harness/scripted.ts";
 import { TrackingHarnessDecorator } from "../adapters/harness/tracking.ts";
+import { providerLimit } from "../adapters/harness/session.ts";
+import { retryPlan } from "./retry-plan.ts";
 import { activityPreview } from "../adapters/harness/activity-preview";
 import {
   CodexAppServerHarness,
@@ -868,7 +870,7 @@ export class Coordinator {
     const view = this.journal.getView(runId);
     if (
       !view ||
-      !["failed", "interrupted"].includes(view.state.status) ||
+      !["running", "paused", "failed", "interrupted"].includes(view.state.status) ||
       ((view.state.control ?? "none") !== "none" &&
         !(view.state.status === "interrupted" && view.state.control === "interrupt-requested"))
     )
@@ -876,23 +878,10 @@ export class Coordinator {
     if (view.state.status === "interrupted" && view.state.control !== "interrupt-requested")
       return false;
     const invocation = view.state.invocations[invocationId];
-    const node = view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.find(
-      (item) => item.id === invocation?.nodeId,
-    );
-    // Retrying a nested/consumed result requires invalidating its dependants.
-    // Admit only failed root effects whose result has not been consumed.
     if (
       !invocation ||
       invocation.status !== "failed" ||
-      invocation.scopeId !== view.state.rootScopeId ||
-      !node ||
-      !["agent", "command"].includes(node.kind) ||
-      Object.values(view.state.invocations).some(
-        (item) => item.sourceInvocationId === invocationId,
-      ) ||
-      view.bundle.definitions[view.bundle.rootDefinitionId]?.nodes.some(
-        (item) => item.kind === "fork" && (item as ForkNode).branchIds.includes(invocation.nodeId),
-      )
+      !retryPlan(view.bundle, view.state, invocationId)
     )
       return false;
     const latest = Object.values(view.state.attempts)
@@ -907,6 +896,106 @@ export class Coordinator {
     return !this.journal.db
       .query("SELECT 1 FROM unconfirmed_harness_shutdowns WHERE run_id = ?1 LIMIT 1")
       .get(runId);
+  }
+
+  /** Older Claude attempts already contain their SDK session ID in retained evidence. */
+  private nativeSession(
+    attempt: import("@kouro/core").AttemptState,
+  ): import("@kouro/core").JsonObject | undefined {
+    const execution = attempt.resolvedExecution;
+    if (!execution || !["claude", "codex"].includes(execution.harness)) return undefined;
+    const reference = attempt.sessionReference;
+    if (
+      reference &&
+      typeof reference === "object" &&
+      !Array.isArray(reference) &&
+      typeof reference.id === "string" &&
+      reference.id
+    )
+      return reference;
+    if (execution.harness !== "claude") return undefined;
+    for (const artifact of attempt.evidence) {
+      if (artifact.mediaType !== "text/plain; charset=utf-8") continue;
+      try {
+        const messages: unknown = JSON.parse(
+          new TextDecoder().decode(this.journal.blobs.read(artifact)),
+        );
+        if (!Array.isArray(messages)) continue;
+        const message = messages.find(
+          (item) => item && typeof item.session_id === "string" && item.session_id,
+        );
+        if (message)
+          return {
+            id: message.session_id,
+            harness: "claude",
+            adapterVersion: execution.adapterVersion,
+          };
+      } catch {
+        /* Other evidence is not an SDK transcript. */
+      }
+    }
+    return undefined;
+  }
+
+  canResume(runId: string): boolean {
+    const view = this.journal.getView(runId);
+    if (!view) return false;
+    if (
+      view.state.status === "paused" &&
+      !Object.values(view.state.invocations).some(
+        (item) => item.status === "failed" && this.providerDeferred(view.state, item.id),
+      )
+    )
+      return true;
+    const failed = Object.values(view.state.invocations).filter(
+      (item) => item.status === "failed" && this.canRetry(runId, item.id),
+    );
+    return (
+      failed.length > 0 &&
+      failed.every((item) => {
+        const latest = Object.values(view.state.attempts)
+          .filter((attempt) => attempt.invocationId === item.id)
+          .sort((a, b) => b.ordinal - a.ordinal)[0];
+        return !!latest && this.continuationAvailable(runId, latest);
+      })
+    );
+  }
+
+  private continuationAvailable(
+    runId: string,
+    attempt: import("@kouro/core").AttemptState,
+  ): boolean {
+    if (!this.nativeSession(attempt)) return false;
+    return this.scouts
+      .requests(runId)
+      .filter(
+        (request) =>
+          request.parentAttemptId === attempt.id && request.state === "failed" && !request.optional,
+      )
+      .every((request) => {
+        const reference = request.sessionReference;
+        return (
+          reference &&
+          typeof reference === "object" &&
+          !Array.isArray(reference) &&
+          typeof reference.id === "string" &&
+          reference.id.length > 0
+        );
+      });
+  }
+
+  private providerDeferred(state: ExecutionState, invocationId: string): boolean {
+    if (providerLimit(state.invocations[invocationId]?.error)) return true;
+    const latest = Object.values(state.attempts)
+      .filter((item) => item.invocationId === invocationId)
+      .sort((a, b) => b.ordinal - a.ordinal)[0];
+    const reference = latest?.sessionReference;
+    return (
+      !!reference &&
+      typeof reference === "object" &&
+      !Array.isArray(reference) &&
+      (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit")
+    );
   }
 
   private normalizeActivity(runId: string, event: HarnessEvent): HarnessEvent {
@@ -1135,7 +1224,12 @@ export class Coordinator {
         log("Attempt budget exhausted", `maximum attempt duration ${timeoutMs}ms reached`);
         return settleAfterStop("budget-exhausted");
       }
-      if (runDeadlineAt !== undefined && now >= runDeadlineAt) {
+      const view = this.journal.getView(input.runId);
+      const currentRunDeadline =
+        view && (view.state.budgetPausedAt || view.state.budgetPausedMs)
+          ? this.runDeadline(view)
+          : runDeadlineAt;
+      if (currentRunDeadline !== undefined && now >= currentRunDeadline) {
         log("Run budget exhausted", "maximum run duration reached");
         return settleAfterStop("run-budget-exhausted");
       }
@@ -1144,7 +1238,6 @@ export class Coordinator {
         log("Tool operation timed out", `${expiredTool} exceeded ${this.operationTimeoutMs}ms`);
         return settleAfterStop("operation-timeout");
       }
-      const view = this.journal.getView(input.runId);
       const suspended =
         view?.state.status === "paused" ||
         Object.values(view?.state.approvals ?? {}).some(
@@ -1215,6 +1308,50 @@ export class Coordinator {
       throw new Error(
         `stale-action: expected revision ${input.expectedRevision}, current revision ${view.revision}`,
       );
+    if (input.action === "resume") {
+      const failed = Object.values(view.state.invocations).filter(
+        (item) => item.status === "failed" && this.canRetry(input.runId, item.id),
+      );
+      if (failed.length) {
+        for (const invocation of failed) {
+          const latest = Object.values(view.state.attempts)
+            .filter((item) => item.invocationId === invocation.id)
+            .sort((a, b) => b.ordinal - a.ordinal)[0]!;
+          if (!this.continuationAvailable(input.runId, latest))
+            throw new Error(
+              "Native session continuation is unavailable for this agent or a failed required subagent; a saved session ID is missing.",
+            );
+        }
+        if (
+          Object.keys(view.state.attempts).length + failed.length >
+          view.bundle.limits.maxAttempts
+        )
+          throw new Error("Continuation would exceed the workflow attempt budget");
+        this.journal.transaction(() => {
+          for (const invocation of failed) {
+            this.retryOnce(
+              {
+                ...input,
+                invocationId: invocation.id,
+                expectedRevision: this.journal.getView(input.runId)!.revision,
+              },
+              false,
+            );
+          }
+        });
+        this.schedule(input.runId);
+        const current = this.journal.getView(input.runId)!;
+        return { revision: current.revision, status: current.state.status };
+      }
+      if (
+        Object.values(view.state.invocations).some(
+          (item) => item.status === "failed" && this.providerDeferred(view.state, item.id),
+        )
+      )
+        throw new Error(
+          "Session continuation is blocked: the failed agent is outside its retry budget or has already been consumed.",
+        );
+    }
     if (view.state.status === "recovery-required") {
       if (input.action !== "cancel")
         throw new Error("Resolve or stop the recovery run before taking this action.");
@@ -1276,7 +1413,10 @@ export class Coordinator {
     }).result;
   }
 
-  private retryOnce(input: Omit<Parameters<Coordinator["retry"]>[0], "idempotencyKey">): {
+  private retryOnce(
+    input: Omit<Parameters<Coordinator["retry"]>[0], "idempotencyKey">,
+    schedule = true,
+  ): {
     revision: number;
     status: string;
   } {
@@ -1307,7 +1447,12 @@ export class Coordinator {
       this.journal.append({
         runId: input.runId,
         type: "run.retried",
-        payload: { invocationId: input.invocationId, sourceAttemptId: source.id, attemptId },
+        payload: {
+          invocationId: input.invocationId,
+          sourceAttemptId: source.id,
+          attemptId,
+          ...retryPlan(view.bundle, view.state, input.invocationId),
+        },
         actor: input.actor,
         subjectId: input.invocationId,
       });
@@ -1318,7 +1463,7 @@ export class Coordinator {
         attemptId,
       );
     });
-    this.schedule(input.runId);
+    if (schedule) this.schedule(input.runId);
     const next = this.journal.getView(input.runId)!;
     return { revision: next.revision, status: next.state.status };
   }
@@ -1411,10 +1556,16 @@ export class Coordinator {
     }
   }
 
+  private runDeadline(view: import("@kouro/core").RunView): number | undefined {
+    if (view.state.budgetPausedAt) return undefined;
+    const startedAt = view.state.startedAt ? Date.parse(view.state.startedAt) : Date.now();
+    return startedAt + view.bundle.limits.maxRunDurationMs + (view.state.budgetPausedMs ?? 0);
+  }
+
   private armRunBudget(runId: string, view: import("@kouro/core").RunView): void {
     if (this.runBudgetTimers.has(runId)) return;
-    const startedAt = view.state.startedAt ? Date.parse(view.state.startedAt) : Date.now();
-    const deadline = startedAt + view.bundle.limits.maxRunDurationMs;
+    const deadline = this.runDeadline(view);
+    if (deadline === undefined) return;
     const timer = setTimeout(() => this.expireRunBudget(runId), Math.max(1, deadline - Date.now()));
     this.runBudgetTimers.set(runId, timer);
   }
@@ -1423,6 +1574,12 @@ export class Coordinator {
     this.runBudgetTimers.delete(runId);
     const view = this.journal.getView(runId);
     if (!view || !["running", "paused"].includes(view.state.status)) return;
+    const deadline = this.runDeadline(view);
+    if (deadline === undefined) return;
+    if (deadline > Date.now()) {
+      this.armRunBudget(runId, view);
+      return;
+    }
     const attemptId = Object.values(view.state.attempts).find(
       (attempt) => attempt.status === "running",
     )?.id;
@@ -2089,6 +2246,12 @@ export class Coordinator {
                 const current = this.journal.getView(runId)?.state.invocations[intent.invocationId];
                 if (current?.status === "failed") {
                   const currentView = this.journal.getView(runId);
+                  // A provider limit pauses admission; it must not cancel healthy siblings.
+                  if (
+                    currentView?.state.status === "paused" &&
+                    this.providerDeferred(currentView.state, current.id)
+                  )
+                    return;
                   const owningGroup = groups.find((group) =>
                     group.expectedBranchIds.includes(intent.invocationId),
                   );
@@ -2799,9 +2962,12 @@ export class Coordinator {
           : [],
         hiddenNativeContext: "unavailable",
       });
-      // Retries/fallbacks are explicitly fresh sessions. Carry only a bounded,
-      // host-labelled handoff; never imply native provider continuation.
-      if (attempt.ordinal > 0) {
+      const previousAttempt = Object.values(state.attempts)
+        .filter((item) => item.invocationId === invocationId && item.ordinal < attempt.ordinal)
+        .sort((a, b) => b.ordinal - a.ordinal)[0];
+      const resumeReference = previousAttempt && this.nativeSession(previousAttempt);
+      // Harnesses without a saved native conversation use an explicit host handoff.
+      if (attempt.ordinal > 0 && !resumeReference) {
         const prepared = await prepareAgentHandoff({
           context: contextManifest,
           handoff: {
@@ -3039,6 +3205,35 @@ export class Coordinator {
         return;
       }
       if (node.effort !== undefined) nativeConfig = { ...nativeConfig, effort: node.effort };
+      const nativeConfigDigest = nativeConfig
+        ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}`
+        : undefined;
+      if (
+        resumeReference &&
+        (selected.capabilities().resume !== "supported" ||
+          previousAttempt?.resolvedExecution?.harness !== resolvedHarness ||
+          previousAttempt.resolvedExecution.adapterVersion !== resolvedVersion ||
+          (resumeReference.cwd !== undefined && resumeReference.cwd !== invocationWorkspaceDir) ||
+          (resumeReference.modelId !== undefined &&
+            resumeReference.modelId !== (resolvedModelId ?? node.modelId)) ||
+          ((resumeReference.nativeConfigDigest ??
+            previousAttempt.resolvedExecution.nativeConfigDigest) !== undefined &&
+            (resumeReference.nativeConfigDigest ??
+              previousAttempt.resolvedExecution.nativeConfigDigest) !== nativeConfigDigest))
+      ) {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [],
+          artifacts: [],
+          evidence: [],
+          output: [],
+          status: "failed",
+          error:
+            "Native session continuation rejected: harness, model, workspace or permissions changed",
+          sessionReference: resumeReference,
+        });
+        return;
+      }
       if (subagentIds.length) {
         const capabilities = selected.capabilities();
         if (
@@ -3106,11 +3301,7 @@ export class Coordinator {
         node.timeoutMs === undefined
           ? undefined
           : Math.max(1, node.timeoutMs - Math.max(0, Date.now() - attemptStartedAt));
-      const runStartedAt = this.journal.getView(runId)?.state.startedAt;
-      const runDeadlineAt =
-        runStartedAt && Number.isFinite(Date.parse(runStartedAt))
-          ? Date.parse(runStartedAt) + bundle.limits.maxRunDurationMs
-          : Date.now() + bundle.limits.maxRunDurationMs;
+      const runDeadlineAt = this.runDeadline(this.journal.getView(runId)!);
       try {
         harnessResult = await this.superviseHarness(
           trackingAdapter,
@@ -3125,6 +3316,7 @@ export class Coordinator {
             delayMs: this.scriptedDelayMs,
             cwd: invocationWorkspaceDir,
             nativeConfig,
+            ...(resumeReference ? { resumeSession: { id: String(resumeReference.id) } } : {}),
             context: contextManifest,
             ...(collaborationGateway && collaborationGrant
               ? {
@@ -3190,6 +3382,10 @@ export class Coordinator {
         this.activityEvents.delete(attemptId);
         return;
       }
+      harnessResult = {
+        ...harnessResult,
+        stopReason: harnessResult.stopReason ?? providerLimit(harnessResult.error),
+      };
       const collaborationSent = Boolean(
         harnessResult.output &&
         typeof harnessResult.output === "object" &&
@@ -3234,6 +3430,27 @@ export class Coordinator {
         if (scoutError) {
           status = "failed";
           error = `scout-acceptance: ${scoutError}`;
+        }
+      }
+      harnessResult.stopReason ??= providerLimit(error);
+      if (status === "failed" && subagentIds.length) {
+        const limitedChild = this.scouts.requests(runId).find((request) => {
+          const reference = request.sessionReference;
+          return (
+            request.parentAttemptId === attemptId &&
+            request.state === "failed" &&
+            !request.optional &&
+            reference &&
+            typeof reference === "object" &&
+            !Array.isArray(reference) &&
+            (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit")
+          );
+        });
+        const reference = limitedChild?.sessionReference;
+        if (reference && typeof reference === "object" && !Array.isArray(reference)) {
+          harnessResult.stopReason ??= reference.stopReason as "usage-limit" | "turn-limit";
+          if (typeof reference.resumeAfter === "string")
+            harnessResult.resumeAfter ??= reference.resumeAfter;
         }
       }
       const secretValues = Object.entries(process.env)
@@ -3289,6 +3506,7 @@ export class Coordinator {
       }
       const retryable =
         status === "failed" &&
+        !harnessResult.stopReason &&
         this.journal.getView(runId)?.state.control === "none" &&
         (harnessResult.status === "unavailable" ||
           error?.startsWith("invalid-output:") ||
@@ -3309,9 +3527,6 @@ export class Coordinator {
               },
             }
           : undefined;
-      const nativeConfigDigest = nativeConfig
-        ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}`
-        : undefined;
       const allEvents = [...harnessResult.events, ...(this.activityEvents.get(attemptId) ?? [])];
       const uniqueEvents = [...new Map(allEvents.map((event) => [json(event), event])).values()];
       const durableEvents = redactSecrets(
@@ -3320,40 +3535,67 @@ export class Coordinator {
       ) as readonly import("@kouro/core").JsonValue[];
       if (status === "succeeded" && registeredWorkspace && this.workspaceAdapter)
         this.snapshots.set(runId, await this.workspaceAdapter.snapshot(registeredWorkspace));
-      this.journal.completeEffect({
-        effectId: detail.id,
-        storedArtifacts,
-        artifacts: [],
-        evidence: evidenceRefs,
-        output: outputRefs,
-        status,
-        ...(safeError ? { error: safeError } : {}),
-        diagnostics: [
-          harnessResult.error
-            ? String(redactSecrets(harnessResult.error, secretValues))
-            : undefined,
-        ].filter((item): item is string => Boolean(item)),
-        resolvedExecution: {
-          role: node.role,
-          harness: resolvedHarness,
-          adapterVersion: resolvedVersion,
-          ...(resolvedModelId ? { modelId: resolvedModelId } : {}),
-          ...(nativeConfigDigest ? { nativeConfigDigest } : {}),
-          ...(node.effort === undefined ? {} : { effort: node.effort }),
-        },
-        harnessEvents: durableEvents,
-        usage: harnessResult.usage,
-        contextManifest: JSON.parse(JSON.stringify(contextManifest)),
-        sessionReference: {
-          continuation: "fresh-session",
-          handoff: "fresh",
-          nativeContinuation: "unavailable",
-          ...(profile === "codex-readonly" || profile === "codex-workspace-write"
-            ? { reason: "codex-native-resume-unsupported" }
-            : {}),
-          capabilities: selected.capabilities(),
-        },
-        ...(retry ? { retry } : {}),
+      this.journal.transaction(() => {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts,
+          artifacts: [],
+          evidence: evidenceRefs,
+          output: outputRefs,
+          status,
+          ...(safeError ? { error: safeError } : {}),
+          diagnostics: [
+            harnessResult.error
+              ? String(redactSecrets(harnessResult.error, secretValues))
+              : undefined,
+          ].filter((item): item is string => Boolean(item)),
+          resolvedExecution: {
+            role: node.role,
+            harness: resolvedHarness,
+            adapterVersion: resolvedVersion,
+            ...((resolvedModelId ?? node.modelId)
+              ? { modelId: resolvedModelId ?? node.modelId }
+              : {}),
+            ...(nativeConfigDigest ? { nativeConfigDigest } : {}),
+            ...(node.effort === undefined ? {} : { effort: node.effort }),
+          },
+          harnessEvents: durableEvents,
+          usage: harnessResult.usage,
+          contextManifest: JSON.parse(JSON.stringify(contextManifest)),
+          sessionReference: {
+            continuation: resumeReference ? "native-resume" : "fresh-session",
+            nativeContinuation: harnessResult.session ? "available" : "unavailable",
+            ...(harnessResult.session
+              ? {
+                  id: harnessResult.session.id,
+                  harness: resolvedHarness,
+                  adapterVersion: resolvedVersion,
+                  cwd: invocationWorkspaceDir,
+                  ...((resolvedModelId ?? node.modelId)
+                    ? { modelId: resolvedModelId ?? node.modelId }
+                    : {}),
+                  ...(nativeConfigDigest ? { nativeConfigDigest } : {}),
+                }
+              : {}),
+            ...(harnessResult.stopReason ? { stopReason: harnessResult.stopReason } : {}),
+            ...(harnessResult.resumeAfter ? { resumeAfter: harnessResult.resumeAfter } : {}),
+            capabilities: selected.capabilities(),
+          },
+          ...(retry ? { retry } : {}),
+        });
+        if (
+          status === "failed" &&
+          harnessResult.stopReason &&
+          this.journal.getView(runId)?.state.status === "running" &&
+          this.journal.getView(runId)?.state.control === "none"
+        ) {
+          this.journal.append({
+            runId,
+            type: "run.paused",
+            payload: { reason: harnessResult.stopReason, invocationId },
+            actor: "system",
+          });
+        }
       });
       this.activityEvents.delete(attemptId);
       return;
@@ -3628,6 +3870,72 @@ export class Coordinator {
     return this.scouts.invoke({
       ...input,
       runner: async (request, signal) => {
+        const previousParent = Object.values(view.state.attempts)
+          .filter(
+            (attempt) =>
+              attempt.invocationId === input.parentInvocationId &&
+              attempt.id !== input.parentAttemptId,
+          )
+          .sort((a, b) => b.ordinal - a.ordinal)[0];
+        const continuingParent = previousParent && this.nativeSession(previousParent);
+        const prior = continuingParent
+          ? this.scouts
+              .requests(input.runId)
+              .filter(
+                (candidate) =>
+                  candidate.parentInvocationId === input.parentInvocationId &&
+                  candidate.parentAttemptId !== input.parentAttemptId &&
+                  candidate.scoutId === input.scoutId &&
+                  canonicalize(candidate.input) === canonicalize(request.input),
+              )
+              .at(-1)
+          : undefined;
+        if (prior?.state === "succeeded" && prior.result !== undefined) {
+          this.recordHarnessActivity(input.runId, input.parentInvocationId, input.parentAttemptId, {
+            type: "log",
+            at: now(),
+            data: {
+              status: "Reused completed subagent output",
+              scoutId: input.scoutId,
+              requestId: input.requestId,
+            },
+          });
+          return prior.result as JsonValue;
+        }
+        const reference = prior?.sessionReference;
+        const childResume =
+          reference &&
+          typeof reference === "object" &&
+          !Array.isArray(reference) &&
+          typeof reference.id === "string"
+            ? reference
+            : undefined;
+        if (prior && !childResume)
+          throw new Error(
+            "Subagent native session continuation is unavailable; the failed child has no saved session ID",
+          );
+        const childNativeConfig = {
+          toolPolicy: { write: false, terminal: false, network: false, child: true },
+          ...(childAgent.effort === undefined ? {} : { effort: childAgent.effort }),
+          ...(childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : {}),
+          ...(childAdapter.id === "codex" ? { sandbox: "read-only" } : {}),
+        };
+        const childModel =
+          childAgent.modelId ??
+          (childAdapter.id === input.adapter.id ? input.parentModelId : undefined);
+        const childConfigDigest = `sha256:${await sha256Hex(canonicalize(childNativeConfig))}`;
+        if (
+          childResume &&
+          (childAdapter.capabilities().resume !== "supported" ||
+            childResume.harness !== childAdapter.id ||
+            childResume.adapterVersion !== childAdapter.adapterVersion ||
+            childResume.cwd !== input.cwd ||
+            childResume.modelId !== (childModel ?? null) ||
+            childResume.nativeConfigDigest !== childConfigDigest)
+        )
+          throw new Error(
+            "Subagent session continuation rejected: harness, model, workspace or permissions changed",
+          );
         const segments = Object.entries(request.input).map(([name, value]) => {
           const content = JSON.stringify(value);
           return {
@@ -3698,10 +4006,7 @@ export class Coordinator {
           (event) => this.normalizeActivity(input.runId, event),
         );
         try {
-          const childRunDeadline =
-            view.state.startedAt && Number.isFinite(Date.parse(view.state.startedAt))
-              ? Date.parse(view.state.startedAt) + view.bundle.limits.maxRunDurationMs
-              : Date.now() + view.bundle.limits.maxRunDurationMs;
+          const childRunDeadline = this.runDeadline(this.journal.getView(input.runId)!);
           const result = await this.superviseHarness(
             trackedChild,
             {
@@ -3713,17 +4018,13 @@ export class Coordinator {
               ...(outputSchema ? { outputSchema } : {}),
               delayMs: this.scriptedDelayMs,
               cwd: input.cwd,
+              ...(childResume ? { resumeSession: { id: String(childResume.id) } } : {}),
               ...(childAgent.modelId
                 ? { modelId: childAgent.modelId }
                 : childAdapter.id === input.adapter.id && input.parentModelId
                   ? { modelId: input.parentModelId }
                   : {}),
-              nativeConfig: {
-                toolPolicy: { write: false, terminal: false, network: false, child: true },
-                ...(childAgent.effort === undefined ? {} : { effort: childAgent.effort }),
-                ...(childAdapter.id === "claude" ? { permissionMode: "dontAsk" } : {}),
-                ...(childAdapter.id === "codex" ? { sandbox: "read-only" } : {}),
-              },
+              nativeConfig: childNativeConfig,
               context,
               signal: childAborter.signal,
               onEvent: () => undefined,
@@ -3750,6 +4051,23 @@ export class Coordinator {
           );
           if (!result)
             throw new Error("subagent cancellation was not confirmed; parent requires recovery");
+          if (result.session || result.stopReason)
+            this.scouts.recordSession(
+              input.runId,
+              input.parentAttemptId,
+              input.requestId,
+              {
+                ...(result.session ? { id: result.session.id } : {}),
+                harness: childAdapter.id,
+                adapterVersion: childAdapter.adapterVersion,
+                cwd: input.cwd,
+                modelId: childModel ?? null,
+                nativeConfigDigest: childConfigDigest,
+                ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+                ...(result.resumeAfter ? { resumeAfter: result.resumeAfter } : {}),
+              },
+              result.usage,
+            );
           if (result.status !== "succeeded" || result.output === undefined)
             throw new Error(result.error ?? `scout harness ${result.status}`);
           return result.output;

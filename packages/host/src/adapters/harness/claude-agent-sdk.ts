@@ -20,6 +20,7 @@ import type { HarnessAdapter } from "../../types.ts";
 import { parseStructuredOutput } from "./structured-output.ts";
 import { ClaudeMessages } from "./claude-messages.ts";
 import { claudeDisallowedTools, nativeToolPolicy } from "./tool-policy.ts";
+import { providerLimit } from "./session.ts";
 
 export const claudeSdkDescriptor: HarnessDescriptor = {
   id: "claude",
@@ -29,7 +30,7 @@ export const claudeSdkDescriptor: HarnessDescriptor = {
   capabilities: {
     "structured-output": { state: "supported" },
     cancel: { state: "supported" },
-    resume: { state: "unsupported" },
+    resume: { state: "supported" },
     reattach: { state: "unsupported" },
     tools: {
       state: "conditional",
@@ -94,7 +95,11 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     const context = input.context
       ? `\n\n[KOURO_CONTEXT]\n${JSON.stringify(input.context)}\n[/KOURO_CONTEXT]`
       : "";
-    const prompt = `${input.prompt}${context}`;
+    const prompt = `${input.resumeSession ? "Continue the existing session's unfinished work. Preserve completed research and outputs.\n\n" : ""}${input.prompt}${context}`;
+    let sessionId = input.resumeSession?.id;
+    let usageLimited = false;
+    let resumeAfter: string | undefined;
+    const session = () => (sessionId ? { session: { id: sessionId } } : {});
     const policy = nativeToolPolicy(input.nativeConfig);
     const disallowedTools = claudeDisallowedTools(policy);
     const scoutTool = input.context?.tools.find((candidate) => candidate.name === "subagent");
@@ -165,7 +170,8 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
           : { behavior: "allow", updatedInput: args },
       settings: { permissions: { blockReadsOutsideWorkingDirectories: true } },
       settingSources: [],
-      maxTurns: 30,
+      ...(input.resumeSession ? { resume: input.resumeSession.id } : {}),
+      persistSession: true,
       stderr: (data) => {
         stderr += data;
       },
@@ -187,6 +193,29 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     try {
       for await (const message of this.queryProvider({ prompt, options })) {
         messages.push(message);
+        if (message.type === "assistant" && message.error === "rate_limit") usageLimited = true;
+        if (message.type === "rate_limit_event" && message.rate_limit_info.status === "rejected") {
+          usageLimited = true;
+          const resetsAt = message.rate_limit_info.resetsAt;
+          if (resetsAt && Number.isFinite(resetsAt))
+            resumeAfter = new Date(resetsAt * 1000).toISOString();
+        }
+        if (
+          "session_id" in message &&
+          typeof message.session_id === "string" &&
+          message.session_id
+        ) {
+          if (input.resumeSession && message.session_id !== input.resumeSession.id)
+            throw new Error("Claude resumed a different native session");
+          if (sessionId !== message.session_id) {
+            sessionId = message.session_id;
+            input.onEvent?.({
+              type: "log",
+              at: new Date().toISOString(),
+              data: { status: "Native session", sessionId },
+            });
+          }
+        }
         activity.consume(message);
         if (message.type === "result") resultMessage = message;
       }
@@ -194,9 +223,23 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
       if (timer) clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       const cancelled = input.signal?.aborted === true;
+      const error = cancelled
+        ? "cancelled"
+        : resultMessage && resultMessage.subtype !== "success"
+          ? resultMessage.errors.join("\n") || `Claude SDK ended with ${resultMessage.subtype}`
+          : cause instanceof Error
+            ? cause.message
+            : String(cause);
       return {
+        ...session(),
+        ...(!cancelled && (usageLimited || providerLimit(error))
+          ? {
+              stopReason: usageLimited ? ("usage-limit" as const) : providerLimit(error),
+              ...(resumeAfter ? { resumeAfter } : {}),
+            }
+          : {}),
         status: cancelled ? "cancelled" : "failed",
-        error: cancelled ? "cancelled" : cause instanceof Error ? cause.message : String(cause),
+        error,
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
@@ -207,6 +250,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     input.signal?.removeEventListener("abort", abort);
     if (abortController.signal.aborted) {
       return {
+        ...session(),
         status: input.signal?.aborted ? "cancelled" : "failed",
         error: input.signal?.aborted
           ? "cancelled"
@@ -219,10 +263,18 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
     }
     if (resultMessage?.subtype !== "success") {
       const errors = resultMessage?.errors ?? [];
+      const error =
+        errors.join("\n") || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`;
       return {
+        ...session(),
+        ...(usageLimited || providerLimit(error)
+          ? {
+              stopReason: usageLimited ? ("usage-limit" as const) : providerLimit(error),
+              ...(resumeAfter ? { resumeAfter } : {}),
+            }
+          : {}),
         status: "failed",
-        error:
-          errors.join("\n") || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`,
+        error,
         stderr,
         rawOutput: JSON.stringify(messages),
         usage: JSON.parse(JSON.stringify(usageFrom(resultMessage))) as JsonValue,
@@ -238,6 +290,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
       const validation = validateJsonSchema(parsed, input.outputSchema);
       if (!validation.valid)
         return {
+          ...session(),
           status: "failed",
           error: `invalid-output: ${validation.error}`,
           stderr,
@@ -247,6 +300,7 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         };
     }
     return {
+      ...session(),
       status: "succeeded",
       output: parsed,
       stderr,

@@ -70,6 +70,12 @@ The dashboard link appears as `Kouro workbench: ...` in the terminal (stderr).
 Startup and result JSON also include `dashboardUrl`, linking
 directly to the task. From the same project, `kouro serve` prints the active URL.
 
+Claude and Codex tasks pause when an agent hits a provider usage limit. After the
+limit resets, `kouro task resume RUN_ID` or the dashboard's Resume action continues
+saved native sessions. Completed agents and subagent outputs are retained. Session
+continuation requires the provider's local transcript on the same host; Kouro
+reports unavailable continuation instead of silently starting a new conversation.
+
 ```sh
 bun run kouro --help
 bun run typecheck

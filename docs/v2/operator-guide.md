@@ -49,8 +49,20 @@ combined plan below both model sessions.
 | Claimed command or provider effect with uncertain outcome | Reconcile against the recorded operation and workspace before retrying. Do not assume it failed. |
 | Pending human approval | Decide again against the current binding/revision; a fork requires fresh approval. |
 | Failed invocation with a retry policy | Retry creates a new attempt of the same logical invocation. |
+| Claude or Codex provider usage limit | Wait for the provider reset, then Resume. Saved native sessions continue; successful sibling outputs remain available. |
 | Paused and drained Git-backed run | Capture a checkpoint, then fork an identical retained tree into distinct worktrees. |
 | External side effect outside Git/workspace | Verify externally; a checkpoint is not a rewind or compensation mechanism. |
+
+For workflow tasks, use `kouro task status RUN_ID` to inspect `resumeAvailable`
+and `failedInvocations`, then `kouro task resume RUN_ID` from the same project.
+Resume is operator initiated; Kouro does not poll or automatically spend new
+provider quota after a reset. Claude and Codex retain their transcripts locally,
+so continuation uses the original host and workspace. Changed harness/model or
+permissions, consumed effects, exhausted attempt budgets, and missing transcripts
+can prevent continuation. Older Claude failures can recover their session ID from
+retained SDK evidence; older Codex runs without a saved thread ID cannot.
+Time spent waiting on a provider limit does not consume the run duration budget;
+each attempt still obeys its declared timeout.
 
 Checkpoint eligibility in the web UI lists the exact failed predicates. The
 current materializer supports the validated same-bundle root-scope prefix path;

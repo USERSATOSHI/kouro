@@ -2224,6 +2224,14 @@ export class Journal {
 
   private updateEntityTables(event: LifecycleEvent, bundle: Bundle): void {
     if (event.type === "run.retried") {
+      for (const id of event.payload.discardedInvocationIds ?? [])
+        this.db.query("DELETE FROM invocations WHERE id = ?1 AND run_id = ?2").run(id, event.runId);
+      for (const id of event.payload.reopenedInvocationIds ?? [])
+        this.db
+          .query(
+            "UPDATE invocations SET state = 'pending', ended_at = NULL, error = NULL, output_artifact_ids_json = '[]' WHERE id = ?1 AND run_id = ?2",
+          )
+          .run(id, event.runId);
       this.db
         .query(
           "UPDATE invocations SET state = 'running', ended_at = NULL, error = NULL, output_artifact_ids_json = '[]' WHERE id = ?1 AND run_id = ?2",

@@ -156,10 +156,16 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       return recoveryRequired(next, event);
     case "run.paused":
       if (next.status !== "running") throw new Error(`Run cannot pause from ${next.status}`);
-      return { ...next, status: "paused" };
+      return {
+        ...next,
+        status: "paused",
+        ...(["usage-limit", "turn-limit"].includes(event.payload.reason ?? "")
+          ? { budgetPausedAt: event.recordedAt }
+          : {}),
+      };
     case "run.resumed":
       if (next.status !== "paused") throw new Error(`Run cannot resume from ${next.status}`);
-      return { ...next, status: "running" };
+      return { ...next, ...resumedBudget(next, event.recordedAt), status: "running" };
     case "run.cancel.requested":
       if (!["running", "paused", "recovery-required"].includes(next.status))
         throw new Error(`Run cannot cancel from ${next.status}`);
@@ -173,7 +179,7 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       if (next.status === "interrupted" && next.control !== "interrupt-requested")
         throw new Error("Interrupted recovery requires a recorded interrupt request");
       if (
-        !["running", "failed", "interrupted"].includes(next.status) ||
+        !["running", "paused", "failed", "interrupted"].includes(next.status) ||
         ((next.control ?? "none") !== "none" &&
           !(next.status === "interrupted" && next.control === "interrupt-requested"))
       )
@@ -189,17 +195,56 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       )
         throw new Error("Retry source attempt is not failed");
       if (next.attempts[event.payload.attemptId]) throw new Error("Retry attempt already exists");
+      const invocations = { ...next.invocations };
+      for (const id of event.payload.discardedInvocationIds ?? []) {
+        if (
+          !invocations[id] ||
+          Object.values(next.attempts).some((attempt) => attempt.invocationId === id)
+        )
+          throw new Error("Retry cannot discard an effect invocation");
+        delete invocations[id];
+      }
+      for (const id of event.payload.reopenedInvocationIds ?? []) {
+        const item = invocations[id];
+        if (
+          !item ||
+          item.status === "succeeded" ||
+          Object.values(next.attempts).some((attempt) => attempt.invocationId === id)
+        )
+          throw new Error("Retry cannot reopen a completed effect");
+        invocations[id] = {
+          ...item,
+          status: "pending",
+          completedAt: null,
+          outcome: null,
+          error: undefined,
+          output: [],
+          evidence: [],
+          artifacts: [],
+        };
+      }
+      const scopes = { ...next.scopes };
+      for (const id of event.payload.reopenedScopeIds ?? []) {
+        if (!scopes[id]) throw new Error("Retry scope is unavailable");
+        scopes[id] = { ...scopes[id]!, status: "running" };
+      }
+      const forkGroups = { ...next.forkGroups };
+      for (const id of event.payload.reopenedForkGroupIds ?? []) {
+        if (forkGroups[id])
+          forkGroups[id] = { ...forkGroups[id]!, status: "running", joined: false };
+      }
       return {
         ...next,
+        ...resumedBudget(next, event.recordedAt),
         status: "running",
         control: "none",
         finishedAt: null,
         scopes: {
-          ...next.scopes,
+          ...scopes,
           [next.rootScopeId]: { ...next.scopes[next.rootScopeId]!, status: "running" },
         },
         invocations: {
-          ...next.invocations,
+          ...invocations,
           [invocation.id]: {
             ...invocation,
             status: "running",
@@ -211,11 +256,24 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
             artifacts: [],
           },
         },
+        forkGroups,
       };
     }
     default:
       return assertNever(event);
   }
+}
+
+function resumedBudget(state: ExecutionState, resumedAt: string) {
+  const suspendedAt =
+    state.budgetPausedAt ??
+    (["failed", "interrupted"].includes(state.status) ? state.finishedAt : null);
+  return {
+    budgetPausedAt: null,
+    budgetPausedMs:
+      (state.budgetPausedMs ?? 0) +
+      (suspendedAt ? Math.max(0, Date.parse(resumedAt) - Date.parse(suspendedAt)) : 0),
+  };
 }
 
 /** Only declared, bounded feedback returns are eligible for an operator repair. */

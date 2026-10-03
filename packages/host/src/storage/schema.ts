@@ -277,6 +277,7 @@ export function migrate(db: Database): void {
       deadline_at TEXT,
       dispatch_id TEXT,
       usage_json TEXT NOT NULL DEFAULT '{}',
+      session_reference_json TEXT,
       ordinal INTEGER NOT NULL,
       optional INTEGER NOT NULL DEFAULT 0,
       state TEXT NOT NULL,
@@ -413,6 +414,7 @@ export function migrate(db: Database): void {
     "ALTER TABLE scout_requests ADD COLUMN deadline_at TEXT",
     "ALTER TABLE scout_requests ADD COLUMN dispatch_id TEXT",
     "ALTER TABLE scout_requests ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE scout_requests ADD COLUMN session_reference_json TEXT",
     "ALTER TABLE scout_requests ADD COLUMN result_digest TEXT",
   ]) {
     try {
@@ -449,7 +451,7 @@ export function migrate(db: Database): void {
         request_digest TEXT NOT NULL, input_digest TEXT NOT NULL DEFAULT '',
         child_definition_id TEXT NOT NULL DEFAULT '', child_agent_id TEXT NOT NULL DEFAULT '',
         effective_harness TEXT, model_id TEXT, workspace_id TEXT, deadline_at TEXT,
-        dispatch_id TEXT, usage_json TEXT NOT NULL DEFAULT '{}', ordinal INTEGER NOT NULL,
+        dispatch_id TEXT, usage_json TEXT NOT NULL DEFAULT '{}', session_reference_json TEXT, ordinal INTEGER NOT NULL,
         optional INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, result_json TEXT,
         result_artifact_id TEXT, result_digest TEXT, error TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,

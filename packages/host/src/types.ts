@@ -166,6 +166,8 @@ export interface HarnessAdapter {
     cwd?: string;
     modelId?: string;
     nativeConfig?: import("@kouro/core").JsonObject;
+    /** Continue this specific native conversation; never choose the latest session. */
+    resumeSession?: { readonly id: string };
     context?: import("@kouro/core").ContextManifest;
     /** Host-owned, optional collaboration tools. The harness never supplies sender identity. */
     collaboration?: CollaborationTools;
@@ -173,6 +175,9 @@ export interface HarnessAdapter {
     onEvent?: (event: import("@kouro/core").HarnessEvent) => void;
   }): Promise<{
     output?: import("@kouro/core").JsonValue;
+    session?: { readonly id: string };
+    stopReason?: "usage-limit" | "turn-limit";
+    resumeAfter?: string;
     rawOutput?: string;
     stderr?: string;
     status: "succeeded" | "failed" | "cancelled" | "unavailable";
@@ -239,6 +244,7 @@ export interface ScoutRequest {
   readonly deadlineAt?: string;
   readonly dispatchId?: string;
   readonly usage?: unknown;
+  readonly sessionReference?: import("@kouro/core").JsonValue;
   readonly error?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
