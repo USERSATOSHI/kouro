@@ -25,7 +25,8 @@ Run options:
 Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
 Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
 Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
-Without a running host, execution prints a temporary dashboard URL to stderr.
+Execution prints its dashboard URL to stderr. JSON records include dashboardUrl.
+Without a running host, the dashboard is temporary and lasts until the command returns.
 `;
 
 const valueOptions = new Set([

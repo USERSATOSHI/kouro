@@ -61642,7 +61642,8 @@ Run options:
 Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
 Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
 Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
-Without a running host, execution prints a temporary dashboard URL to stderr.
+Execution prints its dashboard URL to stderr. JSON records include dashboardUrl.
+Without a running host, the dashboard is temporary and lasts until the command returns.
 `;
 var valueOptions = new Set([
   "--task",
@@ -65473,11 +65474,13 @@ ${usage}`);
       const dataDir2 = resolve7(args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve7(project2, ".kouro-data"));
       const connection = await findHost(dataDir2);
       if (connection) {
+        const url3 = dashboardUrl(connection);
+        if (args.command !== "workflows")
+          process.stderr.write(`Kouro workbench: ${url3}
+Data: ${dataDir2}
+`);
         const forwarded = argv.slice(1).map((argument, index, arguments_) => argument.startsWith("--workspace=") ? `--workspace=${project2}` : arguments_[index - 1] === "--workspace" ? project2 : argument);
-        return await connectedTaskCommand(connection, [
-          ...forwarded,
-          ...args.get("--workspace") ? [] : ["--workspace", project2]
-        ]);
+        return await connectedTaskCommand(connection, [...forwarded, ...args.get("--workspace") ? [] : ["--workspace", project2]], taskOutput(url3));
       }
       taskService = new ApplicationService({
         dataDir: dataDir2,
@@ -65503,7 +65506,7 @@ ${usage}`);
 Data: ${dataDir2}
 `);
       }
-      return await taskCommand(args, taskService);
+      return await taskCommand(args, taskService, taskOutput(taskHost ? dashboardUrl({ url: `http://127.0.0.1:${taskHost.port}`, token: taskHost.token }) : undefined));
     } catch (cause) {
       process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
 `);
@@ -65723,6 +65726,20 @@ Then open the workbench URL above in your local browser. Keep the tunnel running
     close();
   });
   return 0;
+}
+function taskOutput(url2) {
+  return (value) => {
+    if (url2 && value && typeof value === "object" && !Array.isArray(value)) {
+      const record4 = value;
+      if (typeof record4.runId === "string") {
+        const link = new URL(url2);
+        link.searchParams.set("run", record4.runId);
+        value = { ...record4, dashboardUrl: link.href };
+      }
+    }
+    process.stdout.write(`${JSON.stringify(value)}
+`);
+  };
 }
 function webStaticRoot() {
   return firstExistingPath([

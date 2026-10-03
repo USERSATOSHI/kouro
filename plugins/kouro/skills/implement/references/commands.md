@@ -111,5 +111,10 @@ server does not mean a workflow completed. Keep pairing tokens private.
 Successful repository execution produces a private run workspace. Validate
 that result and use Kouro's existing Delivery flow for integration when
 authorized. Do not invent a CLI `deliver` command or silently merge/release it.
+When CLI output includes `dashboardUrl`, include that link in the user-facing
+progress report so the user can open the task's live dashboard. The terminal
+also prints `Kouro workbench: ...` on stderr, including when connecting to an
+existing host. `kouro serve` from the same project prints the active URL.
+
 Report executed commands, run IDs, actual results, pending gates and remaining
 recovery or delivery actions. Fixture success is not a live-provider claim.

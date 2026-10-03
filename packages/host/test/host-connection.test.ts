@@ -127,6 +127,7 @@ test("a real CLI task uses the running dashboard, remains observable and cancels
     const statusOutput = await new Response(status.stdout).text();
     expect(await status.exited).toBe(0);
     expect(JSON.parse(statusOutput).runId).toBe(run.runId);
+    expect(new URL(JSON.parse(statusOutput).dashboardUrl).searchParams.get("run")).toBe(run.runId);
     const other = await service.createTask({
       task: "Unrelated dashboard work",
       workflowIds: ["task-fixture"],
@@ -139,8 +140,11 @@ test("a real CLI task uses the running dashboard, remains observable and cancels
     expect(await child.exited).toBe(130);
     await until(() => service.getView(run.runId)?.state.status === "cancelled");
     expect(service.getView(other.runId)?.state.status).toBe("running");
-    expect(await error).toBe("");
-    expect(JSON.parse((await output).trim().split("\n")[0]!)).toMatchObject({
+    expect(await error).toContain(dashboardUrl(connection));
+    const started = JSON.parse((await output).trim().split("\n")[0]!);
+    expect(new URL(started.dashboardUrl).searchParams.get("run")).toBe(run.runId);
+    expect(new URL(started.dashboardUrl).hash).toBe(new URL(dashboardUrl(connection)).hash);
+    expect(started).toMatchObject({
       event: "task.started",
       runId: run.runId,
     });
@@ -197,7 +201,13 @@ test("a task started before the dashboard publishes a live URL and serve attache
     expect(await serve.exited).toBe(0);
     expect(await child.exited).toBe(0);
     expect(await error).toContain(dashboardUrl(connection));
-    expect(JSON.parse((await output).trim().split("\n").at(-1)!)).toMatchObject({
+    const records = (await output)
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(records[0].dashboardUrl).toBe(records.at(-1).dashboardUrl);
+    expect(new URL(records[0].dashboardUrl).searchParams.get("run")).toBe(records[0].runId);
+    expect(records.at(-1)).toMatchObject({
       status: "succeeded",
     });
     expect(await Bun.file(join(dataDir, "host.json")).exists()).toBe(false);

@@ -45,9 +45,10 @@ test("a task launched by the actual CLI appears in an already open dashboard", a
         }),
     ),
   );
-  expect(error).toBe("");
+  expect(error).toContain("Kouro workbench: http://127.0.0.1:");
   expect(code).toBe(3);
   const report = JSON.parse(output.trim().split("\n").at(-1)!);
+  expect(new URL(report.dashboardUrl).searchParams.get("run")).toBe(report.runId);
   expect(report.waitingForApproval).toBe(true);
   const row = page.getByRole("button", { name: /CLI dashboard visibility marke/ });
   await expect(row).toBeVisible();

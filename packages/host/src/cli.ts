@@ -100,6 +100,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       );
       const connection = await findHost(dataDir);
       if (connection) {
+        const url = dashboardUrl(connection);
+        if (args.command !== "workflows")
+          process.stderr.write(`Kouro workbench: ${url}\nData: ${dataDir}\n`);
         const forwarded = argv
           .slice(1)
           .map((argument, index, arguments_) =>
@@ -109,10 +112,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
                 ? project
                 : argument,
           );
-        return await connectedTaskCommand(connection, [
-          ...forwarded,
-          ...(args.get("--workspace") ? [] : ["--workspace", project]),
-        ]);
+        return await connectedTaskCommand(
+          connection,
+          [...forwarded, ...(args.get("--workspace") ? [] : ["--workspace", project])],
+          taskOutput(url),
+        );
       }
       taskService = new ApplicationService({
         dataDir,
@@ -138,7 +142,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           `Kouro workbench: ${dashboardUrl(hostConnection)}\nData: ${dataDir}\n`,
         );
       }
-      return await taskCommand(args, taskService);
+      return await taskCommand(
+        args,
+        taskService,
+        taskOutput(
+          taskHost
+            ? dashboardUrl({ url: `http://127.0.0.1:${taskHost.port}`, token: taskHost.token })
+            : undefined,
+        ),
+      );
     } catch (cause) {
       process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
       return 1;
@@ -372,6 +384,21 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     void close();
   });
   return 0;
+}
+
+/** Keep stdout as JSON while making the current run's dashboard discoverable. */
+function taskOutput(url?: string) {
+  return (value: unknown) => {
+    if (url && value && typeof value === "object" && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      if (typeof record.runId === "string") {
+        const link = new URL(url);
+        link.searchParams.set("run", record.runId);
+        value = { ...record, dashboardUrl: link.href };
+      }
+    }
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+  };
 }
 
 function webStaticRoot() {

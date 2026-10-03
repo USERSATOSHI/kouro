@@ -105,6 +105,9 @@ and a stable creation key. Keep long-running commands in the caller's managed
 job mechanism and await their result. Inspect the existing run after an
 uncertain response instead of creating duplicate work.
 
+When task output includes `dashboardUrl`, share that link in the first progress
+update so the user can open the live task. Keep it in the final task report too.
+
 Report pending gates and their current revision, binding digest and invocation
 ID. Use the user's decision for that specific gate, including decisions already
 authorized in the session. A broad implementation request does not implicitly

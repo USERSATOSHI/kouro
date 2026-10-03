@@ -66,6 +66,10 @@ runs. If the CLI starts first, it prints a temporary dashboard URL to stderr;
 first for a persistent dashboard. After updating Kouro, restart the dashboard
 once so CLI commands can connect.
 
+The dashboard link appears as `Kouro workbench: ...` in the terminal (stderr).
+Startup and result JSON also include `dashboardUrl`, linking
+directly to the task. From the same project, `kouro serve` prints the active URL.
+
 ```sh
 bun run kouro --help
 bun run typecheck
