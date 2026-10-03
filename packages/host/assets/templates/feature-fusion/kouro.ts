@@ -1,5 +1,5 @@
 import { WorkflowBuilder } from "@kouro/core";
-import { Summary, Task } from "./schemas/schema.ts";
+import { Summary, Task, Review } from "./schemas/schema.ts";
 const firstPrompt = await Bun.file(new URL("./prompts/planner-a.md", import.meta.url)).text();
 const secondPrompt = await Bun.file(new URL("./prompts/planner-b.md", import.meta.url)).text();
 const reviewPrompt = await Bun.file(new URL("./prompts/review.md", import.meta.url)).text();
@@ -7,7 +7,7 @@ const revisionPrompt = await Bun.file(new URL("./prompts/revise.md", import.meta
 const fusionPrompt = await Bun.file(new URL("./prompts/fusion.md", import.meta.url)).text();
 // Each round cross-reviews the latest plans, then revises both plans in parallel.
 // Set to 0 for initial drafts followed directly by synthesis; supported range: 0-10.
-const reviewRounds = 2;
+const reviewRounds = 1;
 // Configure each model once; its draft, reviews and revisions use the same selection.
 const models = {
   a: { modelId: "model-a" },
@@ -38,7 +38,7 @@ const fusion = workflow
   .fusion("planners", {
     task,
     rounds: reviewRounds,
-    reviewProduces: Summary,
+    reviewProduces: Review,
     reviewPrompt,
     revisionPrompt,
     synthesis: synthesizer,

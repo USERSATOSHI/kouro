@@ -66,23 +66,23 @@ describe("workflow template catalog", () => {
       expect.arrayContaining([expect.objectContaining({ id: "planners", kind: "call" })]),
     );
     const fusionStages = fusion.bundle.definitions["catalog-fusion:planners"]!;
-    expect(fusionStages.nodes.filter((node) => node.kind === "agent")).toHaveLength(11);
+    expect(fusionStages.nodes.filter((node) => node.kind === "agent")).toHaveLength(7);
     expect(fusionStages.nodes).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          id: "planner-a-review-2",
+          id: "planner-a-review-1",
           modelId: "model-a",
-          fusion: expect.objectContaining({ stage: "review", round: 2 }),
+          fusion: expect.objectContaining({ stage: "review", round: 1 }),
         }),
         expect.objectContaining({
-          id: "planner-b-revise-2",
+          id: "planner-b-revise-1",
           modelId: "model-b",
-          fusion: expect.objectContaining({ stage: "revision", round: 2 }),
+          fusion: expect.objectContaining({ stage: "revision", round: 1 }),
         }),
         expect.objectContaining({
           id: "fusion",
           modelId: "model-fusion",
-          fusion: expect.objectContaining({ stage: "synthesis", round: 2 }),
+          fusion: expect.objectContaining({ stage: "synthesis", round: 1 }),
         }),
       ]),
     );

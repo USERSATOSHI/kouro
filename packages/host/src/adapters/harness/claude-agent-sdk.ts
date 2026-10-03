@@ -1,3 +1,4 @@
+import { renderHarnessPrompt } from "./prompt";
 import {
   createSdkMcpServer,
   query,
@@ -39,7 +40,7 @@ export const claudeSdkDescriptor: HarnessDescriptor = {
       ],
     },
     usage: { state: "supported" },
-    "cost-cap": { state: "unsupported" },
+    "cost-cap": { state: "supported" },
     "awaited-subagent-tool": { state: "supported" },
     "child-read-only-envelope": { state: "supported" },
   },
@@ -50,6 +51,8 @@ export const claudeSdkDescriptor: HarnessDescriptor = {
       model: { type: "string" },
       permissionMode: { type: "string" },
       effort: { type: "string", enum: [...reasoningEffortsForHarness("claude")] },
+      maxNativeTurns: { type: "integer", minimum: 1 },
+      maxBudgetUsd: { type: "number", exclusiveMinimum: 0 },
     },
   },
 };
@@ -69,6 +72,20 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
   async run(
     input: Parameters<HarnessAdapter["run"]>[0],
   ): Promise<Awaited<ReturnType<HarnessAdapter["run"]>>> {
+    const maxTurns = input.nativeConfig?.maxNativeTurns;
+    const maxBudgetUsd = input.nativeConfig?.maxBudgetUsd;
+    if (
+      (maxTurns !== undefined &&
+        (typeof maxTurns !== "number" || !Number.isSafeInteger(maxTurns) || maxTurns < 1)) ||
+      (maxBudgetUsd !== undefined &&
+        (typeof maxBudgetUsd !== "number" || !Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0))
+    )
+      return {
+        status: "failed",
+        error: "Invalid Claude native query budget",
+        usage: unavailableUsage() as unknown as JsonValue,
+        events: [],
+      };
     const effort = input.nativeConfig?.effort;
     const effortError = validateReasoningEffort(effort, "claude");
     if (effortError)
@@ -92,14 +109,17 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
           );
     let stderr = "";
     const messages: SDKMessage[] = [];
-    const context = input.context
-      ? `\n\n[KOURO_CONTEXT]\n${JSON.stringify(input.context)}\n[/KOURO_CONTEXT]`
-      : "";
-    const prompt = `${input.resumeSession ? "Continue the existing session's unfinished work. Preserve completed research and outputs.\n\n" : ""}${input.prompt}${context}`;
+    const prompt = renderHarnessPrompt(
+      `${input.resumeSession ? "Continue the existing conversation. Preserve completed research and outputs.\n\n" : ""}${input.prompt}`,
+      input.context,
+    );
     let sessionId = input.resumeSession?.id;
     let usageLimited = false;
     let resumeAfter: string | undefined;
-    const session = () => (sessionId ? { session: { id: sessionId } } : {});
+    const session = () => ({
+      usageScope: "session" as const,
+      ...(sessionId ? { session: { id: sessionId } } : {}),
+    });
     const policy = nativeToolPolicy(input.nativeConfig);
     const disallowedTools = claudeDisallowedTools(policy);
     const scoutTool = input.context?.tools.find((candidate) => candidate.name === "subagent");
@@ -153,9 +173,14 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
           }
         : undefined;
     const options: Options = {
+      ...(maxTurns === undefined ? {} : { maxTurns: maxTurns as number }),
+      ...(maxBudgetUsd === undefined ? {} : { maxBudgetUsd: maxBudgetUsd as number }),
       ...(effort === undefined ? {} : { effort: effort as Options["effort"] }),
       includePartialMessages: true,
       cwd: input.cwd ?? process.cwd(),
+      ...(input.contextDirectories?.length
+        ? { additionalDirectories: [...input.contextDirectories] }
+        : {}),
       ...(input.modelId ? { model: input.modelId } : {}),
       ...(typeof input.nativeConfig?.model === "string" ? { model: input.nativeConfig.model } : {}),
       abortController,
@@ -185,6 +210,14 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         : {}),
     };
     let resultMessage: SDKResultMessage | undefined;
+    const limitReason = (error: string) =>
+      usageLimited
+        ? ("usage-limit" as const)
+        : resultMessage?.subtype === "error_max_turns"
+          ? ("turn-limit" as const)
+          : resultMessage?.subtype === "error_max_budget_usd"
+            ? ("budget-limit" as const)
+            : providerLimit(error);
     const events: HarnessEvent[] = [];
     const activity = new ClaudeMessages((event) => {
       events.push(event);
@@ -232,9 +265,9 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
             : String(cause);
       return {
         ...session(),
-        ...(!cancelled && (usageLimited || providerLimit(error))
+        ...(!cancelled && limitReason(error)
           ? {
-              stopReason: usageLimited ? ("usage-limit" as const) : providerLimit(error),
+              stopReason: limitReason(error),
               ...(resumeAfter ? { resumeAfter } : {}),
             }
           : {}),
@@ -267,9 +300,9 @@ export class ClaudeAgentSdkHarnessAdapter implements HarnessAdapter {
         errors.join("\n") || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`;
       return {
         ...session(),
-        ...(usageLimited || providerLimit(error)
+        ...(limitReason(error)
           ? {
-              stopReason: usageLimited ? ("usage-limit" as const) : providerLimit(error),
+              stopReason: limitReason(error),
               ...(resumeAfter ? { resumeAfter } : {}),
             }
           : {}),
@@ -340,6 +373,9 @@ function usageFrom(message?: SDKResultMessage) {
   });
   return {
     inputTokens: value(inputTokens),
+    uncachedInputTokens: value(sum((item) => item.inputTokens)),
+    cacheReadInputTokens: value(sum((item) => item.cacheReadInputTokens)),
+    cacheCreationInputTokens: value(sum((item) => item.cacheCreationInputTokens)),
     outputTokens: value(outputTokens),
     totalTokens: value(inputTokens + outputTokens),
     cost: {

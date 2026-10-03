@@ -306,6 +306,28 @@ export async function compileWorkflowDetailed(
       }
     }
     if (node.kind === "agent") {
+      if (
+        node.maxNativeTurns !== undefined &&
+        (!Number.isSafeInteger(node.maxNativeTurns) || node.maxNativeTurns < 1)
+      )
+        diagnostics.push(
+          error("INVALID_NATIVE_BUDGET", "maxNativeTurns must be a positive integer", node.id),
+        );
+      if (
+        node.maxBudgetUsd !== undefined &&
+        (!Number.isFinite(node.maxBudgetUsd) || node.maxBudgetUsd <= 0)
+      )
+        diagnostics.push(
+          error("INVALID_NATIVE_BUDGET", "maxBudgetUsd must be positive and finite", node.id),
+        );
+      if (
+        (node.maxNativeTurns !== undefined || node.maxBudgetUsd !== undefined) &&
+        node.harness !== undefined &&
+        node.harness !== "claude"
+      )
+        diagnostics.push(
+          error("INVALID_NATIVE_BUDGET", "Native query budgets currently require Claude", node.id),
+        );
       const effortError = validateReasoningEffort(node.effort, node.harness);
       if (effortError) diagnostics.push(error("INVALID_REASONING_EFFORT", effortError, node.id));
       const uses = node.uses ?? [];

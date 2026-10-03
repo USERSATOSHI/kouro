@@ -34,7 +34,7 @@ provider call.
 ## Fusion planning
 
 The `feature-fusion` and `refactor-fusion` starters draft plans with two models
-in parallel, then run two cross-review/revision cycles before synthesis. Edit
+in parallel, then run one cross-review/revision cycle before synthesis. Edit
 `reviewRounds` in the generated `kouro.ts` to choose 0–10 cycles. Zero combines
 the initial drafts directly. Each stage waits for both models to finish.
 
@@ -57,7 +57,7 @@ const synthesizer = workflow.agent("synthesis", {
   modelId: "model-fusion", prompt: fusionPrompt, produces: Summary,
 });
 const fusion = workflow.fusion("planning", {
-  task, rounds: 2, reviewProduces: Summary,
+  task, rounds: 1, reviewProduces: Summary, notesTransport: "auto",
   reviewPrompt, revisionPrompt, synthesis: synthesizer,
 }).use(plannerA, plannerB);
 workflow.startAt(fusion);
@@ -69,12 +69,47 @@ Use `fusion.output` for the synthesized result. Model choices, permissions and
 subagents follow each member through its reviews and revisions. In the web
 launch form, choose each member's model once; that choice applies to every round.
 
-Open the run's **Session** tab and select **Fusion split** to compare model
-sessions side by side. **Planning stage** follows the latest stage or replays
-initial drafts and individual review/revision rounds. The combined plan appears
-below the sessions. On narrow screens, sessions stack vertically. Steering and
-interrupt controls target the agent shown in that panel; cancellation stops the
-whole run.
+Each member retains its draft workspace through review and revision. Claude and
+Codex continue that member's native session, including after a host restart;
+synthesis starts its own session. Pi currently retains the workspace but uses
+an ephemeral conversation for each stage. Session continuation rejects changes
+to the harness, model, workspace or native permissions.
+If a resumable harness has no saved session for the preceding stage, fusion fails
+with an explicit continuation error instead of starting the research again.
+
+Reviewers receive their own previous report and every peer's previous report.
+Revisions receive the previous report and all reviews; synthesis receives the
+final reports and last reviews. `notesTransport: "auto"` passes reports over
+16 KiB as JSON files with a short summary, digest and read instructions in the
+context. Use `"files"` to pass every report as a file, or `"inline"` to embed
+them in the prompt. These copies live in Kouro's run data, outside repository
+worktrees, and survive restart. Agents must read relevant sections and preserve
+citations; reading an entire file still consumes tokens. Canonical reports remain
+durable output artifacts.
+
+New fusion templates use one review/revision round. If every reviewer explicitly
+returns `needsRevision: false`, Kouro carries the reports forward and skips
+remaining revisions and reviews without a model call; synthesis still runs.
+Missing or disagreeing verdicts keep all configured rounds. Use
+`stopWhenUnanimous: false` to require every round. Review schemas must allow the
+boolean verdict. A member only receives scouts explicitly listed in its `uses`;
+synthesis does not inherit the other members' scouts.
+
+Native prompts contain role instructions once and omit journal accounting and
+duplicate tool schemas. Resumed fusion turns omit unchanged inline inputs already
+in that conversation; new peer notes remain available. Other workflow inputs over
+4 KiB (except `task`) use immutable JSON files too. Reading a whole file still
+consumes tokens. Repository scout evidence can be reused within one fusion member
+when its exact question, model and owned Git workspace tree match. Workspace edits
+invalidate the cache; unsupported workspaces are researched normally.
+
+Claude agents and scouts have **no default native turn or spend cap**. Authors
+can opt in with `maxNativeTurns` or `maxBudgetUsd` on an agent or subagent. An
+explicit limit pauses the run with its native session saved. These options
+currently require Claude and apply per query, including resumed queries. Dollar
+estimates do not represent the remaining five-hour subscription allowance. Usage
+details show fresh input, cache reads and cache writes separately when Claude
+reports them. Model and reasoning effort remain explicit author selections.
 
 ## Automatic workflow tasks
 
@@ -129,6 +164,8 @@ eligibility at `GET /api/task-workflows`, create a run with `POST /api/tasks`, a
 read progress at `GET /api/runs/:id/milestones`. Task creation takes `task`,
 `workflowIds`, `planner` and `executor` (`{ harness, modelId }`), `idempotencyKey`,
 and optional `maxMilestones`, `maxConcurrent`, and `workspace.repositoryPath`.
+Automatic task creation defaults to at most three milestones. For one clear task,
+launch its workflow directly to avoid an extra decomposition agent.
 
 The same flow is available as `kouro task run`. [CLI workflow tasks and agent
 plugins](./agent-plugins.md) covers headless execution, greenfield setup, approval

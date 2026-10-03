@@ -22,6 +22,10 @@ export interface FusionOptions<Plan, Review> {
   readonly reviewPrompt: string;
   readonly revisionPrompt: string;
   readonly synthesis: NodeHandle<Plan, true>;
+  /** auto (default) passes reports over 16 KiB as files. */
+  readonly notesTransport?: "auto" | "inline" | "files";
+  /** Enabled by default; requires every reviewer to return needsRevision: false. */
+  readonly stopWhenUnanimous?: boolean;
 }
 
 /** Internal declarations copied from agents supplied through the builder. */
@@ -42,6 +46,15 @@ export function buildFusionStages<Plan, Review>(
   options: FusionStagesOptions<Plan, Review>,
 ) {
   const rounds = validateFusionRounds(options.rounds);
+  if (
+    options.notesTransport !== undefined &&
+    !["auto", "inline", "files"].includes(options.notesTransport)
+  )
+    throw new Error("Fusion notesTransport must be auto, inline or files");
+  const notesTransport = options.notesTransport ?? "auto";
+  if (options.stopWhenUnanimous !== undefined && typeof options.stopWhenUnanimous !== "boolean")
+    throw new Error("Fusion stopWhenUnanimous must be boolean");
+  const stopWhenUnanimous = options.stopWhenUnanimous ?? true;
   if (options.members.length < 2) throw new Error("Fusion requires at least two models");
   const memberIds = options.members.map((member) => member.id);
   if (
@@ -53,7 +66,7 @@ export function buildFusionStages<Plan, Review>(
     throw new Error("Fusion synthesis needs a distinct node ID");
   const common = (member: FusionAgent<Plan>) => {
     const { id: _id, ...agentOptions } = member;
-    return { ...agentOptions, role: member.role ?? member.id };
+    return { ...agentOptions, role: member.role ?? member.id, uses: member.uses ?? [] };
   };
   const stage = (groupId: string, branches: readonly NodeHandle<unknown, true>[]) => {
     const entry = workflow.parallel(groupId, { branches, maxConcurrent: branches.length });
@@ -71,7 +84,14 @@ export function buildFusionStages<Plan, Review>(
       ...common(member),
       input: { ...member.input, task: options.task },
       produces: member.produces ?? options.produces,
-      fusion: { groupId: id, memberId: member.id, stage: "draft", round: 0 },
+      fusion: {
+        groupId: id,
+        memberId: member.id,
+        stage: "draft",
+        round: 0,
+        notesTransport,
+        stopWhenUnanimous,
+      },
     }),
   );
   const initial = stage(id, drafts);
@@ -97,7 +117,14 @@ export function buildFusionStages<Plan, Review>(
           ),
         },
         produces: options.reviewProduces,
-        fusion: { groupId: id, memberId: member.id, stage: "review", round },
+        fusion: {
+          groupId: id,
+          memberId: member.id,
+          stage: "review",
+          round,
+          notesTransport,
+          stopWhenUnanimous,
+        },
       }),
     );
     const reviewStage = stage(`${id}-review-${round}`, reviews);
@@ -115,7 +142,14 @@ export function buildFusionStages<Plan, Review>(
           ),
         },
         produces: member.produces ?? options.produces,
-        fusion: { groupId: id, memberId: member.id, stage: "revision", round },
+        fusion: {
+          groupId: id,
+          memberId: member.id,
+          stage: "revision",
+          round,
+          notesTransport,
+          stopWhenUnanimous,
+        },
       }),
     );
     const revisionStage = stage(`${id}-revision-${round}`, revisions);
@@ -138,7 +172,14 @@ export function buildFusionStages<Plan, Review>(
       ),
     },
     produces: options.produces,
-    fusion: { groupId: id, memberId: options.synthesis.id, stage: "synthesis", round: rounds },
+    fusion: {
+      groupId: id,
+      memberId: options.synthesis.id,
+      stage: "synthesis",
+      round: rounds,
+      notesTransport,
+      stopWhenUnanimous,
+    },
   });
   barrier.on("success").to(result);
   return { entry: initial.entry, result, drafts, rounds: cycles };

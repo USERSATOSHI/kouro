@@ -5044,6 +5044,15 @@ function UsagePanel({ items, view }: { items: UsageView[]; view?: UiRunView }) {
                 {item.estimated ? " · estimated" : ""}
               </Text>
             )}
+            {(item.uncachedInputTokens !== undefined ||
+              item.cacheReadInputTokens !== undefined ||
+              item.cacheCreationInputTokens !== undefined) && (
+              <Text size="xs" c="dimmed">
+                Fresh input {item.uncachedInputTokens?.toLocaleString() ?? "not reported"} · cache
+                read {item.cacheReadInputTokens?.toLocaleString() ?? "not reported"} · cache write{" "}
+                {item.cacheCreationInputTokens?.toLocaleString() ?? "not reported"}
+              </Text>
+            )}
             <Text size="xs" c="dimmed">
               {item.cost === undefined
                 ? billing === "subscription"

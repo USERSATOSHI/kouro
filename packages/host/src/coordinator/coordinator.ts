@@ -1,4 +1,6 @@
-import { mkdirSync } from "node:fs";
+import { convergedFusionOutput } from "./fusion-convergence";
+import { continuationContext } from "./continuation-context";
+import { mkdirSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -30,8 +32,14 @@ import type { RuntimeHarness } from "@kouro/core";
 import { id, json, now, parseJson } from "../id.ts";
 import { DelayedScriptedAgent, ScriptedHarnessAdapter } from "../adapters/harness/scripted.ts";
 import { TrackingHarnessDecorator } from "../adapters/harness/tracking.ts";
-import { providerLimit } from "../adapters/harness/session.ts";
+import {
+  providerLimit,
+  sessionUsageBaseline,
+  sessionUsageIncrement,
+} from "../adapters/harness/session.ts";
 import { retryPlan } from "./retry-plan.ts";
+import { fusionContinuation } from "./fusion-session.ts";
+import { fusionInputSegment } from "./fusion-notes.ts";
 import { activityPreview } from "../adapters/harness/activity-preview";
 import {
   CodexAppServerHarness,
@@ -555,6 +563,8 @@ export class Coordinator {
     this.assertRunDrained(runId);
     const claims = await this.workspaceClaims(runId);
     for (const claim of claims ?? []) await this.workspaceAdapter!.cleanup(claim);
+    // Host scratch workspaces also contain materialized fusion reports.
+    rmSync(join(this.dataDir, "workspaces", runId), { recursive: true, force: true });
     this.workspaces.delete(runId);
     this.snapshots.delete(runId);
     for (const [key, claim] of this.branchWorkspaces) {
@@ -994,7 +1004,9 @@ export class Coordinator {
       !!reference &&
       typeof reference === "object" &&
       !Array.isArray(reference) &&
-      (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit")
+      (reference.stopReason === "usage-limit" ||
+        reference.stopReason === "turn-limit" ||
+        reference.stopReason === "budget-limit")
     );
   }
 
@@ -2764,7 +2776,49 @@ export class Coordinator {
       runInput.__kouroExecutionProfile === "pi-readonly"
         ? runInput.__kouroExecutionProfile
         : "scripted";
-    const workspaceDir = join(this.dataDir, "workspaces", runId, invocationId);
+    const fusion =
+      node.kind === "agent" ? fusionContinuation(bundle, state, node, invocationId) : undefined;
+    if (node.kind === "agent" && fusion?.previousAttempt) {
+      const converged = convergedFusionOutput(
+        bundle,
+        state,
+        node,
+        invocationId,
+        resolvedInputs ?? {},
+        (ref) => JSON.parse(new TextDecoder().decode(this.journal.blobs.read(ref))) as JsonValue,
+      );
+      if (converged !== undefined) {
+        const outputSchema =
+          node.outputPorts[0] && bundle.schemas[node.outputPorts[0].schemaDigest];
+        if (outputSchema) {
+          const validation = validateJsonSchema(converged, outputSchema);
+          if (!validation.valid) throw new Error(`invalid-output: ${validation.error}`);
+        }
+        const output = this.journal.blobs.put(
+          runId,
+          new TextEncoder().encode(json(converged)),
+          "application/json",
+        );
+        const zero = { value: 0, quality: "observed", source: "kouro-convergence" };
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [output],
+          output: [output],
+          artifacts: [],
+          evidence: [],
+          status: "succeeded",
+          diagnostics: [
+            "Fusion converged: all reviewers explicitly requested no revision; no model call",
+          ],
+          resolvedExecution: fusion.previousAttempt.resolvedExecution,
+          sessionReference: fusion.previousAttempt.sessionReference,
+          usage: { inputTokens: zero, outputTokens: zero, totalTokens: zero, cost: zero },
+        });
+        return;
+      }
+    }
+    const workspaceInvocationId = fusion?.workspaceInvocationId ?? invocationId;
+    const workspaceDir = join(this.dataDir, "workspaces", runId, workspaceInvocationId);
     const registeredWorkspace = this.workspaces.get(runId);
     let invocationWorkspace =
       this.milestoneWorkspace(runId, state, state.invocations[invocationId]!.scopeId) ??
@@ -2776,16 +2830,19 @@ export class Coordinator {
       sourceInvocationId &&
       this.workspaceAdapter
     ) {
-      const key = `${runId}:${invocationId}`;
+      const key = `${runId}:${workspaceInvocationId}`;
       invocationWorkspace = this.branchWorkspaces.get(key);
       if (!invocationWorkspace) {
         try {
-          invocationWorkspace = await this.workspaceAdapter.loadByIdentity(runId, invocationId);
+          invocationWorkspace = await this.workspaceAdapter.loadByIdentity(
+            runId,
+            workspaceInvocationId,
+          );
         } catch {
           invocationWorkspace = await this.workspaceAdapter.create({
             repositoryPath: registeredWorkspace.repositoryPath,
             runId,
-            workspaceId: invocationId,
+            workspaceId: workspaceInvocationId,
             baseCommit: registeredWorkspace.baseCommit,
           });
         }
@@ -2876,19 +2933,23 @@ export class Coordinator {
         });
       }
       const promptBytes = new TextEncoder().encode(node.prompt).byteLength;
-      const inputSegments = Object.entries(resolvedInputs ?? {}).map(([name, value]) => {
-        const content = JSON.stringify(value);
-        return {
-          id: `${attemptId}:input:${name}`,
-          source: "artifact-input",
-          content,
-          supplied: true,
-          reason: `resolved workflow input binding ${name}`,
-          bytes: new TextEncoder().encode(content).byteLength,
-          tokenCount: null,
-          tokenQuality: "unavailable" as const,
-        };
-      });
+      const notesDirectory = join(
+        this.dataDir,
+        "workspaces",
+        runId,
+        workspaceInvocationId,
+        "context-files",
+      );
+      const inputSegments = Object.entries(resolvedInputs ?? {}).map(([name, value]) =>
+        fusionInputSegment({ node, name, value, attemptId, directory: notesDirectory }),
+      );
+      const contextDirectories =
+        (node.fusion && node.fusion.notesTransport !== "inline") ||
+        inputSegments.some((segment) => segment.source === "artifact-input-file")
+          ? [notesDirectory]
+          : undefined;
+      // Keep this directory stable across all turns of a member, including its draft.
+      if (contextDirectories) mkdirSync(notesDirectory, { recursive: true, mode: 0o700 });
       let contextManifest = await createContextManifest({
         attemptId,
         segments: [
@@ -2965,7 +3026,10 @@ export class Coordinator {
       const previousAttempt = Object.values(state.attempts)
         .filter((item) => item.invocationId === invocationId && item.ordinal < attempt.ordinal)
         .sort((a, b) => b.ordinal - a.ordinal)[0];
-      const resumeReference = previousAttempt && this.nativeSession(previousAttempt);
+      const retryReference = previousAttempt && this.nativeSession(previousAttempt);
+      const continuationAttempt = retryReference ? previousAttempt : fusion?.previousAttempt;
+      const resumeReference =
+        retryReference ?? (continuationAttempt && this.nativeSession(continuationAttempt));
       // Harnesses without a saved native conversation use an explicit host handoff.
       if (attempt.ordinal > 0 && !resumeReference) {
         const prepared = await prepareAgentHandoff({
@@ -3205,21 +3269,39 @@ export class Coordinator {
         return;
       }
       if (node.effort !== undefined) nativeConfig = { ...nativeConfig, effort: node.effort };
-      const nativeConfigDigest = nativeConfig
-        ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}`
-        : undefined;
+      if (
+        fusion?.previousAttempt &&
+        selected.capabilities().resume === "supported" &&
+        !resumeReference
+      ) {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [],
+          artifacts: [],
+          evidence: [],
+          output: [],
+          status: "failed",
+          error:
+            "Fusion continuation unavailable: the preceding researcher stage has no saved native session",
+        });
+        return;
+      }
+      const nativeConfigDigest =
+        nativeConfig || contextDirectories
+          ? `sha256:${await sha256Hex(canonicalize({ ...nativeConfig, ...(contextDirectories ? { contextDirectories } : {}) }))}`
+          : undefined;
       if (
         resumeReference &&
         (selected.capabilities().resume !== "supported" ||
-          previousAttempt?.resolvedExecution?.harness !== resolvedHarness ||
-          previousAttempt.resolvedExecution.adapterVersion !== resolvedVersion ||
+          continuationAttempt?.resolvedExecution?.harness !== resolvedHarness ||
+          continuationAttempt.resolvedExecution.adapterVersion !== resolvedVersion ||
           (resumeReference.cwd !== undefined && resumeReference.cwd !== invocationWorkspaceDir) ||
           (resumeReference.modelId !== undefined &&
             resumeReference.modelId !== (resolvedModelId ?? node.modelId)) ||
           ((resumeReference.nativeConfigDigest ??
-            previousAttempt.resolvedExecution.nativeConfigDigest) !== undefined &&
+            continuationAttempt.resolvedExecution.nativeConfigDigest) !== undefined &&
             (resumeReference.nativeConfigDigest ??
-              previousAttempt.resolvedExecution.nativeConfigDigest) !== nativeConfigDigest))
+              continuationAttempt.resolvedExecution.nativeConfigDigest) !== nativeConfigDigest))
       ) {
         this.journal.completeEffect({
           effectId: detail.id,
@@ -3234,6 +3316,25 @@ export class Coordinator {
         });
         return;
       }
+      if (node.maxNativeTurns !== undefined || node.maxBudgetUsd !== undefined) {
+        if (selected.id !== "claude")
+          throw new Error("Native query budgets currently require Claude");
+        nativeConfig = {
+          ...nativeConfig,
+          ...(node.maxNativeTurns === undefined ? {} : { maxNativeTurns: node.maxNativeTurns }),
+          ...(node.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: node.maxBudgetUsd }),
+        };
+      }
+      if (node.fusion && resumeReference && continuationAttempt)
+        contextManifest = await continuationContext(
+          contextManifest,
+          continuationAttempt,
+          continuationAttempt.output[0]
+            ? (JSON.parse(
+                new TextDecoder().decode(this.journal.blobs.read(continuationAttempt.output[0])),
+              ) as JsonValue)
+            : undefined,
+        );
       if (subagentIds.length) {
         const capabilities = selected.capabilities();
         if (
@@ -3317,6 +3418,7 @@ export class Coordinator {
             cwd: invocationWorkspaceDir,
             nativeConfig,
             ...(resumeReference ? { resumeSession: { id: String(resumeReference.id) } } : {}),
+            ...(contextDirectories ? { contextDirectories } : {}),
             context: contextManifest,
             ...(collaborationGateway && collaborationGrant
               ? {
@@ -3443,12 +3545,17 @@ export class Coordinator {
             reference &&
             typeof reference === "object" &&
             !Array.isArray(reference) &&
-            (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit")
+            (reference.stopReason === "usage-limit" ||
+              reference.stopReason === "turn-limit" ||
+              reference.stopReason === "budget-limit")
           );
         });
         const reference = limitedChild?.sessionReference;
         if (reference && typeof reference === "object" && !Array.isArray(reference)) {
-          harnessResult.stopReason ??= reference.stopReason as "usage-limit" | "turn-limit";
+          harnessResult.stopReason ??= reference.stopReason as
+            | "usage-limit"
+            | "turn-limit"
+            | "budget-limit";
           if (typeof reference.resumeAfter === "string")
             harnessResult.resumeAfter ??= reference.resumeAfter;
         }
@@ -3560,7 +3667,13 @@ export class Coordinator {
             ...(node.effort === undefined ? {} : { effort: node.effort }),
           },
           harnessEvents: durableEvents,
-          usage: harnessResult.usage,
+          usage:
+            resumeReference && harnessResult.usageScope === "session"
+              ? sessionUsageIncrement(
+                  harnessResult.usage,
+                  resumeReference.cumulativeUsage ?? continuationAttempt?.usage,
+                )
+              : harnessResult.usage,
           contextManifest: JSON.parse(JSON.stringify(contextManifest)),
           sessionReference: {
             continuation: resumeReference ? "native-resume" : "fresh-session",
@@ -3568,6 +3681,14 @@ export class Coordinator {
             ...(harnessResult.session
               ? {
                   id: harnessResult.session.id,
+                  ...(harnessResult.usageScope === "session"
+                    ? {
+                        cumulativeUsage: sessionUsageBaseline(
+                          harnessResult.usage,
+                          resumeReference?.cumulativeUsage ?? continuationAttempt?.usage,
+                        ),
+                      }
+                    : {}),
                   harness: resolvedHarness,
                   adapterVersion: resolvedVersion,
                   cwd: invocationWorkspaceDir,
@@ -3867,9 +3988,80 @@ export class Coordinator {
       ? view.bundle.schemas[childAgent.outputPorts[0].schemaDigest]
       : undefined;
     const childInvocationId = `${input.parentAttemptId}:scout:${input.requestId}`;
+    const parentNode = definition?.nodes.find((node) => node.id === parent?.nodeId);
+    // Cache within a member only: independent drafts must retain independent evidence gathering.
+    const identity = parentNode?.kind === "agent" ? parentNode.fusion : undefined;
+    const ownedWorkspace =
+      identity && this.workspaceAdapter
+        ? [this.workspaces.get(input.runId), ...this.branchWorkspaces.values()].find(
+            (workspace) => workspace?.runId === input.runId && workspace.path === input.cwd,
+          )
+        : undefined;
+    const evidenceFingerprint = (tree: string) =>
+      sha256Hex(
+        canonicalize({
+          scope: scope!.id,
+          group: identity!.groupId,
+          member: identity!.memberId,
+          cwd: input.cwd,
+          tree,
+          scout: scout.definitionId,
+          harness: childAdapter.id,
+          version: childAdapter.adapterVersion,
+          model:
+            childAgent.modelId ??
+            (childAdapter.id === input.adapter.id ? input.parentModelId : null) ??
+            null,
+          input: input.input as JsonValue,
+        }),
+      );
+    let evidenceKey: string | undefined;
+    if (ownedWorkspace && this.workspaceAdapter) {
+      try {
+        evidenceKey = await evidenceFingerprint(
+          (await this.workspaceAdapter.snapshot(ownedWorkspace)).resultTree,
+        );
+      } catch {
+        /* An unavailable fingerprint disables caching, not research. */
+      }
+    }
     return this.scouts.invoke({
       ...input,
       runner: async (request, signal) => {
+        if (evidenceKey) {
+          this.scouts.recordEvidenceKey(
+            input.runId,
+            input.parentAttemptId,
+            input.requestId,
+            evidenceKey,
+          );
+          const cached = this.scouts.cachedEvidence(input.runId, evidenceKey);
+          if (cached) {
+            const zero = { value: 0, quality: "observed", source: "kouro-evidence-cache" };
+            this.scouts.recordSession(
+              input.runId,
+              input.parentAttemptId,
+              input.requestId,
+              { cachedFrom: cached.requestId },
+              { inputTokens: zero, outputTokens: zero, totalTokens: zero, cost: zero },
+            );
+            this.recordHarnessActivity(
+              input.runId,
+              input.parentInvocationId,
+              input.parentAttemptId,
+              {
+                type: "log",
+                at: now(),
+                data: {
+                  status: "Reused unchanged repository evidence",
+                  scoutId: input.scoutId,
+                  requestId: input.requestId,
+                },
+              },
+            );
+            return cached.result;
+          }
+        }
         const previousParent = Object.values(view.state.attempts)
           .filter(
             (attempt) =>
@@ -3890,7 +4082,7 @@ export class Coordinator {
               )
               .at(-1)
           : undefined;
-        if (prior?.state === "succeeded" && prior.result !== undefined) {
+        if (!evidenceKey && prior?.state === "succeeded" && prior.result !== undefined) {
           this.recordHarnessActivity(input.runId, input.parentInvocationId, input.parentAttemptId, {
             type: "log",
             at: now(),
@@ -3902,7 +4094,7 @@ export class Coordinator {
           });
           return prior.result as JsonValue;
         }
-        const reference = prior?.sessionReference;
+        const reference = prior?.state === "succeeded" ? undefined : prior?.sessionReference;
         const childResume =
           reference &&
           typeof reference === "object" &&
@@ -3910,10 +4102,15 @@ export class Coordinator {
           typeof reference.id === "string"
             ? reference
             : undefined;
-        if (prior && !childResume)
+        if (prior && prior.state !== "succeeded" && !childResume)
           throw new Error(
             "Subagent native session continuation is unavailable; the failed child has no saved session ID",
           );
+        if (
+          (childAgent.maxNativeTurns !== undefined || childAgent.maxBudgetUsd !== undefined) &&
+          childAdapter.id !== "claude"
+        )
+          throw new Error("Native query budgets currently require Claude");
         const childNativeConfig = {
           toolPolicy: { write: false, terminal: false, network: false, child: true },
           ...(childAgent.effort === undefined ? {} : { effort: childAgent.effort }),
@@ -4024,7 +4221,19 @@ export class Coordinator {
                 : childAdapter.id === input.adapter.id && input.parentModelId
                   ? { modelId: input.parentModelId }
                   : {}),
-              nativeConfig: childNativeConfig,
+              nativeConfig: {
+                ...childNativeConfig,
+                ...(childAdapter.id === "claude"
+                  ? {
+                      ...(childAgent.maxNativeTurns === undefined
+                        ? {}
+                        : { maxNativeTurns: childAgent.maxNativeTurns }),
+                      ...(childAgent.maxBudgetUsd === undefined
+                        ? {}
+                        : { maxBudgetUsd: childAgent.maxBudgetUsd }),
+                    }
+                  : {}),
+              },
               context,
               signal: childAborter.signal,
               onEvent: () => undefined,
@@ -4070,6 +4279,27 @@ export class Coordinator {
             );
           if (result.status !== "succeeded" || result.output === undefined)
             throw new Error(result.error ?? `scout harness ${result.status}`);
+          if (evidenceKey && ownedWorkspace && this.workspaceAdapter) {
+            let unchanged = false;
+            try {
+              unchanged =
+                evidenceKey ===
+                (await evidenceFingerprint(
+                  (
+                    await this.workspaceAdapter.snapshot(ownedWorkspace)
+                  ).resultTree,
+                ));
+            } catch {
+              /* Failed verification cannot leave reusable evidence. */
+            }
+            if (!unchanged)
+              this.scouts.recordEvidenceKey(
+                input.runId,
+                input.parentAttemptId,
+                input.requestId,
+                null,
+              );
+          }
           return result.output;
         } finally {
           signal?.removeEventListener("abort", abort);

@@ -489,4 +489,12 @@ export function migrate(db: Database): void {
   ) {
     throw new Error("scout delivery schema is inconsistent with scout request schema");
   }
+  const evidenceColumns = db.query("PRAGMA table_info(scout_requests)").all() as Array<{
+    name: string;
+  }>;
+  if (!evidenceColumns.some((column) => column.name === "evidence_key"))
+    db.exec("ALTER TABLE scout_requests ADD COLUMN evidence_key TEXT");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS scout_evidence_idx ON scout_requests(run_id, evidence_key, state)",
+  );
 }

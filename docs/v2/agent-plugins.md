@@ -23,7 +23,7 @@ kouro create template develop --template feature
 kouro task workflows --workspace .
 kouro task run --task "Build the requested app" --workspace . \
   --workflow develop --harness claude --model YOUR_MODEL \
-  --max-milestones 8 --max-concurrent 2
+  --max-milestones 3 --max-concurrent 2
 ```
 
 `--harness` and `--model` set planning and execution defaults. Override either
@@ -36,7 +36,8 @@ workflows. Model IDs must be available through the authenticated harness.
 The CLI loads `.kouro` from the supplied workspace and defaults its durable
 state to `WORKSPACE/.kouro-data`. `--data-dir` overrides `KOURO_DATA_DIR`, which
 overrides the default. Use the same state directory for subsequent commands.
-Do not run a CLI owner and a web host against one state directory concurrently.
+CLI tasks connect to an existing host for that state directory. Without one,
+execution owns a temporary dashboard until the command returns.
 
 The installed CLI bundles the builder runtime used by templates: greenfield
 projects do not need a separate `@kouro/core` installation to load their workflow
@@ -44,7 +45,10 @@ definitions. Template commands and agents still need their declared tools.
 
 ## Inspect and decide
 
-Run output is newline-delimited JSON: a `task.started` record containing the run
+Terminal output shows readable status, milestones, pending approvals and results.
+Use `--plain` for the same report without colors, or `--json` for machine output.
+`NO_COLOR` also disables terminal colors. Redirected output stays newline-delimited
+JSON: a `task.started` record containing the run
 ID, followed by a report with milestone status, dependencies, pending approvals,
 result artifact references and the private run workspace path. A caller can
 retain the first record while a long-running command executes.
@@ -74,8 +78,8 @@ and `130` interrupted execution after cancellation. `kouro task --help` lists
 all options.
 
 After a CLI command returns at a gate, start `kouro serve` from the project to
-review its artifacts and diff in the web UI. Stop that project host before
-handing the same state directory back to the CLI. Successful task execution
+review its artifacts and diff in the web UI. Subsequent task commands connect to
+that host. Successful task execution
 combines changes in the private run worktree; the source checkout is updated
 through the existing **Delivery** flow.
 

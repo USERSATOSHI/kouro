@@ -9,3 +9,13 @@ export const Summary = artifactType<{ summary: string }>("kouro.template-summary
   required: ["summary"],
   properties: { summary: { type: "string", minLength: 1 } },
 });
+
+export const Review = artifactType<{ summary: string; needsRevision: boolean }>(
+  "kouro.fusion-review.v1",
+  {
+    type: "object",
+    additionalProperties: false,
+    required: ["summary", "needsRevision"],
+    properties: { summary: { type: "string", minLength: 1 }, needsRevision: { type: "boolean" } },
+  },
+);

@@ -159,7 +159,7 @@ export function reduceEvent(state: ExecutionState, event: LifecycleEvent): Execu
       return {
         ...next,
         status: "paused",
-        ...(["usage-limit", "turn-limit"].includes(event.payload.reason ?? "")
+        ...(["usage-limit", "turn-limit", "budget-limit"].includes(event.payload.reason ?? "")
           ? { budgetPausedAt: event.recordedAt }
           : {}),
       };

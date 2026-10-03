@@ -230,6 +230,12 @@ function validateFusionRounds(value) {
 }
 function buildFusionStages(workflow, id, options) {
   const rounds = validateFusionRounds(options.rounds);
+  if (options.notesTransport !== undefined && !["auto", "inline", "files"].includes(options.notesTransport))
+    throw new Error("Fusion notesTransport must be auto, inline or files");
+  const notesTransport = options.notesTransport ?? "auto";
+  if (options.stopWhenUnanimous !== undefined && typeof options.stopWhenUnanimous !== "boolean")
+    throw new Error("Fusion stopWhenUnanimous must be boolean");
+  const stopWhenUnanimous = options.stopWhenUnanimous ?? true;
   if (options.members.length < 2)
     throw new Error("Fusion requires at least two models");
   const memberIds = options.members.map((member) => member.id);
@@ -239,7 +245,7 @@ function buildFusionStages(workflow, id, options) {
     throw new Error("Fusion synthesis needs a distinct node ID");
   const common = (member) => {
     const { id: _id, ...agentOptions } = member;
-    return { ...agentOptions, role: member.role ?? member.id };
+    return { ...agentOptions, role: member.role ?? member.id, uses: member.uses ?? [] };
   };
   const stage = (groupId, branches) => {
     const entry = workflow.parallel(groupId, { branches, maxConcurrent: branches.length });
@@ -257,7 +263,14 @@ function buildFusionStages(workflow, id, options) {
     ...common(member),
     input: { ...member.input, task: options.task },
     produces: member.produces ?? options.produces,
-    fusion: { groupId: id, memberId: member.id, stage: "draft", round: 0 }
+    fusion: {
+      groupId: id,
+      memberId: member.id,
+      stage: "draft",
+      round: 0,
+      notesTransport,
+      stopWhenUnanimous
+    }
   }));
   const initial = stage(id, drafts);
   let previous = drafts;
@@ -275,7 +288,14 @@ You are member ${index + 1}. This is review round ${round} of ${rounds}.`,
         ...Object.fromEntries(previous.flatMap((plan, peerIndex) => peerIndex === index ? [] : [[`peer${peerIndex + 1}`, plan.output]]))
       },
       produces: options.reviewProduces,
-      fusion: { groupId: id, memberId: member.id, stage: "review", round }
+      fusion: {
+        groupId: id,
+        memberId: member.id,
+        stage: "review",
+        round,
+        notesTransport,
+        stopWhenUnanimous
+      }
     }));
     const reviewStage = stage(`${id}-review-${round}`, reviews);
     barrier.on("success").to(reviewStage.entry);
@@ -290,7 +310,14 @@ You are member ${index + 1}. This is revision round ${round} of ${rounds}.`,
         ...Object.fromEntries(reviews.map((review, reviewerIndex) => [`review${reviewerIndex + 1}`, review.output]))
       },
       produces: member.produces ?? options.produces,
-      fusion: { groupId: id, memberId: member.id, stage: "revision", round }
+      fusion: {
+        groupId: id,
+        memberId: member.id,
+        stage: "revision",
+        round,
+        notesTransport,
+        stopWhenUnanimous
+      }
     }));
     const revisionStage = stage(`${id}-revision-${round}`, revisions);
     reviewStage.join.on("success").to(revisionStage.entry);
@@ -310,7 +337,14 @@ You are member ${index + 1}. This is revision round ${round} of ${rounds}.`,
       ]))
     },
     produces: options.produces,
-    fusion: { groupId: id, memberId: options.synthesis.id, stage: "synthesis", round: rounds }
+    fusion: {
+      groupId: id,
+      memberId: options.synthesis.id,
+      stage: "synthesis",
+      round: rounds,
+      notesTransport,
+      stopWhenUnanimous
+    }
   });
   barrier.on("success").to(result);
   return { entry: initial.entry, result, drafts, rounds: cycles };
@@ -450,6 +484,8 @@ function directSubagentSource(id, options) {
     ...options.harness === undefined ? {} : { harness: options.harness },
     ...options.modelId === undefined ? {} : { modelId: options.modelId },
     ...options.effort === undefined ? {} : { effort: options.effort },
+    ...options.maxNativeTurns === undefined ? {} : { maxNativeTurns: options.maxNativeTurns },
+    ...options.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: options.maxBudgetUsd },
     inputPorts: inputPorts.map(stripPort),
     outputPorts: [stripPort(output)],
     bindings: inputPorts.map((input) => ({
@@ -600,6 +636,8 @@ class WorkflowBuilder {
       ...options.harness === undefined ? {} : { harness: options.harness },
       ...options.modelId === undefined ? {} : { modelId: options.modelId },
       ...options.effort === undefined ? {} : { effort: options.effort },
+      ...options.maxNativeTurns === undefined ? {} : { maxNativeTurns: options.maxNativeTurns },
+      ...options.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: options.maxBudgetUsd },
       ...options.fusion === undefined ? {} : { fusion: options.fusion },
       ...options.workspaceAccess === undefined ? {} : { workspaceAccess: options.workspaceAccess },
       ...options.capabilities === undefined ? {} : { capabilities: [...new Set(options.capabilities)].sort() },
@@ -1194,6 +1232,8 @@ function stripInternal(node) {
       ...node.harness === undefined ? {} : { harness: node.harness },
       ...node.modelId === undefined ? {} : { modelId: node.modelId },
       ...node.effort === undefined ? {} : { effort: node.effort },
+      ...node.maxNativeTurns === undefined ? {} : { maxNativeTurns: node.maxNativeTurns },
+      ...node.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: node.maxBudgetUsd },
       ...node.fusion === undefined ? {} : { fusion: node.fusion },
       ...node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess },
       ...node.capabilities === undefined ? {} : { capabilities: node.capabilities },
@@ -1506,6 +1546,12 @@ async function compileWorkflowDetailed(source) {
       }
     }
     if (node.kind === "agent") {
+      if (node.maxNativeTurns !== undefined && (!Number.isSafeInteger(node.maxNativeTurns) || node.maxNativeTurns < 1))
+        diagnostics.push(error("INVALID_NATIVE_BUDGET", "maxNativeTurns must be a positive integer", node.id));
+      if (node.maxBudgetUsd !== undefined && (!Number.isFinite(node.maxBudgetUsd) || node.maxBudgetUsd <= 0))
+        diagnostics.push(error("INVALID_NATIVE_BUDGET", "maxBudgetUsd must be positive and finite", node.id));
+      if ((node.maxNativeTurns !== undefined || node.maxBudgetUsd !== undefined) && node.harness !== undefined && node.harness !== "claude")
+        diagnostics.push(error("INVALID_NATIVE_BUDGET", "Native query budgets currently require Claude", node.id));
       const effortError = validateReasoningEffort(node.effort, node.harness);
       if (effortError)
         diagnostics.push(error("INVALID_REASONING_EFFORT", effortError, node.id));
@@ -2188,7 +2234,7 @@ function reduceEvent(state, event) {
       return {
         ...next,
         status: "paused",
-        ...["usage-limit", "turn-limit"].includes(event.payload.reason ?? "") ? { budgetPausedAt: event.recordedAt } : {}
+        ...["usage-limit", "turn-limit", "budget-limit"].includes(event.payload.reason ?? "") ? { budgetPausedAt: event.recordedAt } : {}
       };
     case "run.resumed":
       if (next.status !== "paused")
@@ -16678,7 +16724,7 @@ function workflowSource(workflow, executor) {
   };
   return build(bundle.rootDefinitionId, workflow.id);
 }
-async function compileTask(workflows, planner, executor, maxMilestones = 8, maxConcurrent = 2) {
+async function compileTask(workflows, planner, executor, maxMilestones = 3, maxConcurrent = 2) {
   const largest = (key) => Math.max(...workflows.map((workflow2) => workflow2.bundle.boundSummary[key]));
   const workflow = new WorkflowBuilder({
     id: "automatic-task",
@@ -16729,11 +16775,60 @@ async function compileTask(workflows, planner, executor, maxMilestones = 8, maxC
 init_src();
 init_src();
 
+// packages/host/src/coordinator/fusion-convergence.ts
+function convergedFusionOutput(bundle, state, node, invocationId, inputs, read) {
+  const identity = node.fusion;
+  if (!identity || identity.stopWhenUnanimous !== true || identity.stage === "draft" || identity.stage === "synthesis")
+    return;
+  const invocation = state.invocations[invocationId];
+  const definition = bundle.definitions[state.scopes[invocation.scopeId].definitionId];
+  const members = definition.nodes.filter((candidate) => candidate.kind === "agent" && candidate.fusion?.groupId === identity.groupId && candidate.fusion.stage === "draft");
+  const lastRound = identity.round - (identity.stage === "review" ? 1 : 0);
+  for (let round = 1;round <= lastRound; round++) {
+    const reviews = members.map((member) => {
+      if (member.kind !== "agent")
+        return;
+      const reviewNode = definition.nodes.find((candidate) => candidate.kind === "agent" && candidate.fusion?.groupId === identity.groupId && candidate.fusion.memberId === member.fusion.memberId && candidate.fusion.stage === "review" && candidate.fusion.round === round);
+      const review = Object.values(state.invocations).filter((candidate) => candidate.scopeId === invocation.scopeId && candidate.nodeId === reviewNode?.id && candidate.status === "succeeded" && candidate.activationOrdinal <= invocation.activationOrdinal).sort((a, b) => b.activationOrdinal - a.activationOrdinal)[0];
+      return review?.output[0] ? { memberId: member.fusion.memberId, report: read(review.output[0]) } : undefined;
+    });
+    if (members.length < 2 || !reviews.every((review) => review?.report && typeof review.report === "object" && !Array.isArray(review.report) && review.report.needsRevision === false))
+      continue;
+    return identity.stage === "revision" ? inputs.previous : reviews.find((review) => review?.memberId === identity.memberId)?.report;
+  }
+  return;
+}
+
+// packages/host/src/coordinator/continuation-context.ts
+init_src();
+async function continuationContext(context, previous, previousReport) {
+  const prior = previous.contextManifest;
+  const supplied = new Set(prior?.segments?.map((segment) => segment.content) ?? []);
+  const ownReport = previousReport === undefined ? undefined : canonicalize(previousReport);
+  return createContextManifest({
+    ...context,
+    segments: context.segments.map((segment) => {
+      const name = segment.id.split(":").at(-1);
+      let own = false;
+      if ((name === "own" || name === "previous") && ownReport !== undefined) {
+        try {
+          own = canonicalize(JSON.parse(segment.content)) === ownReport;
+        } catch {}
+      }
+      return segment.source === "artifact-input" && (supplied.has(segment.content) || own) ? {
+        ...segment,
+        supplied: false,
+        reason: "Already present in the resumed native conversation"
+      } : segment;
+    })
+  });
+}
+
 // packages/host/src/coordinator/coordinator.ts
 init_src();
-import { mkdirSync as mkdirSync6 } from "fs";
-import { createHash as createHash4 } from "crypto";
-import { join as join4 } from "path";
+import { mkdirSync as mkdirSync7, rmSync as rmSync3 } from "fs";
+import { createHash as createHash5 } from "crypto";
+import { join as join5 } from "path";
 
 // packages/host/src/id.ts
 import { randomUUID } from "crypto";
@@ -17068,11 +17163,46 @@ function harnessEvent(value) {
 function providerLimit(error2) {
   if (!error2)
     return;
+  if (/error_max_budget_usd|max[ _-]?budget|budget.*exceeded/i.test(error2))
+    return "budget-limit";
   if (/error_max_turns|maximum.*turns|max[ _-]?turns/i.test(error2))
     return "turn-limit";
   if (/usage[ _-]?limit|rate[ _-]?limit|quota|hit your limit|hit.*usage.*limit|limit.*resets|too many requests|\b429\b/i.test(error2))
     return "usage-limit";
   return;
+}
+function sessionUsageIncrement(current, previous) {
+  if (!current || typeof current !== "object" || Array.isArray(current) || !previous || typeof previous !== "object" || Array.isArray(previous))
+    return current;
+  return Object.fromEntries(Object.entries(current).map(([key, value]) => {
+    const baseline = previous[key];
+    if (![
+      "inputTokens",
+      "outputTokens",
+      "totalTokens",
+      "cost",
+      "uncachedInputTokens",
+      "cacheReadInputTokens",
+      "cacheCreationInputTokens"
+    ].includes(key) || !value || typeof value !== "object" || Array.isArray(value) || !baseline || typeof baseline !== "object" || Array.isArray(baseline) || typeof value.value !== "number" || typeof baseline.value !== "number" || !Number.isFinite(value.value) || !Number.isFinite(baseline.value))
+      return [key, value];
+    return [
+      key,
+      {
+        ...value,
+        value: value.value >= baseline.value ? value.value - baseline.value : value.value
+      }
+    ];
+  }));
+}
+function sessionUsageBaseline(current, previous) {
+  if (!current || typeof current !== "object" || Array.isArray(current) || !previous || typeof previous !== "object" || Array.isArray(previous))
+    return current;
+  return Object.fromEntries(Object.entries({ ...previous, ...current }).map(([key, value]) => {
+    const baseline = previous[key];
+    const known = value && typeof value === "object" && !Array.isArray(value) && typeof value.value === "number" && Number.isFinite(value.value);
+    return [key, known ? value : baseline ?? value];
+  }));
 }
 
 // packages/host/src/coordinator/retry-plan.ts
@@ -17140,6 +17270,78 @@ function retryPlan(bundle, state, invocationId) {
   };
 }
 
+// packages/host/src/coordinator/fusion-session.ts
+function fusionContinuation(bundle, state, node, invocationId) {
+  const identity = node.fusion;
+  if (!identity || identity.stage === "synthesis")
+    return;
+  const invocation = state.invocations[invocationId];
+  const definition = bundle.definitions[state.scopes[invocation.scopeId].definitionId];
+  const memberInvocation = (stage, round) => Object.values(state.invocations).filter((candidate) => {
+    if (candidate.scopeId !== invocation.scopeId || candidate.activationOrdinal > invocation.activationOrdinal || candidate.status !== "succeeded")
+      return false;
+    const candidateNode = definition.nodes.find((item) => item.id === candidate.nodeId);
+    const fusion = candidateNode?.kind === "agent" ? candidateNode.fusion : undefined;
+    return fusion?.groupId === identity.groupId && fusion.memberId === identity.memberId && fusion.stage === stage && fusion.round === round;
+  }).sort((a, b) => b.activationOrdinal - a.activationOrdinal)[0];
+  const draft = identity.stage === "draft" ? invocation : memberInvocation("draft", 0);
+  if (!draft)
+    throw new Error(`Fusion member ${identity.memberId} has no completed draft`);
+  const predecessor = identity.stage === "draft" ? undefined : identity.stage === "revision" ? memberInvocation("review", identity.round) : memberInvocation(identity.round === 1 ? "draft" : "revision", identity.round - 1);
+  const previousAttempt = predecessor ? Object.values(state.attempts).filter((item) => item.invocationId === predecessor.id && item.status === "succeeded").sort((a, b) => b.ordinal - a.ordinal)[0] : undefined;
+  if (identity.stage !== "draft" && !previousAttempt)
+    throw new Error(`Fusion member ${identity.memberId} has no completed preceding stage`);
+  return { workspaceInvocationId: draft.id, previousAttempt };
+}
+
+// packages/host/src/coordinator/fusion-notes.ts
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
+import { createHash } from "crypto";
+var FUSION_INLINE_MAX_BYTES = 16 * 1024;
+var INPUT_INLINE_MAX_BYTES = 4 * 1024;
+function fusionInputSegment(input) {
+  let content = JSON.stringify(input.value);
+  const bytes = Buffer.byteLength(content);
+  const transport = input.node.fusion?.notesTransport ?? "auto";
+  const report = /^(own|previous|peer\d+|review\d+|member\d+)$/.test(input.name);
+  const useFile = input.node.fusion && report ? transport === "files" || transport === "auto" && bytes > FUSION_INLINE_MAX_BYTES : input.name !== "task" && bytes > INPUT_INLINE_MAX_BYTES;
+  if (useFile) {
+    const fileContent = JSON.stringify(input.value, null, 2);
+    mkdirSync(input.directory, { recursive: true, mode: 448 });
+    const digest = createHash("sha256").update(fileContent).digest("hex");
+    const path = join(input.directory, `${digest}.json`);
+    try {
+      writeFileSync(path, fileContent, { flag: "wx", mode: 256 });
+    } catch (cause) {
+      if (cause.code !== "EEXIST")
+        throw cause;
+      if (readFileSync(path, "utf8") !== fileContent)
+        throw new Error(`Fusion notes file failed integrity validation: ${path}`);
+    }
+    const summary = input.value && typeof input.value === "object" && !Array.isArray(input.value) ? input.value.summary : undefined;
+    content = JSON.stringify({
+      kind: "kouro-artifact-file",
+      path,
+      mediaType: "application/json",
+      digest: `sha256:${digest}`,
+      bytes: Buffer.byteLength(fileContent),
+      ...typeof summary === "string" ? { summary: summary.slice(0, 1000) } : {},
+      instructions: "This file contains the full bound report. Use native read/search tools to inspect relevant sections before reviewing it. Preserve source citations; the summary is only an index."
+    });
+  }
+  return {
+    id: `${input.attemptId}:input:${input.name}`,
+    source: useFile ? "artifact-input-file" : "artifact-input",
+    content,
+    supplied: true,
+    reason: `resolved workflow input binding ${input.name}${useFile ? ` (${bytes} bytes in file)` : ""}`,
+    bytes: Buffer.byteLength(content),
+    tokenCount: null,
+    tokenQuality: "unavailable"
+  };
+}
+
 // packages/host/src/adapters/harness/activity-preview.ts
 function activityPreview(value) {
   let remaining = 32000;
@@ -17178,6 +17380,22 @@ function activityPreview(value) {
     return result;
   };
   return visit(value, 0);
+}
+
+// packages/host/src/adapters/harness/prompt.ts
+function renderHarnessPrompt(prompt, context) {
+  const segments = context?.segments.filter((segment) => segment.supplied && segment.source !== "role-prompt").map((segment) => ({
+    id: segment.id.includes(":input:") ? segment.id.split(":input:").slice(1).join(":input:") : segment.id.split(":").at(-1),
+    source: segment.source,
+    content: segment.content
+  }));
+  if (!segments?.length)
+    return prompt;
+  return `${prompt}
+
+[KOURO_CONTEXT_BEGIN]
+${JSON.stringify({ segments })}
+[KOURO_CONTEXT_END]`;
 }
 
 // packages/host/src/adapters/harness/codex.ts
@@ -17428,7 +17646,10 @@ class CodexAppServerHarness {
     const transport = this.createTransport(input.cwd);
     const events = [];
     let sessionId = input.resumeSession?.id;
-    const session = () => sessionId ? { session: { id: sessionId } } : {};
+    const session = () => ({
+      usageScope: "session",
+      ...sessionId ? { session: { id: sessionId } } : {}
+    });
     let usage = unavailableUsage();
     const emit = (event) => {
       events.push(event);
@@ -17508,11 +17729,7 @@ class CodexAppServerHarness {
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false
       } : { type: "readOnly", networkAccess: nativeToolPolicy(input.nativeConfig).network };
-      const prompt = input.context ? `${input.role.prompt}
-
-[KOURO_CONTEXT_BEGIN]
-${JSON.stringify(input.context)}
-[KOURO_CONTEXT_END]` : input.role.prompt;
+      const prompt = renderHarnessPrompt(input.role.prompt, input.context);
       let activeTurnId;
       const messages = new CodexMessages(emit);
       let completed;
@@ -18037,10 +18254,7 @@ class ExternalCliHarnessAdapter {
     const args = [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
     if (typeof config.model === "string" && config.model)
       args.push("--model", config.model);
-    const prompt = input.context ? `[KOURO_CONTEXT_BEGIN]
-${JSON.stringify(input.context)}
-[KOURO_CONTEXT_END]
-${input.prompt}` : input.prompt;
+    const prompt = renderHarnessPrompt(input.prompt, input.context);
     args.push(prompt);
     let proc;
     try {
@@ -37643,7 +37857,7 @@ var claudeSdkDescriptor = {
       ]
     },
     usage: { state: "supported" },
-    "cost-cap": { state: "unsupported" },
+    "cost-cap": { state: "supported" },
     "awaited-subagent-tool": { state: "supported" },
     "child-read-only-envelope": { state: "supported" }
   },
@@ -37653,7 +37867,9 @@ var claudeSdkDescriptor = {
     properties: {
       model: { type: "string" },
       permissionMode: { type: "string" },
-      effort: { type: "string", enum: [...reasoningEffortsForHarness("claude")] }
+      effort: { type: "string", enum: [...reasoningEffortsForHarness("claude")] },
+      maxNativeTurns: { type: "integer", minimum: 1 },
+      maxBudgetUsd: { type: "number", exclusiveMinimum: 0 }
     }
   }
 };
@@ -37669,6 +37885,15 @@ class ClaudeAgentSdkHarnessAdapter {
     return Object.fromEntries(Object.entries(claudeSdkDescriptor.capabilities).map(([name, value]) => [name, value.state]));
   }
   async run(input2) {
+    const maxTurns = input2.nativeConfig?.maxNativeTurns;
+    const maxBudgetUsd = input2.nativeConfig?.maxBudgetUsd;
+    if (maxTurns !== undefined && (typeof maxTurns !== "number" || !Number.isSafeInteger(maxTurns) || maxTurns < 1) || maxBudgetUsd !== undefined && (typeof maxBudgetUsd !== "number" || !Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0))
+      return {
+        status: "failed",
+        error: "Invalid Claude native query budget",
+        usage: unavailableUsage(),
+        events: []
+      };
     const effort2 = input2.nativeConfig?.effort;
     const effortError = validateReasoningEffort(effort2, "claude");
     if (effortError)
@@ -37688,18 +37913,16 @@ class ClaudeAgentSdkHarnessAdapter {
     const timer = timeoutMs === undefined ? undefined : setTimeout(() => abortController.abort(new Error(`Claude SDK timed out after ${timeoutMs}ms`)), timeoutMs);
     let stderr = "";
     const messages = [];
-    const context = input2.context ? `
+    const prompt = renderHarnessPrompt(`${input2.resumeSession ? `Continue the existing conversation. Preserve completed research and outputs.
 
-[KOURO_CONTEXT]
-${JSON.stringify(input2.context)}
-[/KOURO_CONTEXT]` : "";
-    const prompt = `${input2.resumeSession ? `Continue the existing session's unfinished work. Preserve completed research and outputs.
-
-` : ""}${input2.prompt}${context}`;
+` : ""}${input2.prompt}`, input2.context);
     let sessionId = input2.resumeSession?.id;
     let usageLimited = false;
     let resumeAfter;
-    const session = () => sessionId ? { session: { id: sessionId } } : {};
+    const session = () => ({
+      usageScope: "session",
+      ...sessionId ? { session: { id: sessionId } } : {}
+    });
     const policy = nativeToolPolicy(input2.nativeConfig);
     const disallowedTools = claudeDisallowedTools(policy);
     const scoutTool = input2.context?.tools.find((candidate) => candidate.name === "subagent");
@@ -37726,9 +37949,12 @@ ${JSON.stringify(input2.context)}
       })
     } : undefined;
     const options = {
+      ...maxTurns === undefined ? {} : { maxTurns },
+      ...maxBudgetUsd === undefined ? {} : { maxBudgetUsd },
       ...effort2 === undefined ? {} : { effort: effort2 },
       includePartialMessages: true,
       cwd: input2.cwd ?? process.cwd(),
+      ...input2.contextDirectories?.length ? { additionalDirectories: [...input2.contextDirectories] } : {},
       ...input2.modelId ? { model: input2.modelId } : {},
       ...typeof input2.nativeConfig?.model === "string" ? { model: input2.nativeConfig.model } : {},
       abortController,
@@ -37753,6 +37979,7 @@ ${JSON.stringify(input2.context)}
       } : {}
     };
     let resultMessage;
+    const limitReason = (error63) => usageLimited ? "usage-limit" : resultMessage?.subtype === "error_max_turns" ? "turn-limit" : resultMessage?.subtype === "error_max_budget_usd" ? "budget-limit" : providerLimit(error63);
     const events = [];
     const activity = new ClaudeMessages((event) => {
       events.push(event);
@@ -37794,8 +38021,8 @@ ${JSON.stringify(input2.context)}
 `) || `Claude SDK ended with ${resultMessage.subtype}` : cause instanceof Error ? cause.message : String(cause);
       return {
         ...session(),
-        ...!cancelled && (usageLimited || providerLimit(error63)) ? {
-          stopReason: usageLimited ? "usage-limit" : providerLimit(error63),
+        ...!cancelled && limitReason(error63) ? {
+          stopReason: limitReason(error63),
           ...resumeAfter ? { resumeAfter } : {}
         } : {},
         status: cancelled ? "cancelled" : "failed",
@@ -37826,8 +38053,8 @@ ${JSON.stringify(input2.context)}
 `) || `Claude SDK ended with ${resultMessage?.subtype ?? "no result"}`;
       return {
         ...session(),
-        ...usageLimited || providerLimit(error63) ? {
-          stopReason: usageLimited ? "usage-limit" : providerLimit(error63),
+        ...limitReason(error63) ? {
+          stopReason: limitReason(error63),
           ...resumeAfter ? { resumeAfter } : {}
         } : {},
         status: "failed",
@@ -37884,6 +38111,9 @@ function usageFrom(message) {
   });
   return {
     inputTokens: value(inputTokens),
+    uncachedInputTokens: value(sum((item) => item.inputTokens)),
+    cacheReadInputTokens: value(sum((item) => item.cacheReadInputTokens)),
+    cacheCreationInputTokens: value(sum((item) => item.cacheCreationInputTokens)),
     outputTokens: value(outputTokens),
     totalTokens: value(inputTokens + outputTokens),
     cost: {
@@ -38141,11 +38371,7 @@ class PiSdkHarness {
         };
       const activity = new PiMessages(emit);
       const unsubscribe = session.subscribe((event) => activity.consume(event));
-      const handoff3 = input2.context ? `${input2.role.prompt}
-
-[KOURO_CONTEXT_BEGIN]
-${JSON.stringify(input2.context)}
-[KOURO_CONTEXT_END]` : input2.role.prompt;
+      const handoff3 = renderHarnessPrompt(input2.role.prompt, input2.context);
       const prompt = input2.role.outputSchema ? `${handoff3}
 
 Return only JSON matching this schema:
@@ -38489,15 +38715,15 @@ class PiHarnessAdapter {
 }
 
 // packages/host/src/adapters/process/darwin.ts
-import { mkdirSync as mkdirSync2 } from "fs";
+import { mkdirSync as mkdirSync3 } from "fs";
 
 // packages/host/src/adapters/process/common.ts
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "fs";
-import { join } from "path";
+import { mkdirSync as mkdirSync2, mkdtempSync, readFileSync as readFileSync2, rmSync } from "fs";
+import { join as join2 } from "path";
 import { tmpdir } from "os";
 async function runEnforcedProcess(input2) {
   const operationKey = input2.operationKey ?? "probe";
-  mkdirSync(input2.cwd, { recursive: true, mode: 448 });
+  mkdirSync2(input2.cwd, { recursive: true, mode: 448 });
   const capture2 = capturePaths();
   let child;
   try {
@@ -38574,7 +38800,7 @@ async function runEnforcedProcess(input2) {
   }
 }
 async function runTrustedCommand(input2) {
-  mkdirSync(input2.cwd, { recursive: true, mode: 448 });
+  mkdirSync2(input2.cwd, { recursive: true, mode: 448 });
   const capture2 = capturePaths();
   let child;
   try {
@@ -38672,13 +38898,13 @@ async function stopGroup(child) {
   return exitCode;
 }
 function capturePaths() {
-  const directory = mkdtempSync(join(tmpdir(), "kouro-process-output-"));
-  return { directory, stdout: join(directory, "stdout"), stderr: join(directory, "stderr") };
+  const directory = mkdtempSync(join2(tmpdir(), "kouro-process-output-"));
+  return { directory, stdout: join2(directory, "stdout"), stderr: join2(directory, "stderr") };
 }
 function readCaptured(capture2) {
   const read = (path) => {
     try {
-      return new Uint8Array(readFileSync(path));
+      return new Uint8Array(readFileSync2(path));
     } catch {
       return new Uint8Array;
     }
@@ -38723,7 +38949,7 @@ class DarwinSandboxProcessAdapter {
     const probe = await this.probe();
     if (!probe.available)
       throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
-    mkdirSync2(input2.workspaceDir, { recursive: true, mode: 448 });
+    mkdirSync3(input2.workspaceDir, { recursive: true, mode: 448 });
     return this.spawn(input2.workspaceDir, ["/usr/bin/printf", `Kouro M1 command
 `], input2.timeoutMs, input2.operationKey);
   }
@@ -38801,7 +39027,7 @@ function escapeSandboxPath(path) {
 }
 
 // packages/host/src/adapters/process/bwrap.ts
-import { mkdirSync as mkdirSync3 } from "fs";
+import { mkdirSync as mkdirSync4 } from "fs";
 class BubblewrapProcessAdapter {
   enforcementMode = "enforced";
   probeResult;
@@ -38819,7 +39045,7 @@ class BubblewrapProcessAdapter {
     const probe = await this.probe();
     if (!probe.available)
       throw new Error(`Enforced process execution unavailable: ${probe.detail}`);
-    mkdirSync3(input2.workspaceDir, { recursive: true, mode: 448 });
+    mkdirSync4(input2.workspaceDir, { recursive: true, mode: 448 });
     return this.spawn(input2.workspaceDir, ["/usr/bin/printf", "Kouro M1 command\\n"], input2.timeoutMs, input2.operationKey);
   }
   async executeCommand(input2) {
@@ -38912,9 +39138,9 @@ function createDefaultProcessAdapter(platform = process.platform) {
 init_src();
 init_src();
 import { Database } from "bun:sqlite";
-import { createHash as createHash2 } from "crypto";
-import { mkdirSync as mkdirSync5 } from "fs";
-import { join as join3 } from "path";
+import { createHash as createHash3 } from "crypto";
+import { mkdirSync as mkdirSync6 } from "fs";
+import { join as join4 } from "path";
 
 // packages/host/src/storage/schema.ts
 function migrate(db) {
@@ -39375,36 +39601,40 @@ function migrate(db) {
   } else if (deliveryColumns.length > 0 && !deliveryColumns.some((column) => column.name === "parent_attempt_id")) {
     throw new Error("scout delivery schema is inconsistent with scout request schema");
   }
+  const evidenceColumns = db.query("PRAGMA table_info(scout_requests)").all();
+  if (!evidenceColumns.some((column) => column.name === "evidence_key"))
+    db.exec("ALTER TABLE scout_requests ADD COLUMN evidence_key TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS scout_evidence_idx ON scout_requests(run_id, evidence_key, state)");
 }
 
 // packages/host/src/storage/blob-store.ts
-import { createHash, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
 import {
   closeSync,
   existsSync,
   fsyncSync,
-  mkdirSync as mkdirSync4,
+  mkdirSync as mkdirSync5,
   openSync,
-  readFileSync as readFileSync2,
+  readFileSync as readFileSync3,
   rmSync as rmSync2,
   renameSync,
-  writeFileSync
+  writeFileSync as writeFileSync2
 } from "fs";
-import { dirname as dirname2, join as join2 } from "path";
+import { dirname as dirname2, join as join3 } from "path";
 class BlobStore {
   root;
   constructor(root) {
     this.root = root;
-    mkdirSync4(join2(root, "blobs"), { recursive: true, mode: 448 });
-    mkdirSync4(join2(root, "tmp"), { recursive: true, mode: 448 });
+    mkdirSync5(join3(root, "blobs"), { recursive: true, mode: 448 });
+    mkdirSync5(join3(root, "tmp"), { recursive: true, mode: 448 });
   }
   put(runId, bytes, mediaType = "application/octet-stream") {
-    const digest = createHash("sha256").update(bytes).digest("hex");
-    const destination = join2(this.root, "blobs", digest.slice(0, 2), digest);
-    mkdirSync4(dirname2(destination), { recursive: true, mode: 448 });
+    const digest = createHash2("sha256").update(bytes).digest("hex");
+    const destination = join3(this.root, "blobs", digest.slice(0, 2), digest);
+    mkdirSync5(dirname2(destination), { recursive: true, mode: 448 });
     if (!existsSync(destination)) {
-      const temporary = join2(this.root, "tmp", `${id("blob")}.partial`);
-      writeFileSync(temporary, bytes, { mode: 384 });
+      const temporary = join3(this.root, "tmp", `${id("blob")}.partial`);
+      writeFileSync2(temporary, bytes, { mode: 384 });
       const fd = openSync(temporary, "r");
       try {
         fsyncSync(fd);
@@ -39431,14 +39661,14 @@ class BlobStore {
   pathForDigest(digest) {
     if (!/^[a-f0-9]{64}$/.test(digest))
       throw new Error("Invalid artifact digest");
-    return join2(this.root, "blobs", digest.slice(0, 2), digest);
+    return join3(this.root, "blobs", digest.slice(0, 2), digest);
   }
   read(ref) {
     if (!ref.digest)
       throw new Error("Artifact has no content digest");
     const path = this.pathForDigest(ref.digest);
-    const bytes = new Uint8Array(readFileSync2(path));
-    const actual = createHash("sha256").update(bytes).digest("hex");
+    const bytes = new Uint8Array(readFileSync3(path));
+    const actual = createHash2("sha256").update(bytes).digest("hex");
     if (actual !== ref.digest)
       throw new Error("Artifact checksum mismatch");
     return bytes;
@@ -39546,12 +39776,12 @@ class Journal {
   frameBatch = null;
   constructor(options) {
     this.dataDir = options.dataDir;
-    mkdirSync5(options.dataDir, { recursive: true, mode: 448 });
-    this.owner = new OwnerLock(join3(options.dataDir, "owner.lock"));
+    mkdirSync6(options.dataDir, { recursive: true, mode: 448 });
+    this.owner = new OwnerLock(join4(options.dataDir, "owner.lock"));
     if (options.requireOwner !== false)
       this.owner.acquire();
     try {
-      this.db = new Database(join3(options.dataDir, "kouro.sqlite"));
+      this.db = new Database(join4(options.dataDir, "kouro.sqlite"));
       migrate(this.db);
       this.blobs = new BlobStore(options.dataDir);
     } catch (cause) {
@@ -39864,7 +40094,7 @@ class Journal {
     });
   }
   createRun(input2) {
-    const requestDigest = createHash2("sha256").update(canonicalize({
+    const requestDigest = createHash3("sha256").update(canonicalize({
       workflowId: input2.workflowId,
       bundleDigest: input2.bundle.digest,
       input: input2.input ?? {},
@@ -39918,7 +40148,7 @@ class Journal {
       validationEvidence: input2.validationEvidence ?? [],
       reviewEvidence: input2.reviewEvidence ?? []
     };
-    const actionDigest = `sha256:${createHash2("sha256").update(canonicalize(base)).digest("hex")}`;
+    const actionDigest = `sha256:${createHash3("sha256").update(canonicalize(base)).digest("hex")}`;
     return this.tx(() => {
       const prior = this.db.query("SELECT * FROM delivery_actions WHERE request_key=?1").get(input2.requestKey);
       if (prior) {
@@ -40337,7 +40567,7 @@ class Journal {
       throw new Error("idempotency key is required");
     if (!input2.actor.trim())
       throw new Error("deletion actor is required");
-    const requestDigest = createHash2("sha256").update(canonicalize({
+    const requestDigest = createHash3("sha256").update(canonicalize({
       runId: input2.runId,
       expectedRevision: input2.expectedRevision,
       actor: input2.actor
@@ -41449,7 +41679,7 @@ function isRecord3(value) {
 
 // packages/host/src/scouting/gateway.ts
 init_src();
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash4 } from "crypto";
 var MAX_TOTAL_REQUESTS = 4;
 var MAX_RESULT_BYTES = 64 * 1024;
 
@@ -41458,6 +41688,13 @@ class ScoutGateway {
   inFlight = new Map;
   constructor(journal) {
     this.journal = journal;
+  }
+  recordEvidenceKey(runId, parentAttemptId, requestId, key) {
+    this.journal.db.query("UPDATE scout_requests SET evidence_key=?1 WHERE run_id=?2 AND parent_attempt_id=?3 AND request_id=?4 AND state='running'").run(key, runId, parentAttemptId, requestId);
+  }
+  cachedEvidence(runId, key) {
+    const row = this.journal.db.query("SELECT request_id, result_json FROM scout_requests WHERE run_id=?1 AND evidence_key=?2 AND state='succeeded' AND result_json IS NOT NULL ORDER BY updated_at DESC LIMIT 1").get(runId, key);
+    return row ? { requestId: row.request_id, result: JSON.parse(row.result_json) } : undefined;
   }
   recordSession(runId, parentAttemptId, requestId, reference, usage) {
     this.journal.db.query("UPDATE scout_requests SET session_reference_json=?1, usage_json=?2 WHERE run_id=?3 AND parent_attempt_id=?4 AND request_id=?5 AND state='running'").run(json(reference), json(usage), runId, parentAttemptId, requestId);
@@ -41759,7 +41996,7 @@ function toRequest(row) {
   };
 }
 function digest(value) {
-  return `sha256:${createHash3("sha256").update(value).digest("hex")}`;
+  return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
 }
 function succeededResult(request) {
   if (!request.resultArtifactId || request.result === undefined)
@@ -42172,6 +42409,7 @@ class Coordinator {
     const claims = await this.workspaceClaims(runId);
     for (const claim3 of claims ?? [])
       await this.workspaceAdapter.cleanup(claim3);
+    rmSync3(join5(this.dataDir, "workspaces", runId), { recursive: true, force: true });
     this.workspaces.delete(runId);
     this.snapshots.delete(runId);
     for (const [key, claim3] of this.branchWorkspaces) {
@@ -42283,7 +42521,7 @@ class Coordinator {
       throw new Error("steer message must be 1 to 4000 characters");
     if (!input2.idempotencyKey.trim())
       throw new Error("idempotency key is required");
-    const requestDigest = createHash4("sha256").update(canonicalize({ invocationId: input2.invocationId, attemptId: input2.attemptId, message })).digest("hex");
+    const requestDigest = createHash5("sha256").update(canonicalize({ invocationId: input2.invocationId, attemptId: input2.attemptId, message })).digest("hex");
     const prior = this.journal.getSteeringCommand(input2.runId, input2.idempotencyKey);
     if (prior) {
       if (prior.requestDigest !== requestDigest)
@@ -42466,7 +42704,7 @@ class Coordinator {
       return true;
     const latest = Object.values(state.attempts).filter((item) => item.invocationId === invocationId).sort((a, b) => b.ordinal - a.ordinal)[0];
     const reference = latest?.sessionReference;
-    return !!reference && typeof reference === "object" && !Array.isArray(reference) && (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit");
+    return !!reference && typeof reference === "object" && !Array.isArray(reference) && (reference.stopReason === "usage-limit" || reference.stopReason === "turn-limit" || reference.stopReason === "budget-limit");
   }
   normalizeActivity(runId, event) {
     if (event.type !== "tool" || !event.data || typeof event.data !== "object" || Array.isArray(event.data) || event.data.output === undefined)
@@ -43375,14 +43613,14 @@ ${json(dependencies)}` : "");
         const groups = Object.values(view.state.scopes).flatMap((scope) => {
           const definition = view.bundle.definitions[scope.definitionId];
           return (definition?.nodes ?? []).filter((candidate) => candidate.kind === "fork").map((fork) => {
-            const join5 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
+            const join6 = definition.nodes.find((candidate) => candidate.kind === "join" && candidate.groupId === fork.groupId);
             return {
               id: `${scope.id}:${fork.groupId}`,
               expectedBranchIds: executions.filter((intent2) => {
                 const invocation = view.state.invocations[intent2.invocationId];
                 return invocation?.scopeId === scope.id && fork.branchIds.includes(invocation.nodeId);
               }).map((intent2) => intent2.invocationId),
-              mode: join5?.mode === "fail-fast" ? "fail-fast" : "all-settled"
+              mode: join6?.mode === "fail-fast" ? "fail-fast" : "all-settled"
             };
           }).filter((group) => group.expectedBranchIds.length > 0);
         });
@@ -43789,21 +44027,51 @@ ${json(dependencies)}` : "");
     const runInput = row ? parseJson(row.input_json) : {};
     const collaborationConfig = runInput.__collaboration && typeof runInput.__collaboration === "object" ? runInput.__collaboration : undefined;
     const profile = runInput.__kouroExecutionProfile === "codex-readonly" || runInput.__kouroExecutionProfile === "codex-workspace-write" || runInput.__kouroExecutionProfile === "claude-readonly" || runInput.__kouroExecutionProfile === "claude-workspace-write" || runInput.__kouroExecutionProfile === "pi-readonly" ? runInput.__kouroExecutionProfile : "scripted";
-    const workspaceDir = join4(this.dataDir, "workspaces", runId, invocationId);
+    const fusion = node2.kind === "agent" ? fusionContinuation(bundle, state, node2, invocationId) : undefined;
+    if (node2.kind === "agent" && fusion?.previousAttempt) {
+      const converged = convergedFusionOutput(bundle, state, node2, invocationId, resolvedInputs ?? {}, (ref) => JSON.parse(new TextDecoder().decode(this.journal.blobs.read(ref))));
+      if (converged !== undefined) {
+        const outputSchema = node2.outputPorts[0] && bundle.schemas[node2.outputPorts[0].schemaDigest];
+        if (outputSchema) {
+          const validation = validateJsonSchema(converged, outputSchema);
+          if (!validation.valid)
+            throw new Error(`invalid-output: ${validation.error}`);
+        }
+        const output2 = this.journal.blobs.put(runId, new TextEncoder().encode(json(converged)), "application/json");
+        const zero = { value: 0, quality: "observed", source: "kouro-convergence" };
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [output2],
+          output: [output2],
+          artifacts: [],
+          evidence: [],
+          status: "succeeded",
+          diagnostics: [
+            "Fusion converged: all reviewers explicitly requested no revision; no model call"
+          ],
+          resolvedExecution: fusion.previousAttempt.resolvedExecution,
+          sessionReference: fusion.previousAttempt.sessionReference,
+          usage: { inputTokens: zero, outputTokens: zero, totalTokens: zero, cost: zero }
+        });
+        return;
+      }
+    }
+    const workspaceInvocationId = fusion?.workspaceInvocationId ?? invocationId;
+    const workspaceDir = join5(this.dataDir, "workspaces", runId, workspaceInvocationId);
     const registeredWorkspace = this.workspaces.get(runId);
     let invocationWorkspace = this.milestoneWorkspace(runId, state, state.invocations[invocationId].scopeId) ?? registeredWorkspace;
     const sourceInvocationId = state.invocations[invocationId]?.sourceInvocationId;
     if (registeredWorkspace && invocationWorkspace === registeredWorkspace && sourceInvocationId && this.workspaceAdapter) {
-      const key = `${runId}:${invocationId}`;
+      const key = `${runId}:${workspaceInvocationId}`;
       invocationWorkspace = this.branchWorkspaces.get(key);
       if (!invocationWorkspace) {
         try {
-          invocationWorkspace = await this.workspaceAdapter.loadByIdentity(runId, invocationId);
+          invocationWorkspace = await this.workspaceAdapter.loadByIdentity(runId, workspaceInvocationId);
         } catch {
           invocationWorkspace = await this.workspaceAdapter.create({
             repositoryPath: registeredWorkspace.repositoryPath,
             runId,
-            workspaceId: invocationId,
+            workspaceId: workspaceInvocationId,
             baseCommit: registeredWorkspace.baseCommit
           });
         }
@@ -43877,19 +44145,11 @@ ${json(dependencies)}` : "");
         });
       }
       const promptBytes = new TextEncoder().encode(node2.prompt).byteLength;
-      const inputSegments = Object.entries(resolvedInputs ?? {}).map(([name, value]) => {
-        const content = JSON.stringify(value);
-        return {
-          id: `${attemptId}:input:${name}`,
-          source: "artifact-input",
-          content,
-          supplied: true,
-          reason: `resolved workflow input binding ${name}`,
-          bytes: new TextEncoder().encode(content).byteLength,
-          tokenCount: null,
-          tokenQuality: "unavailable"
-        };
-      });
+      const notesDirectory = join5(this.dataDir, "workspaces", runId, workspaceInvocationId, "context-files");
+      const inputSegments = Object.entries(resolvedInputs ?? {}).map(([name, value]) => fusionInputSegment({ node: node2, name, value, attemptId, directory: notesDirectory }));
+      const contextDirectories = node2.fusion && node2.fusion.notesTransport !== "inline" || inputSegments.some((segment) => segment.source === "artifact-input-file") ? [notesDirectory] : undefined;
+      if (contextDirectories)
+        mkdirSync7(notesDirectory, { recursive: true, mode: 448 });
       let contextManifest = await createContextManifest({
         attemptId,
         segments: [
@@ -43955,7 +44215,9 @@ ${json(dependencies)}` : "");
         hiddenNativeContext: "unavailable"
       });
       const previousAttempt = Object.values(state.attempts).filter((item) => item.invocationId === invocationId && item.ordinal < attempt.ordinal).sort((a, b) => b.ordinal - a.ordinal)[0];
-      const resumeReference = previousAttempt && this.nativeSession(previousAttempt);
+      const retryReference = previousAttempt && this.nativeSession(previousAttempt);
+      const continuationAttempt = retryReference ? previousAttempt : fusion?.previousAttempt;
+      const resumeReference = retryReference ?? (continuationAttempt && this.nativeSession(continuationAttempt));
       if (attempt.ordinal > 0 && !resumeReference) {
         const prepared = await prepareAgentHandoff({
           context: contextManifest,
@@ -44151,8 +44413,20 @@ ${json(dependencies)}` : "");
       }
       if (node2.effort !== undefined)
         nativeConfig = { ...nativeConfig, effort: node2.effort };
-      const nativeConfigDigest = nativeConfig ? `sha256:${await sha256Hex(canonicalize(nativeConfig))}` : undefined;
-      if (resumeReference && (selected.capabilities().resume !== "supported" || previousAttempt?.resolvedExecution?.harness !== resolvedHarness || previousAttempt.resolvedExecution.adapterVersion !== resolvedVersion || resumeReference.cwd !== undefined && resumeReference.cwd !== invocationWorkspaceDir || resumeReference.modelId !== undefined && resumeReference.modelId !== (resolvedModelId ?? node2.modelId) || (resumeReference.nativeConfigDigest ?? previousAttempt.resolvedExecution.nativeConfigDigest) !== undefined && (resumeReference.nativeConfigDigest ?? previousAttempt.resolvedExecution.nativeConfigDigest) !== nativeConfigDigest)) {
+      if (fusion?.previousAttempt && selected.capabilities().resume === "supported" && !resumeReference) {
+        this.journal.completeEffect({
+          effectId: detail.id,
+          storedArtifacts: [],
+          artifacts: [],
+          evidence: [],
+          output: [],
+          status: "failed",
+          error: "Fusion continuation unavailable: the preceding researcher stage has no saved native session"
+        });
+        return;
+      }
+      const nativeConfigDigest = nativeConfig || contextDirectories ? `sha256:${await sha256Hex(canonicalize({ ...nativeConfig, ...contextDirectories ? { contextDirectories } : {} }))}` : undefined;
+      if (resumeReference && (selected.capabilities().resume !== "supported" || continuationAttempt?.resolvedExecution?.harness !== resolvedHarness || continuationAttempt.resolvedExecution.adapterVersion !== resolvedVersion || resumeReference.cwd !== undefined && resumeReference.cwd !== invocationWorkspaceDir || resumeReference.modelId !== undefined && resumeReference.modelId !== (resolvedModelId ?? node2.modelId) || (resumeReference.nativeConfigDigest ?? continuationAttempt.resolvedExecution.nativeConfigDigest) !== undefined && (resumeReference.nativeConfigDigest ?? continuationAttempt.resolvedExecution.nativeConfigDigest) !== nativeConfigDigest)) {
         this.journal.completeEffect({
           effectId: detail.id,
           storedArtifacts: [],
@@ -44165,6 +44439,17 @@ ${json(dependencies)}` : "");
         });
         return;
       }
+      if (node2.maxNativeTurns !== undefined || node2.maxBudgetUsd !== undefined) {
+        if (selected.id !== "claude")
+          throw new Error("Native query budgets currently require Claude");
+        nativeConfig = {
+          ...nativeConfig,
+          ...node2.maxNativeTurns === undefined ? {} : { maxNativeTurns: node2.maxNativeTurns },
+          ...node2.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: node2.maxBudgetUsd }
+        };
+      }
+      if (node2.fusion && resumeReference && continuationAttempt)
+        contextManifest = await continuationContext(contextManifest, continuationAttempt, continuationAttempt.output[0] ? JSON.parse(new TextDecoder().decode(this.journal.blobs.read(continuationAttempt.output[0]))) : undefined);
       if (subagentIds.length) {
         const capabilities = selected.capabilities();
         if (capabilities["awaited-subagent-tool"] !== "supported" || capabilities["child-read-only-envelope"] !== "supported") {
@@ -44207,7 +44492,7 @@ ${json(dependencies)}` : "");
         });
         return;
       }
-      mkdirSync6(invocationWorkspaceDir, { recursive: true, mode: 448 });
+      mkdirSync7(invocationWorkspaceDir, { recursive: true, mode: 448 });
       let harnessResult;
       const aborter = new AbortController;
       const runAborters = this.aborters.get(runId) ?? new Map;
@@ -44234,6 +44519,7 @@ ${json(dependencies)}` : "");
           cwd: invocationWorkspaceDir,
           nativeConfig,
           ...resumeReference ? { resumeSession: { id: String(resumeReference.id) } } : {},
+          ...contextDirectories ? { contextDirectories } : {},
           context: contextManifest,
           ...collaborationGateway && collaborationGrant ? {
             collaboration: {
@@ -44319,7 +44605,7 @@ ${json(dependencies)}` : "");
       if (status === "failed" && subagentIds.length) {
         const limitedChild = this.scouts.requests(runId).find((request) => {
           const reference2 = request.sessionReference;
-          return request.parentAttemptId === attemptId && request.state === "failed" && !request.optional && reference2 && typeof reference2 === "object" && !Array.isArray(reference2) && (reference2.stopReason === "usage-limit" || reference2.stopReason === "turn-limit");
+          return request.parentAttemptId === attemptId && request.state === "failed" && !request.optional && reference2 && typeof reference2 === "object" && !Array.isArray(reference2) && (reference2.stopReason === "usage-limit" || reference2.stopReason === "turn-limit" || reference2.stopReason === "budget-limit");
         });
         const reference = limitedChild?.sessionReference;
         if (reference && typeof reference === "object" && !Array.isArray(reference)) {
@@ -44404,13 +44690,16 @@ ${json(dependencies)}` : "");
             ...node2.effort === undefined ? {} : { effort: node2.effort }
           },
           harnessEvents: durableEvents,
-          usage: harnessResult.usage,
+          usage: resumeReference && harnessResult.usageScope === "session" ? sessionUsageIncrement(harnessResult.usage, resumeReference.cumulativeUsage ?? continuationAttempt?.usage) : harnessResult.usage,
           contextManifest: JSON.parse(JSON.stringify(contextManifest)),
           sessionReference: {
             continuation: resumeReference ? "native-resume" : "fresh-session",
             nativeContinuation: harnessResult.session ? "available" : "unavailable",
             ...harnessResult.session ? {
               id: harnessResult.session.id,
+              ...harnessResult.usageScope === "session" ? {
+                cumulativeUsage: sessionUsageBaseline(harnessResult.usage, resumeReference?.cumulativeUsage ?? continuationAttempt?.usage)
+              } : {},
               harness: resolvedHarness,
               adapterVersion: resolvedVersion,
               cwd: invocationWorkspaceDir,
@@ -44637,13 +44926,52 @@ ${json(dependencies)}` : "");
     }
     const outputSchema = childAgent.outputPorts[0] ? view.bundle.schemas[childAgent.outputPorts[0].schemaDigest] : undefined;
     const childInvocationId = `${input2.parentAttemptId}:scout:${input2.requestId}`;
+    const parentNode = definition?.nodes.find((node2) => node2.id === parent?.nodeId);
+    const identity = parentNode?.kind === "agent" ? parentNode.fusion : undefined;
+    const ownedWorkspace = identity && this.workspaceAdapter ? [this.workspaces.get(input2.runId), ...this.branchWorkspaces.values()].find((workspace) => workspace?.runId === input2.runId && workspace.path === input2.cwd) : undefined;
+    const evidenceFingerprint = (tree) => sha256Hex(canonicalize({
+      scope: scope.id,
+      group: identity.groupId,
+      member: identity.memberId,
+      cwd: input2.cwd,
+      tree,
+      scout: scout.definitionId,
+      harness: childAdapter.id,
+      version: childAdapter.adapterVersion,
+      model: childAgent.modelId ?? (childAdapter.id === input2.adapter.id ? input2.parentModelId : null) ?? null,
+      input: input2.input
+    }));
+    let evidenceKey;
+    if (ownedWorkspace && this.workspaceAdapter) {
+      try {
+        evidenceKey = await evidenceFingerprint((await this.workspaceAdapter.snapshot(ownedWorkspace)).resultTree);
+      } catch {}
+    }
     return this.scouts.invoke({
       ...input2,
       runner: async (request, signal) => {
+        if (evidenceKey) {
+          this.scouts.recordEvidenceKey(input2.runId, input2.parentAttemptId, input2.requestId, evidenceKey);
+          const cached2 = this.scouts.cachedEvidence(input2.runId, evidenceKey);
+          if (cached2) {
+            const zero = { value: 0, quality: "observed", source: "kouro-evidence-cache" };
+            this.scouts.recordSession(input2.runId, input2.parentAttemptId, input2.requestId, { cachedFrom: cached2.requestId }, { inputTokens: zero, outputTokens: zero, totalTokens: zero, cost: zero });
+            this.recordHarnessActivity(input2.runId, input2.parentInvocationId, input2.parentAttemptId, {
+              type: "log",
+              at: now(),
+              data: {
+                status: "Reused unchanged repository evidence",
+                scoutId: input2.scoutId,
+                requestId: input2.requestId
+              }
+            });
+            return cached2.result;
+          }
+        }
         const previousParent = Object.values(view.state.attempts).filter((attempt) => attempt.invocationId === input2.parentInvocationId && attempt.id !== input2.parentAttemptId).sort((a, b) => b.ordinal - a.ordinal)[0];
         const continuingParent = previousParent && this.nativeSession(previousParent);
         const prior = continuingParent ? this.scouts.requests(input2.runId).filter((candidate) => candidate.parentInvocationId === input2.parentInvocationId && candidate.parentAttemptId !== input2.parentAttemptId && candidate.scoutId === input2.scoutId && canonicalize(candidate.input) === canonicalize(request.input)).at(-1) : undefined;
-        if (prior?.state === "succeeded" && prior.result !== undefined) {
+        if (!evidenceKey && prior?.state === "succeeded" && prior.result !== undefined) {
           this.recordHarnessActivity(input2.runId, input2.parentInvocationId, input2.parentAttemptId, {
             type: "log",
             at: now(),
@@ -44655,10 +44983,12 @@ ${json(dependencies)}` : "");
           });
           return prior.result;
         }
-        const reference = prior?.sessionReference;
+        const reference = prior?.state === "succeeded" ? undefined : prior?.sessionReference;
         const childResume = reference && typeof reference === "object" && !Array.isArray(reference) && typeof reference.id === "string" ? reference : undefined;
-        if (prior && !childResume)
+        if (prior && prior.state !== "succeeded" && !childResume)
           throw new Error("Subagent native session continuation is unavailable; the failed child has no saved session ID");
+        if ((childAgent.maxNativeTurns !== undefined || childAgent.maxBudgetUsd !== undefined) && childAdapter.id !== "claude")
+          throw new Error("Native query budgets currently require Claude");
         const childNativeConfig = {
           toolPolicy: { write: false, terminal: false, network: false, child: true },
           ...childAgent.effort === undefined ? {} : { effort: childAgent.effort },
@@ -44732,7 +45062,13 @@ ${json(dependencies)}` : "");
             cwd: input2.cwd,
             ...childResume ? { resumeSession: { id: String(childResume.id) } } : {},
             ...childAgent.modelId ? { modelId: childAgent.modelId } : childAdapter.id === input2.adapter.id && input2.parentModelId ? { modelId: input2.parentModelId } : {},
-            nativeConfig: childNativeConfig,
+            nativeConfig: {
+              ...childNativeConfig,
+              ...childAdapter.id === "claude" ? {
+                ...childAgent.maxNativeTurns === undefined ? {} : { maxNativeTurns: childAgent.maxNativeTurns },
+                ...childAgent.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: childAgent.maxBudgetUsd }
+              } : {}
+            },
             context,
             signal: childAborter.signal,
             onEvent: () => {
@@ -44760,6 +45096,14 @@ ${json(dependencies)}` : "");
             }, result.usage);
           if (result.status !== "succeeded" || result.output === undefined)
             throw new Error(result.error ?? `scout harness ${result.status}`);
+          if (evidenceKey && ownedWorkspace && this.workspaceAdapter) {
+            let unchanged = false;
+            try {
+              unchanged = evidenceKey === await evidenceFingerprint((await this.workspaceAdapter.snapshot(ownedWorkspace)).resultTree);
+            } catch {}
+            if (!unchanged)
+              this.scouts.recordEvidenceKey(input2.runId, input2.parentAttemptId, input2.requestId, null);
+          }
           return result.output;
         } finally {
           signal?.removeEventListener("abort", abort);
@@ -44902,16 +45246,16 @@ function validateCommandNode(node2) {
 
 // packages/host/src/adapters/workspace/git.ts
 import {
-  mkdirSync as mkdirSync7,
-  readFileSync as readFileSync3,
-  rmSync as rmSync3,
-  writeFileSync as writeFileSync2,
+  mkdirSync as mkdirSync8,
+  readFileSync as readFileSync4,
+  rmSync as rmSync4,
+  writeFileSync as writeFileSync3,
   existsSync as existsSync2,
   cpSync,
   readdirSync,
   chmodSync
 } from "fs";
-import { join as join5, resolve as resolve2 } from "path";
+import { join as join6, resolve as resolve2 } from "path";
 import { randomUUID as randomUUID3 } from "crypto";
 
 class GitWorkspaceAdapter {
@@ -44920,9 +45264,9 @@ class GitWorkspaceAdapter {
   constructor(options) {
     this.root = resolve2(options.worktreeRoot);
     this.executable = options.gitExecutable ?? "git";
-    mkdirSync7(this.root, { recursive: true, mode: 448 });
-    mkdirSync7(join5(this.root, "claims"), { recursive: true, mode: 448 });
-    mkdirSync7(join5(this.root, "indexes"), { recursive: true, mode: 448 });
+    mkdirSync8(this.root, { recursive: true, mode: 448 });
+    mkdirSync8(join6(this.root, "claims"), { recursive: true, mode: 448 });
+    mkdirSync8(join6(this.root, "indexes"), { recursive: true, mode: 448 });
   }
   async create(input2) {
     const repositoryPath = await this.repositoryRoot(input2.repositoryPath);
@@ -44931,10 +45275,10 @@ class GitWorkspaceAdapter {
       `${input2.baseCommit ?? "HEAD"}^{commit}`
     ]);
     const baseTree = await this.git(repositoryPath, ["rev-parse", `${baseCommit}^{tree}`]);
-    const path = join5(this.root, safePart(input2.runId), safePart(input2.workspaceId));
+    const path = join6(this.root, safePart(input2.runId), safePart(input2.workspaceId));
     if (existsSync2(path))
       throw new Error(`workspace path already exists: ${path}`);
-    mkdirSync7(join5(this.root, safePart(input2.runId)), { recursive: true, mode: 448 });
+    mkdirSync8(join6(this.root, safePart(input2.runId)), { recursive: true, mode: 448 });
     await this.git(repositoryPath, ["worktree", "add", "--detach", path, baseCommit]);
     const claim3 = {
       repositoryPath,
@@ -44954,8 +45298,8 @@ class GitWorkspaceAdapter {
       try {
         await this.git(repositoryPath, ["worktree", "remove", "--force", path]);
       } catch {}
-      rmSync3(path, { recursive: true, force: true });
-      rmSync3(this.claimPath(claim3), { force: true });
+      rmSync4(path, { recursive: true, force: true });
+      rmSync4(this.claimPath(claim3), { force: true });
       throw cause;
     }
   }
@@ -44996,11 +45340,11 @@ class GitWorkspaceAdapter {
     const claimPath = this.claimPath({ runId, workspaceId });
     if (!existsSync2(claimPath))
       throw new Error(`workspace claim not found: ${runId}/${workspaceId}`);
-    return this.load(JSON.parse(readFileSync3(claimPath, "utf8")));
+    return this.load(JSON.parse(readFileSync4(claimPath, "utf8")));
   }
   async listClaims(runId) {
     const prefix = `${safePart(runId)}--`;
-    return readdirSync(join5(this.root, "claims")).filter((name) => name.startsWith(prefix) && name.endsWith(".json") && !name.endsWith(".prepared.json")).map((name) => JSON.parse(readFileSync3(join5(this.root, "claims", name), "utf8"))).filter((claim3) => claim3.runId === runId).map((claim3) => claim3);
+    return readdirSync(join6(this.root, "claims")).filter((name) => name.startsWith(prefix) && name.endsWith(".json") && !name.endsWith(".prepared.json")).map((name) => JSON.parse(readFileSync4(join6(this.root, "claims", name), "utf8"))).filter((claim3) => claim3.runId === runId).map((claim3) => claim3);
   }
   async load(ref) {
     const claim3 = this.readClaim(ref);
@@ -45012,7 +45356,7 @@ class GitWorkspaceAdapter {
   }
   async snapshot(ref) {
     const claim3 = await this.load(ref);
-    const temp = join5(this.root, "indexes", `${randomUUID3()}.index`);
+    const temp = join6(this.root, "indexes", `${randomUUID3()}.index`);
     try {
       await this.git(claim3.path, ["read-tree", "HEAD"], { GIT_INDEX_FILE: temp });
       await this.git(claim3.path, ["add", "-A", "--", "."], { GIT_INDEX_FILE: temp });
@@ -45036,7 +45380,7 @@ class GitWorkspaceAdapter {
         changedPaths
       };
     } finally {
-      rmSync3(temp, { force: true });
+      rmSync4(temp, { force: true });
     }
   }
   async diffRepository(repositoryPath, baseRef) {
@@ -45084,11 +45428,11 @@ class GitWorkspaceAdapter {
     if (before.resultTree !== ref.baseTree)
       throw new Error("Run workspace changed during milestone execution");
     const patch = await this.git(ref.path, ["diff", "--binary", before.resultTree, tree]);
-    const backup = join5(this.root, "integration-backups", randomUUID3());
-    mkdirSync7(backup, { recursive: true, mode: 448 });
+    const backup = join6(this.root, "integration-backups", randomUUID3());
+    mkdirSync8(backup, { recursive: true, mode: 448 });
     for (const entry of readdirSync(ref.path))
       if (entry !== ".git")
-        cpSync(join5(ref.path, entry), join5(backup, entry), { recursive: true, force: true });
+        cpSync(join6(ref.path, entry), join6(backup, entry), { recursive: true, force: true });
     try {
       if (patch)
         await this.git(ref.path, ["apply", "--binary", "--whitespace=nowarn"], undefined, `${patch}
@@ -45100,12 +45444,12 @@ class GitWorkspaceAdapter {
     } catch (cause) {
       for (const entry of readdirSync(ref.path))
         if (entry !== ".git")
-          rmSync3(join5(ref.path, entry), { recursive: true, force: true });
+          rmSync4(join6(ref.path, entry), { recursive: true, force: true });
       for (const entry of readdirSync(backup))
-        cpSync(join5(backup, entry), join5(ref.path, entry), { recursive: true, force: true });
+        cpSync(join6(backup, entry), join6(ref.path, entry), { recursive: true, force: true });
       throw cause;
     } finally {
-      rmSync3(backup, { recursive: true, force: true });
+      rmSync4(backup, { recursive: true, force: true });
     }
   }
   async integrate(input2) {
@@ -45126,13 +45470,13 @@ class GitWorkspaceAdapter {
     const conflicts = [...paths.entries()].filter(([, count]) => count > 1).map(([path]) => path).sort();
     if (conflicts.length)
       return { target, sources, conflicts };
-    const backup = join5(this.root, "integration-backups", randomUUID3());
-    mkdirSync7(backup, { recursive: true, mode: 448 });
+    const backup = join6(this.root, "integration-backups", randomUUID3());
+    mkdirSync8(backup, { recursive: true, mode: 448 });
     try {
       for (const entry of readdirSync(input2.target.path)) {
         if (entry === ".git")
           continue;
-        cpSync(join5(input2.target.path, entry), join5(backup, entry), {
+        cpSync(join6(input2.target.path, entry), join6(backup, entry), {
           recursive: true,
           force: true
         });
@@ -45141,15 +45485,15 @@ class GitWorkspaceAdapter {
         const source = sources[sourceIndex];
         for (const change of source.changedPaths) {
           const sourceRef = input2.sources[sourceIndex];
-          const sourcePath = join5(sourceRef.path, change.path);
-          const targetPath = join5(input2.target.path, change.path);
+          const sourcePath = join6(sourceRef.path, change.path);
+          const targetPath = join6(input2.target.path, change.path);
           if (change.oldPath && change.status.startsWith("R"))
-            rmSync3(join5(input2.target.path, change.oldPath), { recursive: true, force: true });
+            rmSync4(join6(input2.target.path, change.oldPath), { recursive: true, force: true });
           if (change.status.startsWith("D"))
-            rmSync3(targetPath, { recursive: true, force: true });
+            rmSync4(targetPath, { recursive: true, force: true });
           else if (existsSync2(sourcePath)) {
-            mkdirSync7(join5(targetPath, ".."), { recursive: true });
-            rmSync3(targetPath, { recursive: true, force: true });
+            mkdirSync8(join6(targetPath, ".."), { recursive: true });
+            rmSync4(targetPath, { recursive: true, force: true });
             cpSync(sourcePath, targetPath, { recursive: true, force: true });
             if (change.mode && !change.mode.endsWith("000"))
               chmodSync(targetPath, Number.parseInt(change.mode, 8) & 511);
@@ -45161,17 +45505,17 @@ class GitWorkspaceAdapter {
       try {
         for (const entry of readdirSync(input2.target.path)) {
           if (entry !== ".git")
-            rmSync3(join5(input2.target.path, entry), { recursive: true, force: true });
+            rmSync4(join6(input2.target.path, entry), { recursive: true, force: true });
         }
         for (const entry of readdirSync(backup))
-          cpSync(join5(backup, entry), join5(input2.target.path, entry), {
+          cpSync(join6(backup, entry), join6(input2.target.path, entry), {
             recursive: true,
             force: true
           });
       } catch {}
       throw cause;
     } finally {
-      rmSync3(backup, { recursive: true, force: true });
+      rmSync4(backup, { recursive: true, force: true });
     }
   }
   async prepareCommit(input2) {
@@ -45210,7 +45554,7 @@ class GitWorkspaceAdapter {
       parent: claim3.baseCommit,
       operationKey: input2.operationKey
     };
-    writeFileSync2(marker, JSON.stringify(prepared, null, 2), { mode: 384 });
+    writeFileSync3(marker, JSON.stringify(prepared, null, 2), { mode: 384 });
     return { ...prepared, idempotent: false };
   }
   async verifyPreparedCommit(input2) {
@@ -45218,7 +45562,7 @@ class GitWorkspaceAdapter {
     const marker = this.preparedPath(claim3);
     if (!existsSync2(marker))
       return null;
-    const value = JSON.parse(readFileSync3(marker, "utf8"));
+    const value = JSON.parse(readFileSync4(marker, "utf8"));
     if (value.operationKey !== input2.operationKey || value.tree !== input2.expectedTree)
       return null;
     const verified = await this.verifyCommit(claim3, {
@@ -45241,9 +45585,9 @@ class GitWorkspaceAdapter {
     if (!registered)
       throw new Error("refusing cleanup of unregistered workspace");
     await this.git(claim3.repositoryPath, ["worktree", "remove", "--force", claim3.path]);
-    rmSync3(claim3.path, { recursive: true, force: true });
-    rmSync3(this.claimPath(claim3), { force: true });
-    rmSync3(this.preparedPath(claim3), { force: true });
+    rmSync4(claim3.path, { recursive: true, force: true });
+    rmSync4(this.claimPath(claim3), { force: true });
+    rmSync4(this.preparedPath(claim3), { force: true });
   }
   async verifyCommit(claim3, input2) {
     const head = await this.git(claim3.path, ["rev-parse", "HEAD"]);
@@ -45261,16 +45605,16 @@ class GitWorkspaceAdapter {
     };
   }
   readClaim(ref) {
-    return JSON.parse(readFileSync3(this.claimPath(ref), "utf8"));
+    return JSON.parse(readFileSync4(this.claimPath(ref), "utf8"));
   }
   writeClaim(claim3) {
-    writeFileSync2(this.claimPath(claim3), JSON.stringify(claim3, null, 2), { mode: 384 });
+    writeFileSync3(this.claimPath(claim3), JSON.stringify(claim3, null, 2), { mode: 384 });
   }
   claimPath(ref) {
-    return join5(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.json`);
+    return join6(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.json`);
   }
   preparedPath(ref) {
-    return join5(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.prepared.json`);
+    return join6(this.root, "claims", `${safePart(ref.runId)}--${safePart(ref.workspaceId)}.prepared.json`);
   }
   async repositoryRoot(path) {
     const root = await this.git(resolve2(path), ["rev-parse", "--show-toplevel"]);
@@ -45290,9 +45634,9 @@ class GitWorkspaceAdapter {
 `).some((line) => line === `worktree ${resolve2(path)}`);
   }
   async git(cwd, args, extraEnv, stdin) {
-    const inputPath = stdin === undefined ? undefined : join5(this.root, "indexes", `stdin-${randomUUID3()}`);
+    const inputPath = stdin === undefined ? undefined : join6(this.root, "indexes", `stdin-${randomUUID3()}`);
     if (inputPath)
-      writeFileSync2(inputPath, stdin, { mode: 384 });
+      writeFileSync3(inputPath, stdin, { mode: 384 });
     try {
       const proc = Bun.spawn([this.executable, ...args], {
         cwd,
@@ -45311,7 +45655,7 @@ class GitWorkspaceAdapter {
       return stdout.trim();
     } finally {
       if (inputPath)
-        rmSync3(inputPath, { force: true });
+        rmSync4(inputPath, { force: true });
     }
   }
 }
@@ -45357,9 +45701,9 @@ init_src();
 
 // packages/host/src/evaluation/verifier.ts
 init_src();
-import { createHash as createHash5 } from "crypto";
-import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync8, mkdtempSync as mkdtempSync2, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "fs";
-import { join as join6, resolve as resolve3 } from "path";
+import { createHash as createHash6 } from "crypto";
+import { chmodSync as chmodSync2, cpSync as cpSync2, mkdirSync as mkdirSync9, mkdtempSync as mkdtempSync2, rmSync as rmSync5, writeFileSync as writeFileSync4 } from "fs";
+import { join as join7, resolve as resolve3 } from "path";
 
 class BunVerifierProcess {
   async execute(input2) {
@@ -45415,7 +45759,7 @@ class BunVerifierProcess {
   }
 }
 function digest2(bytes) {
-  return createHash5("sha256").update(bytes).digest("hex");
+  return createHash6("sha256").update(bytes).digest("hex");
 }
 async function runDeterministicCommandEvaluator(input2) {
   const candidate = resolve3(input2.candidateWorkspace);
@@ -45428,12 +45772,12 @@ async function runDeterministicCommandEvaluator(input2) {
   const observedTreeDigest = await input2.resolveCandidateTreeDigest();
   if (observedTreeDigest !== input2.candidateTreeDigest)
     throw new Error(`candidate tree digest mismatch: expected ${input2.candidateTreeDigest}, observed ${observedTreeDigest}`);
-  mkdirSync8(verifier, { recursive: true, mode: 448 });
-  const runVerifier = mkdtempSync2(join6(verifier, "run-"));
-  const acceptance = join6(runVerifier, "acceptance-source");
-  const isolatedCandidate = join6(runVerifier, "candidate");
+  mkdirSync9(verifier, { recursive: true, mode: 448 });
+  const runVerifier = mkdtempSync2(join7(verifier, "run-"));
+  const acceptance = join7(runVerifier, "acceptance-source");
+  const isolatedCandidate = join7(runVerifier, "candidate");
   cpSync2(candidate, isolatedCandidate, { recursive: true, force: false, errorOnExist: true });
-  writeFileSync3(acceptance, input2.acceptanceSource, { mode: 256 });
+  writeFileSync4(acceptance, input2.acceptanceSource, { mode: 256 });
   chmodSync2(acceptance, 256);
   const sourceDigest = digest2(input2.acceptanceSource);
   const process2 = input2.process ?? new BunVerifierProcess;
@@ -45475,7 +45819,7 @@ async function runDeterministicCommandEvaluator(input2) {
       })
     };
   } finally {
-    rmSync4(runVerifier, { recursive: true, force: true });
+    rmSync5(runVerifier, { recursive: true, force: true });
   }
   const stdoutRef = input2.artifactSink?.put(input2.target.runId, result.stdout, "text/plain");
   const stderrRef = input2.artifactSink?.put(input2.target.runId, result.stderr, "text/plain");
@@ -45921,7 +46265,7 @@ async function compileSwarm(models) {
     members2[0].on("success").to(done);
   } else {
     const fork = workflow.parallel("members", { branches: members2, maxConcurrent: members2.length });
-    const join7 = workflow.join("join-members", {
+    const join8 = workflow.join("join-members", {
       groupId: "members",
       mode: "all-settled",
       failure: "wait-for-all"
@@ -45940,10 +46284,10 @@ async function compileSwarm(models) {
     });
     const final = workflow.complete("final", { output: synthesis.output });
     workflow.startAt(fork);
-    fork.on("success").to(join7);
+    fork.on("success").to(join8);
     for (const member of members2)
-      member.on("success").to(join7);
-    join7.on("success").to(synthesis);
+      member.on("success").to(join8);
+    join8.on("success").to(synthesis);
     synthesis.on("success").to(final);
   }
   return compileWorkflow(workflow.build());
@@ -45951,7 +46295,7 @@ async function compileSwarm(models) {
 
 // packages/host/src/checkpoints/materializer.ts
 init_src();
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash7 } from "crypto";
 class CheckpointMaterializer {
   options;
   constructor(options) {
@@ -46040,7 +46384,7 @@ class CheckpointMaterializer {
     if (canonicalize(withoutProfile(childInput)) !== canonicalize(withoutProfile(sourceInput)))
       throw new Error("fork variant may change only execution profile");
     const childProfile = typeof childInput.__kouroExecutionProfile === "string" ? childInput.__kouroExecutionProfile : "scripted";
-    const childConfigDependencyDigest = `sha256:${createHash6("sha256").update(canonicalize({
+    const childConfigDependencyDigest = `sha256:${createHash7("sha256").update(canonicalize({
       input: childInput,
       profile: childProfile,
       promptVariants: input2.promptVariants ?? {},
@@ -46118,7 +46462,7 @@ class CheckpointMaterializer {
   }
 }
 function stableCheckpointId(requestKey) {
-  return `cp_${createHash6("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
+  return `cp_${createHash7("sha256").update(requestKey).digest("hex").slice(0, 32)}`;
 }
 async function materializePromptVariant(source, replacements, sourceView, inheritedInvocationIds) {
   const entries = Object.entries(replacements);
@@ -46188,16 +46532,16 @@ function structuralIdentity(bundle) {
   });
 }
 // packages/host/src/checkpoints/retention.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync9, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync4 } from "fs";
-import { join as join7 } from "path";
+import { existsSync as existsSync3, mkdirSync as mkdirSync10, readFileSync as readFileSync5, renameSync as renameSync2, writeFileSync as writeFileSync5 } from "fs";
+import { join as join8 } from "path";
 
 class CheckpointRetention {
   path;
   marks;
   constructor(dataDir) {
-    mkdirSync9(dataDir, { recursive: true, mode: 448 });
-    this.path = join7(dataDir, "checkpoint-retention.json");
-    this.marks = existsSync3(this.path) ? JSON.parse(readFileSync4(this.path, "utf8")) : {};
+    mkdirSync10(dataDir, { recursive: true, mode: 448 });
+    this.path = join8(dataDir, "checkpoint-retention.json");
+    this.marks = existsSync3(this.path) ? JSON.parse(readFileSync5(this.path, "utf8")) : {};
   }
   retain(checkpointId, roots) {
     for (const root of roots)
@@ -46249,7 +46593,7 @@ class CheckpointRetention {
   }
   flush() {
     const temp = `${this.path}.tmp`;
-    writeFileSync4(temp, JSON.stringify(this.marks), { mode: 384 });
+    writeFileSync5(temp, JSON.stringify(this.marks), { mode: 384 });
     renameSync2(temp, this.path);
   }
 }
@@ -47510,17 +47854,17 @@ async function compileParallelFixture() {
   const branchA = root.call("branch-a", child);
   const branchB = root.call("branch-b", child);
   const fork = root.parallel("reviewers", { branches: [branchA, branchB], maxConcurrent: 2 });
-  const join8 = root.join("join-reviewers", {
+  const join9 = root.join("join-reviewers", {
     groupId: "reviewers",
     mode: "all-settled",
     failure: "wait-for-all"
   });
   const done = root.complete("done");
   root.startAt(fork);
-  fork.on("success").to(join8);
-  branchA.on("success").to(join8);
-  branchB.on("success").to(join8);
-  join8.on("success").to(done);
+  fork.on("success").to(join9);
+  branchA.on("success").to(join9);
+  branchB.on("success").to(join9);
+  join9.on("success").to(done);
   return compileWorkflow(root.build());
 }
 var authoringPluginRegistered = false;
@@ -47576,7 +47920,7 @@ async function loadFileTemplates(root) {
 
 // packages/host/src/http/server.ts
 import { randomBytes as randomBytes2, randomUUID as randomUUID6 } from "crypto";
-import { join as join8, normalize, relative, resolve as resolve6 } from "path";
+import { join as join9, normalize, relative, resolve as resolve6 } from "path";
 
 // node_modules/.bun/memoirist@0.4.0/node_modules/memoirist/dist/bun/index.js
 var Y = (v, b) => {
@@ -62002,8 +62346,10 @@ var Elysia = _Elysia;
 // packages/host/src/cli/tasks.ts
 import { randomUUID as randomUUID5 } from "crypto";
 import { resolve as resolve5 } from "path";
-var taskUsage = `Usage:
-  kouro task workflows [--workspace PATH]          List available workflows as JSON
+var taskUsage = `Kouro \xB7 Milestone tasks
+
+Usage:
+  kouro task workflows [--workspace PATH]          List available workflows
   kouro task run --task TEXT --harness HARNESS --model ID [options]
   kouro task status RUN [--workspace PATH]         Print milestone progress and pending approvals
   kouro task resume RUN [--workspace PATH]         Continue a durable task until completion or approval
@@ -62016,17 +62362,24 @@ Run options:
   --planner-model ID      Override planning model
   --executor-harness NAME Override execution harness
   --executor-model ID     Override execution model
-  --max-milestones N      Milestone limit, 1-12 (default: 8)
+  --max-milestones N      Milestone limit, 1-12 (default: 3)
   --max-concurrent N      Concurrent milestones, 1-4 (default: 2)
   --idempotency-key KEY   Reuse a task creation or decision request
   --data-dir PATH         Durable state directory (default: workspace/.kouro-data)
 
-Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
-Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
-Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
-Execution prints its dashboard URL to stderr. JSON records include dashboardUrl.
-Without a running host, the dashboard is temporary and lasts until the command returns.
-Provider limits pause tasks. After reset, task resume continues saved Claude/Codex sessions.
+Output:
+  --json                  Structured JSON records (also default when redirected)
+  --plain                 Readable reports without terminal colors
+
+Decisions:
+  --feedback TEXT         Required when requesting changes
+  --binding-digest DIGEST  Bind the decision to the reviewed inputs
+  --subject-revision N    Bind the decision to the reviewed revision
+
+Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 approval or pause.
+Tasks connect to the dashboard owning their data directory; the URL goes to stderr.
+Without a running host, that dashboard lasts until the command returns.
+After provider reset, task resume continues saved Claude/Codex sessions.
 `;
 var valueOptions = new Set([
   "--task",
@@ -63195,7 +63548,7 @@ data: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}
   };
   app.get("/api/*", missingApiRoute);
   app.all("/api/*", missingApiRoute);
-  app.get("/", () => options.staticRoot ? Bun.file(join8(options.staticRoot, "index.html")) : "Kouro local host");
+  app.get("/", () => options.staticRoot ? Bun.file(join9(options.staticRoot, "index.html")) : "Kouro local host");
   if (options.staticRoot)
     app.get("/*", async ({ request, set: set2 }) => {
       if (!validOriginHost(request)) {
@@ -63203,7 +63556,7 @@ data: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}
         return { error: "invalid-origin" };
       }
       const root = normalize(options.staticRoot);
-      const path = normalize(join8(root, decodeURIComponent(new URL(request.url).pathname).replace(/^\//, "")));
+      const path = normalize(join9(root, decodeURIComponent(new URL(request.url).pathname).replace(/^\//, "")));
       if (relative(root, path).startsWith("..")) {
         set2.status = 400;
         return { error: "invalid-path" };
@@ -63211,7 +63564,7 @@ data: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}
       const file3 = Bun.file(path);
       if (await file3.exists())
         return file3;
-      const fallback = Bun.file(join8(root, "index.html"));
+      const fallback = Bun.file(join9(root, "index.html"));
       if (await fallback.exists())
         return fallback;
       set2.status = 404;
@@ -65666,9 +66019,9 @@ async function serveScoutMcp() {
 // packages/host/src/cli/host-connection.ts
 import { randomUUID as randomUUID7 } from "crypto";
 import { lstat, readFile as readFile2, rename, rm, writeFile } from "fs/promises";
-import { join as join9 } from "path";
+import { join as join10 } from "path";
 async function registerHost(dataDir, connection) {
-  const path = join9(dataDir, "host.json");
+  const path = join10(dataDir, "host.json");
   const temporary = `${path}.${randomUUID7()}.tmp`;
   try {
     await writeFile(temporary, JSON.stringify(connection), { mode: 384, flag: "wx" });
@@ -65683,7 +66036,7 @@ async function registerHost(dataDir, connection) {
   };
 }
 async function findHost(dataDir) {
-  const path = join9(dataDir, "host.json");
+  const path = join10(dataDir, "host.json");
   let connection;
   try {
     const info = await lstat(path);
@@ -65782,36 +66135,273 @@ async function connectedTaskCommand(connection, argv, write = (value) => process
     process.off("SIGTERM", stop);
   }
 }
+// packages/host/package.json
+var version2 = "2.0.14";
+
+// packages/host/src/cli/presentation.ts
+var cliVersion = version2;
+var cliUsage = `Kouro ${version2} \xB7 Local agent workflows
+
+Usage: kouro <command> [options]
+
+Work
+  serve                         Open the local workbench (default command)
+  task                          Plan and execute milestones; see task --help
+  run [WORKFLOW]                Execute a workflow headlessly
+  create template NAME          Scaffold a workflow with --template ID
+
+Manage runs
+  inspect RUN                   Print the complete durable run as JSON
+  control ACTION RUN REV        Pause, resume, cancel, interrupt or detach
+  retry RUN INVOCATION REV      Retry a failed invocation
+  checkpoint RUN                Capture a quiescent checkpoint
+  fork CHECKPOINT [REQUEST]     Fork two isolated child runs
+
+Tools
+  plugin path                   Print the bundled plugin marketplace path
+  --help, -h                    Show help; also available on each command
+  --version                     Print the installed version
+  --json                        Keep structured JSON output in a terminal
+  --plain                       Show readable output without terminal colors
+
+Examples
+  kouro create template research --template feature-fusion
+  kouro run research --task "Research this proposal"
+  kouro task status RUN
+
+Environment
+  KOURO_DATA_DIR                State directory (default: .kouro-data)
+  KOURO_PORT                    Loopback port (default: 43127)
+  KOURO_TOKEN                   Optional fixed browser pairing token
+  NO_COLOR                      Disable terminal colors
+
+Redirected output stays JSON. Use kouro <command> --help for options.
+`;
+var commandUsage = {
+  serve: `Usage: kouro serve
+
+Start the local workbench or show the existing host URL.
+Set KOURO_DATA_DIR and KOURO_PORT to choose state and port.
+`,
+  run: `Usage: kouro run [WORKFLOW] [options]
+
+Options
+  --task TEXT                   Task instructions
+  --workspace PATH              Project repository (default: current directory)
+  --profile ID                  Execution profile, e.g. claude-readonly
+  --ticket TEXT                 Ticket input
+  --allow-unrestricted-commands  Opt into unrestricted workflow commands
+  --json / --plain               Choose structured or readable output
+`,
+  create: `Usage: kouro create template NAME --template ID [--output PATH]
+
+Templates
+  feature, refactor, chore, bugfix, hotfix, feature-fusion, refactor-fusion
+
+NAME uses lowercase kebab-case. Output defaults to .kouro/NAME.
+Configure the generated workflow before running it.
+`,
+  plugin: `Usage: kouro plugin path
+
+Print the bundled Codex/Claude plugin marketplace directory.
+`,
+  inspect: `Usage: kouro inspect RUN
+
+Print the complete durable run view as JSON.
+`,
+  control: `Usage: kouro control ACTION RUN REV
+
+Actions: pause, resume, cancel, interrupt, detach.
+REV is the current run revision from kouro inspect RUN.
+`,
+  retry: `Usage: kouro retry RUN INVOCATION REV
+
+Retry one failed invocation using the current run revision.
+`,
+  checkpoint: `Usage: kouro checkpoint RUN
+
+Capture a quiescent checkpoint of a durable run.
+`,
+  fork: `Usage: kouro fork CHECKPOINT [REQUEST]
+
+Fork two isolated child runs. REQUEST is an optional idempotency key.
+`
+};
+function helpFor(command) {
+  return commandUsage[command];
+}
+var valueOptions2 = new Set([
+  "--task",
+  "--workflow",
+  "--workspace",
+  "--harness",
+  "--model",
+  "--profile",
+  "--ticket",
+  "--template",
+  "--output",
+  "--planner-harness",
+  "--planner-model",
+  "--executor-harness",
+  "--executor-model",
+  "--max-milestones",
+  "--max-concurrent",
+  "--idempotency-key",
+  "--data-dir",
+  "--decision",
+  "--revision",
+  "--feedback",
+  "--binding-digest",
+  "--subject-revision"
+]);
+function presentationArgs(input2) {
+  const argv = [];
+  let mode = "auto";
+  let help = false;
+  for (let index = 0;index < input2.length; index++) {
+    const argument = input2[index];
+    if (valueOptions2.has(argument)) {
+      argv.push(argument);
+      if (input2[index + 1] !== undefined)
+        argv.push(input2[++index]);
+    } else if (argument === "--json" || argument === "--plain") {
+      mode = argument === "--json" ? "json" : "plain";
+    } else {
+      argv.push(argument);
+      if (argument === "--help" || argument === "-h")
+        help = true;
+    }
+  }
+  return { argv, mode, help };
+}
+function createPresentation(mode, terminal = Boolean(process.stdout.isTTY), env3 = process.env) {
+  const human = mode === "plain" || mode === "auto" && terminal;
+  const color = human && terminal && mode !== "plain" && env3.NO_COLOR === undefined && env3.TERM !== "dumb";
+  const tint = (text, code) => color ? `\x1B[${code}m${text}\x1B[0m` : text;
+  const safe = (value) => String(value ?? "").replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+  const heading = (text) => tint(safe(text), 1);
+  const status2 = (value) => tint(safe(value), value === "succeeded" ? 32 : ["failed", "cancelled", "rejected"].includes(String(value)) ? 31 : 33);
+  const detail = (label, value) => value === undefined || value === null ? "" : `  ${label.padEnd(12)}${safe(value)}
+`;
+  const shell = (value) => `'${safe(value).replaceAll("'", "'\\''")}'`;
+  const object4 = (value) => value && typeof value === "object" ? value : {};
+  function record4(value) {
+    if (!human)
+      return `${JSON.stringify(value)}
+`;
+    if (Array.isArray(value)) {
+      if (!value.length)
+        return `No workflows available.
+`;
+      if (!value.every((item) => typeof object4(item).eligible === "boolean"))
+        return `${safe(JSON.stringify(value, null, 2))}
+`;
+      return `${heading("Available workflows")}
+
+${value.map((item) => {
+        const row2 = object4(item);
+        if (!row2.id)
+          return safe(JSON.stringify(item, null, 2));
+        return `  ${safe(row2.id)}  ${row2.eligible === false ? status2("unavailable") : status2("ready")}
+${detail("Name", row2.name)}${detail("Reason", row2.reason ?? row2.error ?? (Array.isArray(row2.diagnostics) && row2.diagnostics.length ? row2.diagnostics.join("; ") : undefined))}`;
+      }).join(`
+`)}
+`;
+    }
+    const row = object4(value);
+    if (row.event === "task.started")
+      return `${heading("Task started")}
+${detail("Run", row.runId)}${detail("Workbench", row.dashboardUrl)}
+`;
+    if (typeof row.runId !== "string" || typeof row.status !== "string")
+      return `${safe(JSON.stringify(value, null, 2))}
+`;
+    let text = `${heading("Kouro")} \xB7 ${status2(row.waitingForApproval ? "awaiting approval" : row.status)}
+`;
+    text += detail("Run", row.runId) + detail("Revision", row.revision) + detail("Phase", row.phase) + detail("Workspace", row.workspace) + detail("Workbench", row.dashboardUrl);
+    if (Array.isArray(row.milestones) && row.milestones.length) {
+      text += `
+${heading("Milestones")}
+`;
+      for (const entry of row.milestones) {
+        const milestone = object4(entry);
+        text += `  ${status2(milestone.status)}  ${safe(milestone.title ?? milestone.id)}
+${detail("Workflow", milestone.workflowId)}`;
+      }
+    }
+    if (row.error)
+      text += `
+${tint("Error", 31)}: ${safe(row.error)}
+`;
+    if (Array.isArray(row.failedInvocations))
+      for (const entry of row.failedInvocations) {
+        const failure2 = object4(entry);
+        text += `
+${tint("Failed", 31)}: ${safe(failure2.nodeId)}
+${detail("Invocation", failure2.invocationId)}${detail("Reason", failure2.error)}${detail("Stop reason", failure2.stopReason)}${detail("Resume after", failure2.resumeAfter)}`;
+      }
+    if (Array.isArray(row.approvals) && row.approvals.length) {
+      text += `
+${heading("Pending approvals")}
+`;
+      for (const entry of row.approvals) {
+        const approval = object4(entry);
+        text += detail("Invocation", approval.invocationId);
+        text += `  Review: kouro inspect ${shell(row.runId)}
+`;
+        text += `  Decide: kouro task decide ${shell(row.runId)} ${shell(approval.invocationId)} --decision DECISION --revision ${safe(row.revision)}`;
+        if (approval.bindingDigest)
+          text += ` --binding-digest ${shell(approval.bindingDigest)}`;
+        if (approval.subjectRevision !== undefined)
+          text += ` --subject-revision ${safe(approval.subjectRevision)}`;
+        text += `
+  DECISION: approve, reject or request-changes; changes require --feedback TEXT.
+`;
+      }
+    }
+    if (row.resumeAvailable)
+      text += `
+Resume: kouro task resume ${shell(row.runId)}
+`;
+    if (row.result !== undefined)
+      text += `
+${heading("Result")}
+${safe(JSON.stringify(row.result, null, 2))}
+`;
+    return `${text}
+`;
+  }
+  return {
+    human,
+    record: record4,
+    error: (cause) => `${tint("error", 31)}: ${safe(cause instanceof Error ? cause.message : cause)}
+`,
+    workbench: (url2, dataDir) => human ? `${heading("Kouro workbench")}
+${detail("Open", url2)}${detail("Data", dataDir)}
+` : `Kouro workbench: ${url2}
+Data: ${dataDir}
+`
+  };
+}
 
 // packages/host/src/cli.ts
-var usage = `Kouro v2 M1
-
-Usage:
-  kouro serve     Start the loopback-only local workbench
-  kouro create template NAME --template ID  Create a project template under .kouro
-  kouro run [WORKFLOW] [--task TEXT] [--profile ID] [--allow-unrestricted-commands]  Execute a workflow headlessly
-  kouro task     Generate and execute dependent milestones; use kouro task --help
-  kouro plugin path  Print the bundled Codex/Claude plugin marketplace directory
-  kouro inspect ID  Print one durable run view as JSON
-  kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
-  kouro retry ID INVOCATION REV  Retry one failed invocation
-  kouro checkpoint ID           Capture a quiescent checkpoint
-  kouro fork CHECKPOINT REQUEST Fork two isolated child runs
-  kouro --help    Show this help
-
-Environment:
-  KOURO_DATA_DIR  Durable local state directory (default: .kouro-data)
-  KOURO_PORT      Loopback port (default: 43127; forward it over SSH for remote hosts)
-  KOURO_TOKEN     Optional fixed one-time browser pairing token
-`;
 async function main(argv = process.argv.slice(2)) {
-  const command = argv[0] ?? "serve";
-  if (command === "__scout_mcp") {
+  if (argv[0] === "__scout_mcp") {
     await serveScoutMcp();
     return 0;
   }
-  if (command === "--help" || command === "-h" || command === "help") {
-    process.stdout.write(usage);
+  const parsed = presentationArgs(argv);
+  argv = parsed.argv;
+  const command = argv[0] ?? "serve";
+  const output2 = createPresentation(parsed.mode);
+  if (command === "--version") {
+    process.stdout.write(`${cliVersion}
+`);
+    return 0;
+  }
+  if (command === "--help" || command === "-h" || command === "help" || parsed.help) {
+    const topic = command === "help" ? argv[1] : command;
+    process.stdout.write(topic === "task" ? taskUsage : helpFor(topic ?? "") ?? cliUsage);
     return 0;
   }
   if (!new Set([
@@ -65826,13 +66416,12 @@ async function main(argv = process.argv.slice(2)) {
     "fork",
     "create"
   ]).has(command)) {
-    process.stderr.write(`Unknown command: ${command}
-
-${usage}`);
+    process.stderr.write(output2.error(`Unknown command: ${command}`) + `Try kouro --help.
+`);
     return 2;
   }
   if (command === "create")
-    return createCommand(argv.slice(1));
+    return createCommand(argv.slice(1), output2);
   if (command === "plugin") {
     const root = firstExistingPath([resolve7(import.meta.dir), resolve7(import.meta.dir, "../../..")].filter((candidate) => existsSync4(resolve7(candidate, ".agents/plugins/marketplace.json"))));
     if (argv[1] !== "path") {
@@ -65850,7 +66439,7 @@ ${usage}`);
     return 0;
   }
   if (command === "task") {
-    if (argv.includes("--help") || argv.includes("-h") || argv[1] === "help") {
+    if (argv[1] === "help") {
       process.stdout.write(taskUsage);
       return 0;
     }
@@ -65858,25 +66447,23 @@ ${usage}`);
     try {
       args = parseTaskArgs(argv.slice(1));
     } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
+      process.stderr.write(output2.error(cause) + `Try kouro task --help.
 `);
       return 2;
     }
     const project2 = args.workspace;
     let taskService;
     let taskHost;
-    let unregister2;
+    let unregister;
     try {
       const dataDir2 = resolve7(args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve7(project2, ".kouro-data"));
       const connection = await findHost(dataDir2);
       if (connection) {
-        const url3 = dashboardUrl(connection);
+        const url2 = dashboardUrl(connection);
         if (args.command !== "workflows")
-          process.stderr.write(`Kouro workbench: ${url3}
-Data: ${dataDir2}
-`);
+          process.stderr.write(output2.workbench(url2, dataDir2));
         const forwarded = argv.slice(1).map((argument, index, arguments_) => argument.startsWith("--workspace=") ? `--workspace=${project2}` : arguments_[index - 1] === "--workspace" ? project2 : argument);
-        return await connectedTaskCommand(connection, [...forwarded, ...args.get("--workspace") ? [] : ["--workspace", project2]], taskOutput(url3));
+        return await connectedTaskCommand(connection, [...forwarded, ...args.get("--workspace") ? [] : ["--workspace", project2]], taskOutput(output2, url2));
       }
       taskService = new ApplicationService({
         dataDir: dataDir2,
@@ -65884,31 +66471,28 @@ Data: ${dataDir2}
       });
       await taskService.start();
       if (!["workflows", "status"].includes(args.command)) {
-        const instanceId2 = randomUUID8();
+        const instanceId = randomUUID8();
         taskHost = createHostServer(taskService, {
           staticRoot: webStaticRoot(),
           port: 0,
-          cli: { instanceId: instanceId2, workspace: project2 }
+          cli: { instanceId, workspace: project2 }
         });
         taskHost.start();
         const hostConnection = {
           protocol: 1,
           url: `http://127.0.0.1:${taskHost.port}`,
           token: taskHost.token,
-          instanceId: instanceId2
+          instanceId
         };
-        unregister2 = await registerHost(dataDir2, hostConnection);
-        process.stderr.write(`Kouro workbench: ${dashboardUrl(hostConnection)}
-Data: ${dataDir2}
-`);
+        unregister = await registerHost(dataDir2, hostConnection);
+        process.stderr.write(output2.workbench(dashboardUrl(hostConnection), dataDir2));
       }
-      return await taskCommand(args, taskService, taskOutput(taskHost ? dashboardUrl({ url: `http://127.0.0.1:${taskHost.port}`, token: taskHost.token }) : undefined));
+      return await taskCommand(args, taskService, taskOutput(output2, taskHost ? dashboardUrl({ url: `http://127.0.0.1:${taskHost.port}`, token: taskHost.token }) : undefined));
     } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
-`);
+      process.stderr.write(output2.error(cause));
       return 1;
     } finally {
-      await unregister2?.();
+      await unregister?.();
       if (taskHost)
         await taskHost.stop();
       else
@@ -65921,209 +66505,214 @@ Data: ${dataDir2}
   if (command === "serve") {
     const connection = await findHost(dataDir);
     if (connection) {
-      process.stdout.write(`Kouro workbench: ${dashboardUrl(connection)}
-Data: ${dataDir}
-`);
+      process.stdout.write(output2.workbench(dashboardUrl(connection), dataDir));
       return 0;
     }
   }
   const service = new ApplicationService({ dataDir, templateRoot: resolve7(project, ".kouro") });
-  await service.start();
-  if (command === "run") {
-    const valueOptions2 = new Set(["--profile", "--task", "--workspace", "--ticket"]);
-    let workflowId = "tiny";
-    for (let index = 1;index < argv.length; index += 1) {
-      const arg = argv[index];
-      if (valueOptions2.has(arg)) {
-        index += 1;
-        continue;
+  try {
+    await service.start();
+    if (command === "run") {
+      const valueOptions3 = new Set(["--profile", "--task", "--workspace", "--ticket"]);
+      let workflowId = "tiny";
+      for (let index = 1;index < argv.length; index += 1) {
+        const arg = argv[index];
+        if (valueOptions3.has(arg)) {
+          index += 1;
+          continue;
+        }
+        if (arg.startsWith("--"))
+          continue;
+        workflowId = arg;
+        break;
       }
-      if (arg.startsWith("--"))
-        continue;
-      workflowId = arg;
-      break;
+      const profileArg = argv.find((arg) => arg.startsWith("--profile="));
+      const profileIndex = argv.indexOf("--profile");
+      const profile = profileArg?.slice("--profile=".length) ?? (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
+      const task = optionValue(argv, "--task");
+      const workspace = optionValue(argv, "--workspace") !== undefined || await hasGitHead(project) ? { repositoryPath: project } : undefined;
+      const ticket = optionValue(argv, "--ticket");
+      if (profile !== undefined && profile !== "scripted" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {
+        process.stderr.write(`Unknown execution profile: ${profile}
+`);
+        await service.close();
+        return 2;
+      }
+      const run = await service.createRun({
+        workflowId,
+        idempotencyKey: crypto.randomUUID(),
+        actor: "cli",
+        executionProfile: profile,
+        allowUnrestrictedCommands: argv.includes("--allow-unrestricted-commands"),
+        input: {
+          ...task === undefined ? {} : { task },
+          ...ticket === undefined ? {} : { ticket }
+        },
+        ...workspace ? { workspace } : {}
+      });
+      let view = service.getView(run.runId);
+      while (view && (view.state.status === "pending" || view.state.status === "running") && !Object.values(view.state.approvals).some((approval) => approval.status === "pending")) {
+        await Bun.sleep(50);
+        view = service.getView(run.runId);
+      }
+      process.stdout.write(output2.record({
+        runId: run.runId,
+        status: view?.state.status ?? "unknown",
+        revision: view?.revision ?? 0,
+        unrestrictedCommandOptIn: argv.includes("--allow-unrestricted-commands")
+      }));
+      await service.close();
+      return view?.state.status === "succeeded" ? 0 : 1;
     }
-    const profileArg = argv.find((arg) => arg.startsWith("--profile="));
-    const profileIndex = argv.indexOf("--profile");
-    const profile = profileArg?.slice("--profile=".length) ?? (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
-    const task = optionValue(argv, "--task");
-    const workspace = optionValue(argv, "--workspace") !== undefined || await hasGitHead(project) ? { repositoryPath: project } : undefined;
-    const ticket = optionValue(argv, "--ticket");
-    if (profile !== undefined && profile !== "scripted" && profile !== "codex-readonly" && profile !== "codex-workspace-write" && profile !== "claude-readonly" && profile !== "claude-workspace-write" && profile !== "pi-readonly") {
-      process.stderr.write(`Unknown execution profile: ${profile}
+    if (command === "inspect") {
+      const runId = argv[1];
+      if (!runId) {
+        process.stderr.write(`inspect requires a run ID
+`);
+        await service.close();
+        return 2;
+      }
+      const view = service.getView(runId);
+      if (!view) {
+        process.stderr.write(`Run not found: ${runId}
+`);
+        await service.close();
+        return 1;
+      }
+      process.stdout.write(`${JSON.stringify(view, null, 2)}
 `);
       await service.close();
-      return 2;
+      return 0;
     }
-    const run = await service.createRun({
-      workflowId,
-      idempotencyKey: crypto.randomUUID(),
-      actor: "cli",
-      executionProfile: profile,
-      allowUnrestrictedCommands: argv.includes("--allow-unrestricted-commands"),
-      input: {
-        ...task === undefined ? {} : { task },
-        ...ticket === undefined ? {} : { ticket }
-      },
-      ...workspace ? { workspace } : {}
+    if (command === "control") {
+      const action = argv[1];
+      const runId = argv[2];
+      const revision = Number(argv[3]);
+      if (!["pause", "resume", "cancel", "interrupt", "detach"].includes(action) || !runId || !Number.isSafeInteger(revision)) {
+        process.stderr.write(`control requires ACTION ID REV
+`);
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(output2.record(service.coordinator.control({
+          runId,
+          action,
+          expectedRevision: revision,
+          actor: "cli",
+          idempotencyKey: randomUUID8()
+        })));
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output2.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    if (command === "retry") {
+      const runId = argv[1];
+      const invocationId = argv[2];
+      const revision = Number(argv[3]);
+      if (!runId || !invocationId || !Number.isSafeInteger(revision)) {
+        process.stderr.write(`retry requires ID INVOCATION REV
+`);
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(output2.record(service.coordinator.retry({
+          runId,
+          invocationId,
+          expectedRevision: revision,
+          actor: "cli",
+          idempotencyKey: randomUUID8()
+        })));
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output2.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    if (command === "checkpoint") {
+      const runId = argv[1];
+      if (!runId) {
+        process.stderr.write(`checkpoint requires ID
+`);
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(output2.record(await service.captureCheckpoint(runId, { idempotencyKey: `cli:checkpoint:${runId}` })));
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output2.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    if (command === "fork") {
+      const checkpointId = argv[1];
+      const requestKey = argv[2] ?? randomUUID8();
+      if (!checkpointId) {
+        process.stderr.write(`fork requires CHECKPOINT REQUEST
+`);
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(output2.record(await service.forkCheckpoint({ checkpointId, requestKey })));
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output2.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    const instanceId = randomUUID8();
+    const host = createHostServer(service, { staticRoot, cli: { instanceId, workspace: project } });
+    host.start();
+    const unregister = await registerHost(dataDir, {
+      protocol: 1,
+      url: `http://127.0.0.1:${host.port}`,
+      token: host.token,
+      instanceId
     });
-    let view = service.getView(run.runId);
-    while (view && (view.state.status === "pending" || view.state.status === "running") && !Object.values(view.state.approvals).some((approval) => approval.status === "pending")) {
-      await Bun.sleep(50);
-      view = service.getView(run.runId);
-    }
-    process.stdout.write(`${JSON.stringify({
-      runId: run.runId,
-      status: view?.state.status ?? "unknown",
-      revision: view?.revision ?? 0,
-      unrestrictedCommandOptIn: argv.includes("--allow-unrestricted-commands")
-    })}
-`);
-    await service.close();
-    return view?.state.status === "succeeded" ? 0 : 1;
-  }
-  if (command === "inspect") {
-    const runId = argv[1];
-    if (!runId) {
-      process.stderr.write(`inspect requires a run ID
-`);
-      await service.close();
-      return 2;
-    }
-    const view = service.getView(runId);
-    if (!view) {
-      process.stderr.write(`Run not found: ${runId}
-`);
-      await service.close();
-      return 1;
-    }
-    process.stdout.write(`${JSON.stringify(view, null, 2)}
-`);
-    await service.close();
-    return 0;
-  }
-  if (command === "control") {
-    const action = argv[1];
-    const runId = argv[2];
-    const revision = Number(argv[3]);
-    if (!["pause", "resume", "cancel", "interrupt", "detach"].includes(action) || !runId || !Number.isSafeInteger(revision)) {
-      process.stderr.write(`control requires ACTION ID REV
-`);
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(`${JSON.stringify(service.coordinator.control({ runId, action, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID8() }))}
-`);
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
-`);
-      await service.close();
-      return 1;
-    }
-  }
-  if (command === "retry") {
-    const runId = argv[1];
-    const invocationId = argv[2];
-    const revision = Number(argv[3]);
-    if (!runId || !invocationId || !Number.isSafeInteger(revision)) {
-      process.stderr.write(`retry requires ID INVOCATION REV
-`);
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(`${JSON.stringify(service.coordinator.retry({ runId, invocationId, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID8() }))}
-`);
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
-`);
-      await service.close();
-      return 1;
-    }
-  }
-  if (command === "checkpoint") {
-    const runId = argv[1];
-    if (!runId) {
-      process.stderr.write(`checkpoint requires ID
-`);
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(`${JSON.stringify(await service.captureCheckpoint(runId, { idempotencyKey: `cli:checkpoint:${runId}` }))}
-`);
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
-`);
-      await service.close();
-      return 1;
-    }
-  }
-  if (command === "fork") {
-    const checkpointId = argv[1];
-    const requestKey = argv[2] ?? randomUUID8();
-    if (!checkpointId) {
-      process.stderr.write(`fork requires CHECKPOINT REQUEST
-`);
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(`${JSON.stringify(await service.forkCheckpoint({ checkpointId, requestKey }))}
-`);
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
-`);
-      await service.close();
-      return 1;
-    }
-  }
-  const instanceId = randomUUID8();
-  const host = createHostServer(service, { staticRoot, cli: { instanceId, workspace: project } });
-  host.start();
-  const unregister = await registerHost(dataDir, {
-    protocol: 1,
-    url: `http://127.0.0.1:${host.port}`,
-    token: host.token,
-    instanceId
-  });
-  const url2 = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
-  process.stdout.write(`Kouro workbench: ${url2}
-Data: ${dataDir}
-`);
-  if (process.env.SSH_CONNECTION) {
-    process.stdout.write(`SSH browser access: on your computer run:
+    const url2 = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
+    process.stdout.write(output2.workbench(url2, dataDir));
+    if (process.env.SSH_CONNECTION) {
+      process.stdout.write(`SSH browser access: on your computer run:
   ssh -N -L ${host.port}:127.0.0.1:${host.port} <same-SSH-target>
 Then open the workbench URL above in your local browser. Keep the tunnel running.
 `);
+    }
+    let closing = false;
+    const close = async () => {
+      if (closing)
+        return;
+      closing = true;
+      await unregister();
+      await host.stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", () => {
+      close();
+    });
+    process.on("SIGTERM", () => {
+      close();
+    });
+    return 0;
+  } catch (cause) {
+    await service.close();
+    process.stderr.write(output2.error(cause));
+    return 1;
   }
-  let closing = false;
-  const close = async () => {
-    if (closing)
-      return;
-    closing = true;
-    await unregister();
-    await host.stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", () => {
-    close();
-  });
-  process.on("SIGTERM", () => {
-    close();
-  });
-  return 0;
 }
-function taskOutput(url2) {
+function taskOutput(output2, url2) {
   return (value) => {
     if (url2 && value && typeof value === "object" && !Array.isArray(value)) {
       const record4 = value;
@@ -66133,8 +66722,7 @@ function taskOutput(url2) {
         value = { ...record4, dashboardUrl: link.href };
       }
     }
-    process.stdout.write(`${JSON.stringify(value)}
-`);
+    process.stdout.write(output2.record(value));
   };
 }
 function webStaticRoot() {
@@ -66172,7 +66760,7 @@ var templateIds = [
   "feature-fusion",
   "refactor-fusion"
 ];
-async function createCommand(args) {
+async function createCommand(args, presentation) {
   if (args[0] !== "template") {
     process.stderr.write(`create requires TEMPLATE
 `);
@@ -66221,8 +66809,7 @@ async function createCommand(args) {
     return 0;
   } catch (cause) {
     await rm2(temporary, { recursive: true, force: true });
-    process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
-`);
+    process.stderr.write(presentation.error(cause));
     return 1;
   }
 }
@@ -66248,8 +66835,14 @@ async function renderDirectory(source, target, name) {
       await writeFile2(targetPath, (await readFile3(sourcePath, "utf8")).replaceAll("{{id}}", name).replaceAll("{{name}}", name.split("-").map((part) => `${part[0]?.toUpperCase()}${part.slice(1)}`).join(" ")));
   }
 }
-if (import.meta.main)
-  process.exitCode = await main();
+if (import.meta.main) {
+  try {
+    process.exitCode = await main();
+  } catch (cause) {
+    process.stderr.write(createPresentation("auto").error(cause));
+    process.exitCode = 1;
+  }
+}
 export {
   main
 };

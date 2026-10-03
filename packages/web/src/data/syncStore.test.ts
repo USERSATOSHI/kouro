@@ -94,6 +94,9 @@ describe("run projection sync", () => {
     store.replace(initial);
     const counters = {
       inputTokens: { value: 400, quality: "observed" },
+      uncachedInputTokens: { value: 50, quality: "observed" },
+      cacheReadInputTokens: { value: 300, quality: "observed" },
+      cacheCreationInputTokens: { value: 50, quality: "observed" },
       outputTokens: { value: 60, quality: "observed" },
       totalTokens: { value: 460, quality: "observed" },
       cost: { value: null, quality: "unavailable" },
@@ -120,6 +123,9 @@ describe("run projection sync", () => {
     expect(store.getSnapshot()?.usage).toEqual([
       expect.objectContaining({
         inputTokens: 400,
+        uncachedInputTokens: 50,
+        cacheReadInputTokens: 300,
+        cacheCreationInputTokens: 50,
         outputTokens: 60,
         totalTokens: 460,
         completeness: "complete",

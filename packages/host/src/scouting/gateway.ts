@@ -45,6 +45,30 @@ export class ScoutGateway {
 
   constructor(private readonly journal: Journal) {}
 
+  recordEvidenceKey(
+    runId: string,
+    parentAttemptId: string,
+    requestId: string,
+    key: string | null,
+  ): void {
+    this.journal.db
+      .query(
+        "UPDATE scout_requests SET evidence_key=?1 WHERE run_id=?2 AND parent_attempt_id=?3 AND request_id=?4 AND state='running'",
+      )
+      .run(key, runId, parentAttemptId, requestId);
+  }
+
+  cachedEvidence(runId: string, key: string): { requestId: string; result: JsonValue } | undefined {
+    const row = this.journal.db
+      .query(
+        "SELECT request_id, result_json FROM scout_requests WHERE run_id=?1 AND evidence_key=?2 AND state='succeeded' AND result_json IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+      )
+      .get(runId, key) as { request_id: string; result_json: string } | null;
+    return row
+      ? { requestId: row.request_id, result: JSON.parse(row.result_json) as JsonValue }
+      : undefined;
+  }
+
   recordSession(
     runId: string,
     parentAttemptId: string,

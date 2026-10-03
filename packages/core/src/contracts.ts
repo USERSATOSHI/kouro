@@ -141,6 +141,10 @@ export interface FusionStageIdentity {
   readonly memberId: string;
   readonly stage: "draft" | "review" | "revision" | "synthesis";
   readonly round: number;
+  /** Large peer reports use files by default; choose files to keep all reports out of prompts. */
+  readonly notesTransport?: "auto" | "inline" | "files";
+  /** Skip remaining model calls only when every review explicitly says needsRevision: false. */
+  readonly stopWhenUnanimous?: boolean;
 }
 
 export interface AgentNode {
@@ -152,6 +156,10 @@ export interface AgentNode {
   readonly harness?: Harness;
   readonly modelId?: string;
   readonly effort?: ReasoningEffortValue;
+  /** Opt-in Claude native query turn cap; omitted means no Kouro turn cap. */
+  readonly maxNativeTurns?: number;
+  /** Optional Claude query spend cap, in estimated USD (not subscription quota). */
+  readonly maxBudgetUsd?: number;
   /** Identifies a model's stages in an authored fusion workflow. */
   readonly fusion?: FusionStageIdentity;
   readonly workspaceAccess?: "read-only" | "workspace-write";

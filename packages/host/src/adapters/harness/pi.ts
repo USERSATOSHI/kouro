@@ -1,3 +1,4 @@
+import { renderHarnessPrompt } from "./prompt";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
@@ -319,9 +320,7 @@ export class PiSdkHarness {
         };
       const activity = new PiMessages(emit);
       const unsubscribe = session.subscribe((event) => activity.consume(event));
-      const handoff = input.context
-        ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
-        : input.role.prompt;
+      const handoff = renderHarnessPrompt(input.role.prompt, input.context);
       const prompt = input.role.outputSchema
         ? `${handoff}\n\nReturn only JSON matching this schema:\n${JSON.stringify(input.role.outputSchema)}`
         : handoff;

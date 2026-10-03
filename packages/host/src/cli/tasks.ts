@@ -3,8 +3,10 @@ import { resolve } from "node:path";
 import { taskModel } from "../application/tasks";
 import type { ApplicationService } from "../application/service";
 
-export const taskUsage = `Usage:
-  kouro task workflows [--workspace PATH]          List available workflows as JSON
+export const taskUsage = `Kouro · Milestone tasks
+
+Usage:
+  kouro task workflows [--workspace PATH]          List available workflows
   kouro task run --task TEXT --harness HARNESS --model ID [options]
   kouro task status RUN [--workspace PATH]         Print milestone progress and pending approvals
   kouro task resume RUN [--workspace PATH]         Continue a durable task until completion or approval
@@ -17,17 +19,24 @@ Run options:
   --planner-model ID      Override planning model
   --executor-harness NAME Override execution harness
   --executor-model ID     Override execution model
-  --max-milestones N      Milestone limit, 1-12 (default: 8)
+  --max-milestones N      Milestone limit, 1-12 (default: 3)
   --max-concurrent N      Concurrent milestones, 1-4 (default: 2)
   --idempotency-key KEY   Reuse a task creation or decision request
   --data-dir PATH         Durable state directory (default: workspace/.kouro-data)
 
-Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
-Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
-Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
-Execution prints its dashboard URL to stderr. JSON records include dashboardUrl.
-Without a running host, the dashboard is temporary and lasts until the command returns.
-Provider limits pause tasks. After reset, task resume continues saved Claude/Codex sessions.
+Output:
+  --json                  Structured JSON records (also default when redirected)
+  --plain                 Readable reports without terminal colors
+
+Decisions:
+  --feedback TEXT         Required when requesting changes
+  --binding-digest DIGEST  Bind the decision to the reviewed inputs
+  --subject-revision N    Bind the decision to the reviewed revision
+
+Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 approval or pause.
+Tasks connect to the dashboard owning their data directory; the URL goes to stderr.
+Without a running host, that dashboard lasts until the command returns.
+After provider reset, task resume continues saved Claude/Codex sessions.
 `;
 
 const valueOptions = new Set([

@@ -131,7 +131,7 @@ export async function compileTask(
   workflows: readonly TaskWorkflow[],
   planner: TaskModel,
   executor: TaskModel,
-  maxMilestones = 8,
+  maxMilestones = 3,
   maxConcurrent = 2,
 ) {
   const largest = (key: "scopes" | "invocations" | "attempts") =>

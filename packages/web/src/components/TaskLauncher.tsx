@@ -54,7 +54,7 @@ export function TaskLauncher({
   const [model, setModel] = useState("");
   const [executorHarness, setExecutorHarness] = useState<Harness>("codex");
   const [executorModel, setExecutorModel] = useState("");
-  const [maxMilestones, setMaxMilestones] = useState(8);
+  const [maxMilestones, setMaxMilestones] = useState(3);
   const [maxConcurrent, setMaxConcurrent] = useState(2);
   const request = useRef<{ identity: string; key: string } | undefined>(undefined);
   const submitting = useRef(false);

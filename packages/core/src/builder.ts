@@ -98,6 +98,10 @@ export interface AgentOptions<T = unknown> {
   readonly modelId?: string;
   /** Optional reasoning effort. Supported levels depend on the harness and model. */
   readonly effort?: ReasoningEffortValue;
+  /** Opt-in Claude native query turn cap; omitted means no Kouro turn cap. */
+  readonly maxNativeTurns?: number;
+  /** Optional Claude query spend cap, in estimated USD (not subscription quota). */
+  readonly maxBudgetUsd?: number;
   readonly fusion?: FusionStageIdentity;
   readonly workspaceAccess?: "read-only" | "workspace-write";
   readonly capabilities?: readonly WorkflowCapability[];
@@ -120,6 +124,10 @@ export interface SubagentOptions<T = unknown> {
   readonly modelId?: string;
   /** Child effort is independent of its parent; omit it for the harness default. */
   readonly effort?: ReasoningEffortValue;
+  /** Opt-in Claude native query turn cap; omitted means no Kouro turn cap. */
+  readonly maxNativeTurns?: number;
+  /** Optional Claude query spend cap, in estimated USD (not subscription quota). */
+  readonly maxBudgetUsd?: number;
   /** Input schemas exposed to the subagent. */
   readonly input?: Readonly<Record<string, SchemaInput>>;
   /** The single typed report returned by the subagent. */
@@ -395,6 +403,8 @@ function directSubagentSource<T>(
     ...(options.harness === undefined ? {} : { harness: options.harness }),
     ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
     ...(options.effort === undefined ? {} : { effort: options.effort }),
+    ...(options.maxNativeTurns === undefined ? {} : { maxNativeTurns: options.maxNativeTurns }),
+    ...(options.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: options.maxBudgetUsd }),
     inputPorts: inputPorts.map(stripPort),
     outputPorts: [stripPort(output)],
     bindings: inputPorts.map((input) => ({
@@ -580,6 +590,8 @@ export class WorkflowBuilder {
       ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
       ...(options.effort === undefined ? {} : { effort: options.effort }),
+      ...(options.maxNativeTurns === undefined ? {} : { maxNativeTurns: options.maxNativeTurns }),
+      ...(options.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: options.maxBudgetUsd }),
       ...(options.fusion === undefined ? {} : { fusion: options.fusion }),
       ...(options.workspaceAccess === undefined
         ? {}
@@ -1328,6 +1340,8 @@ function stripInternal(node: InternalNode): Node {
       ...(node.harness === undefined ? {} : { harness: node.harness }),
       ...(node.modelId === undefined ? {} : { modelId: node.modelId }),
       ...(node.effort === undefined ? {} : { effort: node.effort }),
+      ...(node.maxNativeTurns === undefined ? {} : { maxNativeTurns: node.maxNativeTurns }),
+      ...(node.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: node.maxBudgetUsd }),
       ...(node.fusion === undefined ? {} : { fusion: node.fusion }),
       ...(node.workspaceAccess === undefined ? {} : { workspaceAccess: node.workspaceAccess }),
       ...(node.capabilities === undefined ? {} : { capabilities: node.capabilities }),

@@ -8,36 +8,30 @@ import { createHostServer } from "./http/server.ts";
 import { serveScoutMcp } from "./adapters/harness/scout-mcp.ts";
 import { parseTaskArgs, taskCommand, taskUsage } from "./cli/tasks";
 import { connectedTaskCommand, dashboardUrl, findHost, registerHost } from "./cli/host-connection";
-
-const usage = `Kouro v2 M1
-
-Usage:
-  kouro serve     Start the loopback-only local workbench
-  kouro create template NAME --template ID  Create a project template under .kouro
-  kouro run [WORKFLOW] [--task TEXT] [--profile ID] [--allow-unrestricted-commands]  Execute a workflow headlessly
-  kouro task     Generate and execute dependent milestones; use kouro task --help
-  kouro plugin path  Print the bundled Codex/Claude plugin marketplace directory
-  kouro inspect ID  Print one durable run view as JSON
-  kouro control ACTION ID REV  Pause/resume/cancel/interrupt/detach a run
-  kouro retry ID INVOCATION REV  Retry one failed invocation
-  kouro checkpoint ID           Capture a quiescent checkpoint
-  kouro fork CHECKPOINT REQUEST Fork two isolated child runs
-  kouro --help    Show this help
-
-Environment:
-  KOURO_DATA_DIR  Durable local state directory (default: .kouro-data)
-  KOURO_PORT      Loopback port (default: 43127; forward it over SSH for remote hosts)
-  KOURO_TOKEN     Optional fixed one-time browser pairing token
-`;
+import {
+  cliUsage,
+  cliVersion,
+  createPresentation,
+  helpFor,
+  presentationArgs,
+} from "./cli/presentation";
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
-  const command = argv[0] ?? "serve";
-  if (command === "__scout_mcp") {
+  if (argv[0] === "__scout_mcp") {
     await serveScoutMcp();
     return 0;
   }
-  if (command === "--help" || command === "-h" || command === "help") {
-    process.stdout.write(usage);
+  const parsed = presentationArgs(argv);
+  argv = parsed.argv;
+  const command = argv[0] ?? "serve";
+  const output = createPresentation(parsed.mode);
+  if (command === "--version") {
+    process.stdout.write(`${cliVersion}\n`);
+    return 0;
+  }
+  if (command === "--help" || command === "-h" || command === "help" || parsed.help) {
+    const topic = command === "help" ? argv[1] : command;
+    process.stdout.write(topic === "task" ? taskUsage : (helpFor(topic ?? "") ?? cliUsage));
     return 0;
   }
   if (
@@ -54,11 +48,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       "create",
     ]).has(command)
   ) {
-    process.stderr.write(`Unknown command: ${command}\n\n${usage}`);
+    process.stderr.write(output.error(`Unknown command: ${command}`) + "Try kouro --help.\n");
     return 2;
   }
 
-  if (command === "create") return createCommand(argv.slice(1));
+  if (command === "create") return createCommand(argv.slice(1), output);
 
   if (command === "plugin") {
     const root = firstExistingPath(
@@ -79,7 +73,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 
   if (command === "task") {
-    if (argv.includes("--help") || argv.includes("-h") || argv[1] === "help") {
+    if (argv[1] === "help") {
       process.stdout.write(taskUsage);
       return 0;
     }
@@ -87,7 +81,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     try {
       args = parseTaskArgs(argv.slice(1));
     } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
+      process.stderr.write(output.error(cause) + "Try kouro task --help.\n");
       return 2;
     }
     const project = args.workspace;
@@ -101,8 +95,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const connection = await findHost(dataDir);
       if (connection) {
         const url = dashboardUrl(connection);
-        if (args.command !== "workflows")
-          process.stderr.write(`Kouro workbench: ${url}\nData: ${dataDir}\n`);
+        if (args.command !== "workflows") process.stderr.write(output.workbench(url, dataDir));
         const forwarded = argv
           .slice(1)
           .map((argument, index, arguments_) =>
@@ -115,7 +108,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return await connectedTaskCommand(
           connection,
           [...forwarded, ...(args.get("--workspace") ? [] : ["--workspace", project])],
-          taskOutput(url),
+          taskOutput(output, url),
         );
       }
       taskService = new ApplicationService({
@@ -138,21 +131,20 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           instanceId,
         };
         unregister = await registerHost(dataDir, hostConnection);
-        process.stderr.write(
-          `Kouro workbench: ${dashboardUrl(hostConnection)}\nData: ${dataDir}\n`,
-        );
+        process.stderr.write(output.workbench(dashboardUrl(hostConnection), dataDir));
       }
       return await taskCommand(
         args,
         taskService,
         taskOutput(
+          output,
           taskHost
             ? dashboardUrl({ url: `http://127.0.0.1:${taskHost.port}`, token: taskHost.token })
             : undefined,
         ),
       );
     } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
+      process.stderr.write(output.error(cause));
       return 1;
     } finally {
       await unregister?.();
@@ -168,226 +160,250 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (command === "serve") {
     const connection = await findHost(dataDir);
     if (connection) {
-      process.stdout.write(`Kouro workbench: ${dashboardUrl(connection)}\nData: ${dataDir}\n`);
+      process.stdout.write(output.workbench(dashboardUrl(connection), dataDir));
       return 0;
     }
   }
   const service = new ApplicationService({ dataDir, templateRoot: resolve(project, ".kouro") });
-  await service.start();
-  if (command === "run") {
-    const valueOptions = new Set(["--profile", "--task", "--workspace", "--ticket"]);
-    let workflowId = "tiny";
-    for (let index = 1; index < argv.length; index += 1) {
-      const arg = argv[index]!;
-      if (valueOptions.has(arg)) {
-        index += 1;
-        continue;
+  try {
+    await service.start();
+    if (command === "run") {
+      const valueOptions = new Set(["--profile", "--task", "--workspace", "--ticket"]);
+      let workflowId = "tiny";
+      for (let index = 1; index < argv.length; index += 1) {
+        const arg = argv[index]!;
+        if (valueOptions.has(arg)) {
+          index += 1;
+          continue;
+        }
+        if (arg.startsWith("--")) continue;
+        workflowId = arg;
+        break;
       }
-      if (arg.startsWith("--")) continue;
-      workflowId = arg;
-      break;
-    }
-    const profileArg = argv.find((arg) => arg.startsWith("--profile="));
-    const profileIndex = argv.indexOf("--profile");
-    const profile =
-      profileArg?.slice("--profile=".length) ??
-      (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
-    const task = optionValue(argv, "--task");
-    const workspace =
-      optionValue(argv, "--workspace") !== undefined || (await hasGitHead(project))
-        ? { repositoryPath: project }
-        : undefined;
-    const ticket = optionValue(argv, "--ticket");
-    if (
-      profile !== undefined &&
-      profile !== "scripted" &&
-      profile !== "codex-readonly" &&
-      profile !== "codex-workspace-write" &&
-      profile !== "claude-readonly" &&
-      profile !== "claude-workspace-write" &&
-      profile !== "pi-readonly"
-    ) {
-      process.stderr.write(`Unknown execution profile: ${profile}\n`);
+      const profileArg = argv.find((arg) => arg.startsWith("--profile="));
+      const profileIndex = argv.indexOf("--profile");
+      const profile =
+        profileArg?.slice("--profile=".length) ??
+        (profileIndex >= 0 ? argv[profileIndex + 1] : undefined);
+      const task = optionValue(argv, "--task");
+      const workspace =
+        optionValue(argv, "--workspace") !== undefined || (await hasGitHead(project))
+          ? { repositoryPath: project }
+          : undefined;
+      const ticket = optionValue(argv, "--ticket");
+      if (
+        profile !== undefined &&
+        profile !== "scripted" &&
+        profile !== "codex-readonly" &&
+        profile !== "codex-workspace-write" &&
+        profile !== "claude-readonly" &&
+        profile !== "claude-workspace-write" &&
+        profile !== "pi-readonly"
+      ) {
+        process.stderr.write(`Unknown execution profile: ${profile}\n`);
+        await service.close();
+        return 2;
+      }
+      const run = await service.createRun({
+        workflowId,
+        idempotencyKey: crypto.randomUUID(),
+        actor: "cli",
+        executionProfile: profile as
+          | "scripted"
+          | "codex-readonly"
+          | "codex-workspace-write"
+          | "claude-readonly"
+          | "claude-workspace-write"
+          | "pi-readonly"
+          | undefined,
+        allowUnrestrictedCommands: argv.includes("--allow-unrestricted-commands"),
+        input: {
+          ...(task === undefined ? {} : { task }),
+          ...(ticket === undefined ? {} : { ticket }),
+        },
+        ...(workspace ? { workspace } : {}),
+      });
+      let view = service.getView(run.runId);
+      while (
+        view &&
+        (view.state.status === "pending" || view.state.status === "running") &&
+        !Object.values(view.state.approvals).some((approval) => approval.status === "pending")
+      ) {
+        await Bun.sleep(50);
+        view = service.getView(run.runId);
+      }
+      process.stdout.write(
+        output.record({
+          runId: run.runId,
+          status: view?.state.status ?? "unknown",
+          revision: view?.revision ?? 0,
+          unrestrictedCommandOptIn: argv.includes("--allow-unrestricted-commands"),
+        }),
+      );
       await service.close();
-      return 2;
+      return view?.state.status === "succeeded" ? 0 : 1;
     }
-    const run = await service.createRun({
-      workflowId,
-      idempotencyKey: crypto.randomUUID(),
-      actor: "cli",
-      executionProfile: profile as
-        | "scripted"
-        | "codex-readonly"
-        | "codex-workspace-write"
-        | "claude-readonly"
-        | "claude-workspace-write"
-        | "pi-readonly"
-        | undefined,
-      allowUnrestrictedCommands: argv.includes("--allow-unrestricted-commands"),
-      input: {
-        ...(task === undefined ? {} : { task }),
-        ...(ticket === undefined ? {} : { ticket }),
-      },
-      ...(workspace ? { workspace } : {}),
+    if (command === "inspect") {
+      const runId = argv[1];
+      if (!runId) {
+        process.stderr.write("inspect requires a run ID\n");
+        await service.close();
+        return 2;
+      }
+      const view = service.getView(runId);
+      if (!view) {
+        process.stderr.write(`Run not found: ${runId}\n`);
+        await service.close();
+        return 1;
+      }
+      process.stdout.write(`${JSON.stringify(view, null, 2)}\n`);
+      await service.close();
+      return 0;
+    }
+    if (command === "control") {
+      const action = argv[1] as "pause" | "resume" | "cancel" | "interrupt" | "detach";
+      const runId = argv[2];
+      const revision = Number(argv[3]);
+      if (
+        !["pause", "resume", "cancel", "interrupt", "detach"].includes(action) ||
+        !runId ||
+        !Number.isSafeInteger(revision)
+      ) {
+        process.stderr.write("control requires ACTION ID REV\n");
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(
+          output.record(
+            service.coordinator.control({
+              runId,
+              action,
+              expectedRevision: revision,
+              actor: "cli",
+              idempotencyKey: randomUUID(),
+            }),
+          ),
+        );
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    if (command === "retry") {
+      const runId = argv[1];
+      const invocationId = argv[2];
+      const revision = Number(argv[3]);
+      if (!runId || !invocationId || !Number.isSafeInteger(revision)) {
+        process.stderr.write("retry requires ID INVOCATION REV\n");
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(
+          output.record(
+            service.coordinator.retry({
+              runId,
+              invocationId,
+              expectedRevision: revision,
+              actor: "cli",
+              idempotencyKey: randomUUID(),
+            }),
+          ),
+        );
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    if (command === "checkpoint") {
+      const runId = argv[1];
+      if (!runId) {
+        process.stderr.write("checkpoint requires ID\n");
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(
+          output.record(
+            await service.captureCheckpoint(runId, { idempotencyKey: `cli:checkpoint:${runId}` }),
+          ),
+        );
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    if (command === "fork") {
+      const checkpointId = argv[1];
+      const requestKey = argv[2] ?? randomUUID();
+      if (!checkpointId) {
+        process.stderr.write("fork requires CHECKPOINT REQUEST\n");
+        await service.close();
+        return 2;
+      }
+      try {
+        process.stdout.write(
+          output.record(await service.forkCheckpoint({ checkpointId, requestKey })),
+        );
+        await service.close();
+        return 0;
+      } catch (cause) {
+        process.stderr.write(output.error(cause));
+        await service.close();
+        return 1;
+      }
+    }
+    const instanceId = randomUUID();
+    const host = createHostServer(service, { staticRoot, cli: { instanceId, workspace: project } });
+    host.start();
+    const unregister = await registerHost(dataDir, {
+      protocol: 1,
+      url: `http://127.0.0.1:${host.port}`,
+      token: host.token,
+      instanceId,
     });
-    let view = service.getView(run.runId);
-    while (
-      view &&
-      (view.state.status === "pending" || view.state.status === "running") &&
-      !Object.values(view.state.approvals).some((approval) => approval.status === "pending")
-    ) {
-      await Bun.sleep(50);
-      view = service.getView(run.runId);
-    }
-    process.stdout.write(
-      `${JSON.stringify({
-        runId: run.runId,
-        status: view?.state.status ?? "unknown",
-        revision: view?.revision ?? 0,
-        unrestrictedCommandOptIn: argv.includes("--allow-unrestricted-commands"),
-      })}\n`,
-    );
-    await service.close();
-    return view?.state.status === "succeeded" ? 0 : 1;
-  }
-  if (command === "inspect") {
-    const runId = argv[1];
-    if (!runId) {
-      process.stderr.write("inspect requires a run ID\n");
-      await service.close();
-      return 2;
-    }
-    const view = service.getView(runId);
-    if (!view) {
-      process.stderr.write(`Run not found: ${runId}\n`);
-      await service.close();
-      return 1;
-    }
-    process.stdout.write(`${JSON.stringify(view, null, 2)}\n`);
-    await service.close();
-    return 0;
-  }
-  if (command === "control") {
-    const action = argv[1] as "pause" | "resume" | "cancel" | "interrupt" | "detach";
-    const runId = argv[2];
-    const revision = Number(argv[3]);
-    if (
-      !["pause", "resume", "cancel", "interrupt", "detach"].includes(action) ||
-      !runId ||
-      !Number.isSafeInteger(revision)
-    ) {
-      process.stderr.write("control requires ACTION ID REV\n");
-      await service.close();
-      return 2;
-    }
-    try {
+    const url = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
+    process.stdout.write(output.workbench(url, dataDir));
+    if (process.env.SSH_CONNECTION) {
       process.stdout.write(
-        `${JSON.stringify(service.coordinator.control({ runId, action, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID() }))}\n`,
+        `SSH browser access: on your computer run:\n  ssh -N -L ${host.port}:127.0.0.1:${host.port} <same-SSH-target>\nThen open the workbench URL above in your local browser. Keep the tunnel running.\n`,
       );
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
-      await service.close();
-      return 1;
     }
-  }
-  if (command === "retry") {
-    const runId = argv[1];
-    const invocationId = argv[2];
-    const revision = Number(argv[3]);
-    if (!runId || !invocationId || !Number.isSafeInteger(revision)) {
-      process.stderr.write("retry requires ID INVOCATION REV\n");
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(
-        `${JSON.stringify(service.coordinator.retry({ runId, invocationId, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID() }))}\n`,
-      );
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
-      await service.close();
-      return 1;
-    }
-  }
-  if (command === "checkpoint") {
-    const runId = argv[1];
-    if (!runId) {
-      process.stderr.write("checkpoint requires ID\n");
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(
-        `${JSON.stringify(await service.captureCheckpoint(runId, { idempotencyKey: `cli:checkpoint:${runId}` }))}\n`,
-      );
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
-      await service.close();
-      return 1;
-    }
-  }
-  if (command === "fork") {
-    const checkpointId = argv[1];
-    const requestKey = argv[2] ?? randomUUID();
-    if (!checkpointId) {
-      process.stderr.write("fork requires CHECKPOINT REQUEST\n");
-      await service.close();
-      return 2;
-    }
-    try {
-      process.stdout.write(
-        `${JSON.stringify(await service.forkCheckpoint({ checkpointId, requestKey }))}\n`,
-      );
-      await service.close();
-      return 0;
-    } catch (cause) {
-      process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
-      await service.close();
-      return 1;
-    }
-  }
-  const instanceId = randomUUID();
-  const host = createHostServer(service, { staticRoot, cli: { instanceId, workspace: project } });
-  host.start();
-  const unregister = await registerHost(dataDir, {
-    protocol: 1,
-    url: `http://127.0.0.1:${host.port}`,
-    token: host.token,
-    instanceId,
-  });
-  const url = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
-  process.stdout.write(`Kouro workbench: ${url}\nData: ${dataDir}\n`);
-  if (process.env.SSH_CONNECTION) {
-    process.stdout.write(
-      `SSH browser access: on your computer run:\n  ssh -N -L ${host.port}:127.0.0.1:${host.port} <same-SSH-target>\nThen open the workbench URL above in your local browser. Keep the tunnel running.\n`,
-    );
-  }
 
-  let closing = false;
-  const close = async () => {
-    if (closing) return;
-    closing = true;
-    await unregister();
-    await host.stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", () => {
-    void close();
-  });
-  process.on("SIGTERM", () => {
-    void close();
-  });
-  return 0;
+    let closing = false;
+    const close = async () => {
+      if (closing) return;
+      closing = true;
+      await unregister();
+      await host.stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", () => {
+      void close();
+    });
+    process.on("SIGTERM", () => {
+      void close();
+    });
+    return 0;
+  } catch (cause) {
+    await service.close();
+    process.stderr.write(output.error(cause));
+    return 1;
+  }
 }
 
-/** Keep stdout as JSON while making the current run's dashboard discoverable. */
-function taskOutput(url?: string) {
+/** Keep dashboard links in both terminal reports and machine records. */
+function taskOutput(output: ReturnType<typeof createPresentation>, url?: string) {
   return (value: unknown) => {
     if (url && value && typeof value === "object" && !Array.isArray(value)) {
       const record = value as Record<string, unknown>;
@@ -397,7 +413,7 @@ function taskOutput(url?: string) {
         value = { ...record, dashboardUrl: link.href };
       }
     }
-    process.stdout.write(`${JSON.stringify(value)}\n`);
+    process.stdout.write(output.record(value));
   };
 }
 
@@ -439,7 +455,10 @@ const templateIds = [
   "refactor-fusion",
 ] as const;
 
-async function createCommand(args: string[]): Promise<number> {
+async function createCommand(
+  args: string[],
+  presentation: ReturnType<typeof createPresentation>,
+): Promise<number> {
   if (args[0] !== "template") {
     process.stderr.write("create requires TEMPLATE\n");
     return 2;
@@ -485,7 +504,7 @@ async function createCommand(args: string[]): Promise<number> {
     return 0;
   } catch (cause) {
     await rm(temporary, { recursive: true, force: true });
-    process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
+    process.stderr.write(presentation.error(cause));
     return 1;
   }
 }
@@ -523,4 +542,11 @@ async function renderDirectory(source: string, target: string, name: string): Pr
   }
 }
 
-if (import.meta.main) process.exitCode = await main();
+if (import.meta.main) {
+  try {
+    process.exitCode = await main();
+  } catch (cause) {
+    process.stderr.write(createPresentation("auto").error(cause));
+    process.exitCode = 1;
+  }
+}

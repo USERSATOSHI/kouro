@@ -56,6 +56,7 @@ test("fusion composes agent handles and subagents with ordinary output and contr
   const child = bundle.definitions["fusion-builder:planning"]!;
   const agents = child.nodes.filter((node) => node.kind === "agent");
   expect(agents).toHaveLength(11);
+  expect(agents.every((node) => node.fusion?.notesTransport === "auto")).toBe(true);
   expect(agents.filter((node) => node.fusion?.memberId === "a").map((node) => node.effort)).toEqual(
     Array(5).fill("low"),
   );
@@ -115,4 +116,54 @@ test("fusion validates rounds, ownership and unwired declarations before consumi
   expect(() => wired.workflow.fusion("planning", wired.options).use(wired.a, wired.b)).toThrow(
     /unwired/,
   );
+});
+
+test("native budgets survive fusion cloning and invalid or unsupported budgets fail compilation", async () => {
+  const result = artifactType<{ summary: string }>("native-budget-report", { type: "object" });
+  const workflow = new WorkflowBuilder({ id: "native-budget" });
+  const task = workflow.input("task", { type: "string" });
+  const a = workflow.agent("a", {
+    prompt: "Research",
+    harness: "claude",
+    maxNativeTurns: 8,
+    maxBudgetUsd: 0.5,
+    produces: result,
+  });
+  const b = workflow.agent("b", { prompt: "Research", produces: result });
+  const synthesis = workflow.agent("synthesis", { prompt: "Combine", produces: result });
+  const fusion = workflow
+    .fusion("fusion", {
+      task,
+      rounds: 1,
+      reviewProduces: result,
+      reviewPrompt: "Review",
+      revisionPrompt: "Revise",
+      synthesis,
+      stopWhenUnanimous: false,
+    })
+    .use(a, b);
+  workflow.startAt(fusion);
+  workflow.sequence(fusion, workflow.complete("done", { output: fusion.output }));
+  const bundle = await compileWorkflow(workflow.build());
+  const agents = bundle.definitions["native-budget:fusion"]!.nodes.filter(
+    (node) => node.kind === "agent",
+  );
+  expect(
+    agents
+      .filter((node) => node.fusion?.memberId === "a")
+      .every((node) => node.maxNativeTurns === 8 && node.maxBudgetUsd === 0.5),
+  ).toBe(true);
+  expect(agents.every((node) => node.fusion?.stopWhenUnanimous === false)).toBe(true);
+  for (const options of [
+    { maxNativeTurns: 0 },
+    { maxNativeTurns: 1.5 },
+    { maxBudgetUsd: -1 },
+    { harness: "codex" as const, maxNativeTurns: 8 },
+  ]) {
+    const invalid = new WorkflowBuilder({ id: "invalid-budget" });
+    const agent = invalid.agent("agent", { prompt: "Research", ...options });
+    invalid.startAt(agent);
+    invalid.sequence(agent, invalid.complete("done"));
+    await expect(compileWorkflow(invalid.build())).rejects.toThrow(/INVALID_NATIVE_BUDGET/);
+  }
 });

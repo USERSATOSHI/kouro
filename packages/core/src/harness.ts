@@ -87,11 +87,14 @@ export interface UsageSummary {
   readonly outputTokens: UsageValue;
   readonly totalTokens: UsageValue;
   readonly cost: UsageValue;
+  readonly uncachedInputTokens?: UsageValue;
+  readonly cacheReadInputTokens?: UsageValue;
+  readonly cacheCreationInputTokens?: UsageValue;
 }
 export interface HarnessResult {
   /** Provider-owned conversation persisted locally by the native harness. */
   readonly session?: { readonly id: string };
-  readonly stopReason?: "usage-limit" | "turn-limit";
+  readonly stopReason?: "usage-limit" | "turn-limit" | "budget-limit";
   readonly resumeAfter?: string;
   readonly status: "succeeded" | "failed" | "cancelled" | "unavailable";
   readonly output?: JsonValue;
@@ -99,6 +102,8 @@ export interface HarnessResult {
   /** Separate native stderr stream, retained independently from stdout. */
   readonly stderr?: string;
   readonly usage: UsageSummary;
+  /** Omitted means this turn; native thread counters require a persisted baseline. */
+  readonly usageScope?: "invocation" | "session";
   readonly error?: string;
   readonly events: readonly HarnessEvent[];
 }

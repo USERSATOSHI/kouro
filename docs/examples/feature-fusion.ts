@@ -2,6 +2,7 @@ import { WorkflowBuilder } from "@kouro/core";
 import {
   Task,
   Evidence,
+  FusionReview,
   Plan,
   Change,
   read,
@@ -59,10 +60,10 @@ const synthesis = workflow.agent("synthesis", {
 const planning = workflow
   .fusion("planning", {
     task,
-    rounds: 2,
-    reviewProduces: Evidence,
+    rounds: 1,
+    reviewProduces: FusionReview,
     reviewPrompt: `Review the peer plan against the task and repository. ${requestScout}
-    Identify specific omissions and propose corrections. Return JSON with summary, findings, uncertainties.`,
+    Identify specific omissions and propose corrections. Return JSON with summary, findings, uncertainties, needsRevision. Set needsRevision to false only when no substantive correction remains.`,
     revisionPrompt: `Revise your plan from all reviews. ${requestScout}
     Recheck disputed claims. Return JSON with summary, steps, acceptance, evidence, risks.`,
     synthesis,

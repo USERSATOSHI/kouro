@@ -1,13 +1,21 @@
 import { WorkflowBuilder, artifactType, compileWorkflow } from "@kouro/core";
+import { readFileSync } from "node:fs";
 import type { HarnessAdapter } from "../packages/host/src/types";
 
-export async function fusionFixture(id = "fusion-fixture", rounds = 2) {
-  const report = artifactType<{ summary: string }>("fusion-fixture-report", {
-    type: "object",
-    required: ["summary"],
-    additionalProperties: false,
-    properties: { summary: { type: "string" } },
-  });
+export async function fusionFixture(
+  id = "fusion-fixture",
+  rounds = 2,
+  notesTransport?: "auto" | "inline" | "files",
+) {
+  const report = artifactType<{ summary: string; needsRevision?: boolean }>(
+    "fusion-fixture-report",
+    {
+      type: "object",
+      required: ["summary"],
+      additionalProperties: false,
+      properties: { summary: { type: "string" }, needsRevision: { type: "boolean" } },
+    },
+  );
   const workflow = new WorkflowBuilder({ id });
   const task = workflow.input(
     "task",
@@ -35,6 +43,7 @@ export async function fusionFixture(id = "fusion-fixture", rounds = 2) {
     .fusion("planning", {
       task,
       rounds,
+      notesTransport,
       reviewProduces: report,
       reviewPrompt: "review",
       revisionPrompt: "revision",
@@ -86,8 +95,16 @@ export class FusionFixtureHarness implements HarnessAdapter {
   async run(input: Parameters<HarnessAdapter["run"]>[0]): ReturnType<HarnessAdapter["run"]> {
     const values = Object.fromEntries(
       (input.context?.segments ?? [])
-        .filter((segment) => segment.source === "artifact-input")
-        .map((segment) => [segment.id.split(":").at(-1)!, JSON.parse(segment.content ?? "null")]),
+        .filter((segment) => ["artifact-input", "artifact-input-file"].includes(segment.source))
+        .map((segment) => {
+          const value = JSON.parse(segment.content ?? "null");
+          return [
+            segment.id.split(":").at(-1)!,
+            segment.source === "artifact-input-file"
+              ? JSON.parse(readFileSync(value.path, "utf8"))
+              : value,
+          ];
+        }),
     );
     const stage = values.previous
       ? "revision"

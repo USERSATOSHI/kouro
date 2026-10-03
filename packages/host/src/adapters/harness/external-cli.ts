@@ -1,3 +1,4 @@
+import { renderHarnessPrompt } from "./prompt";
 import {
   unavailableUsage,
   validateJsonSchema,
@@ -238,9 +239,7 @@ export class ExternalCliHarnessAdapter implements HarnessAdapter {
     const command = binary();
     const args = [command, "run", "--format", "json", "--dir", input.cwd ?? "."];
     if (typeof config.model === "string" && config.model) args.push("--model", config.model);
-    const prompt = input.context
-      ? `[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]\n${input.prompt}`
-      : input.prompt;
+    const prompt = renderHarnessPrompt(input.prompt, input.context);
     args.push(prompt);
     let proc: CliProcess;
     try {

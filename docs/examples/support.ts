@@ -16,6 +16,18 @@ export const Evidence = artifactType<{
     uncertainties: { type: "array", items: { type: "string" } },
   },
 });
+export const FusionReview = artifactType<{
+  summary: string; findings: string[]; uncertainties: string[]; needsRevision: boolean;
+}>("fusion-review", {
+  type: "object", additionalProperties: false,
+  required: ["summary", "findings", "uncertainties", "needsRevision"],
+  properties: {
+    summary: { type: "string", minLength: 1 },
+    findings: { type: "array", items: { type: "string" } },
+    uncertainties: { type: "array", items: { type: "string" } },
+    needsRevision: { type: "boolean" },
+  },
+});
 export const Plan = artifactType<{
   summary: string;
   steps: string[];

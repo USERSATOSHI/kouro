@@ -168,6 +168,8 @@ export interface HarnessAdapter {
     nativeConfig?: import("@kouro/core").JsonObject;
     /** Continue this specific native conversation; never choose the latest session. */
     resumeSession?: { readonly id: string };
+    /** Host-materialized workflow inputs outside the repository workspace. */
+    contextDirectories?: readonly string[];
     context?: import("@kouro/core").ContextManifest;
     /** Host-owned, optional collaboration tools. The harness never supplies sender identity. */
     collaboration?: CollaborationTools;
@@ -176,7 +178,7 @@ export interface HarnessAdapter {
   }): Promise<{
     output?: import("@kouro/core").JsonValue;
     session?: { readonly id: string };
-    stopReason?: "usage-limit" | "turn-limit";
+    stopReason?: "usage-limit" | "turn-limit" | "budget-limit";
     resumeAfter?: string;
     rawOutput?: string;
     stderr?: string;
@@ -184,6 +186,7 @@ export interface HarnessAdapter {
     error?: string;
     events: readonly import("@kouro/core").JsonValue[];
     usage: import("@kouro/core").JsonValue;
+    usageScope?: "invocation" | "session";
   }>;
   steer?(input: { invocationId: string; message: string }): Promise<void>;
 }

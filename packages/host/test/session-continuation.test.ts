@@ -14,7 +14,7 @@ import { compileTask } from "../src/application/tasks";
 import { parseTaskArgs, taskCommand } from "../src/cli/tasks";
 import type { HarnessAdapter } from "../src/types";
 
-test("Claude retains an interrupted conversation and resumes it without the hidden turn cap", async () => {
+test("Claude retains interrupted conversations without imposing a default turn cap", async () => {
   const received: Options[] = [];
   const provider: typeof query = (args) => {
     received.push(args.options!);
@@ -56,9 +56,16 @@ test("Claude retains an interrupted conversation and resumes it without the hidd
     stopReason: "turn-limit",
   });
   expect(received[0]).not.toHaveProperty("maxTurns");
-  const resumed = await adapter.run({ ...input, resumeSession: failed.session });
+  expect(received[0]).not.toHaveProperty("maxBudgetUsd");
+  const resumed = await adapter.run({
+    ...input,
+    resumeSession: failed.session,
+    contextDirectories: ["/tmp/kouro-test-notes"],
+  });
   expect(received[1]?.resume).toBe("claude-session");
+  expect(received[1]).not.toHaveProperty("maxTurns");
   expect(received[1]?.persistSession).toBe(true);
+  expect(received[1]?.additionalDirectories).toEqual(["/tmp/kouro-test-notes"]);
   expect(resumed).toMatchObject({
     status: "succeeded",
     output: { summary: "continued research" },
@@ -608,3 +615,58 @@ for (const { harness, missingChild } of [
     }
   });
 }
+
+test("Claude query budgets retain structured stop reasons, cache counters and configurable caps", async () => {
+  const received: Options[] = [];
+  const provider: typeof query = (args) => {
+    received.push(args.options!);
+    return (async function* () {
+      yield {
+        type: "result",
+        subtype: "error_max_budget_usd",
+        session_id: "budget-session",
+        errors: ["Spending guard stopped this request"],
+        modelUsage: {
+          fixture: {
+            inputTokens: 10,
+            outputTokens: 5,
+            cacheReadInputTokens: 100,
+            cacheCreationInputTokens: 20,
+            costUSD: 0.5,
+          },
+        },
+      } as unknown as SDKMessage;
+    })() as ReturnType<typeof query>;
+  };
+  const adapter = new ClaudeAgentSdkHarnessAdapter(provider);
+  const result = await adapter.run({
+    runId: "run",
+    invocationId: "agent",
+    role: "research",
+    prompt: "Research",
+    delayMs: 0,
+    nativeConfig: { maxNativeTurns: 8, maxBudgetUsd: 0.5 },
+  });
+  expect(received[0]).toMatchObject({ maxTurns: 8, maxBudgetUsd: 0.5 });
+  expect(result).toMatchObject({
+    status: "failed",
+    stopReason: "budget-limit",
+    session: { id: "budget-session" },
+    usage: {
+      inputTokens: { value: 130 },
+      uncachedInputTokens: { value: 10 },
+      cacheReadInputTokens: { value: 100 },
+      cacheCreationInputTokens: { value: 20 },
+    },
+  });
+  const invalid = await adapter.run({
+    runId: "run",
+    invocationId: "agent",
+    role: "research",
+    prompt: "Research",
+    delayMs: 0,
+    nativeConfig: { maxNativeTurns: 0 },
+  });
+  expect(invalid.status).toBe("failed");
+  expect(received).toHaveLength(1);
+});

@@ -1,5 +1,5 @@
 import { WorkflowBuilder } from "@kouro/core";
-import { Task, Evidence, Research, researchAccess } from "./support.ts";
+import { Task, FusionReview, Research, researchAccess } from "./support.ts";
 
 // Example task: compare PostgreSQL and SQLite for a local-first multi-process application.
 // NETWORK_ACCESS enables native Codex live search and Claude WebSearch/WebFetch.
@@ -44,12 +44,14 @@ const synthesis = workflow.agent("synthesis", {
 const research = workflow
   .fusion("research", {
     task,
-    rounds: 2,
-    reviewProduces: Evidence,
+    rounds: 1,
+    // Peer reports are files; members keep their native Claude/Codex sessions across rounds.
+    notesTransport: "files",
+    reviewProduces: FusionReview,
     reviewPrompt: `Audit the peer report's actual sources using available search/fetch tools. Check
     currency, causality, missing counterevidence, and whether conclusions follow from evidence.
-    Return JSON with summary, findings, uncertainties; cite URLs in the findings.`,
-    revisionPrompt: `Recheck sources and revise the report against all critiques. Preserve contradictory
+    Return JSON with summary, findings, uncertainties, needsRevision; cite URLs in the findings. Set needsRevision to false only when no substantive correction remains. Reuse established evidence; retrieve only missing or disputed sources.`,
+    revisionPrompt: `Resolve the concrete issues in the critiques using existing evidence. Fetch sources only for missing or disputed claims. Revise the report only where evidence warrants it. Preserve contradictory
     evidence and unanswered questions. Return JSON with summary, findings, sources, disagreements, openQuestions.`,
     synthesis,
   })

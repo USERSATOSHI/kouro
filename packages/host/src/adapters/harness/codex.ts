@@ -1,3 +1,4 @@
+import { renderHarnessPrompt } from "./prompt";
 import {
   Codex,
   type CodexOptions,
@@ -219,9 +220,7 @@ export class CodexSdkHarness implements HarnessPort {
             () => abortController.abort(new Error(`Codex SDK timed out after ${timeoutMs}ms`)),
             timeoutMs,
           );
-    const prompt = input.context
-      ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
-      : input.role.prompt;
+    const prompt = renderHarnessPrompt(input.role.prompt, input.context);
     const events: HarnessEvent[] = [];
     const raw: string[] = [];
     let response: string | undefined;
@@ -431,7 +430,10 @@ export class CodexAppServerHarness {
     const transport = this.createTransport(input.cwd);
     const events: HarnessEvent[] = [];
     let sessionId = input.resumeSession?.id;
-    const session = () => (sessionId ? { session: { id: sessionId } } : {});
+    const session = () => ({
+      usageScope: "session" as const,
+      ...(sessionId ? { session: { id: sessionId } } : {}),
+    });
     let usage = unavailableUsage();
     const emit = (event: HarnessEvent) => {
       events.push(event);
@@ -527,9 +529,7 @@ export class CodexAppServerHarness {
               excludeSlashTmp: false,
             }
           : { type: "readOnly", networkAccess: nativeToolPolicy(input.nativeConfig).network };
-      const prompt = input.context
-        ? `${input.role.prompt}\n\n[KOURO_CONTEXT_BEGIN]\n${JSON.stringify(input.context)}\n[KOURO_CONTEXT_END]`
-        : input.role.prompt;
+      const prompt = renderHarnessPrompt(input.role.prompt, input.context);
       let activeTurnId: string | undefined;
       const messages = new CodexMessages(emit);
       let completed:
@@ -885,8 +885,8 @@ function consumeCodexEvent(
 }
 
 /** App Server reports thread counters separately from the completed Turn payload.
- * Each Kouro invocation starts a fresh thread, so total includes all its model
- * calls (including tool continuations), whereas last covers only the last call.
+ * total includes all model calls in the thread (including earlier Kouro stages
+ * when resumed), whereas last covers only the last call.
  */
 export function codexAppServerUsage(tokenUsage: unknown): HarnessResult["usage"] | undefined {
   const total = asObject(asObject(tokenUsage).total);

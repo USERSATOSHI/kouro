@@ -190,6 +190,9 @@ export interface LogEntryView {
 }
 export interface UsageView {
   inputTokens?: number;
+  uncachedInputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
   estimated?: boolean;
@@ -209,6 +212,15 @@ export function usageViewFrom(value: unknown): UsageView {
   const observed = qualities.filter((value) => value === "observed").length;
   return {
     inputTokens: usageValue(u.inputTokens),
+    ...(u.uncachedInputTokens === undefined
+      ? {}
+      : { uncachedInputTokens: usageValue(u.uncachedInputTokens) }),
+    ...(u.cacheReadInputTokens === undefined
+      ? {}
+      : { cacheReadInputTokens: usageValue(u.cacheReadInputTokens) }),
+    ...(u.cacheCreationInputTokens === undefined
+      ? {}
+      : { cacheCreationInputTokens: usageValue(u.cacheCreationInputTokens) }),
     outputTokens: usageValue(u.outputTokens),
     totalTokens: usageValue(u.totalTokens),
     estimated: qualities.includes("estimated") || u.estimated === true,
