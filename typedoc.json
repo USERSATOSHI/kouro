@@ -1,0 +1,20 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "Kouro API",
+  "entryPoints": ["packages/core/src/index.ts"],
+  "tsconfig": "tsconfig.json",
+  "out": "docs-dist/api",
+  "readme": "docs/site/api.md",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "customCss": "docs/site/assets/api.css",
+  "customJs": "docs/site/assets/api.js",
+  "favicon": "docs/site/assets/favicon.svg",
+  "customFooterHtml": "Learn workflow authoring in the Kouro guides and downloadable examples.",
+  "githubPages": true,
+  "disableGit": true,
+  "sourceLinkTemplate": "https://github.com/usersatoshi/kouro/blob/main/packages/core/src/{path}#L{line}",
+  "hideGenerator": false,
+  "validation": { "invalidLink": true, "invalidPath": false },
+  "treatWarningsAsErrors": true
+}

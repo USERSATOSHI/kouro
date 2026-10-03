@@ -9,3 +9,4 @@ playwright-report/
 *.tsbuildinfo
 .kouro
 .kouro-data
+docs-dist/

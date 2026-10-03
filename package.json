@@ -26,6 +26,10 @@
     "kouro": "bun run packages/host/src/cli.ts",
     "build": "bun run --cwd packages/web build",
     "build:cli": "bun run build && bun run scripts/build-cli.ts",
+    "docs:check": "tsc --noEmit -p docs/tsconfig.json && bun run scripts/check-doc-examples.ts",
+    "docs:build": "bun run docs:check && bun run scripts/build-docs.ts && bun run scripts/check-doc-links.ts && bun run scripts/verify-doc-archives.ts",
+    "docs:preview": "bun run scripts/preview-docs.ts",
+    "test:docs": "playwright test --config playwright.docs.config.ts",
     "release:forgejo": "bun run typecheck && bun test packages scripts && bun run build:cli && bun run scripts/publish-forgejo.ts",
     "test": "bun test packages scripts",
     "test:browser": "playwright test",
@@ -49,6 +53,7 @@
     "@types/react-dom": "^19.2.0",
     "oxfmt": "^0.60.0",
     "oxlint": "^1.75.0",
+    "typedoc": "0.28.20",
     "typescript": "^5.9.3"
   }
 }

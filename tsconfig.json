@@ -22,6 +22,7 @@
     "scripts/**/*.ts",
     "playwright.config.ts",
     "playwright.native.config.ts",
+    "playwright.docs.config.ts",
     "tests/**/*.ts"
   ]
 }

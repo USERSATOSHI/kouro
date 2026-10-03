@@ -1,0 +1,28 @@
+:root {
+  color-scheme: light dark;
+  --background: #faf9f6;
+  --surface: #fff;
+  --ink: #1c2c26;
+  --muted: #58675f;
+  --line: #dce1d9;
+  --accent: #087b65;
+  --tint: #edf4ee;
+  --code-bg: #17251f;
+  --code-ink: #e2ece4;
+  --code-line: #31433a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #131c18;
+    --surface: #1b2721;
+    --ink: #e5ece5;
+    --muted: #a6b8ac;
+    --line: #33453a;
+    --accent: #63c9a4;
+    --tint: #23382c;
+  }
+  .button.primary {
+    background: #087b65;
+    border-color: #087b65;
+  }
+}

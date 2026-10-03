@@ -8,6 +8,10 @@ workflows, runs them through a durable local coordinator, and exposes the same
 execution state through a live graph, timeline, inspector, CLI and API. A scripted
 harness lets you explore and test it without model credentials.
 
+For custom workflow authoring, build the [HTML documentation](docs/README.md) with
+`bun run docs:build`, then preview it with `bun run docs:preview`. The site includes
+the authoring guide, downloadable workflow examples, and a TypeDoc API reference.
+
 ## Run locally
 
 Requirements: Bun 1.3.14 or newer, plus either Linux with Bubblewrap (`bwrap`) and

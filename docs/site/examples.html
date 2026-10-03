@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="Download checked Kouro workflow examples for fusion feature development, maintenance, bugfixes, research, spec implementation, and swarms."><title>Workflow examples — Kouro</title><link rel="icon" href="assets/favicon.svg"><link rel="stylesheet" href="assets/site.css"><script src="assets/site.js" defer></script></head>
+<body>{{navigation}}<main id="main" class="container">
+  <header class="page-intro"><span class="eyebrow">Learn by building</span><h1>Workflows for real tasks.</h1><p class="lede">Complete authoring examples with structured handoffs, explicit permissions, and concrete checks. Each workflow is typechecked and compiled during the documentation build.</p></header>
+  <div class="layout"><aside class="toc" aria-label="Examples"><strong>Choose an example</strong>{{exampleLinks}}<a href="guide.html#install-example">Install an example →</a></aside><div class="article">
+    <div class="note"><p><strong>Adapt before running.</strong> Replace model placeholders and validation commands, authenticate your harnesses, and commit the project baseline workers need. The build verifies workflow structure; it does not run these tasks against live providers. Downloads include <code>manifest.json</code>, <code>kouro.ts</code>, and any supporting files.</p></div>
+    <div class="examples-toolbar"><label for="example-search">Find an example</label><input id="example-search" type="search" placeholder="Try fusion, repair, Rust…"><span id="search-status" role="status" aria-live="polite">7 examples</span></div>
+    {{examples}}
+  </div></div>
+</main>{{footer}}</body></html>

@@ -1,0 +1,45 @@
+:root {
+  --color-link: #087b65;
+}
+.kouro-api-nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1.4rem;
+  padding: 1rem max(1rem, calc((100vw - 1200px) /2));
+  border-bottom: 1px solid #d9dfda;
+  font:
+    500 14px system-ui,
+    sans-serif;
+}
+.kouro-api-nav a {
+  color: inherit;
+  text-decoration: none;
+}
+.kouro-api-nav a:first-child {
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -0.7px;
+  margin-right: auto;
+}
+.kouro-api-nav a:hover {
+  color: var(--color-link);
+}
+.kouro-api-nav a:focus-visible {
+  outline: 2px solid #087b65;
+  outline-offset: 5px;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --color-background: #faf9f6;
+    --color-background-secondary: #f0f1eb;
+  }
+}
+:root[data-theme="dark"] {
+  --color-link: #63c9a4;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-link: #63c9a4;
+  }
+}
