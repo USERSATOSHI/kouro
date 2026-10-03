@@ -16555,10 +16555,10 @@ var require_dist2 = __commonJS((exports, module) => {
 });
 
 // packages/host/src/cli.ts
-import { randomUUID as randomUUID7 } from "crypto";
+import { randomUUID as randomUUID8 } from "crypto";
 import { existsSync as existsSync4 } from "fs";
-import { mkdir, readdir as readdir2, readFile as readFile2, rename, rm, stat as stat2, writeFile } from "fs/promises";
-import { dirname as dirname3, resolve as resolve6 } from "path";
+import { mkdir, readdir as readdir2, readFile as readFile3, rename as rename2, rm as rm2, stat as stat2, writeFile as writeFile2 } from "fs/promises";
+import { dirname as dirname3, resolve as resolve7 } from "path";
 
 // packages/host/src/application/tasks.ts
 init_src();
@@ -47193,8 +47193,8 @@ async function loadFileTemplates(root) {
 }
 
 // packages/host/src/http/server.ts
-import { randomBytes as randomBytes2, randomUUID as randomUUID5 } from "crypto";
-import { join as join8, normalize, relative } from "path";
+import { randomBytes as randomBytes2, randomUUID as randomUUID6 } from "crypto";
+import { join as join8, normalize, relative, resolve as resolve6 } from "path";
 
 // node_modules/.bun/memoirist@0.4.0/node_modules/memoirist/dist/bun/index.js
 var Y = (v, b) => {
@@ -61617,6 +61617,242 @@ var _Elysia = class _Elysia2 {
 };
 var Elysia = _Elysia;
 
+// packages/host/src/cli/tasks.ts
+import { randomUUID as randomUUID5 } from "crypto";
+import { resolve as resolve5 } from "path";
+var taskUsage = `Usage:
+  kouro task workflows [--workspace PATH]          List available workflows as JSON
+  kouro task run --task TEXT --harness HARNESS --model ID [options]
+  kouro task status RUN [--workspace PATH]         Print milestone progress and pending approvals
+  kouro task resume RUN [--workspace PATH]         Continue a durable task until completion or approval
+  kouro task decide RUN INVOCATION --decision approve|reject|request-changes --revision N
+
+Run options:
+  --workflow ID           Allowed workflow (repeatable; defaults to eligible project workflows)
+  --workspace PATH        Git repository with a committed HEAD (default: current directory)
+  --planner-harness NAME  Override planning harness
+  --planner-model ID      Override planning model
+  --executor-harness NAME Override execution harness
+  --executor-model ID     Override execution model
+  --max-milestones N      Milestone limit, 1-12 (default: 8)
+  --max-concurrent N      Concurrent milestones, 1-4 (default: 2)
+  --idempotency-key KEY   Reuse a task creation or decision request
+  --data-dir PATH         Durable state directory (default: workspace/.kouro-data)
+
+Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
+Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
+Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
+Without a running host, execution prints a temporary dashboard URL to stderr.
+`;
+var valueOptions = new Set([
+  "--task",
+  "--workflow",
+  "--workspace",
+  "--harness",
+  "--model",
+  "--planner-harness",
+  "--planner-model",
+  "--executor-harness",
+  "--executor-model",
+  "--max-milestones",
+  "--max-concurrent",
+  "--idempotency-key",
+  "--data-dir",
+  "--decision",
+  "--revision",
+  "--feedback",
+  "--binding-digest",
+  "--subject-revision"
+]);
+function parseTaskArgs(args) {
+  const positional = [];
+  const options = new Map;
+  for (let i = 0;i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith("--")) {
+      positional.push(arg);
+      continue;
+    }
+    const separator = arg.indexOf("=");
+    const name = separator < 0 ? arg : arg.slice(0, separator);
+    if (!valueOptions.has(name))
+      throw new Error(`Unknown task option ${name}`);
+    const value = separator < 0 ? args[++i] : arg.slice(separator + 1);
+    if (!value || value.startsWith("--"))
+      throw new Error(`${name} requires a value`);
+    if (name !== "--workflow" && options.has(name))
+      throw new Error(`Duplicate task option ${name}`);
+    options.set(name, [...options.get(name) ?? [], value]);
+  }
+  const command = positional[0] ?? "run";
+  if (!["run", "workflows", "status", "resume", "decide"].includes(command))
+    throw new Error(`Unknown task command ${command}`);
+  const expected = command === "decide" ? 3 : ["status", "resume"].includes(command) ? 2 : 1;
+  if (positional.length > expected || expected > 1 && positional.length !== expected)
+    throw new Error(`task ${command} requires ${command === "decide" ? "RUN INVOCATION" : "RUN"}`);
+  const get = (name) => options.get(name)?.[0];
+  const shared = new Set(["--workspace", "--data-dir"]);
+  const decisions = new Set([
+    "--decision",
+    "--revision",
+    "--feedback",
+    "--binding-digest",
+    "--subject-revision"
+  ]);
+  for (const name of options.keys()) {
+    const permitted = shared.has(name) || command === "run" && !decisions.has(name) || command === "decide" && (decisions.has(name) || name === "--idempotency-key");
+    if (!permitted)
+      throw new Error(`${name} is not an option for task ${command}`);
+  }
+  const integer2 = (name, minimum, maximum = Number.MAX_SAFE_INTEGER) => {
+    const value = get(name);
+    if (value === undefined)
+      return;
+    const number4 = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(number4) || number4 < minimum || number4 > maximum)
+      throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    return number4;
+  };
+  const model = (prefix) => taskModel({
+    harness: get(`--${prefix}-harness`) ?? get("--harness"),
+    modelId: get(`--${prefix}-model`) ?? get("--model")
+  });
+  if (command === "run" && !get("--task")?.trim())
+    throw new Error("task run requires --task TEXT");
+  const planner = command === "run" ? model("planner") : undefined;
+  const executor = command === "run" ? model("executor") : undefined;
+  const maxMilestones = integer2("--max-milestones", 1, 12);
+  const maxConcurrent = integer2("--max-concurrent", 1, 4);
+  const revision = integer2("--revision", 0);
+  const subjectRevision = integer2("--subject-revision", 0);
+  const decision = get("--decision");
+  if (command === "decide" && (!decision || !["approve", "reject", "request-changes"].includes(decision) || revision === undefined))
+    throw new Error("task decide requires --decision approve|reject|request-changes and --revision N");
+  if (command === "decide" && decision === "request-changes" && !get("--feedback")?.trim())
+    throw new Error("request-changes requires --feedback TEXT");
+  return {
+    command,
+    workspace: resolve5(get("--workspace") ?? process.cwd()),
+    runId: positional[1],
+    invocationId: positional[2],
+    get,
+    planner,
+    executor,
+    maxMilestones,
+    maxConcurrent,
+    revision,
+    subjectRevision,
+    workflowIds: options.get("--workflow")
+  };
+}
+async function taskCommand(args, service, write = (value) => process.stdout.write(`${JSON.stringify(value)}
+`), options = {}) {
+  options.signal?.throwIfAborted();
+  if (args.command === "workflows") {
+    write(await service.taskWorkflows());
+    return 0;
+  }
+  let runId = args.runId;
+  if (args.command === "run") {
+    const workflowIds = args.workflowIds ?? (await service.taskWorkflows()).filter((item) => item.eligible && !["tiny", "feature", "parallel"].includes(item.id)).map((item) => item.id);
+    if (!workflowIds.length)
+      throw new Error("No eligible project workflows. Create one with kouro create template develop --template feature, configure its validation commands, then rerun.");
+    const run = await service.createTask({
+      task: args.get("--task"),
+      workflowIds,
+      planner: args.planner,
+      executor: args.executor,
+      maxMilestones: args.maxMilestones,
+      maxConcurrent: args.maxConcurrent,
+      idempotencyKey: args.get("--idempotency-key") ?? randomUUID5(),
+      workspace: { repositoryPath: args.workspace }
+    });
+    runId = run.runId;
+  }
+  const view = service.getView(runId);
+  if (!view || view.bundle.rootDefinitionId !== "automatic-task")
+    throw new Error(`Workflow task not found: ${runId}`);
+  if (args.command === "decide") {
+    const decision = args.get("--decision");
+    service.decideApproval({
+      runId,
+      invocationId: args.invocationId,
+      expectedRevision: args.revision,
+      decision: decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "changes-requested",
+      feedback: args.get("--feedback"),
+      bindingDigest: args.get("--binding-digest"),
+      subjectRevision: args.subjectRevision,
+      actor: "cli",
+      idempotencyKey: args.get("--idempotency-key") ?? randomUUID5()
+    });
+  }
+  if (args.command === "resume" && view.state.status === "paused")
+    service.control({
+      runId,
+      action: "resume",
+      expectedRevision: view.revision,
+      actor: "cli",
+      idempotencyKey: randomUUID5()
+    });
+  if (args.command !== "status") {
+    write({ event: "task.started", runId });
+    let interrupted = false;
+    const stop = () => {
+      interrupted = true;
+      const current = service.getView(runId);
+      if (current && ["pending", "running", "paused"].includes(current.state.status))
+        service.control({
+          runId,
+          action: "cancel",
+          expectedRevision: current.revision,
+          actor: "cli",
+          idempotencyKey: randomUUID5()
+        });
+    };
+    if (options.processSignals !== false) {
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
+    }
+    options.signal?.addEventListener("abort", stop, { once: true });
+    if (options.signal?.aborted)
+      stop();
+    try {
+      for (;; ) {
+        await service.coordinator.waitForCheckpointDrain(runId);
+        const current = service.getView(runId);
+        if (!["pending", "running"].includes(current.state.status) || Object.values(current.state.approvals).some((item) => item.status === "pending"))
+          break;
+        await Bun.sleep(50);
+      }
+    } finally {
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
+      options.signal?.removeEventListener("abort", stop);
+    }
+    if (interrupted) {
+      write(taskReport(service, runId));
+      return 130;
+    }
+  }
+  const report = taskReport(service, runId);
+  write(report);
+  return args.command === "status" || report.status === "succeeded" ? 0 : report.waitingForApproval || report.status === "paused" ? 3 : 1;
+}
+function taskReport(service, runId) {
+  const view = service.getView(runId);
+  const approvals = Object.values(view.state.approvals).filter((item) => item.status === "pending").map((item) => ({ ...item, inputs: view.state.invocations[item.invocationId]?.inputBindings }));
+  return {
+    runId,
+    status: view.state.status,
+    revision: view.revision,
+    waitingForApproval: approvals.length > 0,
+    approvals,
+    ...service.coordinator.milestones(runId),
+    result: Object.values(view.state.invocations).find((item) => item.scopeId === view.state.rootScopeId && item.nodeId === "done")?.output,
+    workspace: service.coordinator.workspacePath(runId)
+  };
+}
+
 // packages/host/src/http/server.ts
 init_src();
 function createHostServer(service, options = {}) {
@@ -61630,6 +61866,7 @@ function createHostServer(service, options = {}) {
     return { error: "unauthorized", message };
   };
   const denied = (set2) => set2.status === 403 ? { error: "forbidden", message: "Origin or CSRF check failed" } : unauthorized(set2);
+  const cliAuthenticated = (request) => options.cli && validOriginHost(request) && request.headers.get("authorization") === `Bearer ${token}`;
   const checked = (request, set2, command = false) => {
     if (!validOriginHost(request)) {
       set2.status = 403;
@@ -61665,11 +61902,65 @@ function createHostServer(service, options = {}) {
       set2.status = 401;
       return { error: "invalid-token" };
     }
-    const sessionId = randomUUID5();
+    const sessionId = randomUUID6();
     const csrf = randomBytes2(24).toString("base64url");
     sessions.set(sessionId, { csrf, createdAt: Date.now() });
     set2.headers["set-cookie"] = `kouro_session=${sessionId}; HttpOnly; SameSite=Strict; Path=/`;
     return { csrfToken: csrf };
+  });
+  app.get("/api/cli/host", ({ request, set: set2 }) => cliAuthenticated(request) ? { instanceId: options.cli.instanceId, workspace: options.cli.workspace } : unauthorized(set2));
+  app.post("/api/cli/tasks", ({ request, set: set2, body }) => {
+    if (!cliAuthenticated(request))
+      return unauthorized(set2);
+    let args;
+    try {
+      const argv = bodyObject(body).argv;
+      if (!Array.isArray(argv) || argv.some((value) => typeof value !== "string"))
+        throw new Error("Task argv must be an array of strings");
+      args = parseTaskArgs(argv);
+      if (args.workspace !== resolve6(options.cli.workspace))
+        throw new Error("The dashboard and task must use the same project directory");
+    } catch (cause) {
+      set2.status = 400;
+      return {
+        error: "invalid-cli-task",
+        message: cause instanceof Error ? cause.message : String(cause)
+      };
+    }
+    const aborter = new AbortController;
+    const disconnected = () => aborter.abort();
+    request.signal.addEventListener("abort", disconnected, { once: true });
+    if (request.signal.aborted)
+      disconnected();
+    return new Response(new ReadableStream({
+      start(controller) {
+        const encoder2 = new TextEncoder;
+        const writeLine = (line) => {
+          if (aborter.signal.aborted)
+            return;
+          try {
+            controller.enqueue(encoder2.encode(line));
+          } catch {
+            disconnected();
+          }
+        };
+        const write = (value) => writeLine(`${JSON.stringify(value)}
+`);
+        const heartbeat = setInterval(() => writeLine(`
+`), 5000);
+        taskCommand(args, service, write, { signal: aborter.signal, processSignals: false }).then((exitCode) => write({ event: "task.finished", exitCode })).catch((cause) => write({
+          event: "task.error",
+          message: cause instanceof Error ? cause.message : String(cause)
+        })).finally(() => {
+          clearInterval(heartbeat);
+          request.signal.removeEventListener("abort", disconnected);
+          try {
+            controller.close();
+          } catch {}
+        });
+      },
+      cancel: disconnected
+    }), { headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" } });
   });
   app.get("/api/workflows", ({ request, set: set2 }) => checked(request, set2) ? service.workflows() : denied(set2));
   app.get("/api/execution-profiles", ({ request, set: set2 }) => checked(request, set2) ? service.executionProfiles() : denied(set2));
@@ -62533,7 +62824,9 @@ data: ${JSON.stringify({ ...frame, m2: service.operatorState(params.id) })}
   return {
     app,
     token,
-    port: port2,
+    get port() {
+      return server?.port ?? port2;
+    },
     start() {
       server = Bun.serve({ hostname: "127.0.0.1", port: port2, fetch: app.handle });
       return server;
@@ -63971,7 +64264,7 @@ class Protocol {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1000;
-        await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
+        await new Promise((resolve7) => setTimeout(resolve7, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error63) {
@@ -63983,7 +64276,7 @@ class Protocol {
   }
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve5, reject) => {
+    return new Promise((resolve7, reject) => {
       const earlyReject = (error63) => {
         reject(error63);
       };
@@ -64061,7 +64354,7 @@ class Protocol {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve5(parseResult.data);
+            resolve7(parseResult.data);
           }
         } catch (error63) {
           reject(error63);
@@ -64252,12 +64545,12 @@ class Protocol {
         interval = task.pollInterval;
       }
     } catch {}
-    return new Promise((resolve5, reject) => {
+    return new Promise((resolve7, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve5, interval);
+      const timeoutId = setTimeout(resolve7, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -64922,12 +65215,12 @@ class StdioServerTransport {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve5) => {
+    return new Promise((resolve7) => {
       const json3 = serializeMessage(message);
       if (this._stdout.write(json3)) {
-        resolve5();
+        resolve7();
       } else {
-        this._stdout.once("drain", resolve5);
+        this._stdout.once("drain", resolve7);
       }
     });
   }
@@ -64973,232 +65266,124 @@ async function serveScoutMcp() {
   await server.connect(new StdioServerTransport);
 }
 
-// packages/host/src/cli/tasks.ts
-import { randomUUID as randomUUID6 } from "crypto";
-import { resolve as resolve5 } from "path";
-var taskUsage = `Usage:
-  kouro task workflows [--workspace PATH]          List available workflows as JSON
-  kouro task run --task TEXT --harness HARNESS --model ID [options]
-  kouro task status RUN [--workspace PATH]         Print milestone progress and pending approvals
-  kouro task resume RUN [--workspace PATH]         Continue a durable task until completion or approval
-  kouro task decide RUN INVOCATION --decision approve|reject|request-changes --revision N
-
-Run options:
-  --workflow ID           Allowed workflow (repeatable; defaults to eligible project workflows)
-  --workspace PATH        Git repository with a committed HEAD (default: current directory)
-  --planner-harness NAME  Override planning harness
-  --planner-model ID      Override planning model
-  --executor-harness NAME Override execution harness
-  --executor-model ID     Override execution model
-  --max-milestones N      Milestone limit, 1-12 (default: 8)
-  --max-concurrent N      Concurrent milestones, 1-4 (default: 2)
-  --idempotency-key KEY   Reuse a task creation or decision request
-  --data-dir PATH         Durable state directory (default: workspace/.kouro-data)
-
-Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
-Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
-Approval gates are preserved. Only one CLI or web host may own a data directory at a time.
-`;
-var valueOptions = new Set([
-  "--task",
-  "--workflow",
-  "--workspace",
-  "--harness",
-  "--model",
-  "--planner-harness",
-  "--planner-model",
-  "--executor-harness",
-  "--executor-model",
-  "--max-milestones",
-  "--max-concurrent",
-  "--idempotency-key",
-  "--data-dir",
-  "--decision",
-  "--revision",
-  "--feedback",
-  "--binding-digest",
-  "--subject-revision"
-]);
-function parseTaskArgs(args) {
-  const positional = [];
-  const options = new Map;
-  for (let i = 0;i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("--")) {
-      positional.push(arg);
-      continue;
-    }
-    const separator = arg.indexOf("=");
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (!valueOptions.has(name))
-      throw new Error(`Unknown task option ${name}`);
-    const value = separator < 0 ? args[++i] : arg.slice(separator + 1);
-    if (!value || value.startsWith("--"))
-      throw new Error(`${name} requires a value`);
-    if (name !== "--workflow" && options.has(name))
-      throw new Error(`Duplicate task option ${name}`);
-    options.set(name, [...options.get(name) ?? [], value]);
+// packages/host/src/cli/host-connection.ts
+import { randomUUID as randomUUID7 } from "crypto";
+import { lstat, readFile as readFile2, rename, rm, writeFile } from "fs/promises";
+import { join as join9 } from "path";
+async function registerHost(dataDir, connection) {
+  const path = join9(dataDir, "host.json");
+  const temporary = `${path}.${randomUUID7()}.tmp`;
+  try {
+    await writeFile(temporary, JSON.stringify(connection), { mode: 384, flag: "wx" });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
   }
-  const command = positional[0] ?? "run";
-  if (!["run", "workflows", "status", "resume", "decide"].includes(command))
-    throw new Error(`Unknown task command ${command}`);
-  const expected = command === "decide" ? 3 : ["status", "resume"].includes(command) ? 2 : 1;
-  if (positional.length > expected || expected > 1 && positional.length !== expected)
-    throw new Error(`task ${command} requires ${command === "decide" ? "RUN INVOCATION" : "RUN"}`);
-  const get = (name) => options.get(name)?.[0];
-  const shared = new Set(["--workspace", "--data-dir"]);
-  const decisions = new Set([
-    "--decision",
-    "--revision",
-    "--feedback",
-    "--binding-digest",
-    "--subject-revision"
-  ]);
-  for (const name of options.keys()) {
-    const permitted = shared.has(name) || command === "run" && !decisions.has(name) || command === "decide" && (decisions.has(name) || name === "--idempotency-key");
-    if (!permitted)
-      throw new Error(`${name} is not an option for task ${command}`);
-  }
-  const integer2 = (name, minimum, maximum = Number.MAX_SAFE_INTEGER) => {
-    const value = get(name);
-    if (value === undefined)
-      return;
-    const number5 = Number(value);
-    if (!/^\d+$/.test(value) || !Number.isSafeInteger(number5) || number5 < minimum || number5 > maximum)
-      throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
-    return number5;
-  };
-  const model = (prefix) => taskModel({
-    harness: get(`--${prefix}-harness`) ?? get("--harness"),
-    modelId: get(`--${prefix}-model`) ?? get("--model")
-  });
-  if (command === "run" && !get("--task")?.trim())
-    throw new Error("task run requires --task TEXT");
-  const planner = command === "run" ? model("planner") : undefined;
-  const executor = command === "run" ? model("executor") : undefined;
-  const maxMilestones = integer2("--max-milestones", 1, 12);
-  const maxConcurrent = integer2("--max-concurrent", 1, 4);
-  const revision = integer2("--revision", 0);
-  const subjectRevision = integer2("--subject-revision", 0);
-  const decision = get("--decision");
-  if (command === "decide" && (!decision || !["approve", "reject", "request-changes"].includes(decision) || revision === undefined))
-    throw new Error("task decide requires --decision approve|reject|request-changes and --revision N");
-  if (command === "decide" && decision === "request-changes" && !get("--feedback")?.trim())
-    throw new Error("request-changes requires --feedback TEXT");
-  return {
-    command,
-    workspace: resolve5(get("--workspace") ?? process.cwd()),
-    runId: positional[1],
-    invocationId: positional[2],
-    get,
-    planner,
-    executor,
-    maxMilestones,
-    maxConcurrent,
-    revision,
-    subjectRevision,
-    workflowIds: options.get("--workflow")
+  return async () => {
+    const current = JSON.parse(await readFile2(path, "utf8").catch(() => "null"));
+    if (current?.instanceId === connection.instanceId)
+      await rm(path, { force: true });
   };
 }
-async function taskCommand(args, service, write = (value) => process.stdout.write(`${JSON.stringify(value)}
+async function findHost(dataDir) {
+  const path = join9(dataDir, "host.json");
+  let connection;
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.mode & 63 || info.uid !== process.getuid?.())
+      throw new Error("Kouro host connection file must be owned by you and private (mode 600)");
+    connection = JSON.parse(await readFile2(path, "utf8"));
+  } catch (cause) {
+    if (cause.code === "ENOENT")
+      return;
+    throw cause;
+  }
+  const url2 = new URL(connection.url);
+  if (connection.protocol !== 1 || url2.protocol !== "http:" || url2.hostname !== "127.0.0.1" || url2.username || url2.password || url2.search || url2.hash || url2.pathname !== "/" || typeof connection.token !== "string" || typeof connection.instanceId !== "string")
+    throw new Error("Invalid Kouro host connection file");
+  let response;
+  try {
+    response = await fetch(`${connection.url}/api/cli/host`, {
+      headers: { authorization: `Bearer ${connection.token}` },
+      signal: AbortSignal.timeout(2000),
+      redirect: "error"
+    });
+  } catch (cause) {
+    if (["ECONNREFUSED", "ConnectionRefused"].includes(cause.code ?? ""))
+      return;
+    throw new Error("Cannot reach the Kouro host owning this data directory", { cause });
+  }
+  if (!response.ok || (await response.json()).instanceId !== connection.instanceId)
+    throw new Error("Kouro host connection is stale; use the running host's current CLI version");
+  return connection;
+}
+function dashboardUrl(connection) {
+  return `${connection.url}/#token=${encodeURIComponent(connection.token)}`;
+}
+async function connectedTaskCommand(connection, argv, write = (value) => process.stdout.write(`${JSON.stringify(value)}
 `)) {
-  if (args.command === "workflows") {
-    write(await service.taskWorkflows());
-    return 0;
-  }
-  let runId = args.runId;
-  if (args.command === "run") {
-    const workflowIds = args.workflowIds ?? (await service.taskWorkflows()).filter((item) => item.eligible && !["tiny", "feature", "parallel"].includes(item.id)).map((item) => item.id);
-    if (!workflowIds.length)
-      throw new Error("No eligible project workflows. Create one with kouro create template develop --template feature, configure its validation commands, then rerun.");
-    const run = await service.createTask({
-      task: args.get("--task"),
-      workflowIds,
-      planner: args.planner,
-      executor: args.executor,
-      maxMilestones: args.maxMilestones,
-      maxConcurrent: args.maxConcurrent,
-      idempotencyKey: args.get("--idempotency-key") ?? randomUUID6(),
-      workspace: { repositoryPath: args.workspace }
+  const aborter = new AbortController;
+  const stop = () => aborter.abort();
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  try {
+    const response = await fetch(`${connection.url}/api/cli/tasks`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${connection.token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ argv }),
+      signal: aborter.signal,
+      redirect: "error"
     });
-    runId = run.runId;
-  }
-  const view = service.getView(runId);
-  if (!view || view.bundle.rootDefinitionId !== "automatic-task")
-    throw new Error(`Workflow task not found: ${runId}`);
-  if (args.command === "decide") {
-    const decision = args.get("--decision");
-    service.decideApproval({
-      runId,
-      invocationId: args.invocationId,
-      expectedRevision: args.revision,
-      decision: decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "changes-requested",
-      feedback: args.get("--feedback"),
-      bindingDigest: args.get("--binding-digest"),
-      subjectRevision: args.subjectRevision,
-      actor: "cli",
-      idempotencyKey: args.get("--idempotency-key") ?? randomUUID6()
-    });
-  }
-  if (args.command === "resume" && view.state.status === "paused")
-    service.control({
-      runId,
-      action: "resume",
-      expectedRevision: view.revision,
-      actor: "cli",
-      idempotencyKey: randomUUID6()
-    });
-  if (args.command !== "status") {
-    write({ event: "task.started", runId });
-    let interrupted = false;
-    const stop = () => {
-      interrupted = true;
-      const current = service.getView(runId);
-      if (current && ["pending", "running", "paused"].includes(current.state.status))
-        service.control({
-          runId,
-          action: "cancel",
-          expectedRevision: current.revision,
-          actor: "cli",
-          idempotencyKey: randomUUID6()
-        });
-    };
-    process.on("SIGINT", stop);
-    process.on("SIGTERM", stop);
+    if (!response.ok) {
+      const error63 = await response.json();
+      throw new Error(error63.message ?? `Kouro task request failed: HTTP ${response.status}`);
+    }
+    if (!response.body)
+      throw new Error("Kouro task response has no body");
+    let pending = "";
+    let exitCode;
+    const decoder = new TextDecoder;
+    const reader = response.body.getReader();
     try {
       for (;; ) {
-        await service.coordinator.waitForCheckpointDrain(runId);
-        const current = service.getView(runId);
-        if (!["pending", "running"].includes(current.state.status) || Object.values(current.state.approvals).some((item) => item.status === "pending"))
+        const { value: chunk, done } = await reader.read();
+        if (done)
           break;
-        await Bun.sleep(50);
+        pending += decoder.decode(chunk, { stream: true });
+        let newline;
+        while ((newline = pending.indexOf(`
+`)) >= 0) {
+          const line = pending.slice(0, newline);
+          pending = pending.slice(newline + 1);
+          if (!line.trim())
+            continue;
+          const value = JSON.parse(line);
+          if (value.event === "task.finished")
+            exitCode = value.exitCode;
+          else if (value.event === "task.error")
+            throw new Error(value.message);
+          else
+            write(value);
+        }
       }
     } finally {
-      process.off("SIGINT", stop);
-      process.off("SIGTERM", stop);
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
-    if (interrupted) {
-      write(taskReport(service, runId));
+    if (!Number.isInteger(exitCode))
+      throw new Error("Kouro task connection ended before its result");
+    return exitCode;
+  } catch (cause) {
+    if (aborter.signal.aborted)
       return 130;
-    }
+    throw cause;
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
   }
-  const report = taskReport(service, runId);
-  write(report);
-  return args.command === "status" || report.status === "succeeded" ? 0 : report.waitingForApproval || report.status === "paused" ? 3 : 1;
-}
-function taskReport(service, runId) {
-  const view = service.getView(runId);
-  const approvals = Object.values(view.state.approvals).filter((item) => item.status === "pending").map((item) => ({ ...item, inputs: view.state.invocations[item.invocationId]?.inputBindings }));
-  return {
-    runId,
-    status: view.state.status,
-    revision: view.revision,
-    waitingForApproval: approvals.length > 0,
-    approvals,
-    ...service.coordinator.milestones(runId),
-    result: Object.values(view.state.invocations).find((item) => item.scopeId === view.state.rootScopeId && item.nodeId === "done")?.output,
-    workspace: service.coordinator.workspacePath(runId)
-  };
 }
 
 // packages/host/src/cli.ts
@@ -65252,7 +65437,7 @@ ${usage}`);
   if (command === "create")
     return createCommand(argv.slice(1));
   if (command === "plugin") {
-    const root = firstExistingPath([resolve6(import.meta.dir), resolve6(import.meta.dir, "../../..")].filter((candidate) => existsSync4(resolve6(candidate, ".agents/plugins/marketplace.json"))));
+    const root = firstExistingPath([resolve7(import.meta.dir), resolve7(import.meta.dir, "../../..")].filter((candidate) => existsSync4(resolve7(candidate, ".agents/plugins/marketplace.json"))));
     if (argv[1] !== "path") {
       process.stderr.write(`Usage: kouro plugin path
 `);
@@ -65282,30 +65467,68 @@ ${usage}`);
     }
     const project2 = args.workspace;
     let taskService;
+    let taskHost;
+    let unregister2;
     try {
+      const dataDir2 = resolve7(args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve7(project2, ".kouro-data"));
+      const connection = await findHost(dataDir2);
+      if (connection) {
+        const forwarded = argv.slice(1).map((argument, index, arguments_) => argument.startsWith("--workspace=") ? `--workspace=${project2}` : arguments_[index - 1] === "--workspace" ? project2 : argument);
+        return await connectedTaskCommand(connection, [
+          ...forwarded,
+          ...args.get("--workspace") ? [] : ["--workspace", project2]
+        ]);
+      }
       taskService = new ApplicationService({
-        dataDir: resolve6(args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve6(project2, ".kouro-data")),
-        templateRoot: resolve6(project2, ".kouro")
+        dataDir: dataDir2,
+        templateRoot: resolve7(project2, ".kouro")
       });
       await taskService.start();
+      if (!["workflows", "status"].includes(args.command)) {
+        const instanceId2 = randomUUID8();
+        taskHost = createHostServer(taskService, {
+          staticRoot: webStaticRoot(),
+          port: 0,
+          cli: { instanceId: instanceId2, workspace: project2 }
+        });
+        taskHost.start();
+        const hostConnection = {
+          protocol: 1,
+          url: `http://127.0.0.1:${taskHost.port}`,
+          token: taskHost.token,
+          instanceId: instanceId2
+        };
+        unregister2 = await registerHost(dataDir2, hostConnection);
+        process.stderr.write(`Kouro workbench: ${dashboardUrl(hostConnection)}
+Data: ${dataDir2}
+`);
+      }
       return await taskCommand(args, taskService);
     } catch (cause) {
       process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
 `);
       return 1;
     } finally {
-      await taskService?.close();
+      await unregister2?.();
+      if (taskHost)
+        await taskHost.stop();
+      else
+        await taskService?.close();
     }
   }
-  const project = command === "run" ? resolve6(optionValue(argv, "--workspace") ?? process.cwd()) : process.cwd();
-  const dataDir = resolve6(process.env.KOURO_DATA_DIR ?? resolve6(project, ".kouro-data"));
-  const staticRoot = firstExistingPath([
-    resolve6("packages/web/dist"),
-    resolve6(import.meta.dir, "web"),
-    resolve6(import.meta.dir, "../../web/dist"),
-    resolve6(import.meta.dir, "../web")
-  ]);
-  const service = new ApplicationService({ dataDir, templateRoot: resolve6(project, ".kouro") });
+  const project = command === "run" ? resolve7(optionValue(argv, "--workspace") ?? process.cwd()) : process.cwd();
+  const dataDir = resolve7(process.env.KOURO_DATA_DIR ?? resolve7(project, ".kouro-data"));
+  const staticRoot = webStaticRoot();
+  if (command === "serve") {
+    const connection = await findHost(dataDir);
+    if (connection) {
+      process.stdout.write(`Kouro workbench: ${dashboardUrl(connection)}
+Data: ${dataDir}
+`);
+      return 0;
+    }
+  }
+  const service = new ApplicationService({ dataDir, templateRoot: resolve7(project, ".kouro") });
   await service.start();
   if (command === "run") {
     const valueOptions2 = new Set(["--profile", "--task", "--workspace", "--ticket"]);
@@ -65391,7 +65614,7 @@ ${usage}`);
       return 2;
     }
     try {
-      process.stdout.write(`${JSON.stringify(service.coordinator.control({ runId, action, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID7() }))}
+      process.stdout.write(`${JSON.stringify(service.coordinator.control({ runId, action, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID8() }))}
 `);
       await service.close();
       return 0;
@@ -65413,7 +65636,7 @@ ${usage}`);
       return 2;
     }
     try {
-      process.stdout.write(`${JSON.stringify(service.coordinator.retry({ runId, invocationId, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID7() }))}
+      process.stdout.write(`${JSON.stringify(service.coordinator.retry({ runId, invocationId, expectedRevision: revision, actor: "cli", idempotencyKey: randomUUID8() }))}
 `);
       await service.close();
       return 0;
@@ -65446,7 +65669,7 @@ ${usage}`);
   }
   if (command === "fork") {
     const checkpointId = argv[1];
-    const requestKey = argv[2] ?? randomUUID7();
+    const requestKey = argv[2] ?? randomUUID8();
     if (!checkpointId) {
       process.stderr.write(`fork requires CHECKPOINT REQUEST
 `);
@@ -65465,8 +65688,15 @@ ${usage}`);
       return 1;
     }
   }
-  const host = createHostServer(service, { staticRoot });
+  const instanceId = randomUUID8();
+  const host = createHostServer(service, { staticRoot, cli: { instanceId, workspace: project } });
   host.start();
+  const unregister = await registerHost(dataDir, {
+    protocol: 1,
+    url: `http://127.0.0.1:${host.port}`,
+    token: host.token,
+    instanceId
+  });
   const url2 = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
   process.stdout.write(`Kouro workbench: ${url2}
 Data: ${dataDir}
@@ -65482,6 +65712,7 @@ Then open the workbench URL above in your local browser. Keep the tunnel running
     if (closing)
       return;
     closing = true;
+    await unregister();
     await host.stop();
     process.exit(0);
   };
@@ -65492,6 +65723,14 @@ Then open the workbench URL above in your local browser. Keep the tunnel running
     close();
   });
   return 0;
+}
+function webStaticRoot() {
+  return firstExistingPath([
+    resolve7("packages/web/dist"),
+    resolve7(import.meta.dir, "web"),
+    resolve7(import.meta.dir, "../../web/dist"),
+    resolve7(import.meta.dir, "../web")
+  ]);
 }
 function optionValue(argv, name) {
   const inline = argv.find((arg) => arg.startsWith(`${name}=`));
@@ -65543,32 +65782,32 @@ async function createCommand(args) {
 `);
     return 2;
   }
-  const target = resolve6(output2, name);
+  const target = resolve7(output2, name);
   if (await exists(target)) {
     process.stderr.write(`target already exists: ${target}
 `);
     return 1;
   }
   const templateRoot = firstExistingPath([
-    resolve6(import.meta.dir, "..", "assets", "templates"),
-    resolve6(import.meta.dir, "assets", "templates")
+    resolve7(import.meta.dir, "..", "assets", "templates"),
+    resolve7(import.meta.dir, "assets", "templates")
   ]);
   if (!templateRoot) {
     process.stderr.write(`Kouro CLI template assets are not installed
 `);
     return 1;
   }
-  const source = resolve6(templateRoot, template);
-  const temporary = `${target}.tmp-${randomUUID7()}`;
+  const source = resolve7(templateRoot, template);
+  const temporary = `${target}.tmp-${randomUUID8()}`;
   try {
     await renderDirectory(source, temporary, name);
     await mkdir(dirname3(target), { recursive: true });
-    await rename(temporary, target);
+    await rename2(temporary, target);
     process.stdout.write(`Created ${target} from ${template}
 `);
     return 0;
   } catch (cause) {
-    await rm(temporary, { recursive: true, force: true });
+    await rm2(temporary, { recursive: true, force: true });
     process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}
 `);
     return 1;
@@ -65588,12 +65827,12 @@ async function exists(path) {
 async function renderDirectory(source, target, name) {
   await mkdir(target, { recursive: true });
   for (const entry of await readdir2(source, { withFileTypes: true })) {
-    const sourcePath = resolve6(source, entry.name);
-    const targetPath = resolve6(target, entry.name);
+    const sourcePath = resolve7(source, entry.name);
+    const targetPath = resolve7(target, entry.name);
     if (entry.isDirectory())
       await renderDirectory(sourcePath, targetPath, name);
     else if (entry.isFile())
-      await writeFile(targetPath, (await readFile2(sourcePath, "utf8")).replaceAll("{{id}}", name).replaceAll("{{name}}", name.split("-").map((part) => `${part[0]?.toUpperCase()}${part.slice(1)}`).join(" ")));
+      await writeFile2(targetPath, (await readFile3(sourcePath, "utf8")).replaceAll("{{id}}", name).replaceAll("{{name}}", name.split("-").map((part) => `${part[0]?.toUpperCase()}${part.slice(1)}`).join(" ")));
   }
 }
 if (import.meta.main)

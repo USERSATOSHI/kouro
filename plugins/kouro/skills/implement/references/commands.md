@@ -24,8 +24,11 @@ in the workflow when needed. If essential input is missing, ask only for it.
 default to the supplied workspace's `.kouro-data` and accept `--data-dir` as an
 override. Keep that directory consistent for inspection and control. Only one
 CLI or web host may own it; do not kill a host or bypass its lock to run another
-command. Hand off after the current owner returns, or use an already available
-authenticated host API for the same requested action.
+command. `kouro task` connects to the running dashboard for that directory.
+If the task starts first, it prints a temporary dashboard URL to stderr and
+`kouro serve` returns the same URL. The temporary dashboard lasts until that
+command returns; start `kouro serve` first for persistent operation. Other
+headless commands still require ownership to have been released.
 
 ## Plugin entrypoints
 
@@ -90,7 +93,7 @@ Use the user's authorization for that specific gate. `request-changes` needs
 Decisions continue until the next gate or terminal state. A stale revision or
 digest requires fresh inspection and review. Resume keeps undecided gates
 pending. Use `kouro inspect` with the same state directory for full references,
-or `kouro serve` after the CLI releases ownership to review artifacts and diffs.
+or use the dashboard URL to review artifacts and diffs while the task runs.
 
 ## Recovery, branches and delivery
 

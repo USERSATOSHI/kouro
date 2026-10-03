@@ -1,7 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { join, normalize, relative } from "node:path";
+import { join, normalize, relative, resolve } from "node:path";
 import { Elysia } from "elysia";
 import type { ApplicationService } from "../application/service.ts";
+import { parseTaskArgs, taskCommand } from "../cli/tasks";
 import {
   validateDataset,
   validateExperiment,
@@ -16,6 +17,7 @@ export interface HostServerOptions {
   token?: string;
   port?: number;
   staticRoot?: string;
+  cli?: { instanceId: string; workspace: string };
 }
 interface Session {
   csrf: string;
@@ -48,6 +50,10 @@ export function createHostServer(
     set.status === 403
       ? { error: "forbidden", message: "Origin or CSRF check failed" }
       : unauthorized(set);
+  const cliAuthenticated = (request: Request) =>
+    options.cli &&
+    validOriginHost(request) &&
+    request.headers.get("authorization") === `Bearer ${token}`;
   const checked = (request: Request, set: MutableStatus, command = false): Session | null => {
     if (!validOriginHost(request)) {
       set.status = 403;
@@ -89,6 +95,70 @@ export function createHostServer(
     sessions.set(sessionId, { csrf, createdAt: Date.now() });
     set.headers["set-cookie"] = `kouro_session=${sessionId}; HttpOnly; SameSite=Strict; Path=/`;
     return { csrfToken: csrf };
+  });
+
+  app.get("/api/cli/host", ({ request, set }) =>
+    cliAuthenticated(request)
+      ? { instanceId: options.cli!.instanceId, workspace: options.cli!.workspace }
+      : unauthorized(set),
+  );
+  app.post("/api/cli/tasks", ({ request, set, body }) => {
+    if (!cliAuthenticated(request)) return unauthorized(set);
+    let args: ReturnType<typeof parseTaskArgs>;
+    try {
+      const argv = bodyObject(body).argv;
+      if (!Array.isArray(argv) || argv.some((value) => typeof value !== "string"))
+        throw new Error("Task argv must be an array of strings");
+      args = parseTaskArgs(argv);
+      if (args.workspace !== resolve(options.cli!.workspace))
+        throw new Error("The dashboard and task must use the same project directory");
+    } catch (cause) {
+      set.status = 400;
+      return {
+        error: "invalid-cli-task",
+        message: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+    const aborter = new AbortController();
+    const disconnected = () => aborter.abort();
+    request.signal.addEventListener("abort", disconnected, { once: true });
+    if (request.signal.aborted) disconnected();
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const writeLine = (line: string) => {
+            if (aborter.signal.aborted) return;
+            try {
+              controller.enqueue(encoder.encode(line));
+            } catch {
+              disconnected();
+            }
+          };
+          const write = (value: unknown) => writeLine(`${JSON.stringify(value)}\n`);
+          const heartbeat = setInterval(() => writeLine("\n"), 5000);
+          void taskCommand(args, service, write, { signal: aborter.signal, processSignals: false })
+            .then((exitCode) => write({ event: "task.finished", exitCode }))
+            .catch((cause) =>
+              write({
+                event: "task.error",
+                message: cause instanceof Error ? cause.message : String(cause),
+              }),
+            )
+            .finally(() => {
+              clearInterval(heartbeat);
+              request.signal.removeEventListener("abort", disconnected);
+              try {
+                controller.close();
+              } catch {
+                /* client disconnected */
+              }
+            });
+        },
+        cancel: disconnected,
+      }),
+      { headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" } },
+    );
   });
 
   app.get("/api/workflows", ({ request, set }) =>
@@ -1090,7 +1160,9 @@ export function createHostServer(
   return {
     app,
     token,
-    port,
+    get port() {
+      return server?.port ?? port;
+    },
     start() {
       server = Bun.serve({ hostname: "127.0.0.1", port, fetch: app.handle });
       return server;

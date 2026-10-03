@@ -59,6 +59,13 @@ The host serves the built web application and API through ElysiaJS. Use the loca
 URL printed by the host. Keep the pairing token private. The server binds to
 loopback; this is a local workbench, not a hosted service.
 
+In Kouro 2.0.11 and newer, `kouro task` connects to a dashboard already running
+for the same project and data directory, so CLI tasks appear live in Recent
+runs. If the CLI starts first, it prints a temporary dashboard URL to stderr;
+`kouro serve` returns that same URL while the command runs. Start `kouro serve`
+first for a persistent dashboard. After updating Kouro, restart the dashboard
+once so CLI commands can connect.
+
 ```sh
 bun run kouro --help
 bun run typecheck
@@ -99,8 +106,8 @@ string values remain accepted. Codex accepts `minimal`, `low`, `medium`, `high`,
 through `max`. Individual model support can be narrower. OpenCode effort is not
 wired through Kouro. Fusion reviews and revisions retain the member's effort;
 child agents use their own setting. The workbench's node settings can override
-effort for a run, which is pinned in its bundle. These additions require the
-current source checkout; rebuild the CLI before using them.
+effort for a run, which is pinned in its bundle. Reasoning effort is available
+in Kouro 2.0.10 and newer.
 
 ```ts
 import { ReasoningEffort } from "@kouro/core";

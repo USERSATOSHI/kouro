@@ -7,6 +7,7 @@ import { ApplicationService } from "./application/service.ts";
 import { createHostServer } from "./http/server.ts";
 import { serveScoutMcp } from "./adapters/harness/scout-mcp.ts";
 import { parseTaskArgs, taskCommand, taskUsage } from "./cli/tasks";
+import { connectedTaskCommand, dashboardUrl, findHost, registerHost } from "./cli/host-connection";
 
 const usage = `Kouro v2 M1
 
@@ -91,32 +92,74 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     const project = args.workspace;
     let taskService: ApplicationService | undefined;
+    let taskHost: ReturnType<typeof createHostServer> | undefined;
+    let unregister: (() => Promise<void>) | undefined;
     try {
+      const dataDir = resolve(
+        args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve(project, ".kouro-data"),
+      );
+      const connection = await findHost(dataDir);
+      if (connection) {
+        const forwarded = argv
+          .slice(1)
+          .map((argument, index, arguments_) =>
+            argument.startsWith("--workspace=")
+              ? `--workspace=${project}`
+              : arguments_[index - 1] === "--workspace"
+                ? project
+                : argument,
+          );
+        return await connectedTaskCommand(connection, [
+          ...forwarded,
+          ...(args.get("--workspace") ? [] : ["--workspace", project]),
+        ]);
+      }
       taskService = new ApplicationService({
-        dataDir: resolve(
-          args.get("--data-dir") ?? process.env.KOURO_DATA_DIR ?? resolve(project, ".kouro-data"),
-        ),
+        dataDir,
         templateRoot: resolve(project, ".kouro"),
       });
       await taskService.start();
+      if (!["workflows", "status"].includes(args.command)) {
+        const instanceId = randomUUID();
+        taskHost = createHostServer(taskService, {
+          staticRoot: webStaticRoot(),
+          port: 0,
+          cli: { instanceId, workspace: project },
+        });
+        taskHost.start();
+        const hostConnection = {
+          protocol: 1 as const,
+          url: `http://127.0.0.1:${taskHost.port}`,
+          token: taskHost.token,
+          instanceId,
+        };
+        unregister = await registerHost(dataDir, hostConnection);
+        process.stderr.write(
+          `Kouro workbench: ${dashboardUrl(hostConnection)}\nData: ${dataDir}\n`,
+        );
+      }
       return await taskCommand(args, taskService);
     } catch (cause) {
       process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
       return 1;
     } finally {
-      await taskService?.close();
+      await unregister?.();
+      if (taskHost) await taskHost.stop();
+      else await taskService?.close();
     }
   }
 
   const project =
     command === "run" ? resolve(optionValue(argv, "--workspace") ?? process.cwd()) : process.cwd();
   const dataDir = resolve(process.env.KOURO_DATA_DIR ?? resolve(project, ".kouro-data"));
-  const staticRoot = firstExistingPath([
-    resolve("packages/web/dist"),
-    resolve(import.meta.dir, "web"),
-    resolve(import.meta.dir, "../../web/dist"),
-    resolve(import.meta.dir, "../web"),
-  ]);
+  const staticRoot = webStaticRoot();
+  if (command === "serve") {
+    const connection = await findHost(dataDir);
+    if (connection) {
+      process.stdout.write(`Kouro workbench: ${dashboardUrl(connection)}\nData: ${dataDir}\n`);
+      return 0;
+    }
+  }
   const service = new ApplicationService({ dataDir, templateRoot: resolve(project, ".kouro") });
   await service.start();
   if (command === "run") {
@@ -297,8 +340,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 1;
     }
   }
-  const host = createHostServer(service, { staticRoot });
+  const instanceId = randomUUID();
+  const host = createHostServer(service, { staticRoot, cli: { instanceId, workspace: project } });
   host.start();
+  const unregister = await registerHost(dataDir, {
+    protocol: 1,
+    url: `http://127.0.0.1:${host.port}`,
+    token: host.token,
+    instanceId,
+  });
   const url = `http://127.0.0.1:${host.port}/#token=${encodeURIComponent(host.token)}`;
   process.stdout.write(`Kouro workbench: ${url}\nData: ${dataDir}\n`);
   if (process.env.SSH_CONNECTION) {
@@ -311,6 +361,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const close = async () => {
     if (closing) return;
     closing = true;
+    await unregister();
     await host.stop();
     process.exit(0);
   };
@@ -321,6 +372,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     void close();
   });
   return 0;
+}
+
+function webStaticRoot() {
+  return firstExistingPath([
+    resolve("packages/web/dist"),
+    resolve(import.meta.dir, "web"),
+    resolve(import.meta.dir, "../../web/dist"),
+    resolve(import.meta.dir, "../web"),
+  ]);
 }
 
 function optionValue(argv: readonly string[], name: string): string | undefined {

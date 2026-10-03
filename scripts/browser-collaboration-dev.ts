@@ -3,8 +3,9 @@ import { resolve } from "node:path";
 import { ApplicationService } from "../packages/host/src/application/service.ts";
 import { CollaborationGateway } from "../packages/host/src/collaboration/gateway.ts";
 import { createHostServer } from "../packages/host/src/http/server.ts";
+import { registerHost } from "../packages/host/src/cli/host-connection";
 import { prepareSwarmProviderFixture } from "./swarm-provider-fixture";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import {
   BrowserSessionHarness,
   prepareLaunchTemplate,
@@ -16,6 +17,27 @@ import {
 // data directory so the UI has real participants/messages to render.
 const dataDir = resolve(process.env.KOURO_DATA_DIR ?? ".kouro-browser-data");
 await mkdir(dataDir, { recursive: true });
+// CLI-to-dashboard tests use an isolated committed project, never the checkout.
+await writeFile(resolve(dataDir, "fixture.txt"), "Browser task project\n");
+await writeFile(resolve(dataDir, ".gitignore"), "*\n!fixture.txt\n!.gitignore\n");
+for (const args of [
+  ["init", "--quiet"],
+  ["add", "fixture.txt", ".gitignore"],
+  [
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@localhost",
+    "commit",
+    "--quiet",
+    "-m",
+    "Browser task project",
+  ],
+]) {
+  const process = Bun.spawn(["git", ...args], { cwd: dataDir, stdout: "ignore", stderr: "pipe" });
+  const error = await new Response(process.stderr).text();
+  if (await process.exited) throw new Error(error);
+}
 process.env.KOURO_OPENCODE_BIN = await prepareSwarmProviderFixture(dataDir);
 const sessionHarness = new BrowserSessionHarness();
 const service = new ApplicationService({
@@ -70,18 +92,27 @@ gateway.send(planner.grantId, {
 
 await seedSessionFixtures(service, sessionHarness);
 
+const instanceId = randomUUID();
 const host = createHostServer(service, {
   staticRoot: resolve("packages/web/dist"),
   token: process.env.KOURO_TOKEN,
   port: Number(process.env.KOURO_PORT ?? 43127),
+  cli: { instanceId, workspace: dataDir },
 });
 host.start();
+const unregister = await registerHost(dataDir, {
+  protocol: 1,
+  url: `http://127.0.0.1:${host.port}`,
+  token: host.token,
+  instanceId,
+});
 process.stdout.write(`Kouro browser fixture: http://127.0.0.1:${host.port}/#token=${host.token}\n`);
 
 let closing = false;
 const close = async () => {
   if (closing) return;
   closing = true;
+  await unregister();
   await host.stop();
   await service.close();
 };

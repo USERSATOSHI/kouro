@@ -24,7 +24,8 @@ Run options:
 
 Decision options: --feedback TEXT, --binding-digest DIGEST, --subject-revision N.
 Output is JSON. Exit codes: 0 success, 1 failure, 2 invalid arguments, 3 waiting for approval or paused.
-Approval gates are preserved. Only one CLI or web host may own a data directory at a time.
+Approval gates are preserved. Tasks connect to the dashboard owning their data directory.
+Without a running host, execution prints a temporary dashboard URL to stderr.
 `;
 
 const valueOptions = new Set([
@@ -147,7 +148,9 @@ export async function taskCommand(
   args: TaskArgs,
   service: ApplicationService,
   write: (value: unknown) => void = (value) => process.stdout.write(`${JSON.stringify(value)}\n`),
+  options: { signal?: AbortSignal; processSignals?: boolean } = {},
 ): Promise<number> {
+  options.signal?.throwIfAborted();
   if (args.command === "workflows") {
     write(await service.taskWorkflows());
     return 0;
@@ -220,8 +223,12 @@ export async function taskCommand(
           idempotencyKey: randomUUID(),
         });
     };
-    process.on("SIGINT", stop);
-    process.on("SIGTERM", stop);
+    if (options.processSignals !== false) {
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
+    }
+    options.signal?.addEventListener("abort", stop, { once: true });
+    if (options.signal?.aborted) stop();
     try {
       for (;;) {
         await service.coordinator.waitForCheckpointDrain(runId!);
@@ -236,6 +243,7 @@ export async function taskCommand(
     } finally {
       process.off("SIGINT", stop);
       process.off("SIGTERM", stop);
+      options.signal?.removeEventListener("abort", stop);
     }
     if (interrupted) {
       write(taskReport(service, runId!));

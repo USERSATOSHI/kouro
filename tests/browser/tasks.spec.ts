@@ -1,4 +1,66 @@
 import { expect, test } from "@playwright/test";
+import { resolve } from "node:path";
+import { execFile } from "node:child_process";
+
+test("a task launched by the actual CLI appears in an already open dashboard", async ({ page }) => {
+  await page.goto("/#token=kouro-browser-test-token");
+  await expect(page.getByRole("button", { name: "Workflow task", exact: true })).toBeVisible();
+  const host = await page.request.get("/api/cli/host", {
+    headers: { authorization: "Bearer kouro-browser-test-token" },
+  });
+  expect(host.ok()).toBe(true);
+  const { workspace } = await host.json();
+  const cliEnvironment = { ...process.env };
+  delete cliEnvironment.FORCE_COLOR;
+  const { output, error, code } = await new Promise<{
+    output: string;
+    error: string;
+    code: number;
+  }>((done) =>
+    execFile(
+      "bun",
+      [
+        resolve("packages/host/src/cli.ts"),
+        "task",
+        "run",
+        "--task",
+        "CLI dashboard visibility marker",
+        "--workflow",
+        "task-gated",
+        "--harness",
+        "codex",
+        "--model",
+        "fixture",
+        "--workspace",
+        workspace,
+        "--data-dir",
+        workspace,
+      ],
+      { timeout: 15000, env: cliEnvironment },
+      (failure, output, error) =>
+        done({
+          output,
+          error,
+          code: typeof failure?.code === "number" ? failure.code : failure ? 1 : 0,
+        }),
+    ),
+  );
+  expect(error).toBe("");
+  expect(code).toBe(3);
+  const report = JSON.parse(output.trim().split("\n").at(-1)!);
+  expect(report.waitingForApproval).toBe(true);
+  const row = page.getByRole("button", { name: /CLI dashboard visibility marke/ });
+  await expect(row).toBeVisible();
+  await row.click();
+  await expect(page.getByTestId("run-status")).toHaveText("running");
+  await page.getByRole("tab", { name: "Milestones", exact: true }).click();
+  await expect(page.getByText("Build A", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Waiting for approval", { exact: true })).toHaveCount(2);
+  await page.reload();
+  await expect(page.getByTestId("run-status")).toHaveText("running");
+  const view = await (await page.request.get(`/api/runs/${report.runId}/view`)).json();
+  expect(view.bundle.rootDefinitionId).toBe("automatic-task");
+});
 
 test("an older backend's HTML response shows how to restart instead of a JSON parse error", async ({
   page,
